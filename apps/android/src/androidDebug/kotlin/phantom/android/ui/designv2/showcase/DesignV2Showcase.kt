@@ -780,6 +780,108 @@ fun ShowcaseOnboardingHowV2() {
     }
 }
 
+// ── Commit 3 additions — IdentityKey states + Finale confirmation ─────
+
+/**
+ * IdentityKeyStepV2 in its four visual states, one showcase composable
+ * per state so Paparazzi captures them independently. Preview card
+ * ONLY signals the key does not exist yet (redline §C1); username
+ * validation drives helper text + trailing icon.
+ */
+
+private const val IdentityStepDotsIndex = 1  // OnboardingStepV2.Identity.dotsIndex
+
+@Composable
+private fun identityFrame(content: @Composable () -> Unit) {
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Identity,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = true,
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) { content() }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyEmpty() {
+    identityFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = ""),
+            dotsIndex = IdentityStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyShort() {
+    identityFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "ab"),
+            dotsIndex = IdentityStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyInvalid() {
+    identityFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "al!ce"),
+            dotsIndex = IdentityStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyValid() {
+    identityFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "alice"),
+            dotsIndex = IdentityStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+        )
+    }
+}
+
+/**
+ * FinaleConfirmationStepV2 rendered with a fixed test-fixture hex so
+ * the golden is deterministic. Real users see the actual
+ * `IdentityRecord.signingPublicKeyHex` returned by `createOrLoad`.
+ */
+@Composable
+fun ShowcaseOnboardingFinaleConfirmation() {
+    // Fixture: 64 chars, distinct enough that a shift-by-1 bug would
+    // show visually in a golden.
+    // 4 + (16 * 3) + 12 = 64 (Ed25519 public key hex length).
+    val fixtureHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.FinaleConfirmation,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = false,   // Finale is chromeless
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) {
+        phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
+                username = "alice",
+                signingPublicKeyHex = fixtureHex,
+            ),
+            onContinueClick = {},
+        )
+    }
+}
+
 // ── Stress goldens — narrow width + long strings, split A + B ──────────────
 //
 // Round-3 REDLINE P1-3: previous single `ShowcaseStress` composable's

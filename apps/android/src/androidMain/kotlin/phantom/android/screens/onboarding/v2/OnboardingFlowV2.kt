@@ -34,6 +34,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import android.util.Log
+import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2
 import phantom.android.screens.onboarding.v2.steps.HowStepV2
@@ -42,6 +46,9 @@ import phantom.android.screens.onboarding.v2.steps.PermissionsStepV2
 import phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2
 import phantom.android.screens.onboarding.v2.steps.WelcomeStepV2
 import phantom.android.ui.designv2.DesignV2Tokens
+import phantom.core.crypto.DhKeyPair
+import phantom.core.crypto.DhPrivateKey
+import phantom.core.crypto.DhPublicKey
 
 /**
  * OnboardingFlowV2 — 5-step gated flow with chrome + finale confirmation.
@@ -96,14 +103,86 @@ fun OnboardingFlowV2(
     container: AppContainer,
     onComplete: () -> Unit,
 ) {
+    // Real production wiring for the two-phase finalize. See
+    // [OnboardingFinalizeController] for the state-machine contract.
+    val controller = remember(container) {
+        OnboardingFinalizeController(
+            createOrLoad = { username -> container.identityManager.createOrLoad(username) },
+            initMessaging = { record, keyPair ->
+                container.initMessaging(
+                    record,
+                    DhKeyPair(
+                        DhPublicKey(keyPair.publicKey.bytes),
+                        DhPrivateKey(keyPair.privateKey.bytes),
+                    ),
+                )
+            },
+            onError = { throwable ->
+                // Log details for diagnostics; the user-visible message
+                // is a stable string produced by the controller.
+                Log.w("OnboardingV2", "finalize error", throwable)
+            },
+        )
+    }
+    OnboardingFlowV2Internal(
+        onComplete = onComplete,
+        controller = controller,
+    )
+}
+
+/**
+ * Test-facing overload — accepts a pre-constructed
+ * [OnboardingFinalizeController]. Contract tests exercise the
+ * controller directly for its state-machine assertions (double-tap,
+ * cancellation, retry after phase-1 vs phase-2 failure); this UI
+ * overload exists so a future integration test can inject a fake
+ * controller and assert flow-level wiring.
+ */
+@Composable
+internal fun OnboardingFlowV2Internal(
+    onComplete: () -> Unit,
+    controller: OnboardingFinalizeController,
+) {
     var currentStep by remember { mutableStateOf(OnboardingStepV2.Welcome) }
     var formState by remember { mutableStateOf(OnboardingFormStateV2()) }
     var toastMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
+    // Surface controller's transient error via the existing toast slot,
+    // then dismiss so it does not re-fire.
+    val transient = controller.transientErrorMessage
+    LaunchedEffect(transient) {
+        if (transient != null) {
+            toastMessage = transient
+            controller.dismissTransientError()
+        }
+    }
+
+    // On success, the controller reaches Complete — advance to Finale
+    // and seed the signingPublicKeyHex for the confirmation UI.
+    val finalizeState = controller.state
+    LaunchedEffect(finalizeState) {
+        if (finalizeState is FinalizeState.Complete) {
+            if (currentStep != OnboardingStepV2.FinaleConfirmation) {
+                formState = formState.copy(
+                    signingPublicKeyHex = finalizeState.record.signingPublicKeyHex,
+                )
+                currentStep = OnboardingStepV2.FinaleConfirmation
+            }
+        }
+    }
+
+    // Round-1 REDLINE Commit-3 §P1-1: back navigation is locked once
+    // the finalize controller reaches Persisted or later — the
+    // persisted record is immutable, so returning to Identity to
+    // "change" the username would be silently ignored.
+    val backLocked = isBackNavigationLockedByFinalize(controller.state)
     val goBack: () -> Unit = {
-        val prev = OnboardingStepV2.entries
-            .firstOrNull { it.ordinalInFlow == currentStep.ordinalInFlow - 1 }
-        if (prev != null) currentStep = prev
+        if (!backLocked) {
+            val prev = OnboardingStepV2.entries
+                .firstOrNull { it.ordinalInFlow == currentStep.ordinalInFlow - 1 }
+            if (prev != null) currentStep = prev
+        }
     }
     val goNext: () -> Unit = {
         if (canAdvanceFromV2(currentStep, formState)) {
@@ -113,11 +192,15 @@ fun OnboardingFlowV2(
         }
     }
 
-    // BackHandler routing (P1-4). Welcome not handled → OS default.
-    // FinaleConfirmation handled with NO-OP body — INTERCEPTS Back and
-    // absorbs it so the OS cannot pop the activity from a post-finalize
-    // state. All other steps: goBack().
-    if (currentStep == OnboardingStepV2.FinaleConfirmation) {
+    // BackHandler routing.
+    //   Welcome: no handler → OS default (exit).
+    //   FinaleConfirmation OR back-nav-locked-by-finalize: install a
+    //     no-op handler that ABSORBS the OS Back. On Finale, the user
+    //     leaves via the Continue CTA. When the finalize controller
+    //     is Persisted (or later), backward navigation from Permissions
+    //     would try to unwind an already-committed identity — no-op.
+    //   Other steps: goBack decrements currentStep.
+    if (currentStep == OnboardingStepV2.FinaleConfirmation || backLocked) {
         BackHandler(enabled = true) { /* intentionally absorbed */ }
     } else if (currentStep != OnboardingStepV2.Welcome) {
         BackHandler(enabled = true) { goBack() }
@@ -139,7 +222,7 @@ fun OnboardingFlowV2(
         // already created. `isEdgeSwipeBackFromEnabled` is a pure
         // function in OnboardingStateV2.kt and is pinned by a unit
         // test in OnboardingV2StateTest.
-        edgeSwipeBackEnabled = isEdgeSwipeBackFromEnabled(currentStep),
+        edgeSwipeBackEnabled = isEdgeSwipeBackFromEnabled(currentStep) && !backLocked,
         onEdgeSwipeBack = goBack,
         toastMessage = toastMessage,
         onToastDismiss = { toastMessage = null },
@@ -185,15 +268,28 @@ fun OnboardingFlowV2(
                     dotsIndex = step.dotsIndex,
                     onFormStateChange = { formState = it },
                     onDoneClick = {
-                        // Commit 2 placeholder — the real finalize
-                        // (createOrLoad + initMessaging + advance to
-                        // FinaleConfirmation) lands in Commit 5.
-                        currentStep = OnboardingStepV2.FinaleConfirmation
+                        // Delegate the 2-phase state machine (double-tap
+                        // guard, createOrLoad, initMessaging, retry
+                        // semantics, cancellation handling) to the
+                        // controller. Advancement to FinaleConfirmation
+                        // happens via the LaunchedEffect above that
+                        // observes `controller.state` transitioning to
+                        // Complete.
+                        scope.launch {
+                            controller.finalize(formState.username)
+                        }
                     },
                 )
                 OnboardingStepV2.FinaleConfirmation -> FinaleConfirmationStepV2(
                     formState = formState,
                     onContinueClick = onComplete,
+                    onKeyCopied = {
+                        // Round-1 REDLINE Commit-3 §P2-1: Copy needs
+                        // acknowledgement per handoff. Route through
+                        // the existing onboarding toast slot so the
+                        // feedback re-uses the flow's Toast composable.
+                        toastMessage = "Key copied to clipboard."
+                    },
                 )
             }
         }

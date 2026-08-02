@@ -7,7 +7,12 @@ import app.cash.paparazzi.DeviceConfig
 import app.cash.paparazzi.Paparazzi
 import org.junit.Rule
 import org.junit.Test
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingFinaleConfirmation
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingHowV2
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyEmpty
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyInvalid
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyShort
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyValid
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingTermsV2
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingWelcomeV2
 
@@ -45,5 +50,32 @@ class OnboardingV2SnapshotTest {
     @Test
     fun onboarding_v2_how() {
         paparazzi.snapshot { ShowcaseOnboardingHowV2() }
+    }
+
+    // Commit 3 additions — IdentityKey states + Finale confirmation.
+
+    @Test
+    fun onboarding_v2_identity_key_empty() {
+        paparazzi.snapshot { ShowcaseOnboardingIdentityKeyEmpty() }
+    }
+
+    @Test
+    fun onboarding_v2_identity_key_short() {
+        paparazzi.snapshot { ShowcaseOnboardingIdentityKeyShort() }
+    }
+
+    @Test
+    fun onboarding_v2_identity_key_invalid_chars() {
+        paparazzi.snapshot { ShowcaseOnboardingIdentityKeyInvalid() }
+    }
+
+    @Test
+    fun onboarding_v2_identity_key_valid() {
+        paparazzi.snapshot { ShowcaseOnboardingIdentityKeyValid() }
+    }
+
+    @Test
+    fun onboarding_v2_finale_confirmation() {
+        paparazzi.snapshot { ShowcaseOnboardingFinaleConfirmation() }
     }
 }

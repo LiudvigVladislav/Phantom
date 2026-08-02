@@ -20,9 +20,13 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
@@ -321,6 +325,151 @@ class OnboardingV2SemanticsTest {
         }
     }
 
+    // Round-1 REDLINE Commit-3 §P2-2: username input semantics.
+    //   - The BasicTextField owns Role.TextField + error semantic when
+    //     invalid.
+    //   - The decorative `@` prefix and decorative status icon MUST NOT
+    //     surface independent semantic nodes; they are excluded via
+    //     `clearAndSetSemantics { }` at their call sites.
+
+    @Test
+    fun username_input_error_state_carries_error_semantic_via_helper_text() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "al!ce"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNode(hasAnyErrorSemantic()).assertExists()
+    }
+
+    @Test
+    fun username_input_at_prefix_is_decorative_no_independent_text_node() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "alice"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        // The @ prefix + divider live inside a `clearAndSetSemantics { }`
+        // Row, so neither the "@" character nor the invisible divider
+        // has an independent semantic node. A screen reader would NOT
+        // announce "@" as a separate item.
+        composeTestRule.onAllNodesWithText("@").assertCountEquals(0)
+    }
+
+    @Test
+    fun username_input_status_icon_is_decorative_no_independent_a11y_node() {
+        // Valid state renders a green confirm icon in the trailing slot.
+        // The icon has clearAndSetSemantics { } → no independent node.
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "alice"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        // No node reports "confirm" / "block" / "check" as a
+        // contentDescription — the icon is decorative.
+        composeTestRule.onAllNodesWithContentDescription("confirm").assertCountEquals(0)
+        composeTestRule.onAllNodesWithContentDescription("check").assertCountEquals(0)
+        composeTestRule.onAllNodesWithContentDescription("valid").assertCountEquals(0)
+    }
+
+    // Round-2 REDLINE Commit-3 §P2-A pin: the "exactly one editable
+    // field" contract. Semantic tree of the Identity step must expose
+    // ONE and only ONE SetText action (the username input), and the
+    // error semantic MUST live on that same node so a screen reader
+    // announces the error against the field itself — not against a
+    // separate helper-text node.
+
+    @Test
+    fun identity_step_exposes_exactly_one_settext_node() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "alice"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        // The username input is the ONLY editable field on the Identity
+        // step. Decorative slots (@ prefix, divider, status icon) must
+        // NOT emit their own SetText action.
+        composeTestRule.onAllNodes(hasSetTextAction()).assertCountEquals(1)
+    }
+
+    @Test
+    fun error_semantic_lives_on_the_same_node_as_settext_action() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "al!ce"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        // Round-3 REDLINE §P2 pin: the Error semantic MUST live on the
+        // same accessibility node that carries the SetText action.
+        // TalkBack announces the error only when it lands on the
+        // node currently focused. An error attached to an ancestor
+        // without `mergeDescendants = true` leaves the field's own
+        // node error-less — a screen reader would not announce the
+        // error when focus enters the field.
+        //
+        // This assertion fails if `error()` is moved off the
+        // BasicTextField's own modifier chain (which is exactly the
+        // regression this test guards against).
+        composeTestRule.onNode(hasSetTextAction()).assert(hasAnyErrorSemantic())
+
+        // Global invariants preserved from round-2: exactly ONE
+        // SetText node (only one editable field on the step) AND
+        // exactly ONE Error node (no rogue duplicate on a sibling
+        // helper-text node).
+        composeTestRule.onAllNodes(hasSetTextAction()).assertCountEquals(1)
+        composeTestRule.onAllNodes(hasAnyErrorSemantic()).assertCountEquals(1)
+    }
+
+    @Test
+    fun decorative_slots_produce_no_extra_interactive_nodes() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2(
+                formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(username = "alice"),
+                dotsIndex = 1,
+                onFormStateChange = {},
+                onContinueClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        // Round-2 REDLINE §P2 pin: the decorative slots (`@` prefix,
+        // 1 dp × 20 dp divider, trailing status icon) all live inside
+        // `Modifier.clearAndSetSemantics { }` — so they emit no
+        // independent interactive semantics. The Identity step's
+        // interactive surface is exactly two nodes: the username input
+        // (SetText action, count = 1) and the Continue button
+        // (Role.Button, count = 1). Any decorative slot that leaked
+        // semantics — a stray editable field, a stray button — would
+        // inflate one of these counts.
+        //
+        // Note: BasicTextField itself owns an OnClick action alongside
+        // SetText (click-to-focus), which is why we discriminate the
+        // "button" count by Role.Button rather than by generic
+        // OnClick presence — the Continue node is the only Role.Button
+        // on the step.
+        composeTestRule.onAllNodes(hasSetTextAction()).assertCountEquals(1)
+        composeTestRule.onAllNodes(hasButtonRole()).assertCountEquals(1)
+    }
+
     @Test
     fun finale_has_no_edge_swipe_surface() {
         // In OnboardingV2HostFrame the overlay is conditionally rendered
@@ -383,3 +532,13 @@ private fun <T> androidx.compose.ui.semantics.SemanticsConfiguration.getOrNull(
 } catch (_: IllegalStateException) {
     null
 }
+
+private fun hasAnyErrorSemantic(): SemanticsMatcher =
+    SemanticsMatcher("Has any Error semantic") { node ->
+        node.config.getOrNull(SemanticsProperties.Error) != null
+    }
+
+private fun hasFocusedSemantic(): SemanticsMatcher =
+    SemanticsMatcher("Has Focused semantic (focusable node)") { node ->
+        node.config.getOrNull(SemanticsProperties.Focused) != null
+    }

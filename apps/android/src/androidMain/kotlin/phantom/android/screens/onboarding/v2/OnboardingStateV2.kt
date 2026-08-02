@@ -158,3 +158,40 @@ fun canAdvanceFromV2(step: OnboardingStepV2, state: OnboardingFormStateV2): Bool
 fun isEdgeSwipeBackFromEnabled(step: OnboardingStepV2): Boolean =
     step != OnboardingStepV2.Welcome &&
     step != OnboardingStepV2.FinaleConfirmation
+
+/**
+ * Format an Ed25519 public-key hex string as chunked groups for legible
+ * display in the finale card. The FULL 64-char hex is preserved — this
+ * only inserts visual grouping spaces.
+ *
+ * Format: 8 groups of 8 chars, single space between adjacent groups,
+ * double space between groups 4 and 5 (mid-hex "waist"). Matches the
+ * handoff `Onboarding.dc.html` finale card layout.
+ *
+ * Returns the input unchanged if the input length is not exactly 64 —
+ * defensive fallback for records that predate the Alpha 2 signing-key
+ * backfill (which report null `signingPublicKeyHex`; callers should
+ * check upstream before calling this).
+ */
+fun formatFingerprintForDisplay(hex: String): String {
+    if (hex.length != 64) return hex
+    return buildString {
+        for (i in 0..7) {
+            if (i > 0) append(if (i == 4) "  " else " ")
+            append(hex.substring(i * 8, i * 8 + 8))
+        }
+    }
+}
+
+/**
+ * Short 8-char fingerprint: first 4 + last 4 of the hex separated by
+ * an ellipsis. Displayed alongside an explicit `fingerprint · short form`
+ * label so the reader knows this is NOT a full key — no truncated
+ * key ever appears without the label (per redline §C1).
+ *
+ * Returns empty string if the input length is not exactly 64.
+ */
+fun formatFingerprintShort(hex: String): String {
+    if (hex.length != 64) return ""
+    return "${hex.substring(0, 4)}…${hex.substring(60, 64)}"
+}

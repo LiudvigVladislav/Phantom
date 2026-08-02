@@ -117,14 +117,17 @@ fun PhantomInput(
 
     val errorDescription = if (isError) helperText ?: "invalid input" else null
 
+    // Round-3 REDLINE on Commit 3 §P2: the Error semantic must live on
+    // the SAME accessibility node that carries `SetText` — the
+    // BasicTextField itself — so a screen reader announces the error
+    // when focus lands on the field. Attaching it here (an ancestor
+    // of BasicTextField, without `mergeDescendants = true`) leaves the
+    // field's own a11y node error-less and requires TalkBack to walk
+    // to an ancestor to discover the error — which it does not do by
+    // default. Error semantic moved onto the BasicTextField's own
+    // modifier below.
     Column(
-        modifier = modifier
-            .alpha(if (enabled) 1f else 0.38f)
-            .then(
-                if (errorDescription != null) {
-                    Modifier.semantics { error(errorDescription) }
-                } else Modifier
-            ),
+        modifier = modifier.alpha(if (enabled) 1f else 0.38f),
     ) {
         Box(
             modifier = Modifier
@@ -161,7 +164,22 @@ fun PhantomInput(
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(DesignV2Tokens.Colors.Cyan),
                         interactionSource = interaction,
                         keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-                        modifier = Modifier.fillMaxWidth(),
+                        // Round-3 REDLINE on Commit 3 §P2: attach the
+                        // Error semantic to the SAME modifier chain as
+                        // the SetText action so a screen reader
+                        // announces the error the instant the field
+                        // receives focus. `Modifier.semantics { }`
+                        // here merges into BasicTextField's own
+                        // semantics node; the SetText action and the
+                        // Error property therefore land on ONE
+                        // accessibility node.
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (errorDescription != null) {
+                                    Modifier.semantics { error(errorDescription) }
+                                } else Modifier
+                            ),
                     )
                 }
                 if (trailingContent != null) {

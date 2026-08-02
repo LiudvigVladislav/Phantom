@@ -174,4 +174,63 @@ class OnboardingV2StateTest {
         // the caller shows a single helper string for out-of-range length.
         assertEquals(UsernameValidationV2.InvalidChars, validateUsernameV2("a".repeat(21)))
     }
+
+    // ── formatFingerprintForDisplay ────────────────────────────────────
+
+    @Test
+    fun display_format_chunks_hex_into_8_groups_of_8() {
+        // Real Ed25519 public keys are 32 bytes = 64 hex chars. The
+        // display format is 8 groups of 8 chars, single space between
+        // adjacent groups, double space between groups 4 and 5 (a
+        // mid-hex "waist" that helps the eye track lines).
+        val hex = "0123456789abcdef".repeat(4)  // 64 chars
+        val formatted = formatFingerprintForDisplay(hex)
+
+        assertEquals("01234567 89abcdef 01234567 89abcdef  01234567 89abcdef 01234567 89abcdef", formatted)
+
+        // Every hex char of the input must appear unchanged in the
+        // output — the format only inserts spaces, never truncates.
+        val stripped = formatted.replace(" ", "")
+        assertEquals(hex, stripped)
+        assertEquals(64, stripped.length)
+    }
+
+    @Test
+    fun display_format_returns_input_unchanged_when_not_64_chars() {
+        // Defensive fallback for malformed records (should not happen
+        // upstream but the composable should not throw).
+        assertEquals("", formatFingerprintForDisplay(""))
+        assertEquals("short", formatFingerprintForDisplay("short"))
+        assertEquals("a".repeat(63), formatFingerprintForDisplay("a".repeat(63)))
+        assertEquals("a".repeat(65), formatFingerprintForDisplay("a".repeat(65)))
+    }
+
+    // ── formatFingerprintShort ─────────────────────────────────────────
+
+    @Test
+    fun short_fingerprint_is_first4_ellipsis_last4() {
+        // Redline §C1: the short form MUST accompany the full key +
+        // always with the "fingerprint · short form" label. This
+        // helper returns just the short-form string; the label is a
+        // separate Text next to the chip.
+        val hex = "abcd" + "0".repeat(56) + "ef01"
+        assertEquals("abcd…ef01", formatFingerprintShort(hex))
+    }
+
+    @Test
+    fun short_fingerprint_returns_empty_when_not_64_chars() {
+        assertEquals("", formatFingerprintShort(""))
+        assertEquals("", formatFingerprintShort("short"))
+        assertEquals("", formatFingerprintShort("a".repeat(63)))
+        assertEquals("", formatFingerprintShort("a".repeat(65)))
+    }
+
+    @Test
+    fun short_fingerprint_length_is_9_for_valid_input() {
+        // 4 chars + 1 ellipsis + 4 chars = 9 characters (ellipsis U+2026
+        // is one Unicode code point). Pins the shape so a future change
+        // to the truncation format is caught by the test.
+        val short = formatFingerprintShort("a".repeat(64))
+        assertEquals(9, short.length)
+    }
 }
