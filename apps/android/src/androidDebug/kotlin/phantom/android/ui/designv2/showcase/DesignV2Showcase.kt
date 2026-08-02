@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -563,6 +564,20 @@ val Dv2OnboardingIcons: List<Pair<String, Int>> = listOf(
     "standard"         to R.drawable.ic_dv2_standard,
 )
 
+/**
+ * The 3 net-new Pricing-sheet tier drawables added in Commit 4 of the
+ * Onboarding redesign — hexagonal shells with tier-specific glyphs
+ * (plus / star / crown). Kept separate from [Dv2OnboardingIcons] so
+ * the audit surface for Commit 4 is a targeted 3-row golden per
+ * architect Round-1 REDLINE §P2-1 ("audit трёх новых иконок в
+ * 24/48 dp").
+ */
+val Dv2PricingIcons: List<Pair<String, Int>> = listOf(
+    "tier_business"    to R.drawable.ic_dv2_tier_business,
+    "tier_plus"        to R.drawable.ic_dv2_tier_plus,
+    "tier_pro"         to R.drawable.ic_dv2_tier_pro,
+)
+
 @Composable
 fun ShowcaseIconContactSheet() {
     // Non-lazy grid: Paparazzi's one-shot render can't drive LazyVerticalGrid
@@ -878,6 +893,168 @@ fun ShowcaseOnboardingFinaleConfirmation() {
                 signingPublicKeyHex = fixtureHex,
             ),
             onContinueClick = {},
+        )
+    }
+}
+
+// ── Commit 4 additions — Privacy dial states + Pricing sheet ─────────
+
+/**
+ * PrivacyLevelStepV2 in each of the three tier-selected states, one
+ * showcase per state. The Ghost state renders the Unlock CTA (locked
+ * tier) that would open the Pricing sheet at runtime; showcase leaves
+ * the callbacks as no-ops.
+ */
+
+private const val PrivacyStepDotsIndex = 2  // OnboardingStepV2.Privacy.dotsIndex
+
+@Composable
+private fun privacyFrame(content: @Composable () -> Unit) {
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Privacy,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = true,
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) { content() }
+}
+
+@Composable
+fun ShowcaseOnboardingPrivacyStandard() {
+    privacyFrame {
+        phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
+                privacyMode = phantom.core.transport.PrivacyMode.Standard,
+            ),
+            dotsIndex = PrivacyStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+            onGhostLockClick = {},
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingPrivacyPrivate() {
+    privacyFrame {
+        phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
+                privacyMode = phantom.core.transport.PrivacyMode.Private,
+            ),
+            dotsIndex = PrivacyStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+            onGhostLockClick = {},
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingPrivacyGhostLocked() {
+    // Ghost tier rendered directly for its golden. In production
+    // `PrivacyMode.Ghost` is never actually written from onboarding —
+    // the segment tap opens the Pricing sheet instead — but the tier
+    // card body renders identically whether the state was reached
+    // synthetically or (hypothetically) via a Ghost selection.
+    privacyFrame {
+        phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
+                privacyMode = phantom.core.transport.PrivacyMode.Ghost,
+            ),
+            dotsIndex = PrivacyStepDotsIndex,
+            onFormStateChange = {},
+            onContinueClick = {},
+            onGhostLockClick = {},
+        )
+    }
+}
+
+/**
+ * Pricing sheet rendered in `open = true` state, layered on top of
+ * the Privacy step (Ghost tier as the "before" background). Golden
+ * captures the modal overlay + all three tier cards.
+ *
+ * Because Commit 4 removed the AnimatedVisibility enter transition
+ * from the sheet (see file KDoc on `OnboardingPricingSheetV2`), the
+ * golden shows the panel at its resting position — same shape a
+ * user sees post-animation on device.
+ */
+@Composable
+fun ShowcaseOnboardingPricingSheet() {
+    // Sheet open with Privacy Ghost background. Round-4 REDLINE on
+    // Commit 4 §P1-4: the background is now composed through
+    // `pricingSheetA11yShroudModifier(pricingSheetPresent = true)`
+    // — the SAME modifier the runtime flow uses — so this golden
+    // captures the round-3 backdrop blur (`Modifier.blur(3.dp)`)
+    // sitting between the flow content and the sheet. Without
+    // this wrap, the golden showed the sharp background and could
+    // not prove handoff `backdropFilter: blur(3px)` was applied.
+    Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = phantom.android.screens.onboarding.v2.pricingSheetA11yShroudModifier(
+                pricingSheetPresent = true,
+            ),
+        ) {
+            privacyFrame {
+                phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+                    formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
+                        privacyMode = phantom.core.transport.PrivacyMode.Ghost,
+                    ),
+                    dotsIndex = PrivacyStepDotsIndex,
+                    onFormStateChange = {},
+                    onContinueClick = {},
+                    onGhostLockClick = {},
+                )
+            }
+        }
+        phantom.android.screens.onboarding.v2.OnboardingPricingSheetV2(
+            visible = true,
+            onDismiss = {},
+            onCtaSelected = {},
+            animationsEnabled = false,  // deterministic golden
+        )
+    }
+}
+
+/**
+ * Second pricing-sheet golden capturing the SCROLLED-BOTTOM state
+ * of the sheet — showing the Business tier card + footer, which the
+ * default top-of-panel golden can't include (the panel caps at ~82 %
+ * viewport height and the Business tier lives below the scroll fold
+ * per handoff).
+ *
+ * Round-1 REDLINE on Commit 4 §P2-1: added so the third tier and its
+ * `tier_business` icon get visual review coverage. Renders the sheet
+ * directly (no background flow) with an initial scroll offset that
+ * pushes the panel's inner scroll to its bottom edge.
+ */
+@Composable
+fun ShowcaseOnboardingPricingSheetScrolledBottom() {
+    // Sheet with `scrollToBottomForShowcase = true` — a showcase-only
+    // hook on `OnboardingPricingSheetV2` that initialises the panel's
+    // inner ScrollState with `Int.MAX_VALUE` so it clamps to
+    // `maxValue` synchronously on first layout (round-2 REDLINE fix
+    // take 2 — Paparazzi doesn't advance coroutine dispatchers
+    // between composition and capture, so a `LaunchedEffect`-based
+    // scroll would suspend and never resume; the initial-value clamp
+    // is Paparazzi-safe). The panel caps at ~82 % viewport height so
+    // on the Pixel 5 (891 dp tall) the fold sits around the Pro
+    // tier's footer; this golden reveals the Business tier card +
+    // "Cancel any time" footer that the top-of-panel golden can't
+    // include.
+    //
+    // Rendered without a background flow so review focus is on the
+    // sheet's own content — the Privacy background is already
+    // captured in the top-of-panel golden.
+    Box(modifier = Modifier.fillMaxSize()) {
+        phantom.android.screens.onboarding.v2.OnboardingPricingSheetV2(
+            visible = true,
+            onDismiss = {},
+            onCtaSelected = {},
+            animationsEnabled = false,
+            scrollToBottomForShowcase = true,
         )
     }
 }

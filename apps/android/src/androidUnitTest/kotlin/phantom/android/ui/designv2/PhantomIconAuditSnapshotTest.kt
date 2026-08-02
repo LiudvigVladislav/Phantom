@@ -9,6 +9,7 @@ import org.junit.Rule
 import org.junit.Test
 import phantom.android.ui.designv2.showcase.Dv2Icons
 import phantom.android.ui.designv2.showcase.Dv2OnboardingIcons
+import phantom.android.ui.designv2.showcase.Dv2PricingIcons
 import phantom.android.ui.designv2.showcase.ShowcaseIconAudit
 
 /**
@@ -54,5 +55,15 @@ class PhantomIconAuditSnapshotTest {
     @Test
     fun icon_audit_onboarding() {
         paparazzi.snapshot { ShowcaseIconAudit(Dv2OnboardingIcons) }
+    }
+
+    @Test
+    fun icon_audit_pricing() {
+        // Round-1 REDLINE on Commit 4 §P2-1: the 3 new tier icons
+        // (`tier_plus`, `tier_pro`, `tier_business`) get their own
+        // 24 / 48 dp audit golden per the Commit-1 pattern
+        // ("проверять только новые иконки в 24/48 dp"). 3 rows fit
+        // trivially in one Paparazzi golden.
+        paparazzi.snapshot { ShowcaseIconAudit(Dv2PricingIcons) }
     }
 }

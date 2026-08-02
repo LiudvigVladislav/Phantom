@@ -13,6 +13,11 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyEmpty
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyInvalid
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyShort
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyValid
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPricingSheet
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPricingSheetScrolledBottom
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPrivacyGhostLocked
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPrivacyPrivate
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPrivacyStandard
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingTermsV2
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingWelcomeV2
 
@@ -77,5 +82,38 @@ class OnboardingV2SnapshotTest {
     @Test
     fun onboarding_v2_finale_confirmation() {
         paparazzi.snapshot { ShowcaseOnboardingFinaleConfirmation() }
+    }
+
+    // Commit 4 additions — Privacy dial states + Pricing sheet.
+
+    @Test
+    fun onboarding_v2_privacy_standard() {
+        paparazzi.snapshot { ShowcaseOnboardingPrivacyStandard() }
+    }
+
+    @Test
+    fun onboarding_v2_privacy_private() {
+        paparazzi.snapshot { ShowcaseOnboardingPrivacyPrivate() }
+    }
+
+    @Test
+    fun onboarding_v2_privacy_ghost_locked() {
+        paparazzi.snapshot { ShowcaseOnboardingPrivacyGhostLocked() }
+    }
+
+    @Test
+    fun onboarding_v2_pricing_sheet() {
+        paparazzi.snapshot { ShowcaseOnboardingPricingSheet() }
+    }
+
+    @Test
+    fun onboarding_v2_pricing_sheet_scrolled_bottom() {
+        // Round-1 REDLINE on Commit 4 §P2-1: second pricing golden
+        // capturing the SCROLLED-BOTTOM state of the sheet — the
+        // Business tier + footer live below the 82 %-viewport fold
+        // in the top-of-panel golden. This golden pushes the sheet's
+        // internal scroll to its bottom via
+        // `scrollToBottomForShowcase = true`.
+        paparazzi.snapshot { ShowcaseOnboardingPricingSheetScrolledBottom() }
     }
 }

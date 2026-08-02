@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -1104,6 +1105,41 @@ class AppContainer(private val context: Context) {
         // subsequent startForegroundService picks up the new mode cleanly.
         runCatching { transport.disconnect() }
         runCatching { transportManager.release() }
+    }
+
+    /**
+     * Round-2 REDLINE on Commit 4 §P1-1: onboarding-only privacy mode
+     * persistence. Writes BOTH storage surfaces `setPrivacyMode` mirrors
+     * (canonical [TransportPreferences.privacyMode] + legacy
+     * `phantom_prefs.privacy_mode` SharedPreferences key) WITHOUT the
+     * socket teardown / hint clearing that `setPrivacyMode` also does —
+     * during first-run onboarding no active transport exists to tear
+     * down, and there's no prior "preferred transport" hint to clear.
+     *
+     * Round-4 REDLINE on Commit 4 §P1-2: hopped to `Dispatchers.IO` for
+     * the underlying synchronous `SharedPreferences.commit()`. Round-3
+     * added the fail-loud commit but forgot to move it off Main —
+     * `OnboardingFlowV2.OnboardingFlowV2Internal` builds the finalize
+     * controller inside `rememberCoroutineScope()` which is Main-
+     * dispatched, and the controller's `withContext(NonCancellable)`
+     * only changes the Job, NOT the dispatcher. Wrapping this call in
+     * `withContext(Dispatchers.IO)` moves the commit off Main; the
+     * inner call inherits the NonCancellable Job from the caller so
+     * the durable-boundary contract (round-3 §P1-1) is preserved.
+     *
+     * Delegates to [applyPrivacyModeToFirstRunStores] so the actual
+     * write logic is a pure function testable with in-memory fakes.
+     * `OnboardingFlowV2` wires this as the `savePrivacyMode` lambda
+     * on the finalize controller.
+     */
+    suspend fun applyPrivacyModeFromOnboarding(mode: PrivacyMode) {
+        withContext(Dispatchers.IO) {
+            phantom.android.screens.onboarding.v2.applyPrivacyModeToFirstRunStores(
+                context = context,
+                transportPreferences = transportPreferences,
+                mode = mode,
+            )
+        }
     }
 
     // ── Messaging (initialised after identity is loaded) ──────────────────────

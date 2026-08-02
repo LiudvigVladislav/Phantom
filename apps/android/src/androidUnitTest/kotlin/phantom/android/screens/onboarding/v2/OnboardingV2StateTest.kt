@@ -233,4 +233,51 @@ class OnboardingV2StateTest {
         val short = formatFingerprintShort("a".repeat(64))
         assertEquals(9, short.length)
     }
+
+    // ── Commit 4 · Privacy state contract ─────────────────────────────
+
+    @Test
+    fun privacy_default_is_standard() {
+        // Commit 4: A brand-new form state starts on PrivacyMode.Standard
+        // — the segment bar renders with only bar 0 filled. Any other
+        // default would surprise users landing on Step 3.
+        val fresh = OnboardingFormStateV2()
+        assertEquals(PrivacyMode.Standard, fresh.privacyMode)
+    }
+
+    @Test
+    fun privacy_can_be_set_to_private_via_form_copy() {
+        val state = OnboardingFormStateV2()
+        val updated = state.copy(privacyMode = PrivacyMode.Private)
+        assertEquals(PrivacyMode.Private, updated.privacyMode)
+    }
+
+    @Test
+    fun privacy_step_always_advances_regardless_of_selection() {
+        // Commit 4: even the initial Standard selection is enough to
+        // continue — no "you must pick something" gate on Privacy.
+        // Commit 5 will keep the same shape for Permissions.
+        for (mode in PrivacyMode.entries) {
+            val state = OnboardingFormStateV2(privacyMode = mode)
+            assertTrue(
+                canAdvanceFromV2(OnboardingStepV2.Privacy, state),
+                "canAdvance must return true from Privacy regardless of mode; got false for $mode",
+            )
+        }
+    }
+
+    @Test
+    fun privacy_step_enables_edge_swipe_back_to_identity() {
+        assertTrue(
+            isEdgeSwipeBackFromEnabled(OnboardingStepV2.Privacy),
+            "Privacy is a mid-flow numbered step — left-edge swipe must return to Identity.",
+        )
+    }
+
+    @Test
+    fun privacy_step_dots_index_is_2() {
+        // Position 2 out of 4 (0-indexed) — the third dot lights up
+        // when Privacy is the current step.
+        assertEquals(2, OnboardingStepV2.Privacy.dotsIndex)
+    }
 }

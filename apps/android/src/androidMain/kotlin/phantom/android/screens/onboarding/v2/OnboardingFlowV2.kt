@@ -30,8 +30,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.invisibleToUser
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.LaunchedEffect
@@ -107,6 +110,20 @@ fun OnboardingFlowV2(
     // [OnboardingFinalizeController] for the state-machine contract.
     val controller = remember(container) {
         OnboardingFinalizeController(
+            // Round-2 REDLINE on Commit 4 §P1-1: dual-write the
+            // user's selected privacy mode to BOTH storage surfaces
+            // `AppContainer.setPrivacyMode` mirrors — the canonical
+            // `TransportPreferences.privacyMode` (read by
+            // `TransportManager`) AND the legacy `phantom_prefs`
+            // SharedPreferences key `privacy_mode` (read by
+            // `ChatScreen`'s read-receipt gate). Round-1 amend wrote
+            // only the canonical store, so a Private-selecting user
+            // got Private transport but kept sending read receipts as
+            // Standard. `applyPrivacyModeToFirstRunStores` does both
+            // writes WITHOUT the socket teardown / hint clearing that
+            // `setPrivacyMode` also does — first-run onboarding has
+            // no active transport to tear down.
+            savePrivacyMode = { mode -> container.applyPrivacyModeFromOnboarding(mode) },
             createOrLoad = { username -> container.identityManager.createOrLoad(username) },
             initMessaging = { record, keyPair ->
                 container.initMessaging(
@@ -146,6 +163,26 @@ internal fun OnboardingFlowV2Internal(
     var currentStep by remember { mutableStateOf(OnboardingStepV2.Welcome) }
     var formState by remember { mutableStateOf(OnboardingFormStateV2()) }
     var toastMessage by remember { mutableStateOf<String?>(null) }
+    // Commit 4: Pricing bottom sheet visibility. Opens when the user
+    // taps the Ghost Mode segment on Privacy step (or the Unlock CTA
+    // inside the Ghost tier card). Closes via backdrop / grab-strip /
+    // any tier CTA (which also fires a "coming soon" toast).
+    //
+    // Round-2 REDLINE on Commit 4 §P1-2: track TWO states —
+    //   `pricingSheetVisible` : user intent — true while the sheet
+    //                            should be shown; flips to false the
+    //                            instant the user dismisses.
+    //   `pricingSheetPresent` : sheet is in the composition — stays
+    //                            true through the ~220 ms exit
+    //                            animation, then flips to false when
+    //                            the sheet fires `onFullyDismissed`.
+    //
+    // The BackHandler, edge-swipe overlay, and a11y shroud MUST gate
+    // on `pricingSheetPresent` — otherwise the modal contract breaks
+    // during exit (Back would reach the flow, background nodes would
+    // become TalkBack-reachable mid-fade, etc.).
+    var pricingSheetVisible by remember { mutableStateOf(false) }
+    var pricingSheetPresent by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // Surface controller's transient error via the existing toast slot,
@@ -193,6 +230,15 @@ internal fun OnboardingFlowV2Internal(
     }
 
     // BackHandler routing.
+    //   PricingSheet visible: highest priority — start the sheet's
+    //     exit animation. Round-2 REDLINE §P1-2: setting
+    //     pricingSheetVisible = false starts fade/slide-out; the
+    //     sheet fires onFullyDismissed when the animation completes,
+    //     flipping pricingSheetPresent to false so subsequent Back
+    //     presses use the ordinary flow routing.
+    //   PricingSheet in exit animation (present && !visible): absorb
+    //     Back — the user has already asked to dismiss; another Back
+    //     press mid-fade would be surprising.
     //   Welcome: no handler → OS default (exit).
     //   FinaleConfirmation OR back-nav-locked-by-finalize: install a
     //     no-op handler that ABSORBS the OS Back. On Finale, the user
@@ -200,7 +246,11 @@ internal fun OnboardingFlowV2Internal(
     //     is Persisted (or later), backward navigation from Permissions
     //     would try to unwind an already-committed identity — no-op.
     //   Other steps: goBack decrements currentStep.
-    if (currentStep == OnboardingStepV2.FinaleConfirmation || backLocked) {
+    if (pricingSheetVisible) {
+        BackHandler(enabled = true) { pricingSheetVisible = false }
+    } else if (pricingSheetPresent) {
+        BackHandler(enabled = true) { /* mid-exit-animation — absorbed */ }
+    } else if (currentStep == OnboardingStepV2.FinaleConfirmation || backLocked) {
         BackHandler(enabled = true) { /* intentionally absorbed */ }
     } else if (currentStep != OnboardingStepV2.Welcome) {
         BackHandler(enabled = true) { goBack() }
@@ -211,6 +261,25 @@ internal fun OnboardingFlowV2Internal(
     // on-device layout.
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
+    Box(modifier = Modifier.fillMaxSize()) {
+    // Round-1 REDLINE on Commit 4 §P1-3: when the pricing sheet is
+    // present (rendered), the flow content beneath it MUST be
+    // invisible to accessibility services — screen readers would
+    // otherwise announce the Back pill / Continue button / segment
+    // tabs sitting behind the modal, giving the impression they are
+    // interactive when they are not.
+    //
+    // Round-2 REDLINE on Commit 4 §P1-3: the shroud gates on
+    // `pricingSheetPresent` (stays true through the exit animation),
+    // not `pricingSheetVisible` — otherwise TalkBack would suddenly
+    // start traversing background nodes the moment the user starts
+    // dismissing, mid-fade.
+    //
+    // Round-2 REDLINE on Commit 4 §P1/P2-5: shroud logic extracted
+    // into [pricingSheetA11yShroudModifier] so the test-only
+    // `PricingA11yShroudPreviewFor` composable and the real flow
+    // share ONE code path.
+    Box(modifier = pricingSheetA11yShroudModifier(pricingSheetPresent)) {
     OnboardingV2HostFrame(
         currentStep = currentStep,
         topInset = statusBarTop,
@@ -222,7 +291,9 @@ internal fun OnboardingFlowV2Internal(
         // already created. `isEdgeSwipeBackFromEnabled` is a pure
         // function in OnboardingStateV2.kt and is pinned by a unit
         // test in OnboardingV2StateTest.
-        edgeSwipeBackEnabled = isEdgeSwipeBackFromEnabled(currentStep) && !backLocked,
+        // Also disabled while the pricing sheet is present so a
+        // left-edge swipe under the modal doesn't sneak back through it.
+        edgeSwipeBackEnabled = isEdgeSwipeBackFromEnabled(currentStep) && !backLocked && !pricingSheetPresent,
         onEdgeSwipeBack = goBack,
         toastMessage = toastMessage,
         onToastDismiss = { toastMessage = null },
@@ -261,7 +332,16 @@ internal fun OnboardingFlowV2Internal(
                     dotsIndex = step.dotsIndex,
                     onFormStateChange = { formState = it },
                     onContinueClick = goNext,
-                    onGhostLockClick = { toastMessage = "Phantom Pro — coming soon." },
+                    // Commit 4: Ghost Mode tap opens the Pricing sheet
+                    // instead of firing a toast. The controller in the
+                    // step composable BOTH intercepts the Ghost
+                    // segment tap AND the "Unlock with Phantom Pro"
+                    // CTA inside the Ghost tier card — both surfaces
+                    // funnel through this callback.
+                    onGhostLockClick = {
+                        pricingSheetPresent = true   // mount + shroud immediately
+                        pricingSheetVisible = true   // start enter animation
+                    },
                 )
                 OnboardingStepV2.Permissions -> PermissionsStepV2(
                     formState = formState,
@@ -276,7 +356,11 @@ internal fun OnboardingFlowV2Internal(
                         // observes `controller.state` transitioning to
                         // Complete.
                         scope.launch {
-                            controller.finalize(formState.username)
+                            // Round-1 REDLINE on Commit 4 §P1-1: pass
+                            // the user's chosen privacyMode so the
+                            // controller can persist it before
+                            // initMessaging fires.
+                            controller.finalize(formState.username, formState.privacyMode)
                         }
                     },
                 )
@@ -294,174 +378,51 @@ internal fun OnboardingFlowV2Internal(
             }
         }
     }
-}
-
-/**
- * OnboardingV2HostFrame — the shared visual frame (P1-2 REDLINE fix).
- *
- * BOTH the runtime [OnboardingFlowV2] and the debug showcase (used by
- * the Paparazzi goldens) call this composable. That guarantees:
- *
- *   1. Status-bar inset is applied the same way in both — [topInset]
- *      is a plain Dp so the runtime can pass
- *      `WindowInsets.statusBars.asPaddingValues().calculateTopPadding()`
- *      while the showcase passes a hard-coded 24 dp (Pixel 5 default
- *      status bar height, matching the Paparazzi device profile).
- *      Without this frame, showcase composables previously skipped
- *      windowInsetsPadding entirely and the golden rendered content
- *      starting at y=0 — misleading vs on-device layout.
- *   2. Cipher background, top bar, edge-swipe-back gesture, and toast
- *      overlay all live here, so a step body only worries about its
- *      own content + its dots + its CTA — nothing else.
- *
- * Step dots are NOT rendered here (P1-3 REDLINE fix); each step body
- * renders its own dots directly above its primary CTA per handoff
- * `Onboarding.dc.html`. This composable exposes `currentStep` so the
- * top bar knows which step number to display and the caller can key
- * behaviour off it, but does not itself paint any per-step widget
- * below the top bar other than the [content] slot.
- */
-@Composable
-fun OnboardingV2HostFrame(
-    currentStep: OnboardingStepV2,
-    topInset: Dp,
-    onBackClick: () -> Unit,
-    edgeSwipeBackEnabled: Boolean,
-    onEdgeSwipeBack: () -> Unit,
-    toastMessage: String?,
-    onToastDismiss: () -> Unit,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(DesignV2Tokens.Colors.SurfaceDeep)
-            .padding(PaddingValues(top = topInset)),
-    ) {
-        OnboardingCipherBackground()
-
-        content()
-
-        if (currentStep.showTopBar) {
-            OnboardingTopBarV2(
-                stepNumber = currentStep.stepNumber,
-                totalSteps = currentStep.totalNumberedSteps,
-                onBackClick = onBackClick,
-                modifier = Modifier.align(Alignment.TopStart),
-            )
-        }
-
-        // Left-edge swipe-back gesture (round-3 REDLINE P1-1 +
-        // round-4 REDLINE P1-2).
+    }  // close the a11y-shroud Box wrapping the host frame
+        // Commit 4: Pricing bottom sheet — modal overlay above the
+        // host frame + top bar + toast. Wrapped in the outer Box so
+        // it lives on top of everything painted by the host frame.
         //
-        // Round-3 constrained the gesture surface to a 34-dp overlay
-        // Box (no more full-frame pointerInput). Round-4 additionally
-        // moves the ACTIVE gesture zone below the top-bar area so it
-        // never overlaps with the Back pill.
+        // Round-2 REDLINE on Commit 4 §P1-2 lifecycle:
+        //   Open: set BOTH present + visible → mount + enter animation.
+        //   Dismiss (backdrop / grab-strip / close-X / Back / CTA):
+        //     set visible = false → exit animation runs.
+        //   onFullyDismissed: set present = false → unmount + lift
+        //     shroud / BackHandler / edge-swipe overlay guards.
         //
-        // Back-pill layout: 20 dp horizontal padding from the frame's
-        // TopStart + Row of pill height ~36 dp + 12 dp vertical
-        // padding. So Back pill occupies roughly x = 20..85 dp, y =
-        // 12..48 dp. A 34-dp × full-height overlay at TopStart would
-        // sit ON TOP of Back's leftmost ~14 dp column and steal any
-        // horizontal drag starting there.
-        //
-        // Fix: pass a `topOffset` to the overlay so its active
-        // pointer-input region starts BELOW the top bar. Content in
-        // the 34 × topOffset area at TopStart is not consumed by the
-        // overlay — taps and drags on the Back pill's leftmost pixels
-        // reach the pill's clickable normally.
-        //
-        // topOffset chosen as 64 dp: top-bar Row is Modifier.padding
-        // (horizontal=20, vertical=12) → 12 + ~36 + 12 = 60 dp. 64 dp
-        // gives a 4-dp margin so any anti-aliasing / pointer slop at
-        // the boundary doesn't steal the Back pill's tap.
-        //
-        // Pinned by OnboardingV2SemanticsTest:
-        //   - edge_swipe_from_left_triggers_back
-        //   - center_horizontal_drag_does_not_trigger_back
-        //   - finale_has_no_edge_swipe_surface
-        //   - overlay_does_not_overlap_top_bar_back_area   (round-4)
-        //   - back_pill_click_survives_edge_overlay_layout (round-4)
-        if (edgeSwipeBackEnabled) {
-            OnboardingLeftEdgeSwipeSurface(
-                triggerWidth = 34.dp,
-                thresholdPx = 62.dp,
-                topOffset = 64.dp,
-                onEdgeSwipeBack = onEdgeSwipeBack,
-                modifier = Modifier.align(Alignment.TopStart),
-            )
-        }
-
-        OnboardingToastV2(
-            message = toastMessage,
-            onDismiss = onToastDismiss,
+        // Any CTA tap closes the sheet AND fires a "coming soon"
+        // toast per handoff. The toast uses the same slot as the
+        // controller's transient-error surface — safe because the
+        // sheet closes before the toast renders (the toast is
+        // subscribed via a LaunchedEffect on toastMessage which
+        // handles the update on the next frame).
+        OnboardingPricingSheetV2(
+            visible = pricingSheetVisible,
+            onDismiss = { pricingSheetVisible = false },
+            onCtaSelected = { cta ->
+                pricingSheetVisible = false
+                toastMessage = "$cta — coming soon."
+            },
+            onFullyDismissed = { pricingSheetPresent = false },
         )
     }
 }
 
 /**
- * Left-edge horizontal-drag catcher for the flow's back navigation.
+ * Round-2 REDLINE on Commit 4 §P1/P2-5: single source of truth for
+ * the "background is invisible to a11y while the pricing sheet is
+ * present" invariant. Both [OnboardingFlowV2Internal] AND the
+ * test-only [PricingA11yShroudPreviewFor] compose this modifier so
+ * a semantics test on the preview reflects the real flow's shape.
  *
- * Overlay Box positioned at TopStart with a `topOffset` reserving the
- * top-bar area (so it does not overlap with the Back pill). The
- * pointer-input Row inside the outer box spans
- *   x = 0..triggerWidth  (default 34 dp)
- *   y = topOffset..parentHeight
- * A rightward drag total that exceeds `thresholdPx` (62 dp) fires
- * [onEdgeSwipeBack].
- *
- * Round-4 REDLINE P1-2 introduced [topOffset]. Round-3 shape put the
- * detector on the full height at TopStart, which overlapped the Back
- * pill's leftmost ~14 dp column and stole any drag starting there.
- *
- * Kept as a private-package composable so [OnboardingV2SemanticsTest]
- * can setContent on it directly and exercise
- * `performTouchInput { swipeRight(...) }` / coordinate taps without
- * needing the whole flow.
+ * Round-3 REDLINE on Commit 4 §P1-3 handoff feature 2: while the
+ * pricing sheet is present, the flow content beneath it is BLURRED
+ * (per handoff `Onboarding.dc.html` line 496 —
+ * `backdropFilter:'blur(3px)'`). Compose's `Modifier.blur()` blurs
+ * the modifier's OWN subtree — applied here to the flow content
+ * (which IS the content sitting beneath the sheet in Z-order), this
+ * produces the same visual as CSS `backdrop-filter` on the sheet's
+ * backdrop overlay would. The blur radius matches the handoff's
+ * 3 dp spec. `BlurredEdgeTreatment.Unbounded` prevents a hard blur
+ * cutoff at the flow-content edge.
  */
-@Composable
-internal fun OnboardingLeftEdgeSwipeSurface(
-    triggerWidth: Dp,
-    thresholdPx: Dp,
-    topOffset: Dp,
-    onEdgeSwipeBack: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val density = LocalDensity.current
-    val thresholdInPx = with(density) { thresholdPx.toPx() }
-
-    // Outer transparent Box reserves the layout slot but installs NO
-    // pointer handler, so touches in the top `topOffset` × triggerWidth
-    // area fall through to any Composable drawn earlier in Z-order
-    // (e.g. the Back pill on the top bar).
-    Box(
-        modifier = modifier
-            .width(triggerWidth)
-            .fillMaxHeight(),
-    ) {
-        // Inner Box: shifted down by topOffset via padding-top; owns
-        // the pointer detector. Compose's chained modifier semantics
-        // make the pointer-input region equal to the inner Box's
-        // layout box after the padding is applied — i.e., strictly
-        // below `topOffset`.
-        Box(
-            modifier = Modifier
-                .padding(top = topOffset)
-                .fillMaxHeight()
-                .fillMaxWidth()
-                .pointerInput(Unit) {
-                    var totalDx = 0f
-                    detectHorizontalDragGestures(
-                        onDragStart = { totalDx = 0f },
-                        onHorizontalDrag = { _, dx -> totalDx += dx },
-                        onDragEnd = {
-                            if (totalDx > thresholdInPx) onEdgeSwipeBack()
-                            totalDx = 0f
-                        },
-                        onDragCancel = { totalDx = 0f },
-                    )
-                },
-        )
-    }
-}

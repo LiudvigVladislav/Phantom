@@ -26,6 +26,7 @@ import phantom.core.identity.IdentityKeyPair
 import phantom.core.identity.IdentityRecord
 import phantom.core.identity.PrivateKey
 import phantom.core.identity.PublicKey
+import phantom.core.transport.PrivacyMode
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
@@ -123,6 +124,7 @@ class OnboardingV2FinalizeContractTest {
         val createOrLoadCalls = AtomicInteger(0)
         val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { username ->
                 createOrLoadCalls.incrementAndGet()
                 assertEquals("alice", username)
@@ -136,7 +138,7 @@ class OnboardingV2FinalizeContractTest {
         )
         assertEquals(FinalizeState.Idle, controller.state)
 
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
 
         assertEquals(1, createOrLoadCalls.get())
         assertEquals(1, initMessagingCalls.get())
@@ -151,6 +153,7 @@ class OnboardingV2FinalizeContractTest {
         val gate = CompletableDeferred<Pair<IdentityRecord, IdentityKeyPair>>()
         val createOrLoadCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ ->
                 createOrLoadCalls.incrementAndGet()
                 gate.await()  // suspend indefinitely
@@ -159,11 +162,11 @@ class OnboardingV2FinalizeContractTest {
         )
 
         // Kick off the first finalize — it will suspend inside createOrLoad.
-        val job1 = launch { controller.finalize("alice") }
+        val job1 = launch { controller.finalize("alice", PrivacyMode.Standard) }
         // While it's in flight (state=Working), a second call must
         // short-circuit without invoking createOrLoad again.
         assertEquals(FinalizeState.Working, controller.state)
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
         assertEquals(1, createOrLoadCalls.get())
 
         // Let the first call complete so runTest doesn't hang.
@@ -178,6 +181,7 @@ class OnboardingV2FinalizeContractTest {
     fun phase1_failure_leaves_state_idle_and_sets_transient_error() = runTest {
         val loggedErrors = mutableListOf<Throwable>()
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ ->
                 throw RuntimeException("simulated disk error — sensitive/path/detail")
             },
@@ -187,7 +191,7 @@ class OnboardingV2FinalizeContractTest {
             onError = { loggedErrors.add(it) },
         )
 
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
 
         // State reverts to Idle so user can retry with (possibly a
         // different) username.
@@ -209,6 +213,7 @@ class OnboardingV2FinalizeContractTest {
         var initMessagingShouldThrow = true
         val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ ->
                 createOrLoadCalls.incrementAndGet()
                 record to keyPair
@@ -219,7 +224,7 @@ class OnboardingV2FinalizeContractTest {
             },
         )
 
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
 
         // createOrLoad ran once; identity has been persisted to disk.
         assertEquals(1, createOrLoadCalls.get())
@@ -235,7 +240,7 @@ class OnboardingV2FinalizeContractTest {
         // record.
         controller.dismissTransientError()
         initMessagingShouldThrow = false
-        controller.finalize("bob-changed-username-but-should-be-ignored")
+        controller.finalize("bob-changed-username-but-should-be-ignored", PrivacyMode.Standard)
 
         assertEquals(1, createOrLoadCalls.get())  // still one call
         assertEquals(2, initMessagingCalls.get())  // two total
@@ -254,6 +259,7 @@ class OnboardingV2FinalizeContractTest {
         val receivedUsernames = mutableListOf<String>()
         val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { u ->
                 receivedUsernames.add(u)
                 record to keyPair
@@ -268,13 +274,13 @@ class OnboardingV2FinalizeContractTest {
             },
         )
 
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
         assertIs<FinalizeState.Persisted>(controller.state)
         assertEquals(listOf("alice"), receivedUsernames)
 
         // A retry with a different username argument. createOrLoad
         // MUST NOT run again — the persisted record is authoritative.
-        controller.finalize("bob")
+        controller.finalize("bob", PrivacyMode.Standard)
         assertEquals(listOf("alice"), receivedUsernames)
         assertEquals(2, initMessagingCalls.get())
         assertIs<FinalizeState.Complete>(controller.state)
@@ -299,13 +305,14 @@ class OnboardingV2FinalizeContractTest {
             // must allow the user to retry with a possibly-different
             // username.
             val controller = OnboardingFinalizeController(
+                savePrivacyMode = { _ -> },
                 createOrLoad = { _ -> throw CancellationException("simulated internal cancellation") },
                 initMessaging = { _, _ -> error("must not run — createOrLoad threw") },
             )
 
             var caught: Throwable? = null
             try {
-                controller.finalize("alice")
+                controller.finalize("alice", PrivacyMode.Standard)
             } catch (t: Throwable) {
                 caught = t
             }
@@ -344,6 +351,7 @@ class OnboardingV2FinalizeContractTest {
             val allowCreateOrLoadReturn = CompletableDeferred<Unit>()
 
             val controller = OnboardingFinalizeController(
+                savePrivacyMode = { _ -> },
                 createOrLoad = { _ ->
                     // Model the SQLite insert committing before the
                     // caller ever sees a return value.
@@ -359,7 +367,7 @@ class OnboardingV2FinalizeContractTest {
             )
 
             val scope = TestScope(UnconfinedTestDispatcher())
-            val job = scope.async { controller.finalize("alice") }
+            val job = scope.async { controller.finalize("alice", PrivacyMode.Standard) }
             // Wait until the save side-effect has fired — disk is now
             // committed from the flow's point of view.
             saveSideEffectFired.await()
@@ -391,12 +399,13 @@ class OnboardingV2FinalizeContractTest {
         val keyPair = makeKeyPair()
         val gate = CompletableDeferred<Unit>()
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ -> record to keyPair },
             initMessaging = { _, _ -> gate.await() },
         )
 
         val scope = TestScope(UnconfinedTestDispatcher())
-        val job = scope.async { controller.finalize("alice") }
+        val job = scope.async { controller.finalize("alice", PrivacyMode.Standard) }
         // Phase 1 completed synchronously; controller now suspending
         // inside initMessaging. Verify Persisted.
         assertIs<FinalizeState.Persisted>(controller.state)
@@ -416,18 +425,19 @@ class OnboardingV2FinalizeContractTest {
         val createOrLoadCalls = AtomicInteger(0)
         val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ ->
                 createOrLoadCalls.incrementAndGet()
                 record to keyPair
             },
             initMessaging = { _, _ -> initMessagingCalls.incrementAndGet() },
         )
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
         assertIs<FinalizeState.Complete>(controller.state)
 
         // Extra taps are ignored — no work should re-run.
-        controller.finalize("alice")
-        controller.finalize("charlie")
+        controller.finalize("alice", PrivacyMode.Standard)
+        controller.finalize("charlie", PrivacyMode.Standard)
         assertEquals(1, createOrLoadCalls.get())
         assertEquals(1, initMessagingCalls.get())
     }
@@ -436,19 +446,23 @@ class OnboardingV2FinalizeContractTest {
     fun back_nav_predicate_is_locked_iff_not_idle() {
         assertTrue(!isBackNavigationLockedByFinalize(FinalizeState.Idle))
         assertTrue(isBackNavigationLockedByFinalize(FinalizeState.Working))
-        assertTrue(isBackNavigationLockedByFinalize(FinalizeState.Persisted(makeRecord(), makeKeyPair())))
+        assertTrue(isBackNavigationLockedByFinalize(
+            FinalizeState.Persisted(makeRecord(), makeKeyPair(), PrivacyMode.Standard),
+        ))
         assertTrue(isBackNavigationLockedByFinalize(FinalizeState.Complete(makeRecord())))
     }
 
     @Test
     fun dismiss_transient_error_clears_message() = runTest {
         val controller = OnboardingFinalizeController(
+            savePrivacyMode = { _ -> },
             createOrLoad = { _ -> throw RuntimeException("x") },
             initMessaging = { _, _ -> },
         )
-        controller.finalize("alice")
+        controller.finalize("alice", PrivacyMode.Standard)
         assertNotNull(controller.transientErrorMessage)
         controller.dismissTransientError()
         assertNull(controller.transientErrorMessage)
     }
+
 }
