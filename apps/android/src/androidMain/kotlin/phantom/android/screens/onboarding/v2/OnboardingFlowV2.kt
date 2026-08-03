@@ -3,13 +3,15 @@
 
 package phantom.android.screens.onboarding.v2
 
+import android.Manifest
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -27,6 +29,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import android.util.Log
+import phantom.core.identity.IdentityRecord
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2
@@ -101,6 +107,146 @@ import phantom.core.crypto.DhPublicKey
  * Commit 2 does not use either — they're forwarded to whichever step
  * becomes the terminal transition point (Permissions "Done" in Commit 5).
  */
+
+/**
+ * Round-14 REDLINE §P1 pin — typed finalize outcome returned to
+ * the single caller coroutine. The caller then performs the
+ * atomic success-transition (seed hex → advance step → set
+ * phase = Completed) in one uninterruptible sequence, so no
+ * intermediate `phase = Completed && currentStep = Permissions`
+ * state can be observed by a rotation between two independent
+ * effect writes (round-13 shape suffered from that gap).
+ *
+ * Terminal resolution:
+ *   - `FinalizeState.Complete(record)` → [FinalizeOutcome.Completed(record)]
+ *   - `FinalizeState.Idle`             → [FinalizeOutcome.FailedBeforePersistence]
+ *       (finalize returned back to Idle → phase-0 error before
+ *        any disk write; user should be able to fix
+ *        username/privacy and retry from a clean slate.)
+ *   - `FinalizeState.Persisted`        → [FinalizeOutcome.FailedAfterPersistence]
+ *       (identity + mode already on disk; initMessaging failed;
+ *        caller keeps phase = InFlight so Back stays locked and
+ *        a Done re-tap hits the controller's Persisted → Complete
+ *        short-circuit.)
+ *   - `FinalizeState.Working`          → [FinalizeOutcome.FailedAfterPersistence]
+ *       (defensive; the suspend function shouldn't return while
+ *        still Working. Same handling as Persisted-error — keep
+ *        Back locked, wait for user re-tap.)
+ */
+internal sealed interface FinalizeOutcome {
+    data class Completed(val record: IdentityRecord) : FinalizeOutcome
+    object FailedBeforePersistence : FinalizeOutcome
+    object FailedAfterPersistence : FinalizeOutcome
+}
+
+/**
+ * Round-16 REDLINE §P1 pin — pure reducer describing the atomic
+ * state advance from a [FinalizeOutcome]. Extracted out of the
+ * caller coroutine so a Kotlin unit test can assert the exact
+ * transition for each outcome without going through Compose UI.
+ * A refactor that splits the writes across parallel effects
+ * would either stop calling this reducer or feed the wrong
+ * fields into it — both cases fail
+ * `OnboardingV2FinalizeOutcomeContractTest`.
+ *
+ * Fields carry `null` when the outcome does NOT change that
+ * particular slot (Failed*Persistence outcomes preserve
+ * `signingPublicKeyHex` and `currentStep` in-place; only the
+ * phase transitions).
+ */
+internal data class FinalizeAdvance(
+    val newSigningPublicKeyHex: String?,
+    val newStep: OnboardingStepV2?,
+    val newPhase: OnboardingFinalizePhase,
+)
+
+internal fun applyFinalizeOutcome(outcome: FinalizeOutcome): FinalizeAdvance = when (outcome) {
+    is FinalizeOutcome.Completed -> FinalizeAdvance(
+        newSigningPublicKeyHex = outcome.record.signingPublicKeyHex,
+        newStep = OnboardingStepV2.FinaleConfirmation,
+        newPhase = OnboardingFinalizePhase.Completed,
+    )
+    FinalizeOutcome.FailedBeforePersistence -> FinalizeAdvance(
+        newSigningPublicKeyHex = null,
+        newStep = null,
+        newPhase = OnboardingFinalizePhase.NotStarted,
+    )
+    FinalizeOutcome.FailedAfterPersistence -> FinalizeAdvance(
+        newSigningPublicKeyHex = null,
+        newStep = null,
+        newPhase = OnboardingFinalizePhase.InFlight,
+    )
+}
+
+/**
+ * Round-17 REDLINE §P1 pin — production-side writer interface used
+ * by [applyAndCommitFinalizeOutcome]. Production `Flow` provides an
+ * anonymous impl that pokes the composable's three
+ * `rememberSaveable` slots (signingPublicKeyHex, currentStep,
+ * finalizePhase). Tests provide a capturing impl that records the
+ * write ORDER and VALUES.
+ *
+ * Ownership scope: for the terminal finalize transition, these
+ * methods own the currently present direct assignment forms of
+ * `signingPublicKeyHex`, `currentStep = FinaleConfirmation`, and
+ * `finalizePhase`. Regular navigation (e.g. Next/Back reassigning
+ * `currentStep`) writes those fields elsewhere and is NOT
+ * governed by this interface.
+ *
+ * `OnboardingV2FinalizeOutcomeContractTest`'s source-contract
+ * test is a NON-EXHAUSTIVE tripwire: it fails-red on the
+ * straight-forward assignment shapes any reasonable refactor
+ * would produce, not on determined indirections through
+ * intermediate vals or reflected setters. Total ownership
+ * requires the planned sealed state holder (Commit 6).
+ */
+internal interface FinalizeStateWriter {
+    fun writeSigningPublicKeyHex(hex: String)
+    fun advanceToFinaleConfirmation()
+    fun setFinalizePhase(phase: OnboardingFinalizePhase)
+}
+
+/**
+ * Round-17 REDLINE §P1 pin — single production helper that Done
+ * tap AND resume LaunchedEffect both invoke. Reads outcome via
+ * `applyFinalizeOutcome` reducer, then commits via [writer].
+ * Guarantees identical write order across both flows.
+ */
+internal fun applyAndCommitFinalizeOutcome(
+    outcome: FinalizeOutcome,
+    writer: FinalizeStateWriter,
+) {
+    val advance = applyFinalizeOutcome(outcome)
+    advance.newSigningPublicKeyHex?.let { writer.writeSigningPublicKeyHex(it) }
+    if (advance.newStep == OnboardingStepV2.FinaleConfirmation) {
+        writer.advanceToFinaleConfirmation()
+    }
+    writer.setFinalizePhase(advance.newPhase)
+}
+
+/**
+ * `internal` (was `private`) so
+ * `OnboardingV2FinalizeOutcomeContractTest` can pin the terminal-
+ * state → outcome mapping without going through Compose UI. The
+ * outcome contract is the load-bearing invariant round-14 shipped
+ * for atomic success-transition; a regression to the round-13
+ * split-writer shape would silently reintroduce the "stranded on
+ * Permissions with Back locked" recreation bug otherwise.
+ */
+internal suspend fun runFinalize(
+    controller: OnboardingFinalizeController,
+    username: String,
+    privacyMode: phantom.core.transport.PrivacyMode,
+): FinalizeOutcome {
+    controller.finalize(username, privacyMode)
+    return when (val end = controller.state) {
+        is FinalizeState.Complete -> FinalizeOutcome.Completed(end.record)
+        is FinalizeState.Idle -> FinalizeOutcome.FailedBeforePersistence
+        is FinalizeState.Persisted -> FinalizeOutcome.FailedAfterPersistence
+        is FinalizeState.Working -> FinalizeOutcome.FailedAfterPersistence
+    }
+}
+
 @Composable
 fun OnboardingFlowV2(
     container: AppContainer,
@@ -160,9 +306,20 @@ internal fun OnboardingFlowV2Internal(
     onComplete: () -> Unit,
     controller: OnboardingFinalizeController,
 ) {
-    var currentStep by remember { mutableStateOf(OnboardingStepV2.Welcome) }
-    var formState by remember { mutableStateOf(OnboardingFormStateV2()) }
-    var toastMessage by remember { mutableStateOf<String?>(null) }
+    // Round-10 REDLINE §P1 pin: rememberSaveable everywhere so a
+    // config change (rotation, dark-mode toggle, font-scale change)
+    // preserves the flow's state. Prior plain `remember` reset
+    // currentStep to Welcome + wiped formState.username on every
+    // rotation.
+    var currentStep by rememberSaveable(stateSaver = OnboardingStepV2Saver) {
+        mutableStateOf(OnboardingStepV2.Welcome)
+    }
+    var formState by rememberSaveable(stateSaver = OnboardingFormStateV2Saver) {
+        mutableStateOf(OnboardingFormStateV2())
+    }
+    var toastMessage by rememberSaveable(
+        stateSaver = androidx.compose.runtime.saveable.autoSaver(),
+    ) { mutableStateOf<String?>(null) }
     // Commit 4: Pricing bottom sheet visibility. Opens when the user
     // taps the Ghost Mode segment on Privacy step (or the Unlock CTA
     // inside the Ghost tier card). Closes via backdrop / grab-strip /
@@ -181,8 +338,35 @@ internal fun OnboardingFlowV2Internal(
     // on `pricingSheetPresent` — otherwise the modal contract breaks
     // during exit (Back would reach the flow, background nodes would
     // become TalkBack-reachable mid-fade, etc.).
-    var pricingSheetVisible by remember { mutableStateOf(false) }
-    var pricingSheetPresent by remember { mutableStateOf(false) }
+    // Round-10 REDLINE §P1 pin: pricing sheet visibility also
+    // survives rotation — if the user opens the sheet then rotates,
+    // it stays open. `rememberSaveable` on the primitive Boolean
+    // is a one-line change.
+    var pricingSheetVisible by rememberSaveable { mutableStateOf(false) }
+    var pricingSheetPresent by rememberSaveable { mutableStateOf(false) }
+    // Round-12 REDLINE §P1 pin: durable three-phase finalize state.
+    // Prior round-11 was a single Boolean set on Done and never
+    // cleared — a rotation on Finale replayed the entire finalize
+    // path against a fresh Idle controller (doubled initMessaging),
+    // and error-before-persistence left Back locked while the
+    // controller had reverted to Idle.
+    //
+    // Round-12 rules (see OnboardingFinalizePhase KDoc):
+    //   - NotStarted → Back unlocked; Done can re-fire.
+    //   - InFlight   → Back locked; resume LaunchedEffect replays
+    //                  finalize IFF controller state is Idle.
+    //   - Completed  → Back locked; resume NEVER re-invokes finalize.
+    //
+    // Transitions:
+    //   Done tap                → InFlight
+    //   controller Complete     → Completed
+    //   controller error before
+    //     persistence (state
+    //     ends up back at Idle) → NotStarted (allow user to fix
+    //                              username/privacy and retry)
+    var finalizePhase by rememberSaveable(stateSaver = OnboardingFinalizePhaseSaver) {
+        mutableStateOf(OnboardingFinalizePhase.NotStarted)
+    }
     val scope = rememberCoroutineScope()
 
     // Surface controller's transient error via the existing toast slot,
@@ -195,17 +379,60 @@ internal fun OnboardingFlowV2Internal(
         }
     }
 
-    // On success, the controller reaches Complete — advance to Finale
-    // and seed the signingPublicKeyHex for the confirmation UI.
-    val finalizeState = controller.state
-    LaunchedEffect(finalizeState) {
-        if (finalizeState is FinalizeState.Complete) {
-            if (currentStep != OnboardingStepV2.FinaleConfirmation) {
-                formState = formState.copy(
-                    signingPublicKeyHex = finalizeState.record.signingPublicKeyHex,
-                )
-                currentStep = OnboardingStepV2.FinaleConfirmation
-            }
+    // Round-14 REDLINE §P1 pin: atomic success-transition owned
+    // by the caller coroutine. Round-13 shape split responsibility
+    // between the coroutine (wrote phase=Completed on Complete)
+    // and a separate Complete-observer LaunchedEffect (advanced
+    // currentStep + seeded hex). A rotation between those two
+    // writes left `phase = Completed && currentStep = Permissions`
+    // — post-restart the resume effect skipped (only InFlight
+    // triggers replay) and the Complete-observer no longer had
+    // a Complete controller state to observe. User stranded on
+    // Permissions with Back locked.
+    //
+    // Round-14 collapses the transition into ONE atomic block
+    // inside the coroutine (seed hex → advance step → set phase =
+    // Completed). No Compose observer touches the transition; no
+    // gap between the two writes is possible.
+    //
+    // Post-recreation resume — fires EXACTLY ONCE per composition
+    // on `LaunchedEffect(Unit)`, which for post-rotation IS the
+    // newly-composed instance. Runs the SAME atomic block as the
+    // Done tap.
+    // Round-17 REDLINE §P1 pin: single production writer for the
+    // terminal finalize transition. Both call sites (Done tap AND
+    // this resume LaunchedEffect) delegate to the helper defined
+    // above — the writer owns the direct terminal-assignment
+    // shapes for `formState.signingPublicKeyHex`, `currentStep =
+    // FinaleConfirmation`, and `finalizePhase`. Guarded by
+    // `OnboardingV2FinalizeOutcomeContractTest`'s source-contract
+    // test — a non-exhaustive tripwire (fails-red on straight-
+    // forward assignments; determined indirections through
+    // intermediate vals can bypass). Total ownership will come
+    // with the sealed state holder in Commit 6.
+    val finalizeStateWriter = object : FinalizeStateWriter {
+        override fun writeSigningPublicKeyHex(hex: String) {
+            formState = formState.copy(signingPublicKeyHex = hex)
+        }
+        override fun advanceToFinaleConfirmation() {
+            currentStep = OnboardingStepV2.FinaleConfirmation
+        }
+        override fun setFinalizePhase(phase: OnboardingFinalizePhase) {
+            finalizePhase = phase
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (finalizePhase == OnboardingFinalizePhase.InFlight &&
+            controller.state is FinalizeState.Idle &&
+            currentStep != OnboardingStepV2.FinaleConfirmation
+        ) {
+            val outcome = runFinalize(
+                controller = controller,
+                username = formState.username,
+                privacyMode = formState.privacyMode,
+            )
+            applyAndCommitFinalizeOutcome(outcome, finalizeStateWriter)
         }
     }
 
@@ -213,7 +440,16 @@ internal fun OnboardingFlowV2Internal(
     // the finalize controller reaches Persisted or later — the
     // persisted record is immutable, so returning to Identity to
     // "change" the username would be silently ignored.
-    val backLocked = isBackNavigationLockedByFinalize(controller.state)
+    // Round-12 REDLINE §P1 pin: OR-include the durable phase.
+    // InFlight OR Completed → Back locked. NotStarted defers to
+    // the controller state (Idle → unlocked; Persisted/Working →
+    // locked via `isBackNavigationLockedByFinalize`). The
+    // error-before-persistence LaunchedEffect above returns
+    // phase to NotStarted on Idle so Back unlocks for user
+    // recovery.
+    val backLocked =
+        isBackNavigationLockedByFinalize(controller.state) ||
+            finalizePhase != OnboardingFinalizePhase.NotStarted
     val goBack: () -> Unit = {
         if (!backLocked) {
             val prev = OnboardingStepV2.entries
@@ -298,19 +534,23 @@ internal fun OnboardingFlowV2Internal(
         toastMessage = toastMessage,
         onToastDismiss = { toastMessage = null },
     ) {
+        // Round-11 REDLINE §P1 pin: replaced the full-screen slide±50%
+        // + fade cross-fade with a lighter fade-only transition. Prior
+        // shape moved every pixel of both outgoing and incoming step
+        // through a 50%-width horizontal translation for 220 ms — with
+        // the cipher background's 3 infinite animations + offscreen
+        // DstIn layer still ticking, the frame budget on Tecno spiked
+        // during Welcome → How and the user perceived "проваливающийся
+        // экран". A pure fade retains a felt-transition without the
+        // per-pixel translation cost.
+        //
+        // Direction (goingForward/back) no longer needs a bespoke curve
+        // — a fade reads correctly in both directions. The step-dots +
+        // top-bar chrome carry the "which way is forward" cue.
         AnimatedContent(
             targetState = currentStep,
             transitionSpec = {
-                val goingForward =
-                    targetState.ordinalInFlow > initialState.ordinalInFlow
-                val duration = 220
-                if (goingForward) {
-                    slideInHorizontally(tween(duration)) { it / 2 } + fadeIn(tween(duration)) togetherWith
-                        slideOutHorizontally(tween(duration)) { -it / 2 } + fadeOut(tween(duration))
-                } else {
-                    slideInHorizontally(tween(duration)) { -it / 2 } + fadeIn(tween(duration)) togetherWith
-                        slideOutHorizontally(tween(duration)) { it / 2 } + fadeOut(tween(duration))
-                }
+                fadeIn(tween(180)) togetherWith fadeOut(tween(160))
             },
             label = "onboarding-step",
             modifier = Modifier.fillMaxSize(),
@@ -343,27 +583,182 @@ internal fun OnboardingFlowV2Internal(
                         pricingSheetVisible = true   // start enter animation
                     },
                 )
-                OnboardingStepV2.Permissions -> PermissionsStepV2(
+                OnboardingStepV2.Permissions -> {
+                    // Round-4 REDLINE on Commit 5:
+                    //   §P1-1 real toggle contract — tap can turn
+                    //         notifications OFF as well as ON.
+                    //   §P1-2 fail-loud commit on Dispatchers.IO,
+                    //         in-flight guard, launcher callback
+                    //         captures `granted` and records the
+                    //         "requested-before" bit + persists
+                    //         opt-in on grant.
+                    //   §P1-3 full 4-signal gate incl. per-channel
+                    //         importance + permanent-denial fallback.
+                    val notifStateHolder = phantom.android.screens.onboarding.v2
+                        .rememberNotificationsPermissionState()
+                    val currentGate = notifStateHolder.gateState.value
+                    val currentNotifState = phantom.android.notifications
+                        .deriveNotificationsToggleState(currentGate)
+
+                    val currentContext = androidx.compose.ui.platform.LocalContext.current
+
+                    // In-flight guard — blocks re-tap while the
+                    // suspend commit is running or the launcher
+                    // callback is pending. Any tap during the
+                    // window is dropped (documented no-op — the
+                    // toggle is disabled visually via `enabled`
+                    // hoisting if needed by design; for now the
+                    // guard just no-ops in the handler).
+                    var tapInFlight by remember { mutableStateOf(false) }
+
+                    val notificationsLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.RequestPermission(),
+                    ) { granted ->
+                        // Round-4 §P1-2 pin: capture `granted`.
+                        // Always mark "requested-before" so future
+                        // taps can infer permanent-denial via
+                        // shouldShowRequestPermissionRationale.
+                        phantom.android.screens.onboarding.v2
+                            .markNotificationPermissionAsRequested(currentContext)
+                        if (granted) {
+                            // On grant, persist opt-in synchronously
+                            // via the suspend fail-loud writer.
+                            // If the write fails, DO NOT flip the
+                            // in-memory holder — refresh will read
+                            // the stale-false pref and the toggle
+                            // stays OFF; log surfaces the failure.
+                            scope.launch {
+                                val ok = phantom.android.screens.onboarding.v2
+                                    .writeUserOptedInToNotifications(
+                                        context = currentContext,
+                                        value = true,
+                                    )
+                                if (!ok) {
+                                    Log.e(
+                                        "OnboardingV2",
+                                        "NOTIF opt_in_write_failed after runtime grant — " +
+                                            "state stays OFF pending user retry",
+                                    )
+                                }
+                                notifStateHolder.refresh()
+                                tapInFlight = false
+                            }
+                        } else {
+                            // Grant refused — leave opt-in as-is,
+                            // just refresh so permanent-denial hint
+                            // updates via the marked-requested bit.
+                            notifStateHolder.refresh()
+                            tapInFlight = false
+                        }
+                    }
+
+                    PermissionsStepV2(
                     formState = formState,
                     dotsIndex = step.dotsIndex,
                     onFormStateChange = { formState = it },
-                    onDoneClick = {
-                        // Delegate the 2-phase state machine (double-tap
-                        // guard, createOrLoad, initMessaging, retry
-                        // semantics, cancellation handling) to the
-                        // controller. Advancement to FinaleConfirmation
-                        // happens via the LaunchedEffect above that
-                        // observes `controller.state` transitioning to
-                        // Complete.
-                        scope.launch {
-                            // Round-1 REDLINE on Commit 4 §P1-1: pass
-                            // the user's chosen privacyMode so the
-                            // controller can persist it before
-                            // initMessaging fires.
-                            controller.finalize(formState.username, formState.privacyMode)
+                    notificationsState = currentNotifState,
+                    onRequestNotificationPermission = {
+                        if (tapInFlight) return@PermissionsStepV2
+                        val action = phantom.android.notifications
+                            .decideNotificationsTapAction(
+                                gate = currentGate,
+                                sdkInt = Build.VERSION.SDK_INT,
+                            )
+                        when (action) {
+                            phantom.android.notifications
+                                .NotificationsTapAction.OptOutAppLevelOnly -> {
+                                // Tap while ON → turn OFF. Persist
+                                // false via the suspend fail-loud
+                                // writer; block re-tap during the
+                                // window; surface failure if the
+                                // commit is rejected.
+                                tapInFlight = true
+                                scope.launch {
+                                    val ok = phantom.android.screens.onboarding.v2
+                                        .writeUserOptedInToNotifications(
+                                            context = currentContext,
+                                            value = false,
+                                        )
+                                    if (!ok) {
+                                        Log.e(
+                                            "OnboardingV2",
+                                            "NOTIF opt_out_write_failed — state stays ON",
+                                        )
+                                    }
+                                    notifStateHolder.refresh()
+                                    tapInFlight = false
+                                }
+                            }
+                            phantom.android.notifications
+                                .NotificationsTapAction.OptInAppLevelOnly -> {
+                                // Tap while OFF and all OS gates
+                                // already ready → flip opt-in true.
+                                tapInFlight = true
+                                scope.launch {
+                                    val ok = phantom.android.screens.onboarding.v2
+                                        .writeUserOptedInToNotifications(
+                                            context = currentContext,
+                                            value = true,
+                                        )
+                                    if (!ok) {
+                                        Log.e(
+                                            "OnboardingV2",
+                                            "NOTIF opt_in_write_failed — state stays OFF",
+                                        )
+                                    }
+                                    notifStateHolder.refresh()
+                                    tapInFlight = false
+                                }
+                            }
+                            phantom.android.notifications
+                                .NotificationsTapAction.LaunchRuntimePermission -> {
+                                // In-flight guard set here too;
+                                // the launcher callback clears it.
+                                tapInFlight = true
+                                notificationsLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            phantom.android.notifications
+                                .NotificationsTapAction.OpenAppNotificationSettings ->
+                                phantom.android.screens.onboarding.v2
+                                    .openAppNotificationSettings(currentContext)
+                            phantom.android.notifications
+                                .NotificationsTapAction.OpenMessageChannelSettings ->
+                                phantom.android.screens.onboarding.v2
+                                    .openMessageChannelSettings(currentContext)
                         }
                     },
-                )
+                    onDoneClick = {
+                        // Delegate the THREE-phase state machine
+                        // (double-tap guard, savePrivacyMode / createOrLoad
+                        // / initMessaging with retry semantics + cancellation
+                        // handling) to the controller. Round-14 REDLINE §P1:
+                        // advancement to FinaleConfirmation is owned by this
+                        // coroutine's atomic outcome-match block below — the
+                        // previous LaunchedEffect(controller.state) Compose
+                        // observer was removed to avoid the observable gap
+                        // between finalize's return and the step advance.
+                        // Round-18 REDLINE §P1 pin: pre-launch
+                        // InFlight transition ALSO goes through the
+                        // writer — no direct assignment of
+                        // `finalizePhase` in the currently present
+                        // shapes outside the writer's
+                        // `setFinalizePhase` body. Guarded by the
+                        // source-contract test (non-exhaustive
+                        // tripwire — see FinalizeStateWriter KDoc).
+                        finalizeStateWriter.setFinalizePhase(
+                            OnboardingFinalizePhase.InFlight,
+                        )
+                        scope.launch {
+                            val outcome = runFinalize(
+                                controller = controller,
+                                username = formState.username,
+                                privacyMode = formState.privacyMode,
+                            )
+                            applyAndCommitFinalizeOutcome(outcome, finalizeStateWriter)
+                        }
+                    },
+                    )  // PermissionsStepV2 close
+                }  // OnboardingStepV2.Permissions block close
                 OnboardingStepV2.FinaleConfirmation -> FinaleConfirmationStepV2(
                     formState = formState,
                     onContinueClick = onComplete,

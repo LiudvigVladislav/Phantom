@@ -21,7 +21,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -82,84 +87,98 @@ fun FinaleConfirmationStepV2(
     val context = LocalContext.current
     val hex = formState.signingPublicKeyHex
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp)
-            .padding(top = 72.dp, bottom = 24.dp),
-    ) {
-        Text(
-            text = "IDENTITY CREATED",
-            color = DesignV2Tokens.Colors.Success,
-            style = TextStyle(
-                fontFamily = DesignV2FontMono,
-                fontSize = 10.5.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 2.4.sp,
-            ),
-        )
-        Spacer(Modifier.height(14.dp))
-        Text(
-            text = "Your Ed25519 key",
-            color = DesignV2Tokens.Colors.TextPrimary,
-            style = TextStyle(
-                fontFamily = DesignV2FontDisplay,
-                fontSize = 26.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.sp,
-                lineHeight = 32.sp,
-            ),
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "Generated on device. Your public key can be shared for verification.",
-            color = DesignV2Tokens.Colors.TextTertiary,
-            style = TextStyle(
-                fontFamily = DesignV2FontBody,
-                fontSize = 13.5.sp,
-                lineHeight = 20.sp,
-            ),
-        )
-
-        Spacer(Modifier.height(20.dp))
-
-        if (hex != null) {
-            FinaleKeyCard(hex = hex)
-            Spacer(Modifier.height(12.dp))
-            FingerprintChip(hex = hex)
-            Spacer(Modifier.height(12.dp))
-            // Round-1 REDLINE Commit-3 §P2-1: warning banner.
-            // The "Lose this key and the account is gone" message
-            // was promised on Step 2 (deferred there per redline §C1
-            // because the key didn't yet exist). Now that it exists,
-            // the warning belongs here.
-            KeyLossWarningBanner()
-            Spacer(Modifier.height(16.dp))
-            CopyKeyButton(
-                onClick = {
-                    copyFullHexToClipboard(context, hex)
-                    onKeyCopied()
-                },
-            )
-        } else {
+    // Round-6 REDLINE on Commit 5 §P0: scrollable body + fixed CTA.
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                // Round-8 REDLINE §P1: top bar reserved above.
+                .padding(top = 4.dp),
+        ) {
             Text(
-                text = "Something went wrong — please restart onboarding.",
-                color = DesignV2Tokens.Colors.Error,
+                text = "IDENTITY CREATED",
+                color = DesignV2Tokens.Colors.Success,
                 style = TextStyle(
-                    fontFamily = DesignV2FontBody,
-                    fontSize = 14.sp,
+                    fontFamily = DesignV2FontMono,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 2.4.sp,
                 ),
             )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = "Your Ed25519 key",
+                color = DesignV2Tokens.Colors.TextPrimary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontDisplay,
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                    lineHeight = 32.sp,
+                ),
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Generated on device. Your public key can be shared for verification.",
+                color = DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontBody,
+                    fontSize = 13.5.sp,
+                    lineHeight = 20.sp,
+                ),
+            )
+
+            Spacer(Modifier.height(20.dp))
+
+            if (hex != null) {
+                FinaleKeyCard(hex = hex)
+                Spacer(Modifier.height(12.dp))
+                FingerprintChip(hex = hex)
+                Spacer(Modifier.height(12.dp))
+                // Round-1 REDLINE Commit-3 §P2-1: warning banner.
+                // The "Lose this key and the account is gone" message
+                // was promised on Step 2 (deferred there per redline §C1
+                // because the key didn't yet exist). Now that it exists,
+                // the warning belongs here.
+                KeyLossWarningBanner()
+                Spacer(Modifier.height(16.dp))
+                CopyKeyButton(
+                    onClick = {
+                        copyFullHexToClipboard(context, hex)
+                        onKeyCopied()
+                    },
+                )
+            } else {
+                Text(
+                    text = "Something went wrong — please restart onboarding.",
+                    color = DesignV2Tokens.Colors.Error,
+                    style = TextStyle(
+                        fontFamily = DesignV2FontBody,
+                        fontSize = 14.sp,
+                    ),
+                )
+            }
+
+            Spacer(Modifier.height(20.dp))
         }
-
-        Spacer(Modifier.weight(1f))
-
-        PhantomButton(
-            text = "Continue",
-            onClick = onContinueClick,
-            enabled = hex != null,
-            modifier = Modifier.fillMaxWidth(),
-        )
+        // Round-9 REDLINE §P1: safe-bottom navigation-bar inset.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            PhantomButton(
+                text = "Continue",
+                onClick = onContinueClick,
+                enabled = hex != null,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 

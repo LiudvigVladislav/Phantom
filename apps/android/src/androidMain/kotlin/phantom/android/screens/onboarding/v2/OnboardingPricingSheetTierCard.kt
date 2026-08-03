@@ -54,6 +54,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * `PricingTierCard` while keeping the rest of the module out of
  * reach.
  */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 internal fun PricingTierCard(
     tier: PricingTierV2,
@@ -72,45 +73,66 @@ internal fun PricingTierCard(
                 .border(1.dp, cardBorder, RoundedCornerShape(18.dp))
                 .padding(horizontal = 18.dp, vertical = 20.dp),
         ) {
-            // Header row: icon + name + price + /mo (baseline-aligned).
-            Row(verticalAlignment = Alignment.Bottom) {
-                Icon(
-                    painter = painterResource(tier.iconRes),
-                    contentDescription = null,
-                    tint = DesignV2Tokens.Colors.Cyan,
-                    modifier = Modifier
-                        .size(18.dp)
-                        .clearAndSetSemantics { },
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    text = tier.name,
-                    color = DesignV2Tokens.Colors.TextPrimary,
-                    style = TextStyle(
-                        fontFamily = DesignV2FontDisplay,
-                        fontSize = 19.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    ),
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    text = tier.price,
-                    color = DesignV2Tokens.Colors.TextPrimary,
-                    style = TextStyle(
-                        fontFamily = DesignV2FontDisplay,
-                        fontSize = 19.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    ),
-                )
-                Text(
-                    text = "/mo",
-                    color = DesignV2Tokens.Colors.TextQuaternary,
-                    style = TextStyle(
-                        fontFamily = DesignV2FontBody,
-                        fontSize = 12.sp,
-                    ),
-                    modifier = Modifier.padding(start = 2.dp, bottom = 3.dp),
-                )
+            // Round-7 REDLINE on Commit 5 §P1 pin: header row
+            // now wraps as (icon + name) / (price + /mo). Prior
+            // single Row with baseline alignment at narrow width
+            // × fontScale 2.0 forced `/mo` to render as a
+            // vertical clipped column of letters and crowded the
+            // tier name against the price. `FlowRow` keeps the
+            // logical grouping (name always with icon; price
+            // always with /mo) so the wrap boundary lands at
+            // the natural " " between them.
+            androidx.compose.foundation.layout.FlowRow(
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Icon(
+                        painter = painterResource(tier.iconRes),
+                        contentDescription = null,
+                        tint = DesignV2Tokens.Colors.Cyan,
+                        modifier = Modifier
+                            .size(18.dp)
+                            .clearAndSetSemantics { },
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = tier.name,
+                        color = DesignV2Tokens.Colors.TextPrimary,
+                        style = TextStyle(
+                            fontFamily = DesignV2FontDisplay,
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        text = tier.price,
+                        color = DesignV2Tokens.Colors.TextPrimary,
+                        style = TextStyle(
+                            fontFamily = DesignV2FontDisplay,
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                    Text(
+                        text = "/mo",
+                        color = DesignV2Tokens.Colors.TextQuaternary,
+                        style = TextStyle(
+                            fontFamily = DesignV2FontBody,
+                            fontSize = 12.sp,
+                        ),
+                        modifier = Modifier.padding(start = 2.dp, bottom = 3.dp),
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                }
             }
             Spacer(Modifier.height(2.dp))
             Text(

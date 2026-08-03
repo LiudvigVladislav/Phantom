@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Match the deep purple-black corners of phantom_logo.png so the
-         adaptive-icon mask shows no contrast ring around the PNG. -->
+    <!-- Adaptive-icon background layer. Solid #000000 to match the dark
+         canvas of the current brandmark treatment (see
+         drawable/ic_phantom_fg_safe.png + ic_phantom_fg_bold.png). Also
+         the color the legacy mipmap PNGs bake as their rounded-square
+         background so square/round launcher masks match. -->
     <color name="ic_launcher_background">#000000</color>
 </resources>

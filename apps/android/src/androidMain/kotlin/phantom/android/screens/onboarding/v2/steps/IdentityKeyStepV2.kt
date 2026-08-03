@@ -15,6 +15,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -77,75 +82,114 @@ fun IdentityKeyStepV2(
     dotsIndex: Int,
     onFormStateChange: (OnboardingFormStateV2) -> Unit,
     onContinueClick: () -> Unit,
+    scrollState: androidx.compose.foundation.ScrollState = androidx.compose.foundation.rememberScrollState(),
 ) {
+    // Round-7 REDLINE on Commit 5 §P2 pin: `scrollState` is
+    // parametrised so responsive goldens can inject a pre-scrolled
+    // state (initial = Int.MAX_VALUE clamps to the bottom) that
+    // brings the username input into view. Production callers get
+    // the default `rememberScrollState()` — the user always starts
+    // at the top.
     val validation = validateUsernameV2(formState.username)
     val canAdvance = validation == UsernameValidationV2.Valid
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp)
-            .padding(top = 72.dp, bottom = 24.dp),
-    ) {
-        // Round-1 REDLINE Commit-3 §P2-2 (handoff Onboarding.dc.html
-        // line 99): the source design does NOT include an
-        // "02 · YOUR IDENTITY KEY" overline on Step 2 — that was a
-        // premature Commit-3 addition. Removed. Title uses handoff's
-        // 29 sp / lineHeight 34 sp (Geist SemiBold), matching the
-        // How-step title metric.
-        Text(
-            text = "Your identity key",
-            color = DesignV2Tokens.Colors.TextPrimary,
-            style = TextStyle(
-                fontFamily = DesignV2FontDisplay,
-                fontSize = 29.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.sp,
-                lineHeight = 34.sp,
-            ),
-        )
+    // Round-6 REDLINE on Commit 5 §P0: split scrollable body from
+    // fixed-bottom CTA so at fontScale=2.0 on a narrow phone the
+    // user can always scroll to the Continue button. Prior static
+    // Column pushed CTA past the viewport at 320 dp × fs 2.0.
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(scrollState)
+                .padding(horizontal = 24.dp)
+                // Round-8 REDLINE §P1 pin: top bar now lives above
+                // this scrollable body in the HostFrame Column, so
+                // the body starts BELOW the top bar. The extra
+                // `top = 4.dp` here is a small breathing gap
+                // between the top bar and the title — the prior
+                // 72.dp assumed the top bar was Z-stacked over
+                // the body.
+                .padding(top = 4.dp),
+        ) {
+            // Round-1 REDLINE Commit-3 §P2-2 (handoff Onboarding.dc.html
+            // line 99): the source design does NOT include an
+            // "02 · YOUR IDENTITY KEY" overline on Step 2 — that was a
+            // premature Commit-3 addition. Removed. Title uses handoff's
+            // 29 sp / lineHeight 34 sp (Geist SemiBold), matching the
+            // How-step title metric.
+            Text(
+                text = "Your identity key",
+                color = DesignV2Tokens.Colors.TextPrimary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontDisplay,
+                    fontSize = 29.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                    lineHeight = 34.sp,
+                ),
+            )
 
-        Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(8.dp))
 
-        // Redline §C3 wording — no overclaims. Public key IS shared for
-        // verification via QR/contact exchange; only the private half
-        // stays on device.
-        Text(
-            text = "Your private key is generated and stored on this device. Your public key can be shared for verification.",
-            color = DesignV2Tokens.Colors.TextTertiary,
-            style = TextStyle(
-                fontFamily = DesignV2FontBody,
-                fontSize = 13.5.sp,
-                lineHeight = 20.sp,
-            ),
-        )
+            // Redline §C3 wording — no overclaims. Public key IS shared for
+            // verification via QR/contact exchange; only the private half
+            // stays on device.
+            //
+            // Round-9 REDLINE §P1: future tense — the key does NOT exist
+            // yet on Step 2 (it is created only in Permissions' finalize).
+            // Prior "is generated and stored" contradicted the preview
+            // card's own "WILL BE GENERATED" copy.
+            Text(
+                text = "Your private key will be generated and stored on this device when you finish onboarding. Your public key can then be shared for verification.",
+                color = DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontBody,
+                    fontSize = 13.5.sp,
+                    lineHeight = 20.sp,
+                ),
+            )
 
-        Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(20.dp))
 
-        IdentityKeyPreviewCard(usernameValid = canAdvance)
+            IdentityKeyPreviewCard(usernameValid = canAdvance)
 
-        Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(24.dp))
 
-        UsernameInputSection(
-            username = formState.username,
-            validation = validation,
-            onUsernameChange = { newValue ->
-                // Case-normalise only. DO NOT strip characters — redline §C2.
-                onFormStateChange(formState.copy(username = newValue.lowercase()))
-            },
-        )
+            UsernameInputSection(
+                username = formState.username,
+                validation = validation,
+                onUsernameChange = { newValue ->
+                    // Case-normalise only. DO NOT strip characters — redline §C2.
+                    onFormStateChange(formState.copy(username = newValue.lowercase()))
+                },
+            )
 
-        Spacer(Modifier.weight(1f))
-
-        OnboardingStepDotsV2(dotsIndex = dotsIndex)
-        Spacer(Modifier.height(12.dp))
-
-        PhantomButton(
-            text = "Continue",
-            onClick = onContinueClick,
-            enabled = canAdvance,
-            modifier = Modifier.fillMaxWidth(),
-        )
+            Spacer(Modifier.height(20.dp))
+        }
+        // Fixed bottom band — dots + primary CTA. Never scrolls off.
+        // Round-9 REDLINE §P1 pin: `windowInsetsPadding(navigationBars)`
+        // reserves the system navigation-bar height, so the CTA
+        // never sits under the 3-button bar / gesture handle on
+        // Android 15 edge-to-edge. The 24-dp visual gap is added
+        // ON TOP of the system inset.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            OnboardingStepDotsV2(dotsIndex = dotsIndex)
+            Spacer(Modifier.height(12.dp))
+            PhantomButton(
+                text = "Continue",
+                onClick = onContinueClick,
+                enabled = canAdvance,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 

@@ -3,7 +3,84 @@
 
 package phantom.android.screens.onboarding.v2
 
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.listSaver
 import phantom.core.transport.PrivacyMode
+
+/**
+ * Round-10 REDLINE on Commit 5 §P1 pin — Savers used by
+ * `OnboardingFlowV2Internal`'s `rememberSaveable` blocks so a
+ * config change (rotation, dark-mode toggle, font-scale change,
+ * Activity recreation on low memory) preserves the entire
+ * onboarding state end-to-end.
+ *
+ * `OnboardingStepV2Saver` — serializes the current step enum by
+ * name; the enum is closed and stable across process launches,
+ * so `valueOf(name)` is safe.
+ *
+ * `OnboardingFormStateV2Saver` — serializes the 3-field data
+ * class as a String list. `signingPublicKeyHex` is `null`-encoded
+ * as an empty String (Bundle can't natively carry null in a list)
+ * and decoded back to null on restore. `PrivacyMode` enum name.
+ */
+public val OnboardingStepV2Saver: Saver<OnboardingStepV2, String> = Saver(
+    save = { it.name },
+    restore = { OnboardingStepV2.valueOf(it) },
+)
+
+/**
+ * Round-12 REDLINE §P1 pin: durable three-phase finalize model.
+ * Prior round-11 shape used a single `Boolean` bit that was set
+ * on `Done` and never cleared, so a rotation on Finale replayed
+ * the entire finalize path against a fresh Idle controller —
+ * doubling `initMessaging` calls and, in the error-before-
+ * persistence case, leaving Back locked while the controller had
+ * quietly reverted to Idle.
+ *
+ * Three phases:
+ *   - `NotStarted` — no finalize has been kicked off yet, OR
+ *     the last attempt failed BEFORE any disk write (identity
+ *     not created, mode not saved). Back is unlocked; the
+ *     Permissions `Done` tap re-enables user recovery
+ *     (change username, change privacy).
+ *   - `InFlight` — `Done` has fired and the finalize coroutine
+ *     is still working (either in the original composition or
+ *     resumed after a rotation). Back is locked. If the
+ *     controller state is Idle here (post-recreation), the
+ *     resume LaunchedEffect replays finalize.
+ *   - `Completed` — all three phases succeeded AND the flow
+ *     advanced to Finale. Back stays locked. Resume MUST NOT
+ *     re-invoke finalize — the identity is already persisted
+ *     and Finale is showing.
+ */
+public enum class OnboardingFinalizePhase {
+    NotStarted,
+    InFlight,
+    Completed,
+    ;
+}
+
+public val OnboardingFinalizePhaseSaver: Saver<OnboardingFinalizePhase, String> = Saver(
+    save = { it.name },
+    restore = { OnboardingFinalizePhase.valueOf(it) },
+)
+
+public val OnboardingFormStateV2Saver: Saver<OnboardingFormStateV2, Any> = listSaver(
+    save = {
+        listOf(
+            it.username,
+            it.privacyMode.name,
+            it.signingPublicKeyHex ?: "",
+        )
+    },
+    restore = {
+        OnboardingFormStateV2(
+            username = it[0] as String,
+            privacyMode = PrivacyMode.valueOf(it[1] as String),
+            signingPublicKeyHex = (it[2] as String).ifEmpty { null },
+        )
+    },
+)
 
 /**
  * OnboardingV2 state model — enum + form-state + validation.
@@ -23,7 +100,9 @@ import phantom.core.transport.PrivacyMode
  *   - Welcome and How touch nothing (Commit 2 — this commit).
  *   - Identity fills [FormState.username] (Commit 3, gated by [validateUsername]).
  *   - Privacy fills [FormState.privacyMode] (Commit 4).
- *   - Permissions fills [FormState.notificationsEnabled] (Commit 5).
+ *   - Permissions writes nothing (round-1 REDLINE §P1-2: OS is
+ *     the source of truth for notifications; Mic/Nearby are info
+ *     rows per §A4).
  *   - FinaleConfirmation reads [FormState.signingPublicKeyHex] set by
  *     the finalize path (Commit 5).
  */
@@ -57,10 +136,10 @@ enum class OnboardingStepV2(
  *                `signingPublicKeyHex` is written by the finalize path after
  *                `IdentityManager.createOrLoad` succeeds.
  *   - Commit 4 : `privacyMode` is filled by PrivacyLevelStep.
- *   - Commit 5 : `notificationsEnabled` is filled by PermissionsStep
- *                (only affects whether the POST_NOTIFICATIONS launcher fires;
- *                the enabled toggle DOES trigger the launcher on Android 13+;
- *                a runtime denial flips this field back to false).
+ *   - Commit 5 : no form-state writes (round-1 REDLINE §P1-2).
+ *                Notifications state is derived from the OS via
+ *                `OnboardingNotificationPermissionCoordinator`;
+ *                Microphone + Nearby are static info rows.
  *
  * Marked as a plain `data class` (no @Serializable) — the state is entirely
  * in-memory for the duration of the onboarding flow. If process dies mid-flow,
@@ -70,8 +149,25 @@ enum class OnboardingStepV2(
 data class OnboardingFormStateV2(
     val username: String = "",
     val privacyMode: PrivacyMode = PrivacyMode.Standard,
-    val notificationsEnabled: Boolean = false,
     val signingPublicKeyHex: String? = null,
+    // Round-1 REDLINE on Commit 5 §P1-1 + §P1-2: no
+    // `notificationsEnabled` / `microphoneEnabled` /
+    // `nearbyDiscoveryEnabled` fields.
+    //
+    // Notifications:
+    //   The OS permission state IS the source of truth per
+    //   `OnboardingNotificationPermissionCoordinator` — an app-
+    //   level bool would trivially desync from Settings changes
+    //   made while the app is running, and no runtime notif-
+    //   publish gate reads it.
+    //
+    // Microphone + Nearby discovery:
+    //   Non-interactive INFORMATIONAL rows in the Permissions
+    //   step per architect §A4 ("Asked when first used"). No
+    //   preference is recorded — the RECORD_AUDIO / BLUETOOTH_SCAN
+    //   dialogs fire at first actual use (call subsystem / mesh
+    //   discovery) via the OS launcher pattern inside those
+    //   subsystems.
 )
 
 /**

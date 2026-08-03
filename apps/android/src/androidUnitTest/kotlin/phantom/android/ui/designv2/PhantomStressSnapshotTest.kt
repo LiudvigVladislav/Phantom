@@ -29,6 +29,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseStressB
  *   - Ring / border misalignment on multi-line Input helper text.
  *   - Chip / segmented cramped layout under 2x font scale.
  */
+@androidx.compose.foundation.layout.ExperimentalLayoutApi
 class PhantomStressSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

@@ -17,6 +17,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -76,12 +79,16 @@ fun HowStepV2(
     dotsIndex: Int,
     onContinueClick: () -> Unit,
 ) {
+    // Round-9 REDLINE §P1: `windowInsetsPadding(navigationBars)` on
+    // the outer Column keeps the CTA above the system nav bar on
+    // Android 15 edge-to-edge (3-button + gesture nav both).
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(horizontal = 24.dp)
-            // top: below the top-bar (~64 dp effective); bottom: system nav margin
-            .padding(top = 72.dp, bottom = 24.dp),
+            // Round-8 REDLINE §P1: top bar reserved above in HostFrame Column.
+            .padding(top = 4.dp, bottom = 24.dp),
     ) {
         // Hard newline per REDLINE P1-3 — matches handoff line-break.
         // letterSpacing = 0.sp per round-2 REDLINE P2-5: the UI contract

@@ -6,6 +6,7 @@ package phantom.android.screens.onboarding.v2
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -99,6 +100,16 @@ fun OnboardingV2HostFrame(
     onToastDismiss: () -> Unit,
     content: @Composable () -> Unit,
 ) {
+    // Round-8 REDLINE on Commit 5 §P1 pin: top bar now lives in a
+    // dedicated slot at the TOP of a Column, so the content slot's
+    // vertical bounds start BELOW the top bar. Prior Z-stacked
+    // shape let scrolled content pass beneath the transparent Back
+    // pill / "STEP N OF 4" text and read as a layout collision at
+    // any non-zero scroll offset.
+    //
+    // Cipher background and overlays (edge-swipe surface, toast)
+    // stay Z-stacked in the outer Box so they cover the full frame
+    // regardless of the Column split.
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -107,15 +118,17 @@ fun OnboardingV2HostFrame(
     ) {
         OnboardingCipherBackground()
 
-        content()
-
-        if (currentStep.showTopBar) {
-            OnboardingTopBarV2(
-                stepNumber = currentStep.stepNumber,
-                totalSteps = currentStep.totalNumberedSteps,
-                onBackClick = onBackClick,
-                modifier = Modifier.align(Alignment.TopStart),
-            )
+        Column(modifier = Modifier.fillMaxSize()) {
+            if (currentStep.showTopBar) {
+                OnboardingTopBarV2(
+                    stepNumber = currentStep.stepNumber,
+                    totalSteps = currentStep.totalNumberedSteps,
+                    onBackClick = onBackClick,
+                )
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                content()
+            }
         }
 
         // Left-edge swipe-back gesture (round-3 REDLINE P1-1 +

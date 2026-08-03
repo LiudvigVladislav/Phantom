@@ -13,6 +13,8 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyEmpty
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyInvalid
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyShort
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyValid
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPermissionsNotifDisabled
+import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPermissionsNotifEnabled
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPricingSheet
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPricingSheetScrolledBottom
 import phantom.android.ui.designv2.showcase.ShowcaseOnboardingPrivacyGhostLocked
@@ -115,5 +117,19 @@ class OnboardingV2SnapshotTest {
         // internal scroll to its bottom via
         // `scrollToBottomForShowcase = true`.
         paparazzi.snapshot { ShowcaseOnboardingPricingSheetScrolledBottom() }
+    }
+
+    // Commit 5 · Round-1 REDLINE additions — Permissions step, 2
+    // Notifications OS-state variants. Mic + Nearby are static
+    // info rows in both goldens (§A4).
+
+    @Test
+    fun onboarding_v2_permissions_notif_disabled() {
+        paparazzi.snapshot { ShowcaseOnboardingPermissionsNotifDisabled() }
+    }
+
+    @Test
+    fun onboarding_v2_permissions_notif_enabled() {
+        paparazzi.snapshot { ShowcaseOnboardingPermissionsNotifEnabled() }
     }
 }

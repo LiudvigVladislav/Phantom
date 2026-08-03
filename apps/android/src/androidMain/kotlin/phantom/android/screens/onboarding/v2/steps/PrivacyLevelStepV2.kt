@@ -17,7 +17,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -103,67 +108,80 @@ fun PrivacyLevelStepV2(
         PrivacyMode.Ghost -> 2
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp)
-            .padding(top = 72.dp, bottom = 24.dp),
-    ) {
-        Text(
-            text = "Choose your\nprivacy level",
-            color = DesignV2Tokens.Colors.TextPrimary,
-            style = TextStyle(
-                fontFamily = DesignV2FontDisplay,
-                fontSize = 29.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 0.sp,
-                lineHeight = 34.sp,
-            ),
-        )
+    // Round-6 REDLINE on Commit 5 §P0: scrollable body + fixed CTA.
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp)
+                // Round-8 REDLINE §P1: top bar reserved above.
+                .padding(top = 4.dp),
+        ) {
+            Text(
+                text = "Choose your\nprivacy level",
+                color = DesignV2Tokens.Colors.TextPrimary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontDisplay,
+                    fontSize = 29.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.sp,
+                    lineHeight = 34.sp,
+                ),
+            )
 
-        Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(10.dp))
 
-        Text(
-            text = "Slide to set how visible you are. Change it any time in Settings.",
-            color = DesignV2Tokens.Colors.TextTertiary,
-            style = TextStyle(
-                fontFamily = DesignV2FontBody,
-                fontSize = 14.5.sp,
-                lineHeight = 22.sp,
-            ),
-        )
+            Text(
+                text = "Slide to set how visible you are. Change it any time in Settings.",
+                color = DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontBody,
+                    fontSize = 14.5.sp,
+                    lineHeight = 22.sp,
+                ),
+            )
 
-        Spacer(Modifier.height(26.dp))
+            Spacer(Modifier.height(26.dp))
 
-        PrivacySegmentBar(
-            selectedIndex = selectedIndex,
-            onSegmentClick = { idx ->
-                when (idx) {
-                    0 -> onFormStateChange(formState.copy(privacyMode = PrivacyMode.Standard))
-                    1 -> onFormStateChange(formState.copy(privacyMode = PrivacyMode.Private))
-                    2 -> onGhostLockClick()
-                }
-            },
-        )
+            PrivacySegmentBar(
+                selectedIndex = selectedIndex,
+                onSegmentClick = { idx ->
+                    when (idx) {
+                        0 -> onFormStateChange(formState.copy(privacyMode = PrivacyMode.Standard))
+                        1 -> onFormStateChange(formState.copy(privacyMode = PrivacyMode.Private))
+                        2 -> onGhostLockClick()
+                    }
+                },
+            )
 
-        Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(24.dp))
 
-        PrivacyTierCard(
-            tier = PRIVACY_TIERS[selectedIndex],
-            onUnlockClick = onGhostLockClick,
-        )
+            PrivacyTierCard(
+                tier = PRIVACY_TIERS[selectedIndex],
+                onUnlockClick = onGhostLockClick,
+            )
 
-        Spacer(Modifier.weight(1f))
-
-        OnboardingStepDotsV2(dotsIndex = dotsIndex)
-        Spacer(Modifier.height(12.dp))
-
-        PhantomButton(
-            text = "Continue",
-            onClick = onContinueClick,
-            enabled = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
+            Spacer(Modifier.height(20.dp))
+        }
+        // Round-9 REDLINE §P1: safe-bottom navigation-bar inset.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            OnboardingStepDotsV2(dotsIndex = dotsIndex)
+            Spacer(Modifier.height(12.dp))
+            PhantomButton(
+                text = "Continue",
+                onClick = onContinueClick,
+                enabled = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
@@ -187,6 +205,7 @@ private fun PrivacySegmentBar(
                 current = idx == selectedIndex,
                 onClick = { onSegmentClick(idx) },
                 modifier = Modifier.weight(1f),
+                isPro = tier.locked,
             )
         }
     }
@@ -201,6 +220,7 @@ private fun PrivacySegment(
     current: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    isPro: Boolean = false,
 ) {
     // Round-1 REDLINE on Commit 4 §P2-2: previous shape wiped the
     // segment label's semantics via `clearAndSetSemantics { }` and
@@ -212,6 +232,13 @@ private fun PrivacySegment(
     // `stateDescription` so TalkBack announces selected state; the
     // label Text merges into the clickable node's a11y tree so the
     // visual "STANDARD" text is still discoverable.
+    // Round-9 REDLINE §P1 pin: Ghost segment carries a permanent
+    // PRO marker (crown badge above the label) BEFORE the user
+    // taps it. Prior shape only revealed the PRO tag inside the
+    // selected-Ghost card, so a first-time user saw plain "GHOST"
+    // and only discovered the paywall by selecting it. The badge
+    // + a11y content description ("Ghost, Phantom Pro required")
+    // set expectations upfront.
     Column(
         modifier = modifier
             .clickable(
@@ -220,7 +247,7 @@ private fun PrivacySegment(
                 onClick = onClick,
             )
             .semantics {
-                contentDescription = label
+                contentDescription = if (isPro) "$label, Phantom Pro required" else label
                 selected = current
                 stateDescription = if (current) "Selected" else "Not selected"
             },
@@ -238,17 +265,67 @@ private fun PrivacySegment(
                 .clearAndSetSemantics { },
         )
         Spacer(Modifier.height(9.dp))
-        Text(
-            text = label,
-            color = if (current) DesignV2Tokens.Colors.Cyan
-                    else DesignV2Tokens.Colors.TextTertiary,
-            style = TextStyle(
-                fontFamily = DesignV2FontMono,
-                fontSize = 9.5.sp,
-                fontWeight = FontWeight.Normal,
-                letterSpacing = 1.14.sp,
-            ),
-        )
+        // Round-10 REDLINE §P1 pin: PRO badge is now a ONE-ROW
+        // composition alongside the label (Row: label + tiny
+        // PRO pill). Prior round-9 shape stacked an emoji-crown
+        // pill on a separate row ABOVE the label — the emoji
+        // rendered via system font at inconsistent metrics and
+        // raised the Ghost segment's height above the two
+        // free tiers, breaking the alignment of the segment bar.
+        //
+        // The crown glyph is now the vector drawable
+        // `ic_dv2_phantom_premium` (Compose Icon) rendered inside
+        // the same pill as the "PRO" text; both live in a Row
+        // to the RIGHT of the label. Semantics are owned by the
+        // parent Column via `contentDescription` — inner Row is
+        // decorative.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = label,
+                color = if (current) DesignV2Tokens.Colors.Cyan
+                        else DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontMono,
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.Normal,
+                    letterSpacing = 1.14.sp,
+                ),
+                maxLines = 2,
+                softWrap = true,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            )
+            if (isPro) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(DesignV2Tokens.Colors.Cyan.copy(alpha = 0.14f))
+                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                        .clearAndSetSemantics { },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_dv2_phantom_premium),
+                        contentDescription = null,
+                        tint = DesignV2Tokens.Colors.Cyan,
+                        modifier = Modifier.size(8.dp),
+                    )
+                    Text(
+                        text = "PRO",
+                        color = DesignV2Tokens.Colors.Cyan,
+                        style = TextStyle(
+                            fontFamily = DesignV2FontMono,
+                            fontSize = 7.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.6.sp,
+                        ),
+                    )
+                }
+            }
+        }
     }
 }
 

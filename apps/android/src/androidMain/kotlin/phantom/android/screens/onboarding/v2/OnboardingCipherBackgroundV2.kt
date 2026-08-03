@@ -151,6 +151,18 @@ fun OnboardingCipherBackground(
         val gapPx = with(density) { 16.dp.toPx() }
         sampleLayout.size.height.toFloat() + gapPx
     }
+    // Round-10 REDLINE §P1 pin: pre-measure the whole 26-line
+    // cipher pool ONCE per density/style change instead of calling
+    // `measurer.measure()` for every line on every frame of every
+    // column (3 columns × 26 lines × 2 pool cycles × 60 fps =
+    // ~9,360 measures/second — dominated the frame budget and was
+    // the visible source of Welcome→How jank on device). Only the
+    // layout depends on density/font/style shape; colour is
+    // overridden at draw time via `drawText(color = ...)`, so a
+    // single layout list serves all three columns.
+    val cipherLayouts = remember(density.density, density.fontScale, styleColumn1, cipherLines) {
+        cipherLines.map { textMeasurer.measure(it, styleColumn1) }
+    }
 
     // Round-5 REDLINE P1-1: draw cipher onto an offscreen layer so the
     // subsequent alpha mask (BlendMode.DstIn) applies only to the
@@ -179,31 +191,28 @@ fun OnboardingCipherBackground(
                     // periods 58 / 74 / 64 s give phase fractions
                     // 0.000 / 12/74 ≈ 0.162 / 26/64 ≈ 0.406.
                     drawCipherColumn(
-                        lines = cipherLines,
+                        layouts = cipherLayouts,
                         drift = progressCol1,
                         phaseOffsetFraction = 0.000f,
                         columnXFraction = -0.06f,
                         lineHeightPx = cipherPitchPx,
-                        measurer = textMeasurer,
-                        style = styleColumn1,
+                        colorOverride = styleColumn1.color,
                     )
                     drawCipherColumn(
-                        lines = cipherLines,
+                        layouts = cipherLayouts,
                         drift = progressCol2,
                         phaseOffsetFraction = 12f / 74f,
                         columnXFraction = 0.34f,
                         lineHeightPx = cipherPitchPx,
-                        measurer = textMeasurer,
-                        style = styleColumn2,
+                        colorOverride = styleColumn2.color,
                     )
                     drawCipherColumn(
-                        lines = cipherLines,
+                        layouts = cipherLayouts,
                         drift = progressCol3,
                         phaseOffsetFraction = 26f / 64f,
                         columnXFraction = 0.72f,
                         lineHeightPx = cipherPitchPx,
-                        measurer = textMeasurer,
-                        style = styleColumn3,
+                        colorOverride = styleColumn3.color,
                     )
                     // Alpha mask via DstIn: dst = cipher content just
                     // drawn; src = the mask brush; result = dst pixels
@@ -217,31 +226,31 @@ fun OnboardingCipherBackground(
 }
 
 private fun DrawScope.drawCipherColumn(
-    lines: List<String>,
+    layouts: List<androidx.compose.ui.text.TextLayoutResult>,
     drift: Float,
     phaseOffsetFraction: Float,
     columnXFraction: Float,
     lineHeightPx: Float,
-    measurer: androidx.compose.ui.text.TextMeasurer,
-    style: TextStyle,
+    colorOverride: androidx.compose.ui.graphics.Color,
 ) {
-    val poolHeightPx = lines.size * lineHeightPx
-    // drift + phase offset, wrapped so the loop is seamless.
+    // Round-10 REDLINE §P1 pin: consumes pre-measured
+    // TextLayoutResult list (round-10 §P1 caching in the
+    // composable body) instead of calling `measurer.measure()`
+    // per line per frame. `drawText(layout, color)` overrides
+    // the layout's baked colour so a single layout list can serve
+    // all three columns; only the alpha differs between columns.
+    val poolHeightPx = layouts.size * lineHeightPx
     val combined = (drift + phaseOffsetFraction) % 1f
     val yShift = combined * poolHeightPx
     val columnX = size.width * columnXFraction
-    // Render 2 pool cycles so wraparound is invisible.
     for (cycle in 0..1) {
         val baseY = -yShift + cycle * poolHeightPx
-        lines.forEachIndexed { i, line ->
+        layouts.forEachIndexed { i, layout ->
             val y = baseY + i * lineHeightPx
             if (y > -lineHeightPx && y < size.height + lineHeightPx) {
-                val layout = measurer.measure(line, style)
-                // Left-anchor the line at columnX (may extend past
-                // the right edge for column 3; that's the intended
-                // trailing-off effect from the handoff).
                 drawText(
                     textLayoutResult = layout,
+                    color = colorOverride,
                     topLeft = Offset(columnX, y),
                 )
             }

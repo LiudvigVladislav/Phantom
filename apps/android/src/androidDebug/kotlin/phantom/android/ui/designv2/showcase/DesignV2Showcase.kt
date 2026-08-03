@@ -1059,6 +1059,61 @@ fun ShowcaseOnboardingPricingSheetScrolledBottom() {
     }
 }
 
+// ── Commit 5 additions — Permissions step states ─────────────────────
+
+private const val PermissionsStepDotsIndex = 3  // OnboardingStepV2.Permissions.dotsIndex
+
+@Composable
+private fun permissionsFrame(content: @Composable () -> Unit) {
+    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Permissions,
+        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+        onBackClick = {},
+        edgeSwipeBackEnabled = true,
+        onEdgeSwipeBack = {},
+        toastMessage = null,
+        onToastDismiss = {},
+    ) { content() }
+}
+
+@Composable
+fun ShowcaseOnboardingPermissionsNotifDisabled() {
+    // Notifications state: Disabled (OS reports notifications OFF
+    // — user hasn't granted POST_NOTIFICATIONS on Android 13+, or
+    // has app-notifs off system-wide on Android 12−). The
+    // Notifications row's toggle is OFF; row bg/border in neutral
+    // Surface tones. Mic + Nearby are static info rows with the
+    // "Asked when first used" body per §A4.
+    permissionsFrame {
+        phantom.android.screens.onboarding.v2.steps.PermissionsStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(),
+            dotsIndex = PermissionsStepDotsIndex,
+            onFormStateChange = {},
+            onDoneClick = {},
+            notificationsState = phantom.android.screens.onboarding.v2
+                .NotificationsPermissionState.Disabled,
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingPermissionsNotifEnabled() {
+    // Notifications state: Enabled (OS reports notifications ON).
+    // The Notifications row's toggle is ON; row bg/border in
+    // Cyan-tinted "on" tones (row transition uses 160 ms ease-out;
+    // the golden captures the end state).
+    permissionsFrame {
+        phantom.android.screens.onboarding.v2.steps.PermissionsStepV2(
+            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(),
+            dotsIndex = PermissionsStepDotsIndex,
+            onFormStateChange = {},
+            onDoneClick = {},
+            notificationsState = phantom.android.screens.onboarding.v2
+                .NotificationsPermissionState.Enabled,
+        )
+    }
+}
+
 // ── Stress goldens — narrow width + long strings, split A + B ──────────────
 //
 // Round-3 REDLINE P1-3: previous single `ShowcaseStress` composable's
@@ -1102,23 +1157,42 @@ fun ShowcaseStressA() {
 }
 
 @Composable
+@androidx.compose.foundation.layout.ExperimentalLayoutApi
 fun ShowcaseStressB() {
     DesignV2SurfaceFrame(width = 220) {
         Column {
             Row("Filter chip row (overflow)") {
-                androidx.compose.foundation.layout.Row(
+                // Round-3 REDLINE on Commit 5 §P1-1: `FlowRow`
+                // (Compose 1.4+) wraps overflowing chips to a new
+                // line — the underlying chip is no longer allowed
+                // to break its label character-by-character
+                // (`maxLines = 1, softWrap = false` fix), so if
+                // the parent doesn't provide enough room the
+                // WHOLE chip wraps to the next row.
+                androidx.compose.foundation.layout.FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     PhantomFilterChip("Verified only", true, {})
                     PhantomFilterChip("Recent contacts", false, {})
                 }
             }
             Row("Segmented, cramped") {
+                // Round-4 REDLINE on Commit 5 §P1-4 pin: use
+                // AdaptiveStack — the strip auto-falls back to
+                // vertical stacking when horizontal layout would
+                // truncate. At the 220 dp stress width with
+                // fontScale = 2.0 the three "Standard / Private
+                // / Ghost Mode" labels can't fit horizontally, so
+                // the golden captures the Column fallback where
+                // every label reads in full.
                 PhantomSegmentedControl(
                     options = listOf("Standard", "Private", "Ghost Mode"),
                     selectedIndex = 2,
                     onSelect = {},
                     modifier = Modifier.fillMaxWidth(),
+                    overflow = phantom.android.ui.designv2.components
+                        .PhantomSegmentedControlOverflow.AdaptiveStack,
                 )
             }
         }

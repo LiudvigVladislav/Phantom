@@ -15,9 +15,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -101,11 +105,15 @@ fun TermsScreenV2(
         label = "arrowFade",
     )
 
+    // Round-9 REDLINE §P1: `windowInsetsPadding(navigationBars)` on
+    // the outer Column keeps the ACCEPT & CONTINUE button above
+    // the system navigation bar on Android 15 edge-to-edge.
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(BgDeep)
             .padding(top = topInset)
+            .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -292,12 +300,21 @@ fun TermsScreenV2(
             }
         }
 
+        // Round-7 REDLINE on Commit 5 §P1 pin: the button's fixed
+        // 54-dp height + wrap-friendly label caused
+        // `ACCEPT & CONTINUE` to clip to `ACCEPT &` at fontScale
+        // 2.0 on narrow phones. `defaultMinSize(minHeight = 54.dp)`
+        // lets the button grow when the label is taller (so the
+        // second-line text remains readable when it actually
+        // wraps), and `singleLine = true` on the Text prevents
+        // mid-word breaks — the letter-spaced monospaced label is
+        // designed to render one line only.
         Button(
             onClick = onAccept,
             enabled = readEnough,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(54.dp),
+                .defaultMinSize(minHeight = 54.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = CyanAccent,
                 contentColor = BgDeep,
@@ -306,12 +323,23 @@ fun TermsScreenV2(
             ),
             shape = RoundedCornerShape(12.dp),
         ) {
+            // Round-9 REDLINE §P1: allow the button label to wrap
+            // to 2 lines at extreme fontScale rather than capping
+            // the user's requested scale. `ACCEPT & CONTINUE`
+            // breaks naturally between the two words. Button's
+            // `defaultMinSize(minHeight = 54.dp)` (round-7 pin)
+            // grows the button vertically to fit the wrapped
+            // label — full text preserved, no ellipsis, user's
+            // fontScale respected.
             Text(
                 text = "ACCEPT & CONTINUE",
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 2.5.sp,
                 fontFamily = PhantomFontMono,
+                maxLines = 2,
+                softWrap = true,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             )
         }
 

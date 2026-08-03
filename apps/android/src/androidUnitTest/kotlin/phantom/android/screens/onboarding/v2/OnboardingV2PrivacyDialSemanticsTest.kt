@@ -206,7 +206,7 @@ class OnboardingV2PrivacyDialSemanticsTest {
             hasTabRole() and hasContentDescriptionExact("PRIVATE"),
         ).assertExists()
         composeTestRule.onNode(
-            hasTabRole() and hasContentDescriptionExact("GHOST"),
+            hasTabRole() and hasContentDescriptionExact("GHOST, Phantom Pro required"),
         ).assertExists()
 
         // Selected-state reflects `privacyMode = Private` — Private
@@ -215,7 +215,7 @@ class OnboardingV2PrivacyDialSemanticsTest {
             .assert(hasSelectedState(true))
         composeTestRule.onNode(hasContentDescriptionExact("STANDARD"))
             .assert(hasSelectedState(false))
-        composeTestRule.onNode(hasContentDescriptionExact("GHOST"))
+        composeTestRule.onNode(hasContentDescriptionExact("GHOST, Phantom Pro required"))
             .assert(hasSelectedState(false))
     }
 

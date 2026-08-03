@@ -123,7 +123,7 @@ class OnboardingV2StateTest {
         assertTrue(
             canAdvanceFromV2(
                 OnboardingStepV2.Permissions,
-                OnboardingFormStateV2(notificationsEnabled = false),
+                OnboardingFormStateV2(),
             ),
         )
     }
@@ -279,5 +279,39 @@ class OnboardingV2StateTest {
         // Position 2 out of 4 (0-indexed) — the third dot lights up
         // when Privacy is the current step.
         assertEquals(2, OnboardingStepV2.Privacy.dotsIndex)
+    }
+
+    // ── Commit 5 round-1 REDLINE · Permissions state contract ────────
+
+    @Test
+    fun permissions_step_always_advances() {
+        // Round-1 REDLINE §P1-1 + §P1-2: Permissions form state
+        // is now empty — no toggles, no pref bits. `canAdvance`
+        // is unconditionally true.
+        val fresh = OnboardingFormStateV2()
+        assertTrue(canAdvanceFromV2(OnboardingStepV2.Permissions, fresh))
+    }
+
+    @Test
+    fun permissions_step_dots_index_is_3() {
+        assertEquals(3, OnboardingStepV2.Permissions.dotsIndex)
+    }
+
+    @Test
+    fun form_state_carries_no_permission_pref_bits() {
+        // Round-1 REDLINE §P1-1 + §P1-2 pin: `microphoneEnabled` +
+        // `nearbyDiscoveryEnabled` were removed (Mic/Nearby are
+        // static info rows per §A4); `notificationsEnabled` was
+        // removed (OS is the source of truth per the coordinator).
+        // The form state has NO permission-related fields.
+        //
+        // This test would fail to compile if any of those fields
+        // were reintroduced. That IS the pin.
+        val fresh = OnboardingFormStateV2()
+        // If a permission-pref field creeps back, the reader below
+        // would compile — remove this assertion accordingly then.
+        assertEquals("", fresh.username)
+        assertEquals(PrivacyMode.Standard, fresh.privacyMode)
+        assertEquals(null, fresh.signingPublicKeyHex)
     }
 }

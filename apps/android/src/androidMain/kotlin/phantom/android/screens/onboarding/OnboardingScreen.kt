@@ -199,7 +199,13 @@ private fun WelcomeStep(onContinue: () -> Unit) {
         // FULL_COMPOSE §09 OnboardingScreen reference (Phase 2 React mock
         // uses height: 60px). The earlier 72dp value crowded the wordmark.
         Image(
-            painter = painterResource(R.drawable.phantom_logo),
+            // Round-9 §P0: switched from R.drawable.phantom_logo
+            // (deleted with icon-refresh) to R.drawable.phantom_splash.
+            // Legacy v1 onboarding is not shipped — Commit 5 switched
+            // MainActivity's Screen.Onboarding arm to OnboardingScreenV2
+            // — but this file still compiles so the reference must be
+            // valid.
+            painter = painterResource(R.drawable.phantom_splash),
             contentDescription = "PHANTOM",
             modifier = Modifier.height(60.dp),
         )

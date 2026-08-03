@@ -9,8 +9,9 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.unit.Dp
 import phantom.android.di.AppContainer
 
 /**
@@ -24,30 +25,57 @@ import phantom.android.di.AppContainer
  *   `Screen.Onboarding -> OnboardingScreenV2(container, onComplete)`
  *
  * Structure mirrors the pre-existing shape at a high level — Terms gate
- * first, then the multi-step flow — but everything downstream is a fresh
- * additive V2 tree living in this `.v2` sub-package. The old file is left
- * intact; both flows co-exist through Commits 2..4 and only Commit 5 flips
- * MainActivity's `Screen.Onboarding` branch to this entry.
- *
- * See `OnboardingStateV2.kt` §KDoc for the 6-step enum + form-state shape
- * and `OnboardingFlowV2.kt` §KDoc for the navigation contract.
+ * first, then the multi-step flow. Round-4 REDLINE on Commit 5 §P2-1:
+ * `tosAccepted` state is HOISTED into this wrapper so
+ * `PreFlowTermsGate` is a stateless renderer. This makes the gate
+ * externally-drivable in tests (e.g. `OnboardingScreenV2GateTest`
+ * passes an explicit `tosAccepted` value + observes `onAccept`
+ * invocation without needing to compose the whole Terms scroll +
+ * button-enable flow).
  */
 @Composable
 fun OnboardingScreenV2(
     container: AppContainer,
     onComplete: () -> Unit,
 ) {
-    var tosAccepted by remember { mutableStateOf(false) }
-
-    // Round-3 REDLINE P2-4: TermsScreenV2 receives the system status-bar
-    // inset explicitly (previously it applied `windowInsetsPadding`
-    // itself, which returned 0 in Paparazzi and made the golden diverge
-    // from device). The showcase passes 24.dp for the same reason.
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    // Round-10 REDLINE §P1 pin: `rememberSaveable` so a config
+    // change (rotation, dark-mode toggle, font-scale change,
+    // Activity recreation on low memory) preserves the accepted-
+    // Terms flag. Prior plain `remember` reset to `false` on
+    // rotation and forced the user to re-read the Terms.
+    var tosAccepted by rememberSaveable { mutableStateOf(false) }
+    PreFlowTermsGate(
+        topInset = topInset,
+        tosAccepted = tosAccepted,
+        onAcceptTos = { tosAccepted = true },
+        flowContent = {
+            OnboardingFlowV2(container = container, onComplete = onComplete)
+        },
+    )
+}
 
+/**
+ * Terms-of-Service gate — round-4 REDLINE on Commit 5 §P2-1 pin.
+ *
+ * Stateless. The wrapper owns [tosAccepted]; the gate renders
+ * either `TermsScreenV2` (with `onAccept = onAcceptTos`) OR
+ * `flowContent`, based on the current value.
+ *
+ * `OnboardingScreenV2GateTest` uses this signature directly to
+ * drive both branches AND the transition without reproducing the
+ * if/else in the test harness.
+ */
+@Composable
+fun PreFlowTermsGate(
+    topInset: Dp,
+    tosAccepted: Boolean,
+    onAcceptTos: () -> Unit,
+    flowContent: @Composable () -> Unit,
+) {
     if (!tosAccepted) {
-        TermsScreenV2(onAccept = { tosAccepted = true }, topInset = topInset)
+        TermsScreenV2(onAccept = onAcceptTos, topInset = topInset)
     } else {
-        OnboardingFlowV2(container = container, onComplete = onComplete)
+        flowContent()
     }
 }

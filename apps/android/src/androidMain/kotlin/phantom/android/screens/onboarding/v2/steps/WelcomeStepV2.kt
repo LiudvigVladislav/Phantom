@@ -19,7 +19,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -82,13 +87,19 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
         label = "breathe-alpha",
     )
 
+    // Round-6 REDLINE on Commit 5 §P0: scrollable body + fixed CTA.
+    // Prior `Spacer(Modifier.weight)` layout pushed the "Get started"
+    // button below the viewport at fontScale = 2.0 on narrow phones.
+    Column(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
-            .fillMaxSize()
+            .weight(1f)
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.weight(0.55f))
+        Spacer(Modifier.height(48.dp))
 
         // Logo inside radial-glow ring, phBreathe pulse.
         //
@@ -189,18 +200,24 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
             ),
         )
 
-        Spacer(Modifier.weight(1f))
-
+        Spacer(Modifier.height(32.dp))
+    } // end scrollable body Column
+    // Round-9 REDLINE §P1: safe-bottom navigation-bar inset.
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.navigationBars)
+            .padding(horizontal = 32.dp)
+            .padding(bottom = 24.dp),
+    ) {
         PhantomButton(
             text = "Get started",
             onClick = onContinueClick,
             modifier = Modifier.fillMaxWidth(),
         )
-
         // Secondary "I already have an account" — INTENTIONALLY OMITTED.
         // Per architect ask A2 (2026-08-01): Restore is deferred to a later
         // track; the CTA returns when Restore lands.
-
-        Spacer(Modifier.height(56.dp))
     }
+    } // end outer container Column
 }

@@ -47,6 +47,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * description + bullets + optional Unlock CTA) and its
  * decorative helpers.
  */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 internal fun PrivacyTierCard(
     tier: PrivacyTierV2,
@@ -89,7 +90,18 @@ internal fun PrivacyTierCard(
             }
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // Round-6 REDLINE on Commit 5 §P1 visual pin: use
+                // `FlowRow` so at `fontScale = 2.0` on a narrow
+                // phone the tag pill wraps to a new line UNDER the
+                // tier name instead of being crammed alongside it.
+                // Prior `Row` shape forced the layout to fit name +
+                // pill on one line — "STANDARD" wrapped mid-word
+                // and "BALANCED" pill fell apart vertically as
+                // `BA / LA / NC / ED`.
+                androidx.compose.foundation.layout.FlowRow(
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     Text(
                         text = tier.name,
                         color = DesignV2Tokens.Colors.TextPrimary,
@@ -99,7 +111,6 @@ internal fun PrivacyTierCard(
                             fontWeight = FontWeight.SemiBold,
                         ),
                     )
-                    Spacer(Modifier.width(8.dp))
                     TierTagPill(text = tier.tag, locked = tier.locked)
                 }
                 Spacer(Modifier.height(4.dp))
@@ -163,6 +174,18 @@ private fun TierTagPill(text: String, locked: Boolean) {
                 letterSpacing = 1.02.sp,
                 lineHeight = 10.sp,
             ),
+            // Round-6 REDLINE on Commit 5 §P1 visual pin: pill label
+            // MUST stay single-line. At fontScale = 2.0 the prior
+            // shape let "BALANCED" break down to `BA / LA / NC / ED`
+            // vertically inside the pill, which read as accessibility-
+            // hostile visual damage. Single-line + no-wrap + clip
+            // keeps the tag legible; the FlowRow parent above
+            // guarantees the whole pill wraps under the name if
+            // horizontal space is tight, so clipping is unlikely in
+            // practice.
+            maxLines = 1,
+            softWrap = false,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Clip,
         )
     }
 }

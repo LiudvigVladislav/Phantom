@@ -20,7 +20,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -212,6 +215,11 @@ internal fun Panel(
                     // arbitration properly.
                     detectTapGestures { /* noop — modal panel absorber */ }
                 }
+                // Round-9 REDLINE §P1: safe-bottom navigation-bar
+                // inset so the sheet's Footer + CTAs don't sit
+                // under the 3-button / gesture nav on Android 15
+                // edge-to-edge.
+                .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         ) {
             GrabStrip(
@@ -239,10 +247,19 @@ private fun HeaderRow(onDismiss: () -> Unit) {
     // "PHANTOM PREMIUM" monospace label on the left, circular close-X
     // on the right (per handoff — replaces the pre-REDLINE
     // "UPGRADE PHANTOM" wording).
+    // Round-7 REDLINE on Commit 5 §P1 pin: title constrained to
+    // single line + ellipsis so at narrow width × fontScale 2.0
+    // it can't wrap into the close button's space. Prior shape
+    // let the letter-spaced title wrap and the button visually
+    // collided with the second line.
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // Round-9 REDLINE §P1: allow wrap on 2 lines. The two-
+        // word "PHANTOM PREMIUM" breaks naturally between words.
+        // User's fontScale respected — no cap.
         Text(
             text = "PHANTOM PREMIUM",
             color = DesignV2Tokens.Colors.TextQuaternary,
@@ -253,6 +270,8 @@ private fun HeaderRow(onDismiss: () -> Unit) {
                 fontWeight = FontWeight.Normal,
             ),
             modifier = Modifier.weight(1f),
+            maxLines = 2,
+            softWrap = true,
         )
         CloseXButton(onClick = onDismiss)
     }
