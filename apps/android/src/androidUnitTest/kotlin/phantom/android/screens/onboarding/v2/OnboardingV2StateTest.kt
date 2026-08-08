@@ -119,12 +119,23 @@ class OnboardingV2StateTest {
     }
 
     @Test
-    fun permissions_always_advances() {
-        assertTrue(
+    fun permissions_never_advances_via_regular_gate() {
+        // C6-a round-1 REDLINE §P1 pin: Permissions has NO regular
+        // Continue button — its Done routes through the sealed
+        // finalize holder (`holder.markInFlight()` + coroutine +
+        // `holder.applyFinalizeOutcome(outcome)`). The gate predicate
+        // MUST reject a regular advance so `goNext` cannot push
+        // `navigationStep` to FinaleConfirmation and bypass the
+        // sealed holder. Belt-and-suspenders alongside
+        // [computeNextNavigationStep] which structurally refuses to
+        // return FinaleConfirmation as a nav target.
+        assertFalse(
             canAdvanceFromV2(
                 OnboardingStepV2.Permissions,
                 OnboardingFormStateV2(),
             ),
+            "Permissions must NOT advance via canAdvanceFromV2 — Done routes through " +
+                "the sealed finalize holder, not through a regular Continue gate.",
         )
     }
 
@@ -284,12 +295,19 @@ class OnboardingV2StateTest {
     // ── Commit 5 round-1 REDLINE · Permissions state contract ────────
 
     @Test
-    fun permissions_step_always_advances() {
-        // Round-1 REDLINE §P1-1 + §P1-2: Permissions form state
-        // is now empty — no toggles, no pref bits. `canAdvance`
-        // is unconditionally true.
+    fun permissions_step_gate_rejects_regular_advance() {
+        // C6-a round-1 REDLINE §P1 pin: Permissions has NO regular
+        // Continue button — Done routes through the sealed finalize
+        // holder. The gate predicate MUST reject a regular advance
+        // so `goNext` cannot push `navigationStep` to
+        // FinaleConfirmation and bypass the sealed holder.
+        //
+        // Predecessor: Commit 5's Permissions form state carried
+        // no pref bits so `canAdvance` was unconditionally true —
+        // that shape allowed a bypass path (goNext advances to
+        // FinaleConfirmation) which round-1 REDLINE closed.
         val fresh = OnboardingFormStateV2()
-        assertTrue(canAdvanceFromV2(OnboardingStepV2.Permissions, fresh))
+        assertFalse(canAdvanceFromV2(OnboardingStepV2.Permissions, fresh))
     }
 
     @Test
@@ -312,6 +330,16 @@ class OnboardingV2StateTest {
         // would compile — remove this assertion accordingly then.
         assertEquals("", fresh.username)
         assertEquals(PrivacyMode.Standard, fresh.privacyMode)
-        assertEquals(null, fresh.signingPublicKeyHex)
+        // C6-a: `signingPublicKeyHex` was removed from
+        // OnboardingFormStateV2 entirely — the sealed
+        // [OnboardingFinalizeStateHolder] owns it now, as the
+        // hex payload of its `Completed` variant. If a
+        // `signingPublicKeyHex` field creeps back onto the form
+        // state, the flow's finalize path could once again write
+        // it out-of-band from the sealed holder — the very split
+        // we're closing. The absence of a `fresh.signingPublicKeyHex`
+        // reference here IS the pin: uncommenting it fails to
+        // compile.
+        // assertEquals(null, fresh.signingPublicKeyHex)
     }
 }

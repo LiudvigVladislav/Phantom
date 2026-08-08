@@ -888,10 +888,7 @@ fun ShowcaseOnboardingFinaleConfirmation() {
         onToastDismiss = {},
     ) {
         phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2(
-            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
-                username = "alice",
-                signingPublicKeyHex = fixtureHex,
-            ),
+            signingPublicKeyHex = fixtureHex,
             onContinueClick = {},
         )
     }
@@ -1112,6 +1109,51 @@ fun ShowcaseOnboardingPermissionsNotifEnabled() {
                 .NotificationsPermissionState.Enabled,
         )
     }
+}
+
+// ── C6-a — Recovery-surface goldens (post-mini-round) ─────────────────
+//
+// Two screens rendered when startup routing diverges from the happy
+// path. Both are chromeless full-screen surfaces (no host frame, no
+// dots row, no back button) — see OnboardingStartupErrorScreen.kt
+// and OnboardingFlowV2.kt::OnboardingRepairRequiredScreen for the
+// production composables.
+//
+//  identity_repair_required :
+//      Proven identity corruption (durable marker written). Shows
+//      "Identity repair required" copy + "Exit onboarding" CTA.
+//      Rendered by OnboardingScreenV2's early-return branch when
+//      finalize holder is MissingKeyRepairRequired.
+//
+//  transient_startup_error :
+//      Transient / operational failure on decideStartupRoute (e.g.
+//      one-off loadIdentity throw). Shows stable "Something went
+//      wrong" copy + "Retry" CTA. NO marker write, NO mention of
+//      the internal TransientReason (mini-round §P2 pin).
+//
+// Rendered without OnboardingV2HostFrame because production wires
+// them straight into a full-screen Box (no shared chrome).
+
+@Composable
+fun ShowcaseOnboardingIdentityRepairRequired() {
+    // onExit is a no-op — the golden captures the visual only.
+    phantom.android.screens.onboarding.v2.OnboardingRepairRequiredScreen(
+        onExit = {},
+    )
+}
+
+@Composable
+fun ShowcaseOnboardingTransientStartupError() {
+    // Reason is retained on the composable signature for
+    // diagnostic side-channel use, but the golden's visual is
+    // identical for every TransientReason value (mini-round §P2
+    // pin: no internal reason label reaches the user). Pinning
+    // LoadIdentityThrew here as the canonical example.
+    phantom.android.screens.onboarding.v2.OnboardingStartupErrorScreen(
+        reason = phantom.android.screens.onboarding.v2.TransientReason.LoadIdentityThrew,
+        enabled = true,
+        onRetry = {},
+    )
 }
 
 // ── Stress goldens — narrow width + long strings, split A + B ──────────────

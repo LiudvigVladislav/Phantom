@@ -18,10 +18,11 @@ import phantom.core.transport.PrivacyMode
  * name; the enum is closed and stable across process launches,
  * so `valueOf(name)` is safe.
  *
- * `OnboardingFormStateV2Saver` — serializes the 3-field data
- * class as a String list. `signingPublicKeyHex` is `null`-encoded
- * as an empty String (Bundle can't natively carry null in a list)
- * and decoded back to null on restore. `PrivacyMode` enum name.
+ * `OnboardingFormStateV2Saver` — serializes the 2-field data
+ * class as a String list: `username` + `privacyMode` enum name.
+ * C6-a: the former `signingPublicKeyHex` slot moved OUT of the
+ * form state into the sealed finalize holder — see
+ * [OnboardingFinalizeStateHolder] + [OnboardingFinalizeStateSaver].
  */
 public val OnboardingStepV2Saver: Saver<OnboardingStepV2, String> = Saver(
     save = { it.name },
@@ -29,55 +30,51 @@ public val OnboardingStepV2Saver: Saver<OnboardingStepV2, String> = Saver(
 )
 
 /**
- * Round-12 REDLINE §P1 pin: durable three-phase finalize model.
- * Prior round-11 shape used a single `Boolean` bit that was set
- * on `Done` and never cleared, so a rotation on Finale replayed
- * the entire finalize path against a fresh Idle controller —
- * doubling `initMessaging` calls and, in the error-before-
- * persistence case, leaving Back locked while the controller had
- * quietly reverted to Idle.
+ * Coarse three-phase enum derived from the sealed
+ * [OnboardingFinalizeState]. Kept public for composable code that
+ * only needs the phase (Back-lock check, phase-specific KDoc
+ * references) without pattern-matching the sealed variant.
+ *
+ * C6-a: the durable saveable slot moved to the sealed model
+ * ([OnboardingFinalizeStateSaver]). No `OnboardingFinalizePhaseSaver`
+ * exists any more — this enum is a read-only projection derived
+ * inside the holder.
  *
  * Three phases:
  *   - `NotStarted` — no finalize has been kicked off yet, OR
- *     the last attempt failed BEFORE any disk write (identity
- *     not created, mode not saved). Back is unlocked; the
- *     Permissions `Done` tap re-enables user recovery
- *     (change username, change privacy).
- *   - `InFlight` — `Done` has fired and the finalize coroutine
- *     is still working (either in the original composition or
- *     resumed after a rotation). Back is locked. If the
- *     controller state is Idle here (post-recreation), the
- *     resume LaunchedEffect replays finalize.
- *   - `Completed` — all three phases succeeded AND the flow
- *     advanced to Finale. Back stays locked. Resume MUST NOT
- *     re-invoke finalize — the identity is already persisted
- *     and Finale is showing.
+ *     the last attempt failed BEFORE any disk write. Back is
+ *     unlocked; user can fix username/privacy and retry.
+ *   - `InFlight` — Done has fired and the finalize coroutine is
+ *     still working (either in the original composition or
+ *     resumed after rotation). Back is locked.
+ *   - `Completed` — all three phases succeeded, identity is on
+ *     disk, Finale is showing. Back stays locked.
  */
 public enum class OnboardingFinalizePhase {
     NotStarted,
     InFlight,
     Completed,
+    // C6-a round-2 REDLINE §P1 pin: coarse projection of the
+    // sealed `MissingKeyRepairRequired` state — the flow
+    // reached Complete but the persisted record's signing key
+    // hex failed the Ed25519 contract. Rendered as a repair-
+    // required screen; safe-exit action resets the sealed
+    // holder to NotStarted.
+    MissingKeyRepair,
     ;
 }
-
-public val OnboardingFinalizePhaseSaver: Saver<OnboardingFinalizePhase, String> = Saver(
-    save = { it.name },
-    restore = { OnboardingFinalizePhase.valueOf(it) },
-)
 
 public val OnboardingFormStateV2Saver: Saver<OnboardingFormStateV2, Any> = listSaver(
     save = {
         listOf(
             it.username,
             it.privacyMode.name,
-            it.signingPublicKeyHex ?: "",
         )
     },
     restore = {
         OnboardingFormStateV2(
             username = it[0] as String,
             privacyMode = PrivacyMode.valueOf(it[1] as String),
-            signingPublicKeyHex = (it[2] as String).ifEmpty { null },
         )
     },
 )
@@ -103,8 +100,12 @@ public val OnboardingFormStateV2Saver: Saver<OnboardingFormStateV2, Any> = listS
  *   - Permissions writes nothing (round-1 REDLINE §P1-2: OS is
  *     the source of truth for notifications; Mic/Nearby are info
  *     rows per §A4).
- *   - FinaleConfirmation reads [FormState.signingPublicKeyHex] set by
- *     the finalize path (Commit 5).
+ *   - FinaleConfirmation receives its `signingPublicKeyHex` from
+ *     the sealed [OnboardingFinalizeStateHolder] directly (C6-a).
+ *     The form state no longer carries the hex — it lives in the
+ *     holder's `Completed(hex)` variant, and the composable passes
+ *     `holder.signingPublicKeyHex` as a parameter to
+ *     [phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2].
  */
 
 enum class OnboardingStepV2(
@@ -132,9 +133,12 @@ enum class OnboardingStepV2(
  * become writable:
  *
  *   - Commit 2 : (nothing — Welcome / How are read-only)
- *   - Commit 3 : `username` is filled by IdentityKeyStep;
- *                `signingPublicKeyHex` is written by the finalize path after
- *                `IdentityManager.createOrLoad` succeeds.
+ *   - Commit 3 : `username` is filled by IdentityKeyStep.
+ *                The signing public key hex used to live here — it
+ *                now lives in the sealed
+ *                [OnboardingFinalizeStateHolder]'s `Completed`
+ *                variant (C6-a). The finalize path writes it as
+ *                part of the atomic sealed-state transition.
  *   - Commit 4 : `privacyMode` is filled by PrivacyLevelStep.
  *   - Commit 5 : no form-state writes (round-1 REDLINE §P1-2).
  *                Notifications state is derived from the OS via
@@ -149,7 +153,6 @@ enum class OnboardingStepV2(
 data class OnboardingFormStateV2(
     val username: String = "",
     val privacyMode: PrivacyMode = PrivacyMode.Standard,
-    val signingPublicKeyHex: String? = null,
     // Round-1 REDLINE on Commit 5 §P1-1 + §P1-2: no
     // `notificationsEnabled` / `microphoneEnabled` /
     // `nearbyDiscoveryEnabled` fields.
@@ -168,6 +171,12 @@ data class OnboardingFormStateV2(
     //   dialogs fire at first actual use (call subsystem / mesh
     //   discovery) via the OS launcher pattern inside those
     //   subsystems.
+    //
+    // C6-a: `signingPublicKeyHex` moved OUT of this data class.
+    // It now lives in the sealed [OnboardingFinalizeStateHolder]'s
+    // `Completed(hex)` variant. Callers of
+    // FinaleConfirmationStepV2 pass `holder.signingPublicKeyHex`
+    // as a parameter directly.
 )
 
 /**
@@ -233,8 +242,50 @@ fun canAdvanceFromV2(step: OnboardingStepV2, state: OnboardingFormStateV2): Bool
     OnboardingStepV2.How                -> true
     OnboardingStepV2.Identity           -> validateUsernameV2(state.username) == UsernameValidationV2.Valid
     OnboardingStepV2.Privacy            -> true
-    OnboardingStepV2.Permissions        -> true
+    // C6-a round-1 REDLINE §P1 pin: Permissions has NO regular
+    // forward-nav Continue button — its Done button routes through
+    // the sealed [OnboardingFinalizeStateHolder]
+    // (`holder.markInFlight()` + coroutine `runFinalize` +
+    // `holder.applyFinalizeOutcome(outcome)`). The predicate MUST
+    // reject a regular advance so `goNext` cannot push
+    // navigationStep to FinaleConfirmation and bypass the holder.
+    // Belt-and-suspenders alongside `computeNextNavigationStep`,
+    // which structurally refuses to return FinaleConfirmation as a
+    // navigation target regardless of this predicate.
+    OnboardingStepV2.Permissions        -> false
     OnboardingStepV2.FinaleConfirmation -> false  // terminal; leaves via onComplete, not via advance
+}
+
+/**
+ * C6-a round-1 REDLINE §P1 pin — pure helper describing what the
+ * next navigation step is after `from`. Extracted out of the
+ * composable's `goNext` so a unit test can pin the
+ * "Finale is never a regular-nav target" invariant WITHOUT
+ * going through Compose UI or the finalize holder.
+ *
+ * Returns `null` for:
+ *   - `FinaleConfirmation` (terminal — no forward nav).
+ *   - `Permissions` (Done tap routes through holder, not through
+ *     regular nav; there IS no next step reachable via a Continue
+ *     CTA on Permissions).
+ *   - Any other step whose ordinalInFlow+1 would land on
+ *     `FinaleConfirmation` (structural block — Finale can ONLY be
+ *     opened by the sealed holder promoting `currentStep` via the
+ *     derived expression `if (holder.state is Completed) Finale
+ *     else navigationStep`).
+ *
+ * Returns the next enum entry by `ordinalInFlow` for the other
+ * steps (Welcome → How → Identity → Privacy).
+ */
+fun computeNextNavigationStep(from: OnboardingStepV2): OnboardingStepV2? {
+    if (from == OnboardingStepV2.FinaleConfirmation) return null
+    val candidate = OnboardingStepV2.entries
+        .firstOrNull { it.ordinalInFlow == from.ordinalInFlow + 1 }
+        ?: return null
+    // Finale is out of reach via regular navigation. The sealed
+    // holder is the only path to Finale.
+    if (candidate == OnboardingStepV2.FinaleConfirmation) return null
+    return candidate
 }
 
 /**
