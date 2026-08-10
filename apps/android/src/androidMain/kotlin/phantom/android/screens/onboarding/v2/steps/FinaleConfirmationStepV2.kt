@@ -43,13 +43,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.R
-import phantom.android.screens.onboarding.v2.formatFingerprintForDisplay
-import phantom.android.screens.onboarding.v2.formatFingerprintShort
+import phantom.android.screens.onboarding.v2.isValidEd25519PublicKeyHex
+import phantom.android.screens.onboarding.v2.isValidX25519PublicKeyHex
 import phantom.android.ui.designv2.DesignV2FontBody
 import phantom.android.ui.designv2.DesignV2FontDisplay
 import phantom.android.ui.designv2.DesignV2FontMono
 import phantom.android.ui.designv2.DesignV2Tokens
 import phantom.android.ui.designv2.components.PhantomButton
+import phantom.android.ui.designv2.formatFullKeyForDisplay
+import phantom.android.ui.designv2.formatShortKeyIdForDisplay
 
 /**
  * FinaleConfirmationStepV2 — post-Permissions confirmation state
@@ -60,7 +62,7 @@ import phantom.android.ui.designv2.components.PhantomButton
  *
  *   - Shows the REAL `signingPublicKeyHex` (full 64-char Ed25519
  *     public key) chunked as 8 groups of 8 hex chars via
- *     [formatFingerprintForDisplay]. Header "ED25519 · CREATED"
+ *     [formatFullKeyForDisplay]. Header "ED25519 · CREATED"
  *     with green status dot.
  *   - `Copy` button copies the FULL 64-char hex to the system
  *     clipboard (not a truncated slice) — [copyFullHexToClipboard].
@@ -89,11 +91,28 @@ import phantom.android.ui.designv2.components.PhantomButton
 @Composable
 fun FinaleConfirmationStepV2(
     signingPublicKeyHex: String?,
+    publicKeyHex: String?,
     onContinueClick: () -> Unit,
-    onKeyCopied: () -> Unit = {},
+    // Dual-key labels track 2026-08-10: hex parameter added so
+    // tests (and any UI observer) can distinguish which key was
+    // copied without needing to reach into the ClipboardManager.
+    // Existing callers that don't care simply ignore the param.
+    onKeyCopied: (hex: String) -> Unit = {},
 ) {
     val context = LocalContext.current
-    val hex = signingPublicKeyHex
+    // Dual-key labels track 2026-08-10 architect refinement:
+    // Continue MUST validate BOTH hexes via Ed25519 / X25519
+    // validators (defence-in-depth at UI boundary), NOT just
+    // check != null. A regression that passes a malformed but
+    // non-null hex through this call site would otherwise render
+    // the two cards with garbled content AND leave Continue
+    // enabled. Both keys are 32-byte curve-25519 points → 64 hex
+    // chars; the validators reject empty / wrong-length / non-hex.
+    val bothHexesValid =
+        signingPublicKeyHex != null &&
+            isValidEd25519PublicKeyHex(signingPublicKeyHex) &&
+            publicKeyHex != null &&
+            isValidX25519PublicKeyHex(publicKeyHex)
 
     // Round-6 REDLINE on Commit 5 §P0: scrollable body + fixed CTA.
     Column(modifier = Modifier.fillMaxSize()) {
@@ -118,7 +137,7 @@ fun FinaleConfirmationStepV2(
             )
             Spacer(Modifier.height(14.dp))
             Text(
-                text = "Your Ed25519 key",
+                text = "Your keys",
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontDisplay,
@@ -130,7 +149,10 @@ fun FinaleConfirmationStepV2(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "Generated on device. Your public key can be shared for verification.",
+                // Dual-key labels track 2026-08-10 — architect §2
+                // exact footer copy.
+                text = "Ed25519 verifies identity signatures. X25519 establishes " +
+                    "encrypted messaging sessions.",
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -141,24 +163,62 @@ fun FinaleConfirmationStepV2(
 
             Spacer(Modifier.height(20.dp))
 
-            if (hex != null) {
-                FinaleKeyCard(hex = hex)
+            if (bothHexesValid) {
+                // Card 1 — Ed25519 identity signing key.
+                FinaleKeyCard(
+                    titleLabel = "IDENTITY SIGNING KEY",
+                    typeBadge = "ED25519 · CREATED",
+                    hex = signingPublicKeyHex!!,
+                )
                 Spacer(Modifier.height(12.dp))
-                FingerprintChip(hex = hex)
+                ShortKeyIdChip(
+                    chipLabel = "Ed25519 short ID",
+                    hex = signingPublicKeyHex,
+                )
                 Spacer(Modifier.height(12.dp))
-                // Round-1 REDLINE Commit-3 §P2-1: warning banner.
-                // The "Lose this key and the account is gone" message
-                // was promised on Step 2 (deferred there per redline §C1
-                // because the key didn't yet exist). Now that it exists,
-                // the warning belongs here.
-                KeyLossWarningBanner()
-                Spacer(Modifier.height(16.dp))
                 CopyKeyButton(
+                    buttonLabel = "Copy Ed25519 signing key",
                     onClick = {
-                        copyFullHexToClipboard(context, hex)
-                        onKeyCopied()
+                        copyFullHexToClipboard(
+                            context, signingPublicKeyHex,
+                            clipLabel = "Phantom Ed25519 signing key",
+                        )
+                        onKeyCopied(signingPublicKeyHex)
                     },
                 )
+
+                Spacer(Modifier.height(24.dp))
+
+                // Card 2 — X25519 messaging encryption key
+                // (dual-key labels track 2026-08-10).
+                FinaleKeyCard(
+                    titleLabel = "MESSAGING ENCRYPTION KEY",
+                    typeBadge = "X25519 · CREATED",
+                    hex = publicKeyHex!!,
+                )
+                Spacer(Modifier.height(12.dp))
+                ShortKeyIdChip(
+                    chipLabel = "X25519 short ID",
+                    hex = publicKeyHex,
+                )
+                Spacer(Modifier.height(12.dp))
+                CopyKeyButton(
+                    buttonLabel = "Copy X25519 encryption key",
+                    onClick = {
+                        copyFullHexToClipboard(
+                            context, publicKeyHex,
+                            clipLabel = "Phantom X25519 encryption key",
+                        )
+                        onKeyCopied(publicKeyHex)
+                    },
+                )
+
+                Spacer(Modifier.height(16.dp))
+
+                // Round-1 REDLINE Commit-3 §P2-1: warning banner —
+                // now covers loss of EITHER key (dual-key track
+                // 2026-08-10; architect chose neutral single copy).
+                KeyLossWarningBanner()
             } else {
                 Text(
                     text = "Something went wrong — please restart onboarding.",
@@ -183,15 +243,29 @@ fun FinaleConfirmationStepV2(
             PhantomButton(
                 text = "Continue",
                 onClick = onContinueClick,
-                enabled = hex != null,
+                enabled = bothHexesValid,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
     }
 }
 
+/**
+ * Reusable key-card composable.
+ *
+ * Dual-key labels track 2026-08-10 §2 — parameterised so both
+ * cards (Ed25519 signing key + X25519 encryption key) share
+ * identical layout, hex-formatting, and colour scheme. The
+ * SHARED [formatFullKeyForDisplay] guarantees the two
+ * cards render their hex payloads with visually identical
+ * chunking — architect §2 explicit requirement.
+ */
 @Composable
-private fun FinaleKeyCard(hex: String) {
+private fun FinaleKeyCard(
+    titleLabel: String,
+    typeBadge: String,
+    hex: String,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -200,6 +274,19 @@ private fun FinaleKeyCard(hex: String) {
             .border(1.dp, DesignV2Tokens.Colors.Cyan.copy(alpha = 0.28f), RoundedCornerShape(18.dp))
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
+        // Title row (dual-key labels track 2026-08-10 §2 —
+        // architect exact copy).
+        Text(
+            text = titleLabel,
+            color = DesignV2Tokens.Colors.TextSecondary,
+            style = TextStyle(
+                fontFamily = DesignV2FontMono,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 1.6.sp,
+            ),
+        )
+        Spacer(Modifier.height(8.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -212,7 +299,7 @@ private fun FinaleKeyCard(hex: String) {
             )
             Spacer(Modifier.width(8.dp))
             Text(
-                text = "ED25519 · CREATED",
+                text = typeBadge,
                 color = DesignV2Tokens.Colors.Cyan,
                 style = TextStyle(
                     fontFamily = DesignV2FontMono,
@@ -231,7 +318,7 @@ private fun FinaleKeyCard(hex: String) {
         }
         Spacer(Modifier.height(14.dp))
         Text(
-            text = formatFingerprintForDisplay(hex),
+            text = formatFullKeyForDisplay(hex),
             color = DesignV2Tokens.Colors.TextPrimary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -243,7 +330,7 @@ private fun FinaleKeyCard(hex: String) {
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            text = "Generated on device. Your public key can be shared for verification.",
+            text = "Generated on device.",
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -257,7 +344,10 @@ private fun FinaleKeyCard(hex: String) {
 }
 
 @Composable
-private fun FingerprintChip(hex: String) {
+private fun ShortKeyIdChip(
+    chipLabel: String,
+    hex: String,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -272,7 +362,7 @@ private fun FingerprintChip(hex: String) {
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text(
-            text = formatFingerprintShort(hex),
+            text = formatShortKeyIdForDisplay(hex),
             color = DesignV2Tokens.Colors.TextPrimary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -281,11 +371,11 @@ private fun FingerprintChip(hex: String) {
                 letterSpacing = 1.2.sp,
             ),
         )
-        // Explicit label per REDLINE §C1: a truncated form must NEVER
-        // appear without this label. Prevents the reader from mistaking
-        // the short form for a trustworthy value.
+        // Explicit label — dual-key labels track 2026-08-10
+        // architect §2: short values are `Ed25519 short ID` /
+        // `X25519 short ID`, NOT "fingerprint".
         Text(
-            text = "fingerprint · short form",
+            text = chipLabel,
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -336,7 +426,10 @@ private fun KeyLossWarningBanner() {
 }
 
 @Composable
-private fun CopyKeyButton(onClick: () -> Unit) {
+private fun CopyKeyButton(
+    buttonLabel: String,
+    onClick: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(12.dp))
@@ -346,7 +439,7 @@ private fun CopyKeyButton(onClick: () -> Unit) {
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 role = Role.Button,
-                onClickLabel = "Copy public key",
+                onClickLabel = buttonLabel,
                 onClick = onClick,
             )
             .padding(horizontal = 14.dp, vertical = 10.dp),
@@ -360,7 +453,7 @@ private fun CopyKeyButton(onClick: () -> Unit) {
             modifier = Modifier.size(16.dp),
         )
         Text(
-            text = "Copy public key",
+            text = buttonLabel,
             color = DesignV2Tokens.Colors.TextSecondary,
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
@@ -372,13 +465,22 @@ private fun CopyKeyButton(onClick: () -> Unit) {
 }
 
 /**
- * Copy the FULL 64-char hex to the system clipboard. Redline §C1
- * requires the copied value equal the entire key — never a truncated
- * display slice. Pinned by
- * `OnboardingV2FinalizeContractTest.copy_writes_full_64_char_hex_to_clipboard`.
+ * Copy the FULL 64-char hex to the system clipboard with a
+ * label that identifies which key type was copied. Redline §C1
+ * requires the copied value equal the entire key — never a
+ * truncated display slice. Dual-key labels track 2026-08-10:
+ * `clipLabel` distinguishes signing vs encryption clipboard
+ * entries so paste UIs (Android Clipboard notification, some
+ * password managers) can display "Ed25519 signing key" or
+ * "X25519 encryption key" instead of a generic
+ * "public key".
  */
-internal fun copyFullHexToClipboard(context: Context, fullHex: String) {
+internal fun copyFullHexToClipboard(
+    context: Context,
+    fullHex: String,
+    clipLabel: String = "Phantom public key",
+) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    val clip = ClipData.newPlainText("Phantom public key", fullHex)
+    val clip = ClipData.newPlainText(clipLabel, fullHex)
     clipboard.setPrimaryClip(clip)
 }

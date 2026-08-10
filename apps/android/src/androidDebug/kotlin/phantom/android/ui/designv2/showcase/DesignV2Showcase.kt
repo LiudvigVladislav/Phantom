@@ -962,8 +962,15 @@ fun ShowcaseOnboardingFinaleConfirmation() {
         toastMessage = null,
         onToastDismiss = {},
     ) {
+        // Dual-key labels track 2026-08-10: Showcase now provides
+        // BOTH hexes. `publicKeyHex` uses a distinct fixture so the
+        // golden shows visually different values across the two
+        // cards (proves independent field routing to independent
+        // card rendering).
+        val fixturePublicKeyHex = "1234" + "fedcba9876543210".repeat(3) + "1234abcdef56"
         phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2(
             signingPublicKeyHex = fixtureHex,
+            publicKeyHex = fixturePublicKeyHex,
             onContinueClick = {},
         )
     }

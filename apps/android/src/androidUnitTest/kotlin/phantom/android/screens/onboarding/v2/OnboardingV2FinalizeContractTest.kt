@@ -24,6 +24,8 @@ import org.robolectric.annotation.Config
 import phantom.android.screens.onboarding.v2.steps.copyFullHexToClipboard
 import phantom.core.identity.IdentityKeyPair
 import phantom.core.identity.IdentityRecord
+import phantom.android.ui.designv2.formatFullKeyForDisplay
+import phantom.android.ui.designv2.formatShortKeyIdForDisplay
 import phantom.core.identity.PrivateKey
 import phantom.core.identity.PublicKey
 import phantom.core.transport.PrivacyMode
@@ -107,8 +109,8 @@ class OnboardingV2FinalizeContractTest {
 
     @Test
     fun display_and_short_form_derive_from_the_same_hex() {
-        val display = formatFingerprintForDisplay(fakeHex)
-        val short = formatFingerprintShort(fakeHex)
+        val display = formatFullKeyForDisplay(fakeHex)
+        val short = formatShortKeyIdForDisplay(fakeHex)
         assertEquals(fakeHex, display.replace(" ", ""))
         assertEquals(9, short.length)
         assertEquals(fakeHex.substring(0, 4), short.substring(0, 4))

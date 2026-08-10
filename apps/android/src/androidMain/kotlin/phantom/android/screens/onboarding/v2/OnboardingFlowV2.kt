@@ -9,6 +9,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -158,7 +162,20 @@ import phantom.core.crypto.DhPublicKey
  *     Working. Same handling as Persisted-error.)
  */
 internal sealed interface FinalizeOutcome {
-    data class Completed(val signingPublicKeyHex: String) : FinalizeOutcome {
+    /**
+     * Both keys landed successfully:
+     *   - [signingPublicKeyHex] — Ed25519 identity signing key (64 hex).
+     *   - [publicKeyHex]        — X25519 messaging encryption key (64 hex).
+     *
+     * Dual-key labels track (2026-08-10): the atomic Completed
+     * outcome now carries BOTH keys per architect §3.1. Either
+     * hex being missing / malformed collapses to
+     * [MissingKeyMaterial] upstream in [runFinalize].
+     */
+    data class Completed(
+        val signingPublicKeyHex: String,
+        val publicKeyHex: String,
+    ) : FinalizeOutcome {
         init {
             require(isValidEd25519PublicKeyHex(signingPublicKeyHex)) {
                 "FinalizeOutcome.Completed requires a valid Ed25519 signingPublicKeyHex " +
@@ -166,6 +183,13 @@ internal sealed interface FinalizeOutcome {
                     "${signingPublicKeyHex.length}. Malformed hex must be filtered upstream " +
                     "in runFinalize and routed to MissingKeyMaterial " +
                     "(round-2 REDLINE §P1 pin)."
+            }
+            require(isValidX25519PublicKeyHex(publicKeyHex)) {
+                "FinalizeOutcome.Completed requires a valid X25519 publicKeyHex " +
+                    "(exactly 64 hex chars, [0-9a-fA-F]); got length " +
+                    "${publicKeyHex.length}. Malformed hex must be filtered upstream " +
+                    "in runFinalize and routed to MissingKeyMaterial " +
+                    "(dual-key-labels track 2026-08-10 §3.1)."
             }
         }
     }
@@ -256,9 +280,20 @@ internal suspend fun runFinalize(
             //     an unhandled IllegalArgumentException inside the
             //     coroutine. Fixed here by the isValidEd25519PublicKeyHex
             //     check upfront (length != 64 fails empty too).
-            val hex = end.record.signingPublicKeyHex
-            if (hex != null && isValidEd25519PublicKeyHex(hex)) {
-                FinalizeOutcome.Completed(hex)
+            // Dual-key labels track (2026-08-10) — architect §3.3:
+            // Extract BOTH the Ed25519 signing key AND the X25519
+            // messaging encryption key from the record. Both must
+            // pass validation atomically; either malformed / missing
+            // collapses to MissingKeyMaterial (same repair path).
+            val signHex = end.record.signingPublicKeyHex
+            val encHex  = end.record.publicKeyHex
+            val signValid = signHex != null && isValidEd25519PublicKeyHex(signHex)
+            val encValid  = isValidX25519PublicKeyHex(encHex)
+            if (signValid && encValid) {
+                FinalizeOutcome.Completed(
+                    signingPublicKeyHex = signHex!!,
+                    publicKeyHex        = encHex,
+                )
             } else {
                 FinalizeOutcome.MissingKeyMaterial
             }
@@ -724,16 +759,38 @@ internal fun OnboardingFlowV2Internal(
         // Direction (goingForward/back) no longer needs a bespoke curve
         // — a fade reads correctly in both directions. The step-dots +
         // top-bar chrome carry the "which way is forward" cue.
+        //
+        // Logo-flash-fix track (2026-08-10): the Welcome→How
+        // transition SCOPE-ONLY drops the exit fade to prevent the
+        // PHANTOM logo (rendered by WelcomeStepV2) from being visible
+        // at partial alpha over the fading-in How step during the
+        // 160-ms overlap. All OTHER step transitions keep the
+        // symmetric crossfade. See
+        // `onboardingStepContentTransform` below +
+        // `docs/tracks/android-onboarding/logo-flash-fix-contract.md`.
         AnimatedContent(
             targetState = currentStep,
-            transitionSpec = {
-                fadeIn(tween(180)) togetherWith fadeOut(tween(160))
-            },
+            transitionSpec = { onboardingStepContentTransform() },
             label = "onboarding-step",
             modifier = Modifier.fillMaxSize(),
         ) { step ->
             when (step) {
-                OnboardingStepV2.Welcome -> WelcomeStepV2(onContinueClick = goNext)
+                OnboardingStepV2.Welcome -> WelcomeStepV2(
+                    // Logo-flash-fix track 2026-08-10 §7 pin:
+                    // guard against double-fire on Get started.
+                    // Without this, a rapid double-tap advances
+                    // navigation Welcome→How→Identity in a single
+                    // gesture window (because `canAdvanceFromV2`
+                    // returns true for BOTH Welcome and How, the
+                    // second fire moves nav past How to Identity).
+                    // The guard silently drops the second fire when
+                    // `navigationStep` has already left `Welcome`.
+                    // Pinned by
+                    // `OnboardingFlowV2TransitionTest.get_started_double_tap_ends_at_how_not_identity`.
+                    onContinueClick = {
+                        if (navigationStep == OnboardingStepV2.Welcome) goNext()
+                    },
+                )
                 OnboardingStepV2.How -> HowStepV2(
                     dotsIndex = step.dotsIndex,
                     onContinueClick = goNext,
@@ -952,13 +1009,23 @@ internal fun OnboardingFlowV2Internal(
                     // through `formState.signingPublicKeyHex`, there
                     // is no way for a caller to render this step
                     // with a stale hex.
+                    //
+                    // Dual-key labels track 2026-08-10: BOTH hexes
+                    // pass through the holder's projections.
                     signingPublicKeyHex = finalizeHolder.signingPublicKeyHex,
+                    publicKeyHex        = finalizeHolder.publicKeyHex,
                     onContinueClick = onComplete,
-                    onKeyCopied = {
+                    onKeyCopied = { _copiedHex ->
                         // Round-1 REDLINE Commit-3 §P2-1: Copy needs
                         // acknowledgement per handoff. Route through
                         // the existing onboarding toast slot so the
                         // feedback re-uses the flow's Toast composable.
+                        // Dual-key labels track 2026-08-10: the hex
+                        // param identifies WHICH key was copied
+                        // (Ed25519 signing vs X25519 encryption) —
+                        // production toast keeps the generic
+                        // wording; per-key toasts can differentiate
+                        // in a later polish pass if requested.
                         toastMessage = "Key copied to clipboard."
                     },
                 )
@@ -1190,3 +1257,52 @@ private suspend fun persistMissingKeyMarkerIfNeeded(
     }
     return ok
 }
+
+/**
+ * Step-transition `ContentTransform` used by the shared
+ * `AnimatedContent` above. Scoped fix (logo-flash-fix track,
+ * 2026-08-10):
+ *
+ *   - **Welcome → How ONLY**: `EnterTransition.None togetherWith
+ *     ExitTransition.None` — instant swap. Neither incoming How
+ *     fades in nor outgoing Welcome fades out; the composition
+ *     shows Welcome on frame N and How on frame N+1 with no
+ *     overlap and no fade artifact. Empirically required on
+ *     Compose 1.x (verified 2026-08-10): plain
+ *     `fadeIn(180) togetherWith ExitTransition.None` still
+ *     keeps the outgoing Welcome content in the tree for at
+ *     least the first frame after the tap (see
+ *     `AnimatedContent` internals'
+ *     `KeepUntilTransitionsFinished` machinery), so the PHANTOM
+ *     logo remained visible on that frame. `EnterTransition.None`
+ *     is the belt-and-braces fallback specified by the architect
+ *     in the logo-flash contract sheet §4. The step-dots +
+ *     top-bar chrome remain the direction cue.
+ *
+ *   - **All other transitions**: retained symmetric crossfade
+ *     `fadeIn(180) togetherWith fadeOut(160)` — the previous
+ *     behaviour, unchanged. Backward transition (`How →
+ *     Welcome` via BackHandler) also uses the crossfade path
+ *     since it is NOT the scoped forward branch.
+ *
+ * The Welcome→How special case is a defect fix, not a design
+ * change. The "outgoing Welcome removed on next frame" invariant
+ * is pinned by
+ * `OnboardingFlowV2TransitionTest.welcome_logo_absent_immediately_after_get_started_tap`.
+ * See
+ * `docs/tracks/android-onboarding/logo-flash-fix-contract.md`
+ * for the empirical audit that established the need for the
+ * `EnterTransition.None` fallback.
+ *
+ * Extracted from an inline lambda so tests can call the same
+ * function directly and share the exact transition logic.
+ */
+internal fun AnimatedContentTransitionScope<OnboardingStepV2>.onboardingStepContentTransform(): ContentTransform =
+    if (
+        initialState == OnboardingStepV2.Welcome &&
+        targetState == OnboardingStepV2.How
+    ) {
+        EnterTransition.None togetherWith ExitTransition.None
+    } else {
+        fadeIn(tween(180)) togetherWith fadeOut(tween(160))
+    }

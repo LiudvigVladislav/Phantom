@@ -22,7 +22,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyPreview
  * three PNGs — targeted record pass matches C6-a's recovery-
  * snapshot pattern.
  *
- * Both the deterministic target hex sequence AND the per-tick
+ * Both the target bullet pattern AND the per-tick decorative-glyph
  * shuffle glyph table are seeded from a fixed 64-bit constant
  * (`KEY_PREVIEW_DETERMINISTIC_SEED`), so all three frames are
  * byte-stable across machines.
