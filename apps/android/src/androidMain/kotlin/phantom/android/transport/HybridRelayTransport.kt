@@ -1053,15 +1053,64 @@ class HybridRelayTransport(
     // ── Outbound routing ─────────────────────────────────────────────────────
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
+        // Direct WSS Yota-First diagnostic — §11 lock 2 (Method b).
+        //
+        // Outer-arm enforcement is delegated to preflight
+        // (`privacy_mode_report` subcommand): the diagnostic matrix
+        // is only allowed to run when `PrivacyMode.Standard` (Direct)
+        // is the active mode. HRT under a pin logs
+        // `outer_transport=direct` on that basis. If a future round
+        // wants HRT to enforce this directly rather than at preflight,
+        // it needs to plumb an `outerArmProvider` into the HRT
+        // constructor — which is not in scope for WSS-1.
+        val guardState = phantom.android.diagnostic.DiagnosticTransportGuard.current()
+        val pinned = guardState.pin != phantom.android.diagnostic.DiagnosticTransportGuard.Pin.NONE
+
+        val innerRoutePlanned: phantom.android.diagnostic.WssDiag.InnerRoute = when {
+            !pinned && !restCapabilityActive -> phantom.android.diagnostic.WssDiag.InnerRoute.WSS
+            !pinned -> when (stateMachine.current) {
+                RestMode.WsActive -> phantom.android.diagnostic.WssDiag.InnerRoute.WSS
+                RestMode.RestActive, RestMode.WsCandidate -> phantom.android.diagnostic.WssDiag.InnerRoute.REST
+            }
+            guardState.pin == phantom.android.diagnostic.DiagnosticTransportGuard.Pin.WSS ->
+                phantom.android.diagnostic.WssDiag.InnerRoute.WSS
+            else -> phantom.android.diagnostic.WssDiag.InnerRoute.REST
+        }
+
+        phantom.android.diagnostic.WssDiag.emit(
+            event = "sender_transport_decision",
+            role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+            correlationId = message.messageId,
+            outerTransport = phantom.android.diagnostic.WssDiag.OuterTransport.DIRECT,
+            innerRoute = innerRoutePlanned,
+            dispatched = true,
+        )
+
+        // §11 lock 2 — pinned inner route branches BEFORE the
+        // production state-machine consultation, so pins are strictly
+        // enforced without touching the state machine's semantics.
+        if (pinned) {
+            return when (guardState.pin) {
+                phantom.android.diagnostic.DiagnosticTransportGuard.Pin.WSS ->
+                    wssSendWithDiag(message)
+                phantom.android.diagnostic.DiagnosticTransportGuard.Pin.REST ->
+                    restOutboundOrderMutex.withLock { sendViaRest(message, RestMode.RestActive) }
+                phantom.android.diagnostic.DiagnosticTransportGuard.Pin.NONE ->
+                    error("unreachable — pin==NONE was ruled out above")
+            }
+        }
+
+        // ── Production path (pin == NONE) ─────────────────────────
+        //
         // While REST is not active, every send goes through WS — this is the
         // pre-D1b path. As soon as REST capability is on, the state machine
         // owns the routing decision.
         if (!restCapabilityActive) {
-            return wsTransport.send(message)
+            return wssSendWithDiag(message)
         }
         val mode = stateMachine.current
         return when (mode) {
-            RestMode.WsActive -> wsTransport.send(message)
+            RestMode.WsActive -> wssSendWithDiag(message)
             RestMode.RestActive, RestMode.WsCandidate -> {
                 // PR-D1c: wait for the WS-pending → REST migration before
                 // routing any new envelope. Without this gate a fresh send
@@ -1078,6 +1127,30 @@ class HybridRelayTransport(
                 }
             }
         }
+    }
+
+    /**
+     * Direct WSS Yota-First diagnostic — wraps `wsTransport.send`
+     * with a `sender_wss_frame_written` event carrying the
+     * boolean-return outcome. Every WSS send path through `HRT.send`
+     * routes through this helper so pinned + un-pinned WSS branches
+     * share the same observability schema.
+     */
+    private suspend fun wssSendWithDiag(message: RelayMessage.Send): Boolean {
+        val ok = wsTransport.send(message)
+        phantom.android.diagnostic.WssDiag.emit(
+            event = "sender_wss_frame_written",
+            role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+            correlationId = message.messageId,
+            innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.WSS,
+            outcomeFlag = if (ok) {
+                phantom.android.diagnostic.WssDiag.OutcomeFlag.NONE
+            } else {
+                phantom.android.diagnostic.WssDiag.OutcomeFlag.SEND_ERROR
+            },
+            dispatched = ok,
+        )
+        return ok
     }
 
     private suspend fun sendViaRest(message: RelayMessage.Send, mode: RestMode): Boolean {
@@ -1097,21 +1170,68 @@ class HybridRelayTransport(
             sequenceTs = nowMs(),
             sealedSenderBase64 = sealedSender,
         )
+        val restPinned =
+            phantom.android.diagnostic.DiagnosticTransportGuard.current().pin ==
+                phantom.android.diagnostic.DiagnosticTransportGuard.Pin.REST
         return when (outcome) {
-            is SendOutcome.Accepted -> true
-            is SendOutcome.Duplicate -> true
-            is SendOutcome.DisabledByCapability -> {
-                // Capability flipped to false after bootstrap (shouldn't
-                // happen in steady state, but defend against it): fall
-                // back to WS for this single send.
-                Log.w(
-                    TAG,
-                    "REST_TRACE route_send_fallback_ws id=${message.messageId.take(8)} " +
-                        "reason=disabled_by_capability",
+            is SendOutcome.Accepted -> {
+                phantom.android.diagnostic.WssDiag.emit(
+                    event = "sender_rest_post_completed",
+                    role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                    correlationId = message.messageId,
+                    innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.REST,
+                    relayAcceptance = phantom.android.diagnostic.WssDiag.RelayAcceptance.ACCEPTED,
                 )
-                wsTransport.send(message)
+                true
+            }
+            is SendOutcome.Duplicate -> {
+                phantom.android.diagnostic.WssDiag.emit(
+                    event = "sender_rest_post_completed",
+                    role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                    correlationId = message.messageId,
+                    innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.REST,
+                    relayAcceptance = phantom.android.diagnostic.WssDiag.RelayAcceptance.DUPLICATE,
+                )
+                true
+            }
+            is SendOutcome.DisabledByCapability -> {
+                phantom.android.diagnostic.WssDiag.emit(
+                    event = "sender_rest_post_completed",
+                    role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                    correlationId = message.messageId,
+                    innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.REST,
+                    relayAcceptance = phantom.android.diagnostic.WssDiag.RelayAcceptance.DISABLED_BY_CAPABILITY,
+                    outcomeFlag = phantom.android.diagnostic.WssDiag.OutcomeFlag.DROPPED_BY_CAPABILITY,
+                )
+                if (restPinned) {
+                    // §11 lock — Pin.REST fail-closed. Do NOT
+                    // silently fall back to WSS. The verifier reads
+                    // this as BLOCKED for the cell.
+                    Log.w(
+                        TAG,
+                        "REST_TRACE pin_rest_fail_closed id=${message.messageId.take(8)} " +
+                            "reason=disabled_by_capability",
+                    )
+                    false
+                } else {
+                    // Production behaviour unchanged when pin==NONE.
+                    Log.w(
+                        TAG,
+                        "REST_TRACE route_send_fallback_ws id=${message.messageId.take(8)} " +
+                            "reason=disabled_by_capability",
+                    )
+                    wsTransport.send(message)
+                }
             }
             is SendOutcome.OversizeBody -> {
+                phantom.android.diagnostic.WssDiag.emit(
+                    event = "sender_rest_post_completed",
+                    role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                    correlationId = message.messageId,
+                    innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.REST,
+                    relayAcceptance = phantom.android.diagnostic.WssDiag.RelayAcceptance.FAILED,
+                    outcomeFlag = phantom.android.diagnostic.WssDiag.OutcomeFlag.SEND_ERROR,
+                )
                 Log.w(
                     TAG,
                     "REST_TRACE send_oversize id=${message.messageId.take(8)} " +
@@ -1124,6 +1244,14 @@ class HybridRelayTransport(
                 false
             }
             is SendOutcome.Failed -> {
+                phantom.android.diagnostic.WssDiag.emit(
+                    event = "sender_rest_post_completed",
+                    role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                    correlationId = message.messageId,
+                    innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.REST,
+                    relayAcceptance = phantom.android.diagnostic.WssDiag.RelayAcceptance.FAILED,
+                    outcomeFlag = phantom.android.diagnostic.WssDiag.OutcomeFlag.SEND_ERROR,
+                )
                 Log.w(
                     TAG,
                     "REST_TRACE send_failed id=${message.messageId.take(8)} " +

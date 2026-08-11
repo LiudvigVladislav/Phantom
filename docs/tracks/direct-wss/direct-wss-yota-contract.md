@@ -4,7 +4,28 @@
 **Relay tree examined:** `D:/VL Stories Studio/Phantom` HEAD `d63366b6` on branch `fix/relay-queue-durability-pr2` — the PR #397 (M6-3 queue-durability) code. Per architect 2026-08-11 answer to §8-Q1, PR #397 IS merged into upstream `master` (this local `master@fadc5c9c` is stale). VPS-side deployment is still unconfirmed.
 **Gate:** WSS-0 review required before any runtime change, APK build, VPS action, push, or long test.
 
-**§0 — no fix has been made.** No production or test code was modified during WSS-0 research. Round-1 REDLINE (2026-08-11) was a doc-only amend of commit `bc7051ed`. Round-2 REDLINE (2026-08-11) is a doc-only amend of `4e841b5b`; still no runtime, Gradle, tests, APK, or bundle.
+**§0 — status.** WSS-0 doc-only rounds landed as `bc7051ed` (initial), `4e841b5b` (REDLINE-1), `bf748db3` (REDLINE-2 — architect FINAL GREEN). WSS-1 implementation round is now in progress under architect implementation locks (see §11).
+
+## §11 — Implementation locks (architect FINAL GREEN on REDLINE-2)
+
+The following four locks close the choice-points left open in earlier rounds. They are BINDING for WSS-1 implementation — no re-litigation without a new architect direction.
+
+1. **Command component = BroadcastReceiver only.** The debug command surface is ONE `BroadcastReceiver` declared solely in the debug `AndroidManifest.xml` overlay. `Activity` is NOT used. The receiver runs on explicit component invocation (`am broadcast -n <APP_ID>/.diagnostic.DiagnosticCommandReceiver …`) and is physically absent from the release APK's merged manifest.
+
+2. **Outer Direct enforcement = Method (b) fail-closed check.** `TransportManager` is NOT modified. If the actually-selected outer arm at send time is not `direct`, `HybridRelayTransport.send` refuses to dispatch, emits `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`, and the verifier stamps the matrix cell `BLOCKED`. Every send under a WSS or REST pin MUST log `outer_transport=direct` in the winning `sender_transport_decision` event.
+
+3. **Conversation selection = automatic, not operator-supplied.** The `contact_alias` extra is REMOVED from the receiver whitelist. After a clean bootstrap, each device has exactly ONE paired conversation whose peer is the other device in the matrix. The receiver's `send` subcommand queries the local conversation store, requires exactly one matching paired conversation, and fails-red otherwise. The operator cannot influence which peer receives the send.
+
+4. **Additional focused tests (locked, on top of §5):**
+   - `wss_diag_unknown_extras_and_subcommands_are_rejected` — any extra outside the strict whitelist, or any `subcommand` outside the enum, exits the receiver red without touching `sendMessage`.
+   - `wss_diag_send_calls_production_api_exactly_once_with_no_external_text` — the `send` subcommand invokes `MessagingService.sendMessage` exactly once with text derived internally as `YOTA-WSS-${cell_id}-${sequence}`; no text extra is accepted or consumed.
+   - `wss_diag_pin_write_read_round_trip_through_app_code` — writes via `DiagnosticCommandReceiver` (in-app EncryptedSharedPreferences) → reads via the same store → observes the value in `DiagnosticTransportGuard`. No ADB file write is possible or supported.
+   - `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest` — introspects the merged manifest for both variants (via `manifest-merger` output files under `build/intermediates/merged_manifests/`), asserts the receiver appears in debug and NOT in release.
+
+## §11.1 — REDLINE-2 clarifications (non-blocking)
+
+- `recipient_message_persisted` proves the chat-store write completed for the message row; it does NOT literally prove the message is visible on the recipient's screen at that instant (a fully-composed row that's off-screen or hidden behind chrome still qualifies). Verifier documentation states this scope explicitly.
+- The Method-B "controlled fail-closed REST capability envelope" (§8-Q6, §9.6) is a preflight probe. It is **NOT counted in the `8 × 5 = 40` matrix envelopes** and it does NOT consume a `cell_id`. It carries its own `cell_id = "preflight.rest_capability"` and its outcome only stamps `preflight.json.rest_capability = disabled|enabled|unknown`.
 
 The `docs/tracks/direct-wss/` directory is new; the contract sheet, the operator-package spec (§9), and the future observability diff (§7) will live under it.
 
@@ -289,10 +310,12 @@ All tests pin the correlation contract; none touch transport internals; none req
 
 ### Store shape
 
-- **Kotlin file lives ONLY in the debug source set**: `apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticTransportPin.kt` — an object exposing `read(context): PinState` and `write(context, state: PinState)`. Store is backed by `EncryptedSharedPreferences` (`androidx.security:security-crypto`) keyed under `MasterKey.Builder(context).setKeyScheme(AES256_GCM).build()`. **The backing file is AES-GCM-encrypted XML under `context.filesDir/../shared_prefs/diagnostic_transport_pin.xml` and is NOT plaintext.** The earlier claim that the store could be written via `echo` into `run-as` is incorrect and has been removed.
-- `data class PinState(pin: Pin, run_id: String, cell_id: String, emitter_id: String)` where `enum class Pin { NONE, WSS, REST }`, default `PinState(NONE, "", "", <persisted emitter_id from install>)`.
-- **Release variant does NOT include `DiagnosticTransportPin.kt` at all** (source-set separation — file physically absent from the release APK dex). Any code that references it lives under `src/debug/`, gated by an `interface` in `src/main/` that the release variant implements as a no-op.
-- The store is written EXCLUSIVELY via the debug command component (§9.3) which runs inside the app process (has access to `MasterKey` + `EncryptedSharedPreferences.create(...)`) and validates every input against a strict whitelist. No file write from ADB shell.
+- **In-memory only.** The pin is a `@Volatile` field on a top-level `DiagnosticTransportGuard` object living in `src/main/`. It is not persisted to disk. This deliberately eliminates any file-write attack surface (`run-as`, ADB `echo`, symlink games) — the only path that mutates the field is the debug-only receiver code below.
+- `data class PinState(pin: Pin, runId: String, cellId: String)` where `enum class Pin { NONE, WSS, REST }`, default `PinState(NONE, "", "")`.
+- **Reader lives in `src/main/`** (`DiagnosticTransportGuard.current(): PinState`). Present in every APK variant, always returns `PinState.NONE` unless a writer has explicitly set it.
+- **Writer lives ONLY in `src/debug/`** (`DiagnosticCommandReceiver`, §9.3). Physically absent from the release APK. Reads a broadcast Intent, validates every input against the whitelist, writes `DiagnosticTransportGuard.set(newState)`.
+- Process death (crash, background kill) resets the pin to `PinState.NONE`. This is a FEATURE: the matrix runner writes the pin at the head of every cell and waits for a matching `diagnostic_pin_active` event before firing the first envelope; a pin loss surfaces as a missing / mismatched event in the next cell and `evidence_integrity` fails-red at the verifier. The operator reruns the matrix; no silent corruption.
+- The `emitter_id` (`phone` or `emulator`) is baked at build time as `BuildConfig` string flavour and read from a companion field on `DiagnosticTransportGuard`. It does NOT change per cell or per pin write — pinning affects `pin`/`runId`/`cellId` only. In this diagnostic APK both emitter_ids are shipped in the same APK (see build variants below) and selected at install time via a one-shot `am broadcast … --es subcommand set_emitter_id --es emitter_id phone|emulator` — the receiver validates the value against `{"phone", "emulator"}` and writes to another `@Volatile` field. Preflight verifies via `diag-cmd.sh health`.
 
 ### Semantics
 

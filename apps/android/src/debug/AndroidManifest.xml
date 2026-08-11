@@ -1,84 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Trek 2 Stage 2B-B (C6 review-fix round 10): debug-only
-    manifest overlay declaring the S6 controllable breaker trigger
-    Activity. Round-9 declared it in `androidMain/AndroidManifest.xml`
-    which left the component enumerable via `pm list packages -f` and
-    `dumpsys package` on release APKs even though the runtime gates
-    would refuse to dispatch.
+  Direct WSS Yota-First diagnostic — debug-only manifest overlay.
 
-    Round 10 manifest-surface review flagged this as a regression
-    vs the round 3-8 dynamic-receiver approach (which never existed
-    in release manifests). This overlay restores the round 3-8
-    invariant: the activity exists ONLY in debug-variant APKs.
+  §11 lock 1 (architect FINAL GREEN): the diagnostic BroadcastReceiver
+  is declared ONLY here (in the debug source set). At release build
+  time the merged manifest does NOT include this receiver — verified by
+  focused test `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest`.
 
-    Release builds still pin BuildConfig.S6_DEBUG_TRIGGER_ENABLED to
-    "0" as a defence-in-depth backstop; the orchestrator constructor
-    gate (s6DebugTriggerEnabled = false in release) is the load-
-    bearing third layer.
+  `android:exported="true"` is required so `am broadcast -n` can invoke
+  the receiver by explicit component from an ADB shell. Combined with
+  explicit-component invocation (no intent-filter), external apps
+  cannot deliver broadcasts to this receiver — only the shell UID.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application>
-        <!--
-            Trek 2 Stage 2B-B (C6 review-fix round 10): the
-            activity is gated on
-            android.permission.INTERACT_ACROSS_USERS_FULL. The
-            permission is held by the shell uid (which is what
-            `adb shell am start` runs as) and is signature-scoped
-            to the system signing certificate, so co-installed
-            third-party apps cannot satisfy it. Verified at the
-            wire on TECNO BF7-12 (round 10): `am start` from the
-            shell uid 2000 launches the activity cleanly; all four
-            expected logcat lines (S6 invocation, trigger fired,
-            breaker open, dispatched=true) emit within ~15 ms.
-            See docs/tracks/trek2-stage2b-b-tele2-smoke.md for the
-            full smoke recipe and field-evidence requirements.
-        -->
-        <activity
-            android:name="phantom.android.dev.S6BreakerTriggerActivity"
-            android:exported="true"
-            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
-            android:noHistory="true"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.NoDisplay" />
-        <!--
-            QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §5.2 (2026-06-30)
-            — manifest-side declaration of the L1 synthetic-trigger
-            debug Activity. Debug-only entry point that routes
-            an `adb shell am start` invocation into the L1 synthetic
-            Mode 2 trigger
-            [phantom.core.transport.KtorRelayTransport.debugForceMode2Synthetic].
-            Identical four-layer S6BreakerTriggerActivity pattern:
 
-              1. Declared ONLY in this debug-variant overlay; release
-                 APKs do not carry the entry.
-              2. Gated on `android.permission.INTERACT_ACROSS_USERS_FULL`
-                 (signature-scoped to system signing cert; shell uid
-                 satisfies, co-installed third-party apps cannot).
-              3. `onCreate` re-checks
-                 `BuildConfig.DEBUG_FORCE_MODE_2_DETECTION == "1"` AND
-                 `BuildConfig.DEBUG == true` and `finish()`es if either
-                 is false.
-              4. `AppContainer.triggerDebugForceMode2()` re-checks the
-                 BuildConfig field + the orchestrator's sticky-armed
-                 state, and the `debugForceMode2Enabled` Boolean
-                 injected into `KtorRelayTransport`'s constructor is
-                 `false` in release as a final backstop.
+        <receiver
+            android:name="phantom.android.diagnostic.DiagnosticCommandReceiver"
+            android:enabled="true"
+            android:exported="true" />
 
-            Trigger recipe (from connected laptop): use the `am start`
-            command with `-n phantom.android/phantom.android.dev.DebugForceMode2Activity`
-            and optionally pass the `durationMs` extra via the `am`
-            long-extra flag with a value in 25000..65000 (default 45000,
-            the mid-range of the Mode 2 signature window).
+        <!--
+          Zero-touch boot-init provider: instantiated by the Android
+          framework BEFORE Application.onCreate() so the shared
+          WssDiagBridge is installed before any messaging code runs.
+          Authority is unique + does not overlap any production
+          provider. `exported="false"` — external apps cannot query.
         -->
-        <activity
-            android:name="phantom.android.dev.DebugForceMode2Activity"
-            android:exported="true"
-            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
-            android:noHistory="true"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.NoDisplay" />
+        <provider
+            android:name="phantom.android.diagnostic.DiagnosticBootInitProvider"
+            android:authorities="${applicationId}.diagnostic.bootinit"
+            android:enabled="true"
+            android:exported="false" />
+
     </application>
 
 </manifest>

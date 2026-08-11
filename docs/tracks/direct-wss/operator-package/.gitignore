@@ -1,0 +1,7 @@
+# The 194 MiB diagnostic APK stays on the operator's Mac only; it is
+# produced by `assembleDebug` and copied into this dir by the WSS-1
+# handoff step. The SHA-256 file IS tracked so the operator can
+# verify a downloaded APK against the exact WSS-1 build.
+android-debug-diagnostic.apk
+# Evidence dirs are per-run artefacts — never tracked.
+evidence/

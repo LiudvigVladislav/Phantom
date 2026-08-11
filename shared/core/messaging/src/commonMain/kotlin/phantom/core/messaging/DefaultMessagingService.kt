@@ -1581,7 +1581,14 @@ class DefaultMessagingService(
                             status = MessageStatus.QUEUED,
                             createdAt = insertedAtMs,
                             expiresAtMs = outgoingExpiresAtMs,
-                        )
+                        ).also {
+                            // Direct WSS Yota-First diagnostic §4 — sender_enqueue.
+                            WssDiagBridgeHolder.instance?.emit(
+                                event = "sender_enqueue",
+                                correlationId = message.id,
+                                role = WssDiagBridge.Role.SENDER,
+                            )
+                        }
                     )
                 },
             )
@@ -2316,6 +2323,21 @@ class DefaultMessagingService(
                     else        -> MessageStatus.RELAYED
                 }
                 messageRepository.updateStatus(ack.messageId, newStatus)
+                // Direct WSS Yota-First diagnostic §4 —
+                // sender_relay_ack_received. RENAMED from the
+                // legacy MessageStatus.DELIVERED name so it cannot
+                // be misread as end-to-end delivery — this ack is
+                // "relay pushed to recipient mpsc" (see routes.rs
+                // R7 in contract §1).
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "sender_relay_ack_received",
+                    correlationId = ack.messageId,
+                    role = WssDiagBridge.Role.SENDER,
+                    outcomeFlag = when (ack.status) {
+                        "delivered" -> WssDiagBridge.OutcomeFlag.SENDER_RELAY_ACK_DELIVERED
+                        else -> WssDiagBridge.OutcomeFlag.SENDER_RELAY_ACK_RELAYED
+                    },
+                )
             }
             .launchIn(scope)
     }
@@ -2582,7 +2604,21 @@ class DefaultMessagingService(
                     MessagingLogLevel.INFO,
                     "Duplicate envelope (already in ledger): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping decrypt",
                 )
+                // Direct WSS Yota-First diagnostic §4 — recipient_deliver_received.
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_deliver_received",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                    dedupGate = WssDiagBridge.DedupGate.DUPLICATE,
+                )
                 transport.sendDeliveryAck(deliver.messageId)
+                // Direct WSS Yota-First diagnostic §4 — recipient_ack_deliver_sent
+                // (re-ack for duplicate path).
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_ack_deliver_sent",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                )
                 return@runCatching
             }
 
@@ -2598,9 +2634,29 @@ class DefaultMessagingService(
                     MessagingLogLevel.INFO,
                     "Duplicate envelope (already in messages DB): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping",
                 )
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_deliver_received",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                    dedupGate = WssDiagBridge.DedupGate.DUPLICATE,
+                )
                 transport.sendDeliveryAck(deliver.messageId)
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_ack_deliver_sent",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                )
                 return@runCatching
             }
+
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_deliver_received (fresh path).
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_deliver_received",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+                dedupGate = WssDiagBridge.DedupGate.FRESH,
+            )
 
             val rawPayloadBytes = deliver.payload.decodeBase64Bytes()
 
@@ -4078,6 +4134,16 @@ class DefaultMessagingService(
                 )
             )
             messagingLog(MessagingLogLevel.INFO, "DB insertMessage OK")
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_message_persisted. Fires STRICTLY AFTER
+            // insertMessage returns; proves the chat-store row is
+            // committed. Does NOT prove screen-visibility (see
+            // §11.1 clarification).
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_message_persisted",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+            )
 
             // Create conversation as REQUEST if unknown sender, keep TRUSTED if already known.
             val existing = conversationRepository.getConversation(conversationId)
@@ -4183,6 +4249,15 @@ class DefaultMessagingService(
             // messages table makes any duplication harmless, but explicit
             // ack-deliver is what actually frees server-side memory.
             transport.sendDeliveryAck(deliver.messageId)
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_ack_deliver_sent. Emits AFTER the ack frame
+            // hand-off, closing the round-trip loop the verifier needs
+            // for outcome (1) `Delivered once`.
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_ack_deliver_sent",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+            )
 
             messagingLog(
                 MessagingLogLevel.INFO,

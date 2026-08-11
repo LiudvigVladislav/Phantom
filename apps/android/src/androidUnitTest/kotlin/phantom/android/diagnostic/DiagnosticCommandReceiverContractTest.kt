@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Willen LLC
+
+package phantom.android.diagnostic
+
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+import org.junit.Test
+
+/**
+ * Direct WSS Yota-First — §11 additional focused tests for the
+ * debug-only [DiagnosticCommandReceiver].
+ *
+ * These are pure JVM tests targeting the whitelist/enum surface of
+ * the receiver's companion object — they do NOT instantiate the
+ * receiver itself, do NOT touch Android system services, and do
+ * NOT talk to `MessagingService`. That keeps them fast and
+ * independent of the cumulative Robolectric flake (see
+ * `project_android_test_infra_appnotidleexception_cumulative_2026_08_11`).
+ */
+class DiagnosticCommandReceiverContractTest {
+
+    // ── §11 lock 4 test #1: unknown extras / subcommands rejected ──
+
+    @Test
+    fun allowed_subcommands_enum_is_strict() {
+        val expected = setOf(
+            "pin", "send", "canary", "set_emitter_id",
+            "dual_sim_report", "rest_capability_probe", "health",
+        )
+        assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
+    }
+
+    @Test
+    fun allowed_pins_enum_is_strict() {
+        val expected = setOf("none", "wss", "rest")
+        assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_PINS)
+    }
+
+    @Test
+    fun pin_subcommand_whitelist_rejects_send_specific_extras() {
+        val pinAllowed = DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["pin"] ?: emptySet()
+        // Must accept exactly the pin-flow extras.
+        assertEquals(setOf("pin", "run_id", "cell_id"), pinAllowed)
+        // Must NOT accept text, contact_alias, or arbitrary payload.
+        for (banned in listOf("text", "plaintext", "content", "contact_alias", "recipient", "public_key")) {
+            assertFalse(pinAllowed.contains(banned), "pin whitelist leaked banned key: $banned")
+        }
+    }
+
+    @Test
+    fun send_subcommand_whitelist_rejects_arbitrary_text_and_contact() {
+        val sendAllowed = DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["send"] ?: emptySet()
+        // §11 lock 3: contact_alias is NOT in the whitelist.
+        // §11 lock 4 test #2: text must not be accepted.
+        assertEquals(setOf("run_id", "cell_id", "sequence"), sendAllowed)
+        for (banned in listOf("text", "plaintext", "content", "contact_alias", "recipient", "public_key", "hex")) {
+            assertFalse(sendAllowed.contains(banned), "send whitelist leaked banned key: $banned")
+        }
+    }
+
+    @Test
+    fun canary_subcommand_accepts_no_extras() {
+        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["canary"]!!.isEmpty())
+    }
+
+    @Test
+    fun set_emitter_id_only_accepts_emitter_id_key() {
+        val allowed = DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["set_emitter_id"] ?: emptySet()
+        assertEquals(setOf("emitter_id"), allowed)
+    }
+
+    @Test
+    fun health_dual_sim_and_rest_probe_accept_no_extras() {
+        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["health"]!!.isEmpty())
+        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["dual_sim_report"]!!.isEmpty())
+        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["rest_capability_probe"]!!.isEmpty())
+    }
+}
