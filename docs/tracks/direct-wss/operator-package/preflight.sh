@@ -188,6 +188,10 @@ cat > "$OUT/device-manifest.json" <<EOF
 }
 EOF
 
+# §12 Round-3 audit P0-3: verifier cross-checks matrix.run_id ==
+# preflight.run_id == device-manifest.run_id, matrix.rest_capability ==
+# preflight.rest_capability, and skews between the two files.
+
 cat > "$OUT/preflight.json" <<EOF
 {
   "run_id": "$RUN_ID",

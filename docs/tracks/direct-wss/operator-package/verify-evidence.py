@@ -2,25 +2,53 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 Willen LLC
 #
-# Direct WSS Yota-First diagnostic — evidence verifier v3
-# (§12 Round-1 audit repair).
+# Direct WSS Yota-First diagnostic — evidence verifier v4
+# (§12 Round-3 audit repair).
 #
-# Changes vs v2:
-#   * Every event is filtered by matrix.json.run_id (P0-2).
-#   * Correlation IDs are globally unique inside a run, not per-cell.
-#   * Pin coverage is per-sender-device + per-run + per-cell timeline.
-#   * classify_envelope() classifies as Delivered once ONLY if pin,
-#     role, emitter, outer arm, and inner route ALL match. Any
-#     violation drops the cell to Unresolved.
-#   * BLOCKED cells require preflight.rest_capability == "disabled"
-#     AND the cell pin == "rest". Any other BLOCKED cell is
-#     integrity RED.
-#   * Preflight booleans are checked for `True` value (not key
-#     presence).
-#   * 120-s window uses a host clock injected via --host-now-ms; if
-#     omitted, derives host_now_ms from clock_skew and the newest
-#     device wall_utc_ms + a "verification age" fudge.
-#   * Exit codes: 0/1/2/3 as v2.
+# Round-3 closes six adversarial false-GREEN paths that survived
+# Round-2:
+#
+#   P0-1  Every non-blocked cell must have exactly 5 sender_enqueue
+#         events, each with a non-empty correlation_id; the 5 CIDs
+#         are unique per cell AND globally unique in the run; and
+#         a matching set of 5 diagnostic_send_dispatched events
+#         (sequences exactly {1,2,3,4,5}) on the sender device.
+#
+#   P0-2  emitter_id MUST match the source-file device label. All
+#         transport-decision events are inspected (not next(...)) —
+#         a contradictory second decision is a violation. All
+#         route-return events are inspected too; opposite-route
+#         events are forbidden; at least one successful WSS return
+#         (WSS pin) or REST completion (REST pin) is required.
+#
+#   P0-3  matrix.run_id, preflight.run_id and device-manifest.run_id
+#         must all match; matrix.rest_capability must match
+#         preflight.rest_capability; skew values duplicated in
+#         preflight+manifest must match; all preflight gates
+#         (apk_variant=debug, env entries "ok", canary "ok",
+#         paired_conversation_count_ok, emitter_ids_set,
+#         yota_confirmed, radio_confirmed, rest_capability
+#         well-formed) are enforced; manifest carries a valid
+#         default-data operator_numeric.
+#
+#   P1-1  rest_capability=="disabled" ⇒ both canonical REST cells
+#         are BLOCKED and carry zero matrix enqueues; conversely
+#         rest_capability ∈ {"enabled","unknown"} ⇒ the REST cells
+#         are NOT BLOCKED.
+#
+#   P1-3  Corrupt / wrong-typed JSON files are surfaced as integrity
+#         issues — never as a Python exception.
+#
+# Retained from Round-2 (unchanged):
+#   * Global correlation-ID uniqueness inside a run.
+#   * Per-sender + per-run + per-cell pin coverage timeline
+#     (session_started restored=false invalidates prior pin_active).
+#   * BLOCKED cells only permitted on rest cells.
+#   * Preflight-boolean value check (must be True, not just present).
+#   * 120-s window driven off host clock via --host-now-ms.
+#   * Safe integer parsing (never raises ValueError).
+#   * Per-device host↔device skew for wall-time alignment.
+#   * Canonical 8-triple matrix set enforcement.
 
 from __future__ import annotations
 import argparse
@@ -49,14 +77,14 @@ KEY_LIKE_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
 
 EXPECTED_CELL_COUNT = 8
 EXPECTED_ENVELOPES_PER_CELL = 5
+EXPECTED_SEQUENCE_SET = frozenset({1, 2, 3, 4, 5})
 ALLOWED_PINS = {"wss", "rest"}
 ALLOWED_DIRECTIONS = {"p2e", "e2p"}
 ALLOWED_SCENARIOS = {"after-connect", "after-idle", "bg-fg", "control"}
 ALLOWED_ROLES = {"sender", "recipient", "matrix"}
+ALLOWED_DEVICES = {"phone", "emulator"}
+OPERATOR_NUMERIC_RE = re.compile(r"^\d{5,6}$")
 
-# §12 Round-2 audit P0-3: the matrix is now a FROZEN canonical set.
-# Any deviation (swapped pin, dropped cell, replaced cell) is
-# integrity RED — not a "8 cells satisfying enum" pass.
 CANONICAL_MATRIX_TRIPLES = frozenset({
     ("wss", "p2e", "after-connect"),
     ("wss", "e2p", "after-connect"),
@@ -67,10 +95,8 @@ CANONICAL_MATRIX_TRIPLES = frozenset({
     ("rest", "p2e", "control"),
     ("rest", "e2p", "control"),
 })
+CANONICAL_REST_CELL_IDS = frozenset({"rest.p2e.control", "rest.e2p.control"})
 
-# §12 Round-2 audit P0-2: recipient-side events MUST have role=recipient.
-# A `recipient_message_persisted` with role=matrix or role=sender is a
-# schema violation, not a "valid signal from unusual role".
 RECIPIENT_EVENTS = {
     "recipient_deliver_received",
     "recipient_message_persisted",
@@ -84,6 +110,22 @@ SENDER_EVENTS = {
     "sender_relay_ack_received",
     "sender_ack_watchdog_requeued",
 }
+MATRIX_EVENTS = {
+    "diagnostic_session_started",
+    "diagnostic_canary",
+    "diagnostic_state_cleared",
+    "diagnostic_pin_active",
+    "diagnostic_send_dispatched",
+    "diagnostic_send_rejected_no_paired_conversation",
+    "diagnostic_send_rejected_multiple_paired_conversations",
+}
+CROSS_RUN_TOLERATED_EVENTS = {
+    "diagnostic_session_started",
+    "diagnostic_canary",
+    "diagnostic_state_cleared",
+}
+
+REQUIRED_PREFLIGHT_ENV_TOOLS = ("adb", "python3", "bash", "jq")
 
 
 @dataclass
@@ -131,15 +173,35 @@ class VerifyReport:
 
 
 def _safe_int(v: Optional[str]) -> Optional[int]:
-    """Parse an integer field or return None. §12 Round-2 audit P1:
-    malformed numeric fields must NOT raise; they must surface as
-    integrity RED via a `parse_errors` marker on the event."""
     if v is None:
         return None
     try:
         return int(v)
     except ValueError:
         return None
+
+
+def _load_json(path: str, expected_top_type: type) -> tuple[object, Optional[str]]:
+    """Return (parsed_value, error) — error is None on success. Never raises.
+    Round-3 P1-3: JSON parse errors and wrong top-level type surface as
+    integrity issues, not as tracebacks."""
+    if not os.path.exists(path):
+        return (expected_top_type() if expected_top_type in (dict, list) else None,
+                f"required file missing: {os.path.basename(path)}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if raw.strip() == "":
+            return (expected_top_type() if expected_top_type in (dict, list) else None,
+                    f"{os.path.basename(path)}: empty file")
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as e:
+        return (expected_top_type() if expected_top_type in (dict, list) else None,
+                f"{os.path.basename(path)}: JSON parse error: {e}")
+    if not isinstance(parsed, expected_top_type):
+        return (expected_top_type() if expected_top_type in (dict, list) else None,
+                f"{os.path.basename(path)}: top-level type is {type(parsed).__name__}, expected {expected_top_type.__name__}")
+    return (parsed, None)
 
 
 def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str]]:
@@ -157,8 +219,6 @@ def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str
             payload = m.group(1).strip()
             fields = dict(FIELD_RE.findall(payload))
 
-            # Track numeric parse failures per event so they surface
-            # as integrity issues, not exceptions.
             wall_ms = _safe_int(fields.get("wall_utc_ms"))
             if "wall_utc_ms" in fields and wall_ms is None:
                 parse_errors.append(f"{device_label}:{lineno} malformed wall_utc_ms={fields['wall_utc_ms']!r}")
@@ -201,24 +261,10 @@ def cell_direction_to_emitters(direction: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def _matches_run_and_cell(e: WssEvent, run_id: str, cell_id: str) -> bool:
-    return e.run_id == run_id and e.cell_id == cell_id
-
-
 def _per_sender_pin_coverage(
     cell_pin: str, run_id: str, cell_id: str, sender_device: str,
     envelope_wall: int, all_events: list[WssEvent],
 ) -> tuple[bool, str]:
-    """
-    Timeline for the SENDER device only:
-      * every diagnostic_pin_active event on the sender for
-        (run, cell) → mark "pin=<value>" at wall
-      * every diagnostic_session_started event on the sender (any
-        cell/run) → if restored=false, the guard was reset;
-        pin coverage is broken until a fresh matching pin_active
-    Latest coverage BEFORE envelope_wall must be pin=cell_pin,
-    matching run_id + cell_id.
-    """
     per_sender = [
         e for e in all_events
         if e.device == sender_device and e.wall_utc_ms is not None
@@ -230,9 +276,6 @@ def _per_sender_pin_coverage(
     latest_meta: str = ""
     for ev in per_sender:
         if ev.event == "diagnostic_session_started":
-            # A restart with restored=false invalidates prior pin_active
-            # coverage regardless of what pin field is carried — the
-            # guard has been reset.
             if ev.restored is False:
                 latest_pin = "none"
                 latest_meta = f"session_started(restored=false) at {ev.wall_utc_ms}"
@@ -244,8 +287,6 @@ def _per_sender_pin_coverage(
                 latest_pin = ev.pin
                 latest_meta = f"pin_active(run={ev.run_id}, cell={ev.cell_id}, pin={ev.pin}) at {ev.wall_utc_ms}"
             else:
-                # Pin_active for a DIFFERENT cell/run resets coverage:
-                # the operator moved on. Cell-scope isolation.
                 latest_pin = "none"
                 latest_meta = f"pin_active(other cell/run={ev.run_id}/{ev.cell_id}) at {ev.wall_utc_ms}"
     if latest_pin == cell_pin:
@@ -253,25 +294,118 @@ def _per_sender_pin_coverage(
     return (False, f"latest pin before enqueue on {sender_device}: {latest_pin or 'none'} ({latest_meta or 'no events'}) — expected {cell_pin} for run={run_id} cell={cell_id}")
 
 
-def integrity_check_bundle(
-    events: list[WssEvent], out: str, matrix: dict, manifest: dict,
-) -> list[str]:
+def _validate_preflight(preflight: dict) -> list[str]:
+    """Round-3 audit P0-3: every gate the operator's preflight ran
+    must be recorded AND set to a passing value. Any missing field
+    or wrong value is integrity RED."""
     problems: list[str] = []
 
-    # (a) Required files present + non-empty.
+    if preflight.get("apk_variant") != "debug":
+        problems.append(f"preflight.apk_variant != 'debug': {preflight.get('apk_variant')!r}")
+
+    env = preflight.get("env")
+    if not isinstance(env, dict):
+        problems.append(f"preflight.env missing or wrong type: {type(env).__name__}")
+    else:
+        for tool in REQUIRED_PREFLIGHT_ENV_TOOLS:
+            if env.get(tool) != "ok":
+                problems.append(f"preflight.env.{tool} != 'ok': {env.get(tool)!r}")
+
+    for req_bool in ("yota_confirmed", "emitter_ids_set", "radio_confirmed",
+                     "paired_conversation_count_ok"):
+        if preflight.get(req_bool) is not True:
+            problems.append(f"preflight.{req_bool} is not True: {preflight.get(req_bool)!r}")
+
+    if preflight.get("canary") != "ok":
+        problems.append(f"preflight.canary != 'ok': {preflight.get('canary')!r}")
+
+    if preflight.get("rest_capability") not in ("enabled", "disabled", "unknown"):
+        problems.append(f"preflight.rest_capability invalid: {preflight.get('rest_capability')!r}")
+
+    if not isinstance(preflight.get("run_id"), str) or not preflight.get("run_id"):
+        problems.append("preflight.run_id missing or empty")
+
+    return problems
+
+
+def _validate_manifest(manifest: dict) -> list[str]:
+    problems: list[str] = []
+    for req in ("run_id", "host_to_phone_skew_ms", "host_to_emulator_skew_ms",
+                "phone_serial", "emulator_serial",
+                "dual_sim_report_operator_numeric"):
+        if req not in manifest:
+            problems.append(f"device-manifest.json missing required key: {req}")
+    if not isinstance(manifest.get("run_id"), str) or not manifest.get("run_id"):
+        problems.append("device-manifest.run_id missing or empty")
+    for k in ("host_to_phone_skew_ms", "host_to_emulator_skew_ms"):
+        v = manifest.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, int) or isinstance(v, bool):
+            problems.append(f"device-manifest.{k} not an integer: {v!r}")
+            continue
+        if abs(v) > 30_000:
+            problems.append(f"|device-manifest.{k}| > 30 000: {v}")
+    op = manifest.get("dual_sim_report_operator_numeric")
+    if op is not None:
+        if not isinstance(op, str) or not OPERATOR_NUMERIC_RE.match(op):
+            problems.append(f"device-manifest.dual_sim_report_operator_numeric not a 5-6 digit string: {op!r}")
+    return problems
+
+
+def _validate_cross_file_run_consistency(
+    matrix: dict, preflight: dict, manifest: dict,
+) -> list[str]:
+    """Round-3 audit P0-3: matrix / preflight / manifest metadata
+    that binds a bundle to a single run must all agree."""
+    problems: list[str] = []
+    m_run = matrix.get("run_id")
+    p_run = preflight.get("run_id")
+    d_run = manifest.get("run_id")
+    if m_run and p_run and m_run != p_run:
+        problems.append(f"matrix.run_id={m_run!r} != preflight.run_id={p_run!r}")
+    if m_run and d_run and m_run != d_run:
+        problems.append(f"matrix.run_id={m_run!r} != device-manifest.run_id={d_run!r}")
+    if p_run and d_run and p_run != d_run:
+        problems.append(f"preflight.run_id={p_run!r} != device-manifest.run_id={d_run!r}")
+
+    m_cap = matrix.get("rest_capability")
+    p_cap = preflight.get("rest_capability")
+    if m_cap is not None and p_cap is not None and m_cap != p_cap:
+        problems.append(
+            f"matrix.rest_capability={m_cap!r} != preflight.rest_capability={p_cap!r}",
+        )
+
+    for k in ("host_to_phone_skew_ms", "host_to_emulator_skew_ms"):
+        pv = preflight.get(k)
+        dv = manifest.get(k)
+        if pv is None or dv is None:
+            continue
+        if pv != dv:
+            problems.append(
+                f"preflight.{k}={pv} != device-manifest.{k}={dv}",
+            )
+    return problems
+
+
+def integrity_check_bundle(
+    events: list[WssEvent], out: str, matrix: dict, preflight: dict, manifest: dict,
+    file_load_errors: list[str],
+) -> list[str]:
+    problems: list[str] = list(file_load_errors)
+
     for name in REQUIRED_FILES:
         p = os.path.join(out, name)
         if not os.path.exists(p):
-            problems.append(f"required file missing: {name}")
+            if not any(name in msg for msg in problems):
+                problems.append(f"required file missing: {name}")
             continue
         if os.path.getsize(p) == 0:
             problems.append(f"required file empty: {name}")
 
-    # (b) No events at all is RED.
     if not events:
         problems.append("no WSS_DIAG events parsed — bundle is not usable")
 
-    # (c) Every event has role, wall_utc_ms, emitter_id.
     for e in events:
         if e.role is None:
             problems.append(f"event missing role: {e.event} @ {e.device}")
@@ -281,12 +415,14 @@ def integrity_check_bundle(
             problems.append(f"event missing wall_utc_ms: {e.event} @ {e.device}")
         if e.emitter_id is None:
             problems.append(f"event missing emitter_id: {e.event} @ {e.device}")
-        elif e.emitter_id not in ("phone", "emulator"):
+        elif e.emitter_id not in ALLOWED_DEVICES:
             problems.append(f"emitter_id not phone/emulator: {e.emitter_id} @ {e.device}")
+        elif e.device in ALLOWED_DEVICES and e.emitter_id != e.device:
+            # Round-3 audit P0-2: emitter_id MUST match source-file device.
+            problems.append(
+                f"event provenance mismatch: {e.event} on {e.device} log carries emitter_id={e.emitter_id}",
+            )
 
-    # (c.1) §12 Round-2 audit P0-2: recipient/sender events MUST
-    # carry the matching role. A `recipient_message_persisted` with
-    # role=matrix (or any non-recipient role) is a schema violation.
     for e in events:
         if e.event in RECIPIENT_EVENTS and e.role != "recipient":
             problems.append(
@@ -296,27 +432,34 @@ def integrity_check_bundle(
             problems.append(
                 f"sender event {e.event} has role={e.role} (expected 'sender') @ {e.device}",
             )
+        if e.event in MATRIX_EVENTS and e.role != "matrix":
+            problems.append(
+                f"matrix event {e.event} has role={e.role} (expected 'matrix') @ {e.device}",
+            )
 
-    # (d) session_started present on BOTH devices.
-    for dev in ("phone", "emulator"):
+    for dev in ALLOWED_DEVICES:
         if not any(e.event == "diagnostic_session_started" and e.device == dev for e in events):
             problems.append(f"no diagnostic_session_started event on {dev}")
 
-    # (e) forbidden verifier-only classification on client.
     for e in events:
         if e.event == "unresolved_120s_marker" or e.outcome_flag == "unresolved_120s_marker":
             problems.append(f"forbidden verifier-only classification emitted by client: {e.raw}")
 
-    # (f) matrix.json shape — §12 Round-2 audit P0-3: canonical set only.
     run_id_matrix = matrix.get("run_id")
     if not run_id_matrix:
         problems.append("matrix.json missing run_id")
-    cells = matrix.get("cells", [])
-    if len(cells) != EXPECTED_CELL_COUNT:
-        problems.append(f"matrix.json cells count={len(cells)} (expected {EXPECTED_CELL_COUNT})")
+    cells_raw = matrix.get("cells")
+    if not isinstance(cells_raw, list):
+        problems.append(f"matrix.cells missing or wrong type: {type(cells_raw).__name__}")
+        cells_raw = []
+    if len(cells_raw) != EXPECTED_CELL_COUNT:
+        problems.append(f"matrix.json cells count={len(cells_raw)} (expected {EXPECTED_CELL_COUNT})")
     seen_cell_ids: set[str] = set()
     observed_triples: set[tuple[str, str, str]] = set()
-    for cell in cells:
+    for cell in cells_raw:
+        if not isinstance(cell, dict):
+            problems.append(f"matrix.cells has non-object entry: {cell!r}")
+            continue
         cid = cell.get("cell_id")
         if not cid:
             problems.append("cell missing cell_id")
@@ -337,68 +480,73 @@ def integrity_check_bundle(
             problems.append(f"cell {cid} BLOCKED but pin != rest — only REST cells may be BLOCKED")
         if pin and direction and scenario:
             observed_triples.add((pin, direction, scenario))
-        # Enforce cell_id shape "pin.direction.scenario".
         if pin and direction and scenario and cid != f"{pin}.{direction}.{scenario}":
             problems.append(f"cell {cid} does not match pin.direction.scenario shape ({pin}.{direction}.{scenario})")
 
-    # Canonical set check.
-    missing_triples = CANONICAL_MATRIX_TRIPLES - observed_triples
-    extra_triples = observed_triples - CANONICAL_MATRIX_TRIPLES
-    for t in sorted(missing_triples):
+    for t in sorted(CANONICAL_MATRIX_TRIPLES - observed_triples):
         problems.append(f"canonical matrix triple missing: {t}")
-    for t in sorted(extra_triples):
+    for t in sorted(observed_triples - CANONICAL_MATRIX_TRIPLES):
         problems.append(f"non-canonical matrix triple present: {t}")
 
-    # (g) preflight.json required booleans.
-    preflight_disk: dict = {}
-    preflight_path = os.path.join(out, "preflight.json")
-    if os.path.exists(preflight_path):
-        with open(preflight_path, "r", encoding="utf-8") as pf:
-            preflight_disk = json.load(pf)
-    for req_bool in ("yota_confirmed", "emitter_ids_set", "radio_confirmed"):
-        if preflight_disk.get(req_bool) is not True:
-            problems.append(f"preflight.json.{req_bool} is not True: {preflight_disk.get(req_bool)!r}")
-    if preflight_disk.get("rest_capability") not in ("enabled", "disabled", "unknown"):
-        problems.append(f"preflight.json.rest_capability invalid: {preflight_disk.get('rest_capability')!r}")
+    problems += _validate_preflight(preflight)
+    problems += _validate_manifest(manifest)
+    problems += _validate_cross_file_run_consistency(matrix, preflight, manifest)
 
-    # (h) REST BLOCKED cells consistent with preflight.rest_capability=disabled.
-    if any(cell.get("blocked") for cell in cells):
-        if preflight_disk.get("rest_capability") != "disabled":
-            problems.append("cells declare blocked but preflight.rest_capability != 'disabled'")
+    # Round-3 audit P1-1: bidirectional REST BLOCKED / rest_capability parity.
+    rest_cap = preflight.get("rest_capability")
+    rest_cells = [c for c in cells_raw if isinstance(c, dict)
+                  and c.get("cell_id") in CANONICAL_REST_CELL_IDS]
+    if rest_cap == "disabled":
+        for c in rest_cells:
+            if not c.get("blocked"):
+                problems.append(
+                    f"rest_capability=disabled but REST cell {c.get('cell_id')} is not BLOCKED",
+                )
+        # And zero matrix enqueues into those cells.
+        for c in rest_cells:
+            cid = c.get("cell_id")
+            enq_in_blocked = [
+                e for e in events
+                if e.event == "sender_enqueue" and e.cell_id == cid
+                and e.run_id == run_id_matrix
+            ]
+            if enq_in_blocked:
+                problems.append(
+                    f"rest_capability=disabled + BLOCKED cell {cid} has {len(enq_in_blocked)} enqueue(s) — expected zero",
+                )
+    elif rest_cap in ("enabled", "unknown"):
+        for c in rest_cells:
+            if c.get("blocked"):
+                problems.append(
+                    f"rest_capability={rest_cap} but REST cell {c.get('cell_id')} is BLOCKED",
+                )
 
-    # (i) device-manifest.json required keys.
-    for req in ("host_to_phone_skew_ms", "host_to_emulator_skew_ms", "phone_serial", "emulator_serial"):
-        if req not in manifest:
-            problems.append(f"device-manifest.json missing required key: {req}")
-    for k in ("host_to_phone_skew_ms", "host_to_emulator_skew_ms"):
-        v = manifest.get(k, 999_999)
-        try:
-            if abs(int(v)) > 30_000:
-                problems.append(f"|{k}| > 30 000: {v}")
-        except (TypeError, ValueError):
-            problems.append(f"{k} not an integer: {v!r}")
-
-    # (j) Every event's run_id must match matrix.run_id.
+    # Every event's run_id must match matrix.run_id (session/canary/state_cleared exempted).
     if run_id_matrix:
         for e in events:
-            if e.event in ("diagnostic_session_started", "diagnostic_canary", "diagnostic_state_cleared"):
-                continue  # these may fire before the run starts
+            if e.event in CROSS_RUN_TOLERATED_EVENTS:
+                continue
             if e.run_id is None:
                 problems.append(f"event {e.event} missing run_id")
             elif e.run_id != run_id_matrix and e.run_id != "-":
                 problems.append(f"event {e.event} has run_id={e.run_id} but matrix.run_id={run_id_matrix}")
 
-    # (k) Global correlation ID uniqueness inside the run
-    #     (each `sender_enqueue` must have a globally unique CID).
+    # Round-3 audit P0-1: every sender_enqueue must carry a non-empty
+    # correlation_id. A missing CID lets a cell's five envelopes join
+    # through a single delivery triplet via `cid=None`.
     enqueue_by_cid: dict[str, list[WssEvent]] = {}
     for e in events:
-        if e.event == "sender_enqueue" and e.correlation_id:
+        if e.event == "sender_enqueue":
+            if not e.correlation_id or e.correlation_id == "-":
+                problems.append(
+                    f"sender_enqueue missing correlation_id on {e.device} @ wall_utc_ms={e.wall_utc_ms} cell_id={e.cell_id}",
+                )
+                continue
             enqueue_by_cid.setdefault(e.correlation_id, []).append(e)
     for cid, evs in enqueue_by_cid.items():
         if len(evs) > 1:
             problems.append(f"correlation_id used multiple times: {cid} ({len(evs)} enqueues)")
 
-    # (l) Raw banned-token scan.
     for name in ("phone.logcat.wss_diag", "emulator.logcat.wss_diag"):
         p = os.path.join(out, name)
         if not os.path.exists(p):
@@ -427,15 +575,8 @@ def classify_envelope(
     host_now_ms: int,
     sender_wall_to_host_offset_ms: int,
 ) -> tuple[str, list[str]]:
-    """
-    §12 Round-2 audit P0-2: corr_events MUST already be scoped to
-    run_id + cell_id at the caller — cross-cell CID collisions are
-    caught by that filter. Role checks below are STRICT (no matrix-
-    role events count as recipient/sender signals).
-    """
     issues: list[str] = []
 
-    # (1) Enqueue itself must own run/cell/emitter.
     if envelope_enqueue.run_id != run_id:
         issues.append(f"enqueue run_id={envelope_enqueue.run_id} != {run_id}")
     if envelope_enqueue.cell_id != cell_id:
@@ -445,7 +586,6 @@ def classify_envelope(
     if envelope_enqueue.device != sender_device:
         issues.append(f"enqueue device={envelope_enqueue.device} != {sender_device}")
 
-    # (2) Sender events must all be on the sender device with matching run/cell/role.
     for e in corr_events:
         if e.event in SENDER_EVENTS:
             if e.role != "sender":
@@ -455,7 +595,6 @@ def classify_envelope(
             if e.emitter_id != sender_emitter:
                 issues.append(f"sender event {e.event} emitter mismatch: {e.emitter_id}")
 
-    # (3) Recipient events must be on recipient device WITH role=recipient.
     for e in corr_events:
         if e.event in RECIPIENT_EVENTS:
             if e.role != "recipient":
@@ -467,7 +606,6 @@ def classify_envelope(
             if e.run_id != run_id or e.cell_id != cell_id:
                 issues.append(f"recipient event {e.event} owner mismatch (run={e.run_id} cell={e.cell_id})")
 
-    # (4) Pin coverage on sender for this run+cell.
     (covered, why) = _per_sender_pin_coverage(
         cell_pin, run_id, cell_id, sender_device,
         envelope_enqueue.wall_utc_ms or 0, all_events,
@@ -475,38 +613,50 @@ def classify_envelope(
     if not covered:
         issues.append(f"pin coverage: {why}")
 
-    # (5) sender_transport_decision must exist, be direct, and match pin.
-    decision = next((e for e in corr_events if e.event == "sender_transport_decision"), None)
-    if decision is None:
+    # Round-3 audit P0-2: inspect ALL sender_transport_decision events,
+    # not next(...). A contradictory second decision is a violation.
+    decisions = [e for e in corr_events if e.event == "sender_transport_decision"]
+    if not decisions:
         issues.append("missing sender_transport_decision")
     else:
-        if decision.outer_transport != "direct":
-            issues.append(f"outer_transport observed != direct: {decision.outer_transport}")
-        if decision.inner_route != cell_pin:
-            issues.append(f"inner_route != cell pin: {decision.inner_route} vs {cell_pin}")
-        if decision.dispatched is False:
-            issues.append("sender_transport_decision dispatched=false (BLOCKED for this envelope)")
+        for d in decisions:
+            if d.outer_transport != "direct":
+                issues.append(f"transport decision outer_transport={d.outer_transport} != direct")
+            if d.inner_route != cell_pin:
+                issues.append(f"transport decision inner_route={d.inner_route} != cell pin {cell_pin}")
+            if d.dispatched is False:
+                issues.append("transport decision dispatched=false (envelope refused at outer arm)")
+        outer_values = {d.outer_transport for d in decisions}
+        if len(outer_values) > 1:
+            issues.append(f"contradictory sender_transport_decision outer_transport values: {sorted(str(x) for x in outer_values)}")
+        inner_values = {d.inner_route for d in decisions}
+        if len(inner_values) > 1:
+            issues.append(f"contradictory sender_transport_decision inner_route values: {sorted(str(x) for x in inner_values)}")
 
-    # (5b) §12 Round-2 audit P0-2: mandatory send-completion event
-    # matching the cell pin. Missing send-return proves the envelope
-    # never reached the network — outcome can NOT be Delivered once.
+    # Round-3 audit P0-2: inspect ALL route-return events. Opposite
+    # route forbidden; at least one successful matching return required.
+    wss_returns = [e for e in corr_events if e.event == "sender_wss_send_returned"]
+    rest_returns = [e for e in corr_events if e.event == "sender_rest_post_completed"]
     if cell_pin == "wss":
-        wss_return = next((e for e in corr_events if e.event == "sender_wss_send_returned"), None)
-        if wss_return is None:
-            issues.append("missing sender_wss_send_returned")
-        elif wss_return.inner_route != "wss":
-            issues.append(f"sender_wss_send_returned inner_route={wss_return.inner_route} != wss")
+        if rest_returns:
+            issues.append(f"WSS cell has {len(rest_returns)} REST completion event(s) — opposite route")
+        for w in wss_returns:
+            if w.inner_route not in (None, "wss"):
+                issues.append(f"sender_wss_send_returned inner_route={w.inner_route} != wss")
+        if not any(w.dispatched is True and (w.inner_route in (None, "wss")) for w in wss_returns):
+            issues.append("missing successful sender_wss_send_returned (dispatched=true, inner_route=wss)")
     elif cell_pin == "rest":
-        rest_return = next((e for e in corr_events if e.event == "sender_rest_post_completed"), None)
-        if rest_return is None:
-            issues.append("missing sender_rest_post_completed")
-        else:
-            if rest_return.inner_route != "rest":
-                issues.append(f"sender_rest_post_completed inner_route={rest_return.inner_route} != rest")
-            if rest_return.relay_acceptance not in ("accepted", "duplicate"):
-                issues.append(f"sender_rest_post_completed relay_acceptance={rest_return.relay_acceptance} not accepted/duplicate")
+        if wss_returns:
+            issues.append(f"REST cell has {len(wss_returns)} WSS return event(s) — opposite route")
+        for r in rest_returns:
+            if r.inner_route not in (None, "rest"):
+                issues.append(f"sender_rest_post_completed inner_route={r.inner_route} != rest")
+        if not any(
+            (r.inner_route in (None, "rest")) and r.relay_acceptance in ("accepted", "duplicate")
+            for r in rest_returns
+        ):
+            issues.append("missing successful sender_rest_post_completed (inner_route=rest, relay_acceptance ∈ accepted/duplicate)")
 
-    # (6) Delivery signals — STRICT filter (role=recipient AND matching device).
     deliver_fresh = [
         e for e in corr_events
         if e.event == "recipient_deliver_received"
@@ -538,14 +688,9 @@ def classify_envelope(
         missing.append("2nd recipient_deliver_received(fresh) — dedup violation")
 
     if issues:
-        # Contract violations always drop to Unresolved (never "Delivered once with warnings").
         return ("Unresolved", issues + missing)
 
     if missing:
-        # PENDING before 120 s host clock; Unresolved after. §12
-        # Round-2 audit P1: envelope_wall is on the SENDER device;
-        # convert to host time by adding the measured host-to-sender
-        # skew (host_ms - sender_device_ms at preflight time).
         enqueue_wall_device = envelope_enqueue.wall_utc_ms or 0
         enqueue_wall_host = enqueue_wall_device + sender_wall_to_host_offset_ms
         age_ms = host_now_ms - enqueue_wall_host
@@ -554,6 +699,55 @@ def classify_envelope(
         return ("Unresolved", missing + [f"age_ms={age_ms}"])
 
     return ("Delivered once", [])
+
+
+def _check_cell_dispatched_binding(
+    cr: CellReport, enqueues: list[WssEvent], cell_evts: list[WssEvent],
+    sender_device: str, sender_emitter: str,
+) -> None:
+    """Round-3 audit P0-1 (cell-level): exactly 5 diagnostic_send_dispatched
+    events on the sender device; each has a non-empty correlation_id
+    matching one enqueue's CID one-to-one; sequences are exactly
+    {1,2,3,4,5}. Populates cr.issues with problems — the caller sets
+    cr.outcome based on this being nonempty."""
+    dispatched = [e for e in cell_evts if e.event == "diagnostic_send_dispatched"]
+
+    for d in dispatched:
+        if d.device != sender_device:
+            cr.issues.append(f"diagnostic_send_dispatched on {d.device}, expected sender {sender_device}")
+        if d.emitter_id != sender_emitter:
+            cr.issues.append(f"diagnostic_send_dispatched emitter_id={d.emitter_id} != {sender_emitter}")
+        if not d.correlation_id or d.correlation_id == "-":
+            cr.issues.append(f"diagnostic_send_dispatched missing correlation_id (sequence={d.sequence})")
+
+    dispatch_cids = {e.correlation_id for e in dispatched
+                     if e.correlation_id and e.correlation_id != "-"}
+    enqueue_cids = {e.correlation_id for e in enqueues
+                    if e.correlation_id and e.correlation_id != "-"}
+    if dispatch_cids != enqueue_cids:
+        missing_here = enqueue_cids - dispatch_cids
+        extra_here = dispatch_cids - enqueue_cids
+        if missing_here:
+            cr.issues.append(
+                f"enqueue CIDs without matching diagnostic_send_dispatched: {sorted(list(missing_here))[:5]}",
+            )
+        if extra_here:
+            cr.issues.append(
+                f"diagnostic_send_dispatched CIDs without matching enqueue: {sorted(list(extra_here))[:5]}",
+            )
+
+    observed_sequences = sorted(
+        [e.sequence for e in dispatched if e.sequence is not None]
+    )
+    if set(observed_sequences) != EXPECTED_SEQUENCE_SET:
+        cr.issues.append(
+            f"diagnostic_send_dispatched sequence set {observed_sequences} != {sorted(EXPECTED_SEQUENCE_SET)}",
+        )
+
+    if len(dispatched) != EXPECTED_ENVELOPES_PER_CELL:
+        cr.issues.append(
+            f"diagnostic_send_dispatched count={len(dispatched)} != {EXPECTED_ENVELOPES_PER_CELL}",
+        )
 
 
 def _derive_host_now_ms(all_events: list[WssEvent], manifest: dict, override: Optional[int]) -> int:
@@ -569,40 +763,45 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
 
     matrix_path = os.path.join(out, "matrix.json")
     manifest_path = os.path.join(out, "device-manifest.json")
-    matrix: dict = {}
-    manifest: dict = {}
-    if os.path.exists(matrix_path):
-        with open(matrix_path, "r", encoding="utf-8") as f:
-            matrix = json.load(f)
-    if os.path.exists(manifest_path):
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+    preflight_path = os.path.join(out, "preflight.json")
 
-    integrity_issues = integrity_check_bundle(all_events, out, matrix, manifest)
-    # Fold parser errors into integrity issues.
+    matrix, matrix_err = _load_json(matrix_path, dict)
+    manifest, manifest_err = _load_json(manifest_path, dict)
+    preflight, preflight_err = _load_json(preflight_path, dict)
+    file_load_errors = [e for e in (matrix_err, manifest_err, preflight_err) if e]
+
+    assert isinstance(matrix, dict) and isinstance(manifest, dict) and isinstance(preflight, dict)
+
+    integrity_issues = integrity_check_bundle(
+        all_events, out, matrix, preflight, manifest, file_load_errors,
+    )
     integrity_issues += phone_parse_errors + emu_parse_errors
     integrity_ok = not integrity_issues
 
     run_id_matrix = matrix.get("run_id") or ""
 
-    # §12 Round-2 audit P1: per-device host-to-device skews.
-    # Prefer new manifest keys; fall back to zeros if a legacy
-    # manifest is used. These are the ONLY offsets the verifier
-    # uses to align device wall_utc_ms to host time.
-    host_to_phone_ms = manifest.get("host_to_phone_skew_ms", 0) or 0
-    host_to_emu_ms = manifest.get("host_to_emulator_skew_ms", 0) or 0
+    host_to_phone_ms = manifest.get("host_to_phone_skew_ms", 0)
+    host_to_emu_ms = manifest.get("host_to_emulator_skew_ms", 0)
+    if not isinstance(host_to_phone_ms, int) or isinstance(host_to_phone_ms, bool):
+        host_to_phone_ms = 0
+    if not isinstance(host_to_emu_ms, int) or isinstance(host_to_emu_ms, bool):
+        host_to_emu_ms = 0
 
-    # For per-envelope classification, restrict events to matching run_id.
-    # session_started/canary/state_cleared/checkpoint events keep whatever run_id was
-    # persisted at that moment; enqueue/decision/delivery events MUST match.
-    run_scoped_events = [e for e in all_events if e.run_id in (run_id_matrix, None, "-")]
+    run_scoped_events = [
+        e for e in all_events if e.run_id in (run_id_matrix, None, "-")
+    ]
 
     host_now_ms = _derive_host_now_ms(all_events, manifest, host_now_override_ms)
 
     cells_report: list[CellReport] = []
     aggregate_pending = False
     aggregate_red = False
-    for cell in matrix.get("cells", []):
+    cells_iter = matrix.get("cells", [])
+    if not isinstance(cells_iter, list):
+        cells_iter = []
+    for cell in cells_iter:
+        if not isinstance(cell, dict):
+            continue
         cr = CellReport(
             cell_id=cell.get("cell_id", "?"),
             pin=cell.get("pin", "?"),
@@ -635,8 +834,13 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
             cells_report.append(cr)
             continue
 
-        # Correlation IDs unique within cell (also enforced globally by integrity).
-        cids = [e.correlation_id for e in enqueues if e.correlation_id]
+        cids = [e.correlation_id for e in enqueues if e.correlation_id and e.correlation_id != "-"]
+        if len(cids) != EXPECTED_ENVELOPES_PER_CELL:
+            cr.issues.append(f"only {len(cids)} of {EXPECTED_ENVELOPES_PER_CELL} enqueues carry a correlation_id")
+            cr.outcome = "Unresolved"
+            aggregate_red = True
+            cells_report.append(cr)
+            continue
         if len(set(cids)) != len(cids):
             cr.issues.append("duplicate correlation_id within cell")
             cr.outcome = "Unresolved"
@@ -644,19 +848,20 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
             cells_report.append(cr)
             continue
 
-        # §12 Round-2 audit P1: pick the host-to-sender skew for
-        # this cell's sender device. envelope wall (device clock) +
-        # this skew = envelope wall in host time.
+        # Round-3 audit P0-1: 5 dispatched events matching the enqueues.
+        pre_dispatch_issues = list(cr.issues)
+        _check_cell_dispatched_binding(cr, enqueues, cell_evts, sender_device, sender_emitter)
+        if len(cr.issues) > len(pre_dispatch_issues):
+            cr.outcome = "Unresolved"
+            aggregate_red = True
+            cells_report.append(cr)
+            continue
+
         sender_offset_ms = host_to_phone_ms if sender_device == "phone" else host_to_emu_ms
 
         env_outcomes: list[str] = []
         for enq in enqueues:
             cid = enq.correlation_id
-            # §12 Round-2 audit P0-2: scope corr_events to
-            # run + cell in addition to correlation_id, so a
-            # cross-cell CID collision (or a stray recipient event
-            # wearing the same CID under a different cell) does not
-            # count.
             corr_evts = [
                 e for e in run_scoped_events
                 if e.correlation_id == cid
@@ -708,7 +913,7 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
 
 
 def render_markdown(rep: VerifyReport) -> str:
-    lines = ["# Direct WSS Yota-First — verification report v3"]
+    lines = ["# Direct WSS Yota-First — verification report v4"]
     lines.append("")
     lines.append(f"run_id: `{rep.run_id}`")
     lines.append("")

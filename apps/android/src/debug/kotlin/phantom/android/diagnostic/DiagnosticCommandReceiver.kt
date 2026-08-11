@@ -22,11 +22,15 @@ import phantom.android.PhantomApplication
  * `AndroidManifest.xml` overlay. Physically absent from the release
  * APK's merged manifest.
  *
- * §12 P1 caller-boundary fix: even though `exported="true"` is required
- * for `am broadcast -n` to work from an ADB shell, [onReceive] gates on
- * `Binder.getCallingUid() ∈ {SHELL_UID, ROOT_UID}`. A third-party app
- * that discovers the component name and fires an explicit broadcast is
- * silently rejected.
+ * §12 Round-1 audit P0-6 caller-boundary: even though `exported="true"`
+ * is required for `am broadcast -n` to work from an ADB shell,
+ * third-party apps are rejected at the AMS boundary via the debug
+ * manifest's `android:permission="android.permission.DUMP"`. Only
+ * callers holding DUMP (shell, root, and system dumps) reach
+ * [onReceive]. The earlier `Binder.getCallingUid()` gate is removed
+ * — it was unreliable inside `onReceive` because delivery is mediated
+ * by the framework and the reported UID can be system rather than the
+ * original sender.
  *
  * §12 P0-2 persistence fix: every `pin` and `set_emitter_id` write is
  * persisted to [DiagnosticTransportPinStore] AND to

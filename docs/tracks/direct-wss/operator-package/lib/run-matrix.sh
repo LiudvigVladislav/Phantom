@@ -4,25 +4,39 @@
 #
 # Direct WSS Yota-First diagnostic — 8 × 5 = 40 envelopes.
 #
-# §12 Round-1 audit P0-1 fixes:
-#   - use `now_ms` from portable.sh (BSD-date-safe)
-#   - poll CID via structured WSS_DIAG `diagnostic_send_dispatched`
-#     event (the send outcome moved from WSS_DIAG_CMD to WSS_DIAG
-#     via `event=diagnostic_send_dispatched correlation_id=... sequence=...`)
-#   - `count_matches` folds two-file grep -c into ONE integer
-#   - pin_active wait matches key/value regardless of field order
-#     and ABORTS the cell if both devices don't ack within timeout
+# §12 Round-3 audit P1-2 fixes:
+#   - refuse to run into an evidence directory that already has
+#     a matrix.json (no accidental cross-run contamination)
+#   - pin waits match pin + cell + run_id + expected emitter on the
+#     expected source log per device (per-device grep, not chained
+#     across both logs)
+#   - CID lookups read ONLY the sender's log and require run_id,
+#     cell_id, sequence, expected emitter, AND wall_utc_ms >=
+#     command_start_ms (captured just before the send subcommand fires)
+#   - the real helpers live in lib/run-matrix-helpers.sh so
+#     tests/test_shell.sh can drive them against synthetic logs
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=portable.sh
 source "$HERE/portable.sh"
+# shellcheck source=run-matrix-helpers.sh
+source "$HERE/run-matrix-helpers.sh"
 
 OUT="${1:?usage: run-matrix.sh <evidence-dir>}"
+
+# Round-3 P1-2: refuse a second run into the same evidence dir.
+if ! refuse_matrix_rerun "$OUT"; then
+  exit 2
+fi
+
 RUN_ID=$(cat "$OUT/run_id")
 
 phone=$(grep '^PHONE=' "$OUT/roles.env" | cut -d= -f2)
 emu=$(grep '^EMULATOR=' "$OUT/roles.env" | cut -d= -f2)
+
+phone_log="$OUT/phone.logcat.wss_diag"
+emu_log="$OUT/emulator.logcat.wss_diag"
 
 rest_capability=$(python3 -c "import json; print(json.load(open('$OUT/preflight.json')).get('rest_capability','unknown'))")
 
@@ -37,7 +51,6 @@ cells=(
   "rest|e2p|control|$emu|$phone"
 )
 
-# matrix.json — 8 cells, blocked flag for REST when capability disabled.
 {
   echo "{"
   echo "  \"run_id\": \"$RUN_ID\","
@@ -62,116 +75,116 @@ cells=(
   echo "}"
 } > "$OUT/matrix.json"
 
-wait_for_pin_active() {
-    # Waits for `diagnostic_pin_active pin=<pin>` on BOTH devices for
-    # (run,cell). Returns 0 on both observed within timeout, 1 else.
-    local pin="$1" cell_id="$2" timeout_s="${3:-30}"
-    local start; start=$(now_ms)
-    local deadline_ms=$(( start + timeout_s * 1000 ))
-    while : ; do
-        # Field-order-agnostic: two greps chained, both must hit.
-        local phone_hit; phone_hit=$(count_matches "diagnostic_pin_active" "$OUT/phone.logcat.wss_diag")
-        local phone_ok=0
-        if grep -h "event=diagnostic_pin_active" "$OUT/phone.logcat.wss_diag" 2>/dev/null | \
-            grep "pin=$pin" | grep -q "cell_id=$cell_id"; then phone_ok=1; fi
-        local emu_ok=0
-        if grep -h "event=diagnostic_pin_active" "$OUT/emulator.logcat.wss_diag" 2>/dev/null | \
-            grep "pin=$pin" | grep -q "cell_id=$cell_id"; then emu_ok=1; fi
-        if [ "$phone_ok" = "1" ] && [ "$emu_ok" = "1" ]; then return 0; fi
-        if [ "$(now_ms)" -ge "$deadline_ms" ]; then return 1; fi
-        sleep 2
-    done
-    # phone_hit unused but keeps the shellcheck happy about the earlier ref.
-    : "$phone_hit"
+# per-cell/per-device helper wrappers with a 30-s poll deadline.
+wait_pin_active_both() {
+  # Round-3 P1-2: check phone log with emitter=phone AND emulator log with
+  # emitter=emulator; both must match pin+cell+run_id.
+  local pin="$1" cell_id="$2" timeout_s="${3:-30}"
+  local start; start=$(now_ms)
+  local deadline_ms=$(( start + timeout_s * 1000 ))
+  while : ; do
+    if wait_for_pin_active_in_log "$pin" "$cell_id" "$RUN_ID" "phone" "$phone_log" \
+       && wait_for_pin_active_in_log "$pin" "$cell_id" "$RUN_ID" "emulator" "$emu_log"; then
+      return 0
+    fi
+    if [ "$(now_ms)" -ge "$deadline_ms" ]; then return 1; fi
+    sleep 2
+  done
+}
+
+wait_send_cid_from_sender() {
+  # Round-3 P1-2: reads ONLY the sender's log, requires run_id +
+  # cell_id + sequence + emitter + wall_utc_ms >= command_start_ms.
+  # Prints the correlation_id or empty (return 1) on timeout.
+  local cell_id="$1" sequence="$2" emitter="$3" sender_log="$4" command_start_ms="$5"
+  local start; start=$(now_ms)
+  local deadline_ms=$(( start + 15000 ))
+  while : ; do
+    local cid
+    cid=$(find_send_cid_in_log "$cell_id" "$sequence" "$RUN_ID" "$emitter" "$command_start_ms" "$sender_log" || true)
+    if [ -n "$cid" ]; then
+      printf '%s' "$cid"
+      return 0
+    fi
+    if [ "$(now_ms)" -ge "$deadline_ms" ]; then return 1; fi
+    sleep 1
+  done
 }
 
 poll_envelope() {
-    # Poll until 4 delivery signals for cid, OR 120s from enqueue_wall.
-    local cid="$1" enqueue_wall_ms="$2"
-    local deadline_ms=$(( enqueue_wall_ms + 120000 ))
-    while : ; do
-        local now; now=$(now_ms)
-        if [ "$now" -ge "$deadline_ms" ]; then return 0; fi
-        local logfiles=("$OUT/phone.logcat.wss_diag" "$OUT/emulator.logcat.wss_diag")
-        local fresh persist ack
-        fresh=$(count_matches "event=recipient_deliver_received.*correlation_id=$cid.*dedup_gate=fresh" "${logfiles[@]}")
-        persist=$(count_matches "event=recipient_message_persisted.*correlation_id=$cid" "${logfiles[@]}")
-        ack=$(count_matches "event=recipient_ack_deliver_sent.*correlation_id=$cid" "${logfiles[@]}")
-        if [ "$fresh" -ge 1 ] && [ "$persist" -ge 1 ] && [ "$ack" -ge 1 ]; then return 0; fi
-        sleep 3
-    done
-}
-
-wait_for_send_cid() {
-    # After a send subcommand fires, poll for the structured
-    # `diagnostic_send_dispatched cell_id=<cid> sequence=<seq>`
-    # event and print its correlation_id. §12 Round-2 audit P1:
-    # match on BOTH cell_id AND sequence — sequence alone repeats
-    # across cells and a rejected earlier envelope could otherwise
-    # give the runner a stale correlation_id from a previous cell.
-    local cell_id="$1" sequence="$2"
-    local start; start=$(now_ms)
-    local deadline_ms=$(( start + 15000 ))
-    while : ; do
-        local line; line=$(grep -h "event=diagnostic_send_dispatched" \
-            "$OUT/phone.logcat.wss_diag" "$OUT/emulator.logcat.wss_diag" 2>/dev/null \
-            | grep " cell_id=$cell_id " | grep " sequence=$sequence" | tail -1)
-        if [ -n "$line" ]; then
-            extract_field correlation_id "$line"
-            return 0
-        fi
-        if [ "$(now_ms)" -ge "$deadline_ms" ]; then return 1; fi
-        sleep 1
-    done
+  # Poll until 4 delivery signals for cid, OR 120s from enqueue_wall.
+  local cid="$1" enqueue_wall_ms="$2"
+  local deadline_ms=$(( enqueue_wall_ms + 120000 ))
+  while : ; do
+    local now; now=$(now_ms)
+    if [ "$now" -ge "$deadline_ms" ]; then return 0; fi
+    local fresh persist ack
+    fresh=$(count_matches "event=recipient_deliver_received.*correlation_id=$cid.*dedup_gate=fresh" "$phone_log" "$emu_log")
+    persist=$(count_matches "event=recipient_message_persisted.*correlation_id=$cid" "$phone_log" "$emu_log")
+    ack=$(count_matches "event=recipient_ack_deliver_sent.*correlation_id=$cid" "$phone_log" "$emu_log")
+    if [ "$fresh" -ge 1 ] && [ "$persist" -ge 1 ] && [ "$ack" -ge 1 ]; then return 0; fi
+    sleep 3
+  done
 }
 
 for row in "${cells[@]}"; do
-    IFS='|' read -r pin dir scenario sender recipient <<< "$row"
-    cell_id="${pin}.${dir}.${scenario}"
-    echo ""
-    echo "=== CELL $cell_id ==="
+  IFS='|' read -r pin dir scenario sender recipient <<< "$row"
+  cell_id="${pin}.${dir}.${scenario}"
+  echo ""
+  echo "=== CELL $cell_id ==="
 
-    if [ "$pin" = "rest" ] && [ "$rest_capability" = "disabled" ]; then
-        echo "SKIPPED (BLOCKED: rest_capability=disabled)"
-        continue
+  if [ "$pin" = "rest" ] && [ "$rest_capability" = "disabled" ]; then
+    echo "SKIPPED (BLOCKED: rest_capability=disabled)"
+    continue
+  fi
+
+  # emitter mapping — the SENDER for this cell's direction:
+  case "$dir" in
+    p2e) sender_emitter="phone"    ; sender_log="$phone_log" ;;
+    e2p) sender_emitter="emulator" ; sender_log="$emu_log" ;;
+    *)   sender_emitter="unknown"  ; sender_log="/dev/null" ;;
+  esac
+
+  # Write pin on BOTH devices; wait for diagnostic_pin_active on both.
+  "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin "$pin" --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null
+  "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin "$pin" --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null
+  if ! wait_pin_active_both "$pin" "$cell_id" 30; then
+    echo "cell $cell_id ABORTED: pin_active not observed on both devices within 30s (run_id + emitter matched)" >&2
+    continue
+  fi
+
+  case "$scenario" in
+    after-connect) : ;;
+    after-idle)    sleep 300 ;;
+    bg-fg)
+      adb -s "$sender" shell input keyevent KEYCODE_HOME
+      sleep 5
+      adb -s "$sender" shell monkey -p "${APP_ID:-phantom.android}" \
+          -c android.intent.category.LAUNCHER 1 >/dev/null
+      sleep 3
+      ;;
+    control) : ;;
+    *) : ;;
+  esac
+
+  for seq in 1 2 3 4 5; do
+    # Round-3 P1-2: capture command_start_ms BEFORE broadcasting the
+    # subcommand. Only diagnostic_send_dispatched events with
+    # wall_utc_ms >= command_start_ms may satisfy the CID lookup.
+    command_start_ms=$(now_ms)
+    enqueue_wall_ms=$command_start_ms
+    "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
+    cid=$(wait_send_cid_from_sender "$cell_id" "$seq" "$sender_emitter" "$sender_log" "$command_start_ms" || true)
+    if [ -n "$cid" ]; then
+      poll_envelope "$cid" "$enqueue_wall_ms"
+    else
+      echo "warn: could not read correlation_id for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter, not_before_ms=$command_start_ms)" >&2
+      sleep 5
     fi
+  done
 
-    # Write pin on BOTH devices; wait for diagnostic_pin_active on both.
-    "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin "$pin" --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null
-    "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin "$pin" --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null
-    if ! wait_for_pin_active "$pin" "$cell_id" 30; then
-        echo "cell $cell_id ABORTED: pin_active not observed on both devices within 30s" >&2
-        continue
-    fi
-
-    case "$scenario" in
-        after-connect) : ;;
-        after-idle)    sleep 300 ;;
-        bg-fg)
-            adb -s "$sender" shell input keyevent KEYCODE_HOME
-            sleep 5
-            adb -s "$sender" shell monkey -p "${APP_ID:-phantom.android}" \
-                -c android.intent.category.LAUNCHER 1 >/dev/null
-            sleep 3
-            ;;
-        control) : ;;
-        *) : ;;
-    esac
-
-    for seq in 1 2 3 4 5; do
-        enqueue_wall_ms=$(now_ms)
-        "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
-        cid=$(wait_for_send_cid "$cell_id" "$seq" || true)
-        if [ -n "$cid" ]; then
-            poll_envelope "$cid" "$enqueue_wall_ms"
-        else
-            echo "warn: could not read correlation_id for seq=$seq" >&2
-            sleep 5
-        fi
-    done
-
-    "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
-    "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
+  "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
+  "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
 done
 
 "$HERE/diag-cmd.sh" clear --serial "$phone" >/dev/null || true

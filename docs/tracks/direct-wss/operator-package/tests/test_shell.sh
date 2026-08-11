@@ -124,6 +124,87 @@ assert_eq "1" "$persist_count" "signal counting: persist across two files"
 assert_eq "1" "$ack_count" "signal counting: ack across two files"
 rm -f "$tmpa" "$tmpb"
 
+# ── Round-3 audit P1-2: runner helpers (real functions, not regex) ─
+
+# shellcheck source=../lib/run-matrix-helpers.sh
+source "$PKG/lib/run-matrix-helpers.sh"
+
+# Fixture: a phone log that carries a STALE prior-run pin_active line
+# AND the current run's pin_active line. Only the current one should
+# satisfy wait_for_pin_active_in_log("run-current").
+stale_log=$(mktemp)
+cat > "$stale_log" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_pin_active role=matrix emitter_id=phone run_id=run-old cell_id=wss.p2e.after-connect wall_utc_ms=100 monotonic_ms=1 pin=wss inner_route=wss
+08-11 I WSS_DIAG: event=diagnostic_pin_active role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=200 monotonic_ms=2 pin=wss inner_route=wss
+LOG
+
+if wait_for_pin_active_in_log "wss" "wss.p2e.after-connect" "run-current" "phone" "$stale_log"; then
+    echo "PASS: wait_for_pin_active_in_log matches current run"; pass=$((pass+1))
+else
+    echo "FAIL: wait_for_pin_active_in_log did NOT match current run"; fail=$((fail+1))
+fi
+
+# Stale run alone must NOT satisfy — remove current line, only prior.
+prior_only=$(mktemp)
+head -1 "$stale_log" > "$prior_only"
+if wait_for_pin_active_in_log "wss" "wss.p2e.after-connect" "run-current" "phone" "$prior_only"; then
+    echo "FAIL: wait_for_pin_active_in_log accepted stale prior-run line"; fail=$((fail+1))
+else
+    echo "PASS: wait_for_pin_active_in_log refuses stale prior-run"; pass=$((pass+1))
+fi
+
+# Wrong emitter must NOT satisfy (phone log carries emitter=emulator).
+wrong_emitter=$(mktemp)
+sed 's/emitter_id=phone/emitter_id=emulator/g' "$stale_log" > "$wrong_emitter"
+if wait_for_pin_active_in_log "wss" "wss.p2e.after-connect" "run-current" "phone" "$wrong_emitter"; then
+    echo "FAIL: wait_for_pin_active_in_log accepted wrong emitter"; fail=$((fail+1))
+else
+    echo "PASS: wait_for_pin_active_in_log refuses wrong emitter"; pass=$((pass+1))
+fi
+
+rm -f "$stale_log" "$prior_only" "$wrong_emitter"
+
+# find_send_cid_in_log — stale prior-run line must be rejected on
+# both run_id and wall_utc_ms. Only the current-run line dated
+# >= command_start_ms is accepted.
+sender_log=$(mktemp)
+cat > "$sender_log" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-old cell_id=wss.p2e.after-connect wall_utc_ms=100 monotonic_ms=1 correlation_id=STALE-CID sequence=1
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=1000 monotonic_ms=1 correlation_id=CURRENT-CID sequence=1
+LOG
+
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 500 "$sender_log" || true)
+assert_eq "CURRENT-CID" "$cid" "find_send_cid_in_log picks current-run line"
+
+# Same cell + sequence but run-old must give empty (wrong run_id).
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-old" "phone" 50 "$sender_log" || true)
+assert_eq "STALE-CID" "$cid" "find_send_cid_in_log picks run-old when asked (but not run-current)"
+
+# not_before_ms > all matching walls must give empty.
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 9999 "$sender_log" || true)
+assert_eq "" "$cid" "find_send_cid_in_log rejects line predating not_before_ms"
+
+# Wrong emitter must give empty.
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "emulator" 500 "$sender_log" || true)
+assert_eq "" "$cid" "find_send_cid_in_log rejects wrong emitter"
+
+rm -f "$sender_log"
+
+# refuse_matrix_rerun: empty dir OK; dir with matrix.json refuses.
+tmpdir=$(mktemp -d)
+if refuse_matrix_rerun "$tmpdir" >/dev/null 2>&1; then
+    echo "PASS: refuse_matrix_rerun allows empty directory"; pass=$((pass+1))
+else
+    echo "FAIL: refuse_matrix_rerun blocked empty directory"; fail=$((fail+1))
+fi
+echo "{}" > "$tmpdir/matrix.json"
+if refuse_matrix_rerun "$tmpdir" >/dev/null 2>&1; then
+    echo "FAIL: refuse_matrix_rerun ALLOWED a dir with existing matrix.json"; fail=$((fail+1))
+else
+    echo "PASS: refuse_matrix_rerun blocks dir with existing matrix.json"; pass=$((pass+1))
+fi
+rm -rf "$tmpdir"
+
 echo ""
 echo "shell tests: pass=$pass fail=$fail"
 if [ "$fail" -gt 0 ]; then exit 1; fi

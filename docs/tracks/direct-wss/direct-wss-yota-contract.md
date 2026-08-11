@@ -45,6 +45,112 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.3 — Round-3 audit repair (2026-08-12)
+
+Third architect audit closed. Scope was strictly limited to
+`verifier + runner + fixtures + documentation/packaging`. No Android
+runtime, transport, APK or ADB touched. Baseline `7f144793` accepted
+the Round-2 fixes but retained six adversarial false-GREEN paths;
+all six are now closed by verifier and runner behaviour changes plus
+new fixtures that fail without them.
+
+**P0-1 five unique CIDs and matching dispatched-event set.**
+Every non-blocked cell must now emit exactly five `sender_enqueue`
+events, each carrying a non-empty `correlation_id`; the five CIDs are
+unique per cell AND globally unique in the run; and the runner's
+`diagnostic_send_dispatched` events must land as an exact 1-to-1
+mapping to those enqueue CIDs, with sequences equal to `{1,2,3,4,5}`,
+on the sender device, with the sender's `emitter_id`. Absent-CID or
+shared-join collapse (five enqueues joining through `cid=None` to one
+recipient triplet) is now integrity RED. Wrong sequence set or
+missing dispatched events land the cell as `Unresolved`.
+
+**P0-2 event provenance and route conflict closure.**
+Every event must carry `emitter_id == source-file device label`; a
+phone-log entry with `emitter_id=emulator` is integrity RED. All
+`sender_transport_decision` events per envelope are inspected — the
+prior `next(...)` picked the first and ignored contradictions.
+Contradictory `outer_transport` or `inner_route` across duplicated
+decisions is an issue. All route-return events per envelope are
+inspected: for WSS cells, any REST completion is an opposite-route
+violation and at least one successful WSS return
+(`dispatched=true`, `inner_route=wss`) is required. Symmetrically for
+REST cells: any WSS return is a violation and at least one REST
+completion with `relay_acceptance ∈ {accepted, duplicate}` is
+required.
+
+**P0-3 cross-file run and gate consistency.**
+The verifier now enforces `matrix.run_id == preflight.run_id ==
+device-manifest.run_id`; `matrix.rest_capability ==
+preflight.rest_capability`; and skew values duplicated across
+`preflight.json` and `device-manifest.json` must match. All preflight
+gates are checked: `apk_variant=debug`; every required `env` tool
+(`adb`, `python3`, `bash`, `jq`) equal to `"ok"`; `canary=="ok"`;
+booleans `yota_confirmed`, `emitter_ids_set`, `radio_confirmed`,
+`paired_conversation_count_ok` all `True`; `rest_capability` in
+`{enabled, disabled, unknown}`. Manifest must carry a valid
+`dual_sim_report_operator_numeric` (5–6 digits) — malformed or
+missing is integrity RED.
+
+**P1-1 bidirectional REST BLOCKED parity.**
+`rest_capability=="disabled"` requires BOTH canonical REST cells
+(`rest.p2e.control`, `rest.e2p.control`) to be BLOCKED AND to carry
+zero matrix enqueues. `rest_capability ∈ {"enabled","unknown"}`
+requires those cells to NOT be BLOCKED. Any deviation is integrity
+RED.
+
+**P1-2 runner staleness closure.**
+Helpers `wait_for_pin_active_in_log`, `find_send_cid_in_log`, and
+`refuse_matrix_rerun` moved to `lib/run-matrix-helpers.sh` so they
+can be driven by `tests/test_shell.sh` against synthetic logs.
+`wait_for_pin_active` now matches `pin + cell_id + run_id + expected
+emitter` on the expected source file per device.
+`wait_for_send_cid` reads ONLY the current sender's log and requires
+`run_id + cell_id + sequence + expected emitter + wall_utc_ms >=
+command_start_ms` (captured just BEFORE the send subcommand fires).
+`refuse_matrix_rerun` blocks a rerun into an evidence directory that
+already contains `matrix.json`.
+
+**P1-3 corrupt JSON fail-closed.**
+Every JSON file load is wrapped in a Round-3 helper that returns
+`(value, error)` instead of raising. Malformed JSON, empty files,
+and wrong top-level types surface in `integrity_issues` — never as
+a Python exception.
+
+**P2 documentation cleanup.**
+Receiver KDoc updated to reflect the DUMP permission boundary (the
+removed `Binder.getCallingUid()` block was still described).
+`README-OPERATOR.md` no longer requires GNU `sha256sum` — the
+`portable.sh` `sha256_file` helper falls back to `shasum -a 256`
+which is stock on macOS. Tele2 follow-up section relabelled as
+DEFERRED: the current preflight hardcodes typed `YOTA`, so a Tele2
+pass would abort at the operator prompt. A later block will add
+operator parametrization.
+
+**P2 packaging hygiene.**
+No APK, `.DS_Store`, or `__pycache__` are shipped with the
+logical-review handoff. The pack is delivered as a `tar.gz` made
+from a clean Git worktree so POSIX modes (`100755` on all `.sh` /
+`.py`) survive extraction.
+
+**Fixtures (all GREEN in isolation, clean-clone rerun).**
+
+* Kotlin — 8 classes unchanged.
+* Python — 49 fixtures (24 new for Round-3): `cid=None` shared-join,
+  missing dispatched, wrong dispatched sequence set, contradictory
+  transport decision, opposite-route return, WSS return without
+  `dispatched=true`, cross-file `run_id` mismatch on both
+  preflight + manifest, `rest_capability` mismatch, skew mismatch,
+  missing `apk_variant` / env tool / canary / `paired_conversation_count_ok`,
+  missing/malformed operator numeric, `disabled`-with-unblocked,
+  `disabled` + BLOCKED-with-enqueues, `enabled`-with-BLOCKED,
+  corrupt matrix/preflight/manifest JSON, matrix wrong top-level
+  type, matrix.cells wrong type.
+* Shell — 21 fixtures (9 new for Round-3): runner helpers exercised
+  against synthetic logs with stale prior-run pin/CID lines, wrong
+  emitter, and predating wall_utc_ms; `refuse_matrix_rerun` block
+  vs allow.
+
 ### §12.2 — Round-2 audit repair (2026-08-12)
 
 Third Mac audit REDLINE closed. Compile + focused tests only.

@@ -5,7 +5,8 @@
 ## Prerequisites (Mac)
 
 - `adb` on PATH.
-- `python3` ≥ 3.9, `bash`, `jq`, `sha256sum` (comes with GNU coreutils; on macOS install via `brew install coreutils` → `gsha256sum`, symlink or alias to `sha256sum`).
+- `python3` ≥ 3.9, `bash`, `jq`.
+- SHA-256: `sha256sum` OR `shasum`. `lib/portable.sh` picks the available one (`shasum -a 256` is the default macOS binary; no `brew` install is required).
 - One physical Android phone with **Yota** as the default-data SIM.
 - One running Android Emulator (any recent API 33+).
 
@@ -93,13 +94,9 @@ Exit codes (`verify-evidence.py`):
 
 Per §12 P0-7 the first pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. Fallback breadcrumbs (`attempt`, `session_epoch`, watchdog requeue) are NOT emitted in WSS-1 — a later block can add them via a shared/core-transport bridge extension.
 
-## Tele2 follow-up
+## Tele2 follow-up — DEFERRED
 
-- Do NOT re-bootstrap.
-- Switch the phone default-data SIM to Tele2.
-- Repeat radio checklist (Wi-Fi OFF, etc.).
-- `preflight` (dual-SIM check now reads Tele2 numeric; TYPE `TELE2` at the prompt — reject `YOTA`).
-- `matrix`.
+Not runnable from this operator package. Preflight currently hard-codes the typed `YOTA` confirmation and rejects any other operator numeric — there is no `TELE2` branch or `--operator` parameter yet. A later block will add operator parametrization; until then, do not attempt a Tele2 pass from this package (it would abort at the Yota prompt).
 
 ## Hard rules
 
