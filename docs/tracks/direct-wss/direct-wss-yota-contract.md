@@ -495,7 +495,17 @@ handleDeliver
 
 ---
 
-## §2 — Delivery outcomes contract (REDLINE-1)
+## §2 — Delivery outcomes contract — SUPERSEDED
+
+**The three-state Recovered/Delivered-once/Unresolved model that used to live here is not the current outcome contract.** WSS-1 first-pass explicitly removed the `Recovered` classification (§12 P0-7: Round-1 audit — the fallback breadcrumbs it depended on, `attempt`, `session_epoch`, `sender_ack_watchdog_requeued`, are undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence). The verifier accepts only four outcomes:
+
+```
+Delivered once | Unresolved | PENDING | BLOCKED
+```
+
+Aggregate `product_outcome=GREEN` iff every non-blocked cell is `Delivered once` (and no cell is `Unresolved` or `PENDING`); `RED` if any cell is `Unresolved`; `PENDING` if any cell is still within its 120-s host-clock window. Source of truth is §12 (Round-1..5 amendments) + `verify-evidence.py`; a follow-up block may reintroduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension. The REDLINE-1 three-state draft below is retained for archaeology and MUST NOT be treated as the outcome contract.
+
+## §2 (archived) — Delivery outcomes contract (REDLINE-1 draft)
 
 **Terminology cleanup.** The current codebase reuses "Delivered" ambiguously:
 
@@ -855,7 +865,24 @@ The pre-Round-5 wording is available in git history; the operational contract is
 - Envelope IDs come from the app (`uuid4()` at `ChatScreen.kt:1074`) — the script does NOT generate correlation IDs.
 - Between cells the runner invokes `diag-cmd.sh pin <wss|rest>` and waits `>= 5 s` for a `diagnostic_pin_active` event with matching `pin` + `run_id` + `cell_id` on BOTH devices before firing the first envelope.
 
-### 9.4 Evidence verifier (`verify-evidence.py`) — dual output
+### 9.4 Evidence verifier (`verify-evidence.py`) — dual output — SUPERSEDED
+
+**The pre-Round-1 draft's outcome model (Recovered / Delivered once / Unresolved / BLOCKED with a Priority 1 → 2 → 3 fallthrough) is not what the verifier does today.** Source of truth is §12 (Round-1..5 amendments) + `verify-evidence.py`. Current behaviour:
+
+- **`evidence_integrity`** — bundle completeness, exactly as before: GREEN when every closed-schema invariant holds, RED on any violation. Details in §12 (Round-1..5) — canonical 8-cell matrix, strict role/emitter provenance, run-id/rest-capability/APK-sha cross-file consistency, strict boolean parsing, nested-type safety, etc.
+- **`product_outcome`** — per non-blocked matrix cell, exactly one of:
+
+  ```
+  Delivered once | Unresolved | PENDING | BLOCKED
+  ```
+
+  `Recovered` is REMOVED (§12 P0-7: the fallback breadcrumbs it required — `attempt`, `session_epoch`, `sender_ack_watchdog_requeued` — are undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence). `BLOCKED` is reserved for the two REST cells when `preflight.rest_capability=disabled`; nothing else is stamped `BLOCKED`. Aggregate: `GREEN` iff every non-blocked cell is `Delivered once`; `RED` if any cell is `Unresolved`; `PENDING` if any cell is still within its 120-s host-clock window and no cell is `Unresolved`.
+
+- Cross-device time comparison is via host↔device skew (`host_to_phone_skew_ms` + `host_to_emulator_skew_ms`) recorded in `device-manifest.json`, NOT phone↔emulator directly (§12.4 P1-3).
+
+The pre-Round-1 wording is retained below (archived) for archaeology and MUST NOT be treated as the operational contract.
+
+#### 9.4 (archived) — pre-Round-1 draft
 
 The verifier reports TWO INDEPENDENT results:
 
