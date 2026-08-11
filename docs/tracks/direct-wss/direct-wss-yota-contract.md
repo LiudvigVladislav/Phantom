@@ -32,7 +32,7 @@ Findings resolved:
 
 - **P0-2 (pin can disappear silently).** Debug-only `DiagnosticTransportPinStore` persists `pin + run_id + cell_id + emitter_id` via plain `SharedPreferences` (`diagnostic_transport_pin` file, `MODE_PRIVATE`, debug source set only). `DiagnosticBootInitProvider` restores the state before messaging init and emits `WSS_DIAG event=diagnostic_session_started restored=true|false pin=… …`. Every `send` subcommand validates that the caller's `cell_id` matches the persisted `cell_id` and fails-red otherwise. Matrix runner + verifier reject a session restart without a matching `diagnostic_session_started` covering the envelope's wall-clock window. `diag-cmd.sh clear` explicitly clears the persisted state at end-of-run.
 
-- **P0-3 (outer_transport asserted, not observed).** `DiagnosticTransportGuard.outerArmReader` is a nullable `() -> String` populated by debug boot init with a lambda reading `PhantomApplication.container.transportPreferences.privacyMode` and mapping `Standard → direct`, `Private → tor`, `Ghost → reality`. `HRT.send` calls the reader and emits the observed value on `sender_transport_decision`. Under `Pin.WSS` or `Pin.REST`, if the observed value is not `direct`, the send is refused: `dispatched=false`, `outcome_flag=send_error`. Production chain order in `TransportManager` is not modified.
+- **P0-3 (outer_transport asserted, not observed).** `DiagnosticTransportGuard.outerArmReader` is a nullable `() -> String` populated by debug boot init with a lambda reading `container.transportManager.state.value` and mapping the actually-selected `ManagerState.Connected(TransportKind)` to `direct` | `reality` | `tor` (never derived from any privacy-mode preference — that mapping was WRONG and is removed). `HRT.send` calls the reader and emits the observed value on `sender_transport_decision`. Under `Pin.WSS` or `Pin.REST`, if the observed value is not `direct`, the send is refused: `dispatched=false`, `outcome_flag=send_error`. Production chain order in `TransportManager` is not modified. See §12 (Round-1 audit P0-8 + Round-2..5 amendments) for the authoritative current story.
 
 - **P0-4 (bootstrap ordering impossible).** Split into three entry points that do not require each other's completion:
   1. `run-yota-wss-diagnostic.sh bootstrap --fresh` runs standalone — detects devices, creates a `bootstrap` scratch dir, uninstalls, SHA-256-verifies the APK, installs, sets `emitter_id` on each via `diag-cmd.sh set_emitter_id`, prints manual onboarding + QR-pairing instructions, exits.
@@ -44,6 +44,104 @@ Findings resolved:
 - **P0-6 (emitter + Yota not enforced).** Preflight (bootstrap phase) calls `diag-cmd.sh set_emitter_id --emitter-id phone` on the phone serial and `--emitter-id emulator` on the emulator serial, then verifies via `diag-cmd.sh health` that the values stick. Measurement preflight requires the operator to type the literal word `YOTA` at the dual-SIM confirmation prompt to proceed. The radio checklist (Wi-Fi OFF / VPN OFF / private DNS OFF / auto-switch OFF / other-SIM data OFF) is enumerated interactively; each item requires typed confirmation and lands in `preflight.json`. Verifier rejects any envelope whose `emitter_id` does not match the device role expected by the cell direction.
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
+
+### §12.5 — Round-5 audit repair (2026-08-12)
+
+Fifth architect audit closed. Scope strictly limited to
+`Python + shell + docs + packaging`. No Android runtime, transport,
+Kotlin/Gradle, APK, ADB or device work.
+
+Baseline `96db5b58` closed the Round-4 blocked/type/skew cases and
+the physical handoff's checksums / mode / executable-file LF were
+verified, but three false-GREEN / non-portable paths remained. All
+are now closed by verifier / packager / preflight changes plus new
+fixtures.
+
+**P0 strict diagnostic boolean parser.** `restored=garbage` and
+`dispatched=garbage` (and every other capitalisation or non-canonical
+string) landed silently as Python `False` in the earlier `fields[x]
+== "true"` idiom, letting a full 8-cell bundle certify as GREEN
+with a malformed `restored` field. The new `_strict_bool` helper
+accepts ONLY the literal strings `true` and `false`; any other
+present value returns `None` AND appends a `malformed ...
+(only 'true'/'false' allowed)` parse error to `parse_errors` which
+lands in `integrity_issues` (integrity RED). Applied to both
+`restored` and `dispatched`. Regression fixtures: a clean full 8-cell
+bundle mutated to `restored=garbage` on one session_started must be
+RED; a mutation to `dispatched=garbage` on one transport decision
+must be RED; a `restored=TRUE` must be RED.
+
+**P1 portable macOS packager.** `build-handoff-tar.sh` rewrote its
+tar invocations to POSIX/BSD-compatible flags only (`-c`, `-z`,
+`-f`, `-x`, `-t`). The prior GNU-only `--force-local` and
+`--show-transformed-names` are gone; the "force-local" need is
+solved by writing the tar at a colon-free `/tmp` path and then
+`mv`ing to the destination. The script has two modes:
+
+* `--review <out.tar.gz>` — ships operator scripts only (no APK).
+* `--final --apk <path> <out.tar.gz>` — ships operator scripts
+  PLUS exactly one debug APK at `<path>` and its `<path>.sha256`
+  sidecar; the pair is verified before staging; the extracted
+  archive is re-verified after sealing.
+
+Both modes still: junk-scan (rejects `.DS_Store`, `__pycache__`,
+`.pyc`; review mode additionally rejects `.apk`); CR-byte scan
+across every packaged `.sh`/`.py`; dry-extract the produced tar
+and re-run shell + python fixtures from the extracted copy. The
+final mode additionally re-verifies the extracted APK sha matches
+its sidecar.
+
+**P1 preflight APK checksum binding on BOTH devices.** `preflight.sh`
+now pulls `base.apk` from BOTH the phone AND the emulator via
+`adb pull`, SHA-256s each locally, and compares to the bundled
+`android-debug-diagnostic.apk.sha256` sidecar; any mismatch fails
+closed with a clear "stale diagnostic APK on device" message. The
+verified SHA is written to `preflight.json.diagnostic_apk_sha256`
+AND `device-manifest.json.diagnostic_apk_sha256`, and
+`verify-evidence.py` enforces:
+
+* both files carry the field;
+* each is a 64-char lowercase hex string;
+* the two match.
+
+**P1 Python 3.9 gate.** Preflight now enforces
+`python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'`
+(the verifier uses 3.9-only PEP 585 generic syntax). A stock macOS
+Python 3.8 no longer passes the environment check.
+
+**P2 contract cleanup.** The pre-Round-1 P0-3 paragraph that
+described `outerArmReader` reading `transportPreferences.privacyMode`
+was factually wrong and contradicted the §12 body; it is rewritten
+to point at the actually-observed `container.transportManager.state.value`
+mapping. §9.5 and §9.6 REDLINE-2 drafts were also stale (talked
+about typing the run ID, a two-device `--verify`, Method A REST
+capability, and a phone↔emulator skew algorithm the scripts do
+not implement); both are collapsed to a SUPERSEDED marker pointing
+at §12 (Round-1..5) and the code as the source of truth. The pre-
+Round-5 wording is available in git history.
+
+**P2 LF-scope narrowing.** The LF guarantee is explicitly narrowed
+to EXECUTABLES under `operator-package/` — `*.sh` and `*.py`. Text
+files that are not run directly (`README-OPERATOR.md`,
+`.gitattributes`, `.gitignore`) may carry CRLF on a Windows clone
+without breaking macOS use. The build-time CR-byte scan and the
+in-repo `tests/test_shell.sh` CR-byte scan both scope to the
+executable set. The `.gitattributes` file remains scoped to
+`*.sh eol=lf` + `*.py eol=lf` under `operator-package/`.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes unchanged.
+* Python — 78 fixtures (6 new for Round-5): `restored=garbage`
+  full-bundle regression, `dispatched=garbage` regression,
+  `restored=TRUE` non-canonical capitalisation regression,
+  `diagnostic_apk_sha256` missing from manifest, `diagnostic_apk_sha256`
+  mismatch between preflight and manifest, `diagnostic_apk_sha256`
+  malformed hex.
+* Shell — 30 fixtures (3 new for Round-5): shell-side detection
+  of non-canonical `restored` values, Python 3.9 gate positive
+  control, Python gate synthetic 3.4 negative control.
+* `bash -n` + `py_compile` clean.
 
 ### §12.4 — Round-4 audit repair (2026-08-12)
 
@@ -779,32 +877,26 @@ Verifier behaviour:
 - Rejects any log line where `event=unresolved_120s_marker` OR `outcome_flag=unresolved_120s_marker` appears (client-side emit of the verifier-only classification = schema violation, fails `evidence_integrity`).
 - Report `verification-report.md` is a table: `cell_id`, `direction`, `pin`, expected outcome, observed `product_outcome`, `evidence_integrity` per cell, `outer_transport` actually selected per cell (proves the §6 pin held), and — for RED cells — the exact missing events with their `correlation_id`.
 
-### 9.5 Identity bootstrap (`lib/bootstrap.sh`) — uninstall protocol, no `pm clear`
+### 9.5 Identity bootstrap (`lib/bootstrap.sh`) — SUPERSEDED
 
-**REDLINE-2 clarification.** `pm clear` leaves package metadata and doesn't guarantee a clean state. Replace with a strict uninstall protocol:
+**The REDLINE-2 draft that used to live here is not the current protocol.**
+Source of truth for identity bootstrap is now §12 (Round-1 audit repair block P0-4 + Round-2..5 amendments) plus the code in `lib/bootstrap.sh` itself. In particular, the confirmation token the operator types is `BOOTSTRAP-CONFIRM` (not the run ID); `bootstrap.sh --verify` does a phone-side spot-check only (the exhaustive both-device APK-SHA binding lives in `preflight.sh`, see §9.6 below); and there is no `pm clear` step anywhere. The pre-Round-5 wording is available in git history; the operational contract is §12 + `lib/bootstrap.sh`.
 
-- `bootstrap.sh --fresh` prints an explicit warning listing what will happen on BOTH devices (package uninstall — no `-k`, no data retention) and requires the operator to type the run ID as confirmation before proceeding.
-- Sequence per device:
-  1. `adb shell pm uninstall $APP_ID` — NOT `pm uninstall -k` (that would keep data). If package isn't installed, this returns cleanly.
-  2. Verify absence: `adb shell pm list packages | grep -q $APP_ID` must NOT match. Preflight aborts if it does.
-  3. `install-apk.sh` verifies the SHA-256 of `android-debug-diagnostic.apk` against `android-debug-diagnostic.apk.sha256` (both bundled) BEFORE installing; then `adb install -r $APK`. On checksum mismatch or install failure, bootstrap aborts.
-  4. Operator runs the production onboarding flow on BOTH devices manually (through the real UI), creating two real Phantom identities.
-  5. Operator uses the production QR-pairing flow (Profile → My Phantom QR → Share my Phantom contact) to pair the two devices — scan one QR from the other via a screen photo. Same code path a real user follows.
-- `bootstrap.sh --verify` (no uninstall, no install) checks: both devices have the same APK sha256 installed, both have a Phantom identity, both share at least one paired conversation. Does not modify anything.
-- No test-only identity injection, no shortcut, no pre-generated key material shipped with the operator package.
+### 9.6 Preflight (`preflight.sh`) — SUPERSEDED
 
-### 9.6 Preflight (`preflight.sh`) — mandatory
+**The rest of this section describes the REDLINE-2 draft. It is not the current preflight.**
+Source of truth for preflight is now §12 (Round-1 audit repair block P0-1 + Round-2..5 amendments) plus the code in `preflight.sh` itself. In particular:
 
-Runs before the matrix. Failing preflight aborts the run with `evidence_integrity=RED` and a clear message.
+- The Python-version gate really is `>= 3.9`, enforced with `python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'`.
+- APK verification pulls `base.apk` from BOTH the phone AND the emulator, SHA-256s each locally, and compares to the bundled `android-debug-diagnostic.apk.sha256` sidecar; any mismatch fails-red. The verified SHA is written to `preflight.json.diagnostic_apk_sha256` AND `device-manifest.json.diagnostic_apk_sha256`, and `verify-evidence.py` cross-checks that the two match.
+- The REST capability probe is Method (b) fail-closed only. There is no `rest_capability_probe` subcommand and no Method (a) path in this operator package. Preflight pins REST, fires one envelope on a synthetic `preflight.rest_capability` cell, and stamps `rest_capability = enabled|disabled|unknown` based on `sender_rest_post_completed.relay_acceptance`.
+- Clock skew is measured host↔device (both `host_to_phone_skew_ms` and `host_to_emulator_skew_ms`, not phone↔emulator directly). The runner subtracts the per-device skew from `command_start_ms` before comparing against device-clock event walls (§12.4 P1-3).
+- Session-startedness proof uses `diag-cmd.sh checkpoint` after `capture-logs.sh` starts streaming, not a `pin none` readback.
+- Every `diagnostic_pin_active` / `diagnostic_send_dispatched` binding is verified in the verifier, not by re-reading `health`.
 
-- **Environment**: `adb --version`, `python3 --version >= 3.9`, `bash`, `jq --version`.
-- **Devices**: exactly one emulator + one physical device online per §9.1; APK sha256 matches `android-debug-diagnostic.apk.sha256` on both.
-- **APK variant**: `pm dump $APP_ID | grep 'versionName\|versionCode'` matches expected; `pm dump` proves the installed variant is debug (release APK does NOT declare the debug command component in its merged manifest — presence of the receiver/activity is the proof).
-- **Debug-only runtime pin store**: `diag-cmd.sh pin none` → observe `diagnostic_pin_active pin=none` on both logcats within 5 s; then read back the store via `diag-cmd.sh health` and assert it reports `pin=none`. Failure here → `evidence_integrity=RED`.
-- **Canary**: `diag-cmd.sh canary` → observe `diagnostic_canary` on both logcats. Confirms `WSS_DIAG` tag emits on the device WITHOUT enqueueing an envelope (the canary explicitly skips `sendMessage` and chat-store insert).
-- **Dual-SIM default-data-operator check** (REDLINE-2 Q9): `diag-cmd.sh dual_sim_report` returns the operator numeric of the DEFAULT DATA subscription (via `SubscriptionManager.getActiveDataSubscriptionId()` + per-subscription `TelephonyManager.getSimOperator()`). Preflight requires the operator to confirm this value matches Yota MCC/MNC. `getprop gsm.operator.numeric` is retained as an informational field only.
-- **REST capability check** (REDLINE-2 Q6): `diag-cmd.sh rest_capability_probe` first attempts Method A (production capability contract, if the endpoint exists). If Method A returns a definitive answer, preflight records it. Otherwise the diagnostic APK runs a **controlled fail-closed REST cell** as the FIRST matrix cell: one envelope pinned `Pin.REST` — if the response is `sender_rest_post_completed relay_acceptance=disabled_by_capability`, `preflight.json` stamps `rest_capability=disabled` and cells #7 + #8 are pre-marked `BLOCKED` in `matrix.json`. **A generic `HTTP GET /rest/send` is NOT accepted as a capability probe.**
-- **Clock skew** (REDLINE-2 Q10): `preflight.sh` records `wall_utc_ms` from both devices via ADB shell `date +%s%3N` at N=5 samples, computes the median skew (phone_wall − emulator_wall), writes to `device-manifest.json`. WARN at `|skew| > 2 000 ms`; FAIL only at `|skew| > 30 000 ms`. Between warn and fail, `evidence_integrity=GREEN` is unaffected.
+The REDLINE-2 draft below is retained for archaeology and MUST NOT be treated as an operational spec.
+
+**REDLINE-2 draft (archaeology, do not follow):** _the archived text has been deleted from this section — see the git history for the pre-Round-5 wording; the operational contract for preflight is §12 + `preflight.sh`._
 
 ### 9.7 `README-OPERATOR.md` (planned outline)
 

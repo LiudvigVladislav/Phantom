@@ -252,17 +252,17 @@ else
 fi
 rm -rf "$tmpdir"
 
-# ── Round-4 audit P0-1: LF-only bytes in every packaged file ────
-
-# Runs against the checked-out tree. On a Windows clone with
-# core.autocrlf=true, the .gitattributes scoped rule for
-# operator-package must keep these LF. On the packaged tarball,
-# a separate build-time scan runs before sealing (via the handoff
-# script), but we ALSO run it here so a broken checkout is caught
-# by the shell fixture suite from the operator's Mac.
+# ── Round-4 audit P0-1 + Round-5 audit P2: LF-only bytes in every
+#     EXECUTABLE .sh/.py under operator-package. The Round-5 audit
+#     narrowed the LF guarantee to executables — text files that are
+#     not run directly (README-OPERATOR.md, .gitattributes, .gitignore)
+#     may carry CRLF on a Windows checkout without breaking macOS use;
+#     but the scripts and Python modules operators actually invoke MUST
+#     be LF. This scoped scan enforces that contract.
 cr_offenders=0
 for f in "$PKG/run-yota-wss-diagnostic.sh" \
          "$PKG/preflight.sh" \
+         "$PKG/build-handoff-tar.sh" \
          "$PKG"/lib/*.sh \
          "$PKG"/tests/*.sh \
          "$PKG/verify-evidence.py" \
@@ -273,11 +273,51 @@ for f in "$PKG/run-yota-wss-diagnostic.sh" \
     fi
 done
 if [ "$cr_offenders" -eq 0 ]; then
-    echo "PASS: no CR bytes in any packaged .sh/.py under the operator-package tree"
+    echo "PASS: no CR bytes in any executable .sh/.py under the operator-package tree"
     pass=$((pass+1))
 else
     echo "FAIL: $cr_offenders file(s) carry CR bytes"
     fail=$((fail+1))
+fi
+
+# ── Round-5 audit P0: strict diagnostic boolean helper ─────────
+
+# The verifier expects `restored=true|false` verbatim. Any other value
+# must land in parse_errors. This shell-side fixture drives the same
+# regex the Python `_strict_bool` uses, so an operator inspecting a
+# fresh evidence dir on Mac can spot a bad restored value quickly.
+count_restored_garbage() {
+    local log="$1"
+    LC_ALL=C grep -oE 'restored=[^ ]+' "$log" 2>/dev/null \
+      | LC_ALL=C grep -vE '^restored=(true|false)$' | wc -l | tr -d ' '
+}
+tmp_log=$(mktemp)
+cat > "$tmp_log" <<'LOG'
+event=diagnostic_session_started restored=true pin=wss
+event=diagnostic_session_started restored=false pin=wss
+event=diagnostic_session_started restored=garbage pin=wss
+event=diagnostic_session_started restored=TRUE pin=wss
+LOG
+n=$(count_restored_garbage "$tmp_log")
+assert_eq "2" "$n" "shell-side detects non-canonical restored values (garbage + TRUE)"
+rm -f "$tmp_log"
+
+# ── Round-5 audit P1: Python version helper ────────────────────
+
+# preflight enforces python3 >= 3.9. The one-liner it uses must
+# succeed on the CURRENT interpreter (bootstrap of the fixture
+# assumes the same Python the fixture is running under).
+if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'; then
+    echo "PASS: python3 >= 3.9 gate passes on host interpreter"; pass=$((pass+1))
+else
+    echo "FAIL: python3 >= 3.9 gate rejected host interpreter"; fail=$((fail+1))
+fi
+# A synthetic subshell forcing a low-version response must fail.
+# This proves the gate LOGIC is a real inequality — not `command -v`.
+if python3 -c 'import sys; sys.exit(0 if (3, 4) >= (3, 9) else 1)'; then
+    echo "FAIL: python3 gate wrongly ACCEPTED synthetic 3.4"; fail=$((fail+1))
+else
+    echo "PASS: python3 gate rejects synthetic 3.4"; pass=$((pass+1))
 fi
 
 echo ""

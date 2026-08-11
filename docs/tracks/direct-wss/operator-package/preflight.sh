@@ -33,6 +33,8 @@ mkdir -p "$OUT"
 RUN_ID="run-yota-$STAMP"
 echo "$RUN_ID" > "$OUT/run_id"
 APP_ID="${APP_ID:-phantom.android}"
+APK="$HERE/android-debug-diagnostic.apk"
+APK_SHA_SIDECAR="${APK}.sha256"
 
 echo "=== measurement preflight $STAMP ==="
 
@@ -42,6 +44,13 @@ for tool in adb python3 bash jq; do
         echo "preflight FAILED: missing $tool" >&2; exit 1
     fi
 done
+# §12 Round-5 audit P1: verifier uses 3.9-only syntax (dict[..], list[..]
+# in dataclass annotations) — enforce the version gate here so a stock
+# macOS python 3.8 doesn't die in unittest with a SyntaxError.
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'; then
+    py_ver=$(python3 -c 'import sys; print(".".join(str(x) for x in sys.version_info[:3]))')
+    echo "preflight FAILED: python3 >= 3.9 required (found $py_ver)" >&2; exit 1
+fi
 # sha256_file abstracts sha256sum vs shasum — no direct requirement here.
 
 # 2. Device detection.
@@ -49,7 +58,24 @@ done
 phone=$(grep '^PHONE=' "$OUT/roles.env" | cut -d= -f2)
 emu=$(grep '^EMULATOR=' "$OUT/roles.env" | cut -d= -f2)
 
-# 3. APK variant + debug receiver presence.
+# 3. APK variant + debug receiver presence + exact SHA-256 binding.
+#    §12 Round-5 audit P1: presence + receiver-name check alone
+#    could not prove that the installed APK is the SAME diagnostic
+#    build that ships in the operator package. A stale prior build
+#    or a differently-signed diagnostic APK would silently pass. Now
+#    we pull `base.apk` from each device and sha it locally, and
+#    fail closed on any mismatch with the bundled sidecar.
+if [ ! -f "$APK" ]; then
+    echo "preflight FAILED: bundled APK not found at $APK — final operator package must ship the APK" >&2; exit 1
+fi
+if [ ! -f "$APK_SHA_SIDECAR" ]; then
+    echo "preflight FAILED: bundled APK .sha256 sidecar not found at $APK_SHA_SIDECAR" >&2; exit 1
+fi
+bundled_apk_sha=$(sha256_file "$APK")
+sidecar_sha=$(awk '{print $1}' "$APK_SHA_SIDECAR")
+if [ -z "$sidecar_sha" ] || [ "$bundled_apk_sha" != "$sidecar_sha" ]; then
+    echo "preflight FAILED: bundled APK sha $bundled_apk_sha != sidecar $sidecar_sha" >&2; exit 1
+fi
 for serial in "$phone" "$emu"; do
     if ! adb -s "$serial" shell pm list packages | tr -d '\r' | grep -q "package:$APP_ID"; then
         echo "preflight FAILED: $APP_ID not installed on $serial — run bootstrap.sh --fresh first" >&2; exit 1
@@ -57,7 +83,28 @@ for serial in "$phone" "$emu"; do
     if ! adb -s "$serial" shell dumpsys package "$APP_ID" | tr -d '\r' | grep -q "DiagnosticCommandReceiver"; then
         echo "preflight FAILED: DiagnosticCommandReceiver missing on $serial — installed variant is not debug" >&2; exit 1
     fi
+    # Pull base.apk (there may be multiple split APKs; the base one is
+    # the one containing the receiver — pick the first `base.apk`).
+    device_base=$(adb -s "$serial" shell pm path "$APP_ID" | tr -d '\r' \
+                   | sed 's|package:||' | grep -E '/base\.apk$' | head -1)
+    if [ -z "$device_base" ]; then
+        # fall back to first path if no split scheme
+        device_base=$(adb -s "$serial" shell pm path "$APP_ID" | tr -d '\r' \
+                       | sed 's|package:||' | head -1)
+    fi
+    pulled="$OUT/base-$serial.apk"
+    adb -s "$serial" pull "$device_base" "$pulled" >/dev/null 2>&1 || {
+        echo "preflight FAILED: could not pull $device_base from $serial" >&2; exit 1
+    }
+    installed_sha=$(sha256_file "$pulled")
+    if [ "$installed_sha" != "$bundled_apk_sha" ]; then
+        echo "preflight FAILED: installed APK on $serial sha $installed_sha != bundled $bundled_apk_sha" >&2
+        echo "  (stale diagnostic APK on device — re-run bootstrap.sh --fresh)" >&2
+        exit 1
+    fi
+    rm -f "$pulled"
 done
+echo "APK sha256 binding OK on both devices (sha256=$bundled_apk_sha)"
 
 # 4. Emitter role sticks on both devices via health readback.
 for want in "$phone|phone" "$emu|emulator"; do
@@ -184,13 +231,16 @@ cat > "$OUT/device-manifest.json" <<EOF
   "emulator_serial": "$emu",
   "host_to_phone_skew_ms": $host_to_phone_ms,
   "host_to_emulator_skew_ms": $host_to_emu_ms,
-  "dual_sim_report_operator_numeric": "$op_numeric"
+  "dual_sim_report_operator_numeric": "$op_numeric",
+  "diagnostic_apk_sha256": "$bundled_apk_sha"
 }
 EOF
 
 # §12 Round-3 audit P0-3: verifier cross-checks matrix.run_id ==
 # preflight.run_id == device-manifest.run_id, matrix.rest_capability ==
 # preflight.rest_capability, and skews between the two files.
+# §12 Round-5 audit P1: verifier also cross-checks
+# preflight.diagnostic_apk_sha256 == device-manifest.diagnostic_apk_sha256.
 
 cat > "$OUT/preflight.json" <<EOF
 {
@@ -204,7 +254,8 @@ cat > "$OUT/preflight.json" <<EOF
   "canary": "ok",
   "rest_capability": "$rest_cap",
   "host_to_phone_skew_ms": $host_to_phone_ms,
-  "host_to_emulator_skew_ms": $host_to_emu_ms
+  "host_to_emulator_skew_ms": $host_to_emu_ms,
+  "diagnostic_apk_sha256": "$bundled_apk_sha"
 }
 EOF
 

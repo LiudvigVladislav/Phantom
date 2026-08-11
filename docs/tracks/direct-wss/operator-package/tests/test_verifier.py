@@ -57,6 +57,9 @@ _spec.loader.exec_module(ve)
 RUN_ID = "run-test"
 
 
+FAKE_APK_SHA256 = "e" * 64
+
+
 def default_preflight() -> dict:
     return {
         "run_id": RUN_ID,
@@ -70,6 +73,7 @@ def default_preflight() -> dict:
         "paired_conversation_count_ok": True,
         "host_to_phone_skew_ms": 100,
         "host_to_emulator_skew_ms": 100,
+        "diagnostic_apk_sha256": FAKE_APK_SHA256,
     }
 
 
@@ -81,6 +85,7 @@ def default_manifest() -> dict:
         "phone_serial": "P",
         "emulator_serial": "E",
         "dual_sim_report_operator_numeric": "25011",
+        "diagnostic_apk_sha256": FAKE_APK_SHA256,
     }
 
 
@@ -1243,6 +1248,126 @@ class VerifierTests(unittest.TestCase):
                            emulator_lines=[_min_boot("emulator")])
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
+
+    # ── Round-5 audit repro cases ────────────────────────────
+
+    # P0 — strict diagnostic boolean parser. Present-but-malformed
+    # values must be integrity RED, not silently coerced to False.
+    def test_R5_P0_restored_garbage_makes_full_bundle_RED(self):
+        # Full-delivery baseline is GREEN…
+        out, base = build_full_matrix_bundle(self.tmp)
+        rep_baseline = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep_baseline.integrity_ok, msg=f"baseline issues: {rep_baseline.integrity_issues}")
+        self.assertEqual(rep_baseline.product_outcome, "GREEN")
+
+        # …but a single `restored=garbage` on the phone's pre-run
+        # session_started must trip integrity RED even though the
+        # rest of the bundle is untouched.
+        p_path = os.path.join(out, "phone.logcat.wss_diag")
+        with open(p_path, "r") as f:
+            data = f.read()
+        mutated = data.replace(
+            "event=diagnostic_session_started role=matrix emitter_id=phone",
+            "event=diagnostic_session_started role=matrix emitter_id=phone",
+            1,
+        )
+        # Locate first session_started line on phone and swap the
+        # `restored=false` for `restored=garbage`.
+        lines = mutated.splitlines()
+        for idx, ln in enumerate(lines):
+            if "event=diagnostic_session_started" in ln and " restored=false" in ln:
+                lines[idx] = ln.replace(" restored=false", " restored=garbage")
+                break
+        else:
+            self.fail("could not find a restored=false line to mutate")
+        with open(p_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("malformed restored" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R5_P0_dispatched_garbage_makes_bundle_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        p_path = os.path.join(out, "phone.logcat.wss_diag")
+        with open(p_path, "r") as f:
+            data = f.read()
+        # Corrupt the first `dispatched=true` on the phone side.
+        lines = data.splitlines()
+        for idx, ln in enumerate(lines):
+            if "sender_transport_decision" in ln and " dispatched=true" in ln:
+                lines[idx] = ln.replace(" dispatched=true", " dispatched=garbage")
+                break
+        else:
+            self.fail("could not find a dispatched=true line to mutate")
+        with open(p_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("malformed dispatched" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R5_P0_restored_uppercase_TRUE_is_integrity_RED(self):
+        # Non-canonical capitalisation must NOT be accepted — the
+        # Kotlin emitter always writes lowercase.
+        cell_id = "wss.p2e.after-connect"
+        bad = "08-11 I WSS_DIAG: event=diagnostic_session_started role=matrix emitter_id=phone run_id=run-test cell_id=- wall_utc_ms=100 monotonic_ms=1 pin=wss inner_route=wss restored=TRUE"
+        phone = [bad]
+        emu = [_min_boot("emulator")]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("malformed restored" in p and "TRUE" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    # P1 — verifier cross-checks the diagnostic APK SHA-256 that
+    # preflight records into preflight.json + device-manifest.json.
+    def test_R5_P1_diagnostic_apk_sha256_missing_from_manifest_is_RED(self):
+        mf = default_manifest()
+        mf.pop("diagnostic_apk_sha256", None)
+        pf = default_preflight()
+        pf["diagnostic_apk_sha256"] = "abc123"
+        out = make_bundle(self.tmp, manifest=mf, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("diagnostic_apk_sha256" in p for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
+
+    def test_R5_P1_diagnostic_apk_sha256_mismatch_between_preflight_and_manifest_is_RED(self):
+        mf = default_manifest()
+        mf["diagnostic_apk_sha256"] = "a" * 64
+        pf = default_preflight()
+        pf["diagnostic_apk_sha256"] = "b" * 64
+        out = make_bundle(self.tmp, manifest=mf, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("diagnostic_apk_sha256" in p and "!=" in p
+                             for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
+
+    def test_R5_P1_diagnostic_apk_sha256_malformed_is_RED(self):
+        mf = default_manifest(); mf["diagnostic_apk_sha256"] = "not-hex"
+        pf = default_preflight(); pf["diagnostic_apk_sha256"] = "not-hex"
+        out = make_bundle(self.tmp, manifest=mf, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("diagnostic_apk_sha256" in p and "not a 64-char lowercase hex" in p
+                             for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
 
 
 if __name__ == "__main__":

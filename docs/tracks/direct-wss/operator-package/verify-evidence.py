@@ -84,6 +84,7 @@ ALLOWED_SCENARIOS = {"after-connect", "after-idle", "bg-fg", "control"}
 ALLOWED_ROLES = {"sender", "recipient", "matrix"}
 ALLOWED_DEVICES = {"phone", "emulator"}
 OPERATOR_NUMERIC_RE = re.compile(r"^\d{5,6}$")
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 CANONICAL_MATRIX_TRIPLES = frozenset({
     ("wss", "p2e", "after-connect"),
@@ -181,6 +182,22 @@ def _safe_int(v: Optional[str]) -> Optional[int]:
         return None
 
 
+# §12 Round-5 audit P0: strict diagnostic boolean parser. Only the
+# literal lower-case strings "true" and "false" are accepted for
+# `restored` and `dispatched`. Any other present value (garbage,
+# capitalisation, numeric, empty) is a schema violation and returns
+# None; the caller must surface it as an integrity issue. The prior
+# `fields["x"] == "true"` idiom silently converted any non-"true"
+# present value to Python False and let restored=garbage certify a
+# whole bundle as GREEN.
+def _strict_bool(v: Optional[str]) -> Optional[bool]:
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    return None
+
+
 def _load_json(path: str, expected_top_type: type) -> tuple[object, Optional[str]]:
     """Return (parsed_value, error) — error is None on success. Never raises.
     Round-3 P1-3: JSON parse errors and wrong top-level type surface as
@@ -229,6 +246,24 @@ def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str
             if "sequence" in fields and seq is None:
                 parse_errors.append(f"{device_label}:{lineno} malformed sequence={fields['sequence']!r}")
 
+            # §12 Round-5 audit P0: strict-only booleans. Present-
+            # but-malformed values are a schema violation, NOT a
+            # silent False.
+            dispatched_val: Optional[bool] = None
+            if "dispatched" in fields:
+                dispatched_val = _strict_bool(fields["dispatched"])
+                if dispatched_val is None:
+                    parse_errors.append(
+                        f"{device_label}:{lineno} malformed dispatched={fields['dispatched']!r} (only 'true'/'false' allowed)",
+                    )
+            restored_val: Optional[bool] = None
+            if "restored" in fields:
+                restored_val = _strict_bool(fields["restored"])
+                if restored_val is None:
+                    parse_errors.append(
+                        f"{device_label}:{lineno} malformed restored={fields['restored']!r} (only 'true'/'false' allowed)",
+                    )
+
             out.append(WssEvent(
                 device=device_label,
                 event=fields.get("event", ""),
@@ -245,8 +280,8 @@ def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str
                 outcome_flag=fields.get("outcome_flag"),
                 relay_acceptance=fields.get("relay_acceptance"),
                 pin=fields.get("pin"),
-                dispatched=(fields["dispatched"] == "true") if "dispatched" in fields else None,
-                restored=(fields["restored"] == "true") if "restored" in fields else None,
+                dispatched=dispatched_val,
+                restored=restored_val,
                 sequence=seq,
                 raw=line.rstrip("\n"),
             ))
@@ -348,6 +383,17 @@ def _validate_preflight(preflight: dict) -> list[str]:
     if not isinstance(preflight.get("run_id"), str) or not preflight.get("run_id"):
         problems.append("preflight.run_id missing or empty")
 
+    # §12 Round-5 audit P1: bundled diagnostic APK SHA-256 must be
+    # recorded here after preflight verified it against BOTH the
+    # local packaged APK AND the installed base.apk on both devices.
+    apk_hash = preflight.get("diagnostic_apk_sha256")
+    if apk_hash is None:
+        problems.append("preflight.diagnostic_apk_sha256 missing (preflight must verify + record)")
+    elif not isinstance(apk_hash, str) or not SHA256_HEX_RE.match(apk_hash):
+        problems.append(
+            f"preflight.diagnostic_apk_sha256 not a 64-char lowercase hex string: {apk_hash!r}",
+        )
+
     return problems
 
 
@@ -380,6 +426,17 @@ def _validate_manifest(manifest: dict) -> list[str]:
     if op is not None:
         if not isinstance(op, str) or not OPERATOR_NUMERIC_RE.match(op):
             problems.append(f"device-manifest.dual_sim_report_operator_numeric not a 5-6 digit string: {op!r}")
+    # §12 Round-5 audit P1: the manifest also carries the diagnostic
+    # APK SHA-256 (the same value written to preflight.json). Both
+    # must be present, both well-formed, and their cross-check is
+    # performed in `_validate_cross_file_run_consistency`.
+    apk_hash = manifest.get("diagnostic_apk_sha256")
+    if apk_hash is None:
+        problems.append("device-manifest.diagnostic_apk_sha256 missing (preflight must verify + record on both devices)")
+    elif not isinstance(apk_hash, str) or not SHA256_HEX_RE.match(apk_hash):
+        problems.append(
+            f"device-manifest.diagnostic_apk_sha256 not a 64-char lowercase hex string: {apk_hash!r}",
+        )
     return problems
 
 
@@ -415,6 +472,16 @@ def _validate_cross_file_run_consistency(
             problems.append(
                 f"preflight.{k}={pv} != device-manifest.{k}={dv}",
             )
+    # §12 Round-5 audit P1: cross-check diagnostic APK SHA between
+    # preflight.json and device-manifest.json. Preflight writes the
+    # same hash to both (recorded after verifying it matched the
+    # local APK AND the installed base.apk on both devices).
+    pa = preflight.get("diagnostic_apk_sha256")
+    da = manifest.get("diagnostic_apk_sha256")
+    if isinstance(pa, str) and isinstance(da, str) and pa != da:
+        problems.append(
+            f"preflight.diagnostic_apk_sha256={pa!r} != device-manifest.diagnostic_apk_sha256={da!r}",
+        )
     return problems
 
 
