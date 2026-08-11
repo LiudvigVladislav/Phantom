@@ -1,77 +1,105 @@
-# Direct WSS Yota-First — Operator Runbook (Mac)
+# Direct WSS Yota-First — Operator Runbook (Mac) v2
 
-**Contract:** [`../direct-wss-yota-contract.md`](../direct-wss-yota-contract.md)
+**Contract:** [`../direct-wss-yota-contract.md`](../direct-wss-yota-contract.md) — §§9, 11, 12.
 
 ## Prerequisites (Mac)
 
-- `adb` — Android platform-tools on PATH.
-- `python3` >= 3.9.
-- `bash`, `jq` (`brew install jq` if missing).
+- `adb` on PATH.
+- `python3` ≥ 3.9, `bash`, `jq`, `sha256sum` (comes with GNU coreutils; on macOS install via `brew install coreutils` → `gsha256sum`, symlink or alias to `sha256sum`).
 - One physical Android phone with **Yota** as the default-data SIM.
 - One running Android Emulator (any recent API 33+).
 
 ## Phone radio setup
 
-Before starting:
+Preflight enforces all of the following via TYPED confirmation. Aborts on any negative answer:
 
-- Yota SIM is the DEFAULT DATA subscription.
+- Yota is the DEFAULT DATA subscription.
 - Wi-Fi OFF.
 - VPN / proxy / private DNS OFF.
 - Automatic data switching OFF.
-- Any second SIM (e.g. Tele2) with mobile data OFF.
+- Any second SIM (e.g. Tele2) mobile data OFF.
 
-Preflight will call the app's default-data-operator API and print the observed operator numeric; confirm it matches Yota when prompted.
+## Order (P0-4 split — bootstrap and preflight are INDEPENDENT)
 
-## First-time bootstrap
+```
+1. bootstrap --fresh   (standalone: uninstall + install + set emitter_id)
+2. Manual onboarding on BOTH devices (production UI)
+3. Manual QR pairing on BOTH devices (Profile → My Phantom QR)
+4. preflight            (measurement preflight: verifies everything + Yota)
+5. matrix               (8 × 5 = 40 envelopes, poll-based, auto-verifier)
+```
+
+### 1. Bootstrap — uninstall + install
 
 ```bash
 cd operator-package
-./run-yota-wss-diagnostic.sh preflight       # detects devices + prep
 ./run-yota-wss-diagnostic.sh bootstrap --fresh
 ```
 
-`bootstrap --fresh` uninstalls the app from both devices (no `-k`, all data lost), verifies absence, verifies the APK SHA-256 against `android-debug-diagnostic.apk.sha256`, then reinstalls.
+Requires typing `BOOTSTRAP-CONFIRM` before uninstalling. Verifies the APK's SHA-256 against `android-debug-diagnostic.apk.sha256` before installing. Sets `emitter_id=phone` on the physical device and `emitter_id=emulator` on the emulator, then reads back via `health` to prove the writes stuck.
 
-After bootstrap:
-1. On the phone AND the emulator, run the production onboarding UI. Create two real Phantom identities.
-2. On the phone AND the emulator, open Profile → **My Phantom QR** → **Share my Phantom contact**. Scan the QR from one device on the other. This creates the paired conversation each side needs.
-3. Confirm each device shows exactly ONE conversation with the other as peer.
+### 2 + 3. Manual onboarding + QR pairing
 
-## Matrix run
+- On both devices, run the real onboarding flow (create identity).
+- On both devices, open Profile → My Phantom QR → Share my Phantom contact → scan the other device's QR.
+- Confirm each device shows exactly ONE conversation with the other.
+
+### 4. Preflight
 
 ```bash
-./run-yota-wss-diagnostic.sh preflight   # re-run for fresh evidence dir
+./run-yota-wss-diagnostic.sh preflight
+```
+
+Creates a fresh evidence directory `evidence/yota-wss-<UTC>/` and populates `preflight.json` + `device-manifest.json` with:
+
+- Debug APK variant confirmed on both devices (`DiagnosticCommandReceiver` present in `dumpsys package`).
+- `emitter_id` verified via `health` readback on each device.
+- Canary emit (WSS_DIAG tag proven).
+- Dual-SIM default-data operator reported; the operator MUST type the literal word `YOTA` to proceed.
+- Radio checklist — each item requires typed `YES`.
+- REST capability probe (Method B controlled fail-closed envelope). Results in `rest_capability = enabled | disabled | unknown`; disabled → REST cells (#7, #8) skipped as BLOCKED.
+- Clock skew — fails at |skew| > 30 s; warns > 2 s.
+
+### 5. Matrix
+
+```bash
 ./run-yota-wss-diagnostic.sh matrix
 ```
 
-The matrix drives 8 directed cells × 5 envelopes = 40 envelopes (contract §9.3). No manual `am` invocation, no logcat capture, no envelope-ID grep — the runner + verifier handle everything.
-
-REST capability is determined by preflight (Method B controlled fail-closed probe). If REST is disabled on the target relay, cells #7 and #8 are stamped `BLOCKED` and skipped.
+- 8 directed cells × 5 envelopes = 40 envelopes.
+- Per-envelope polling: after each `send`, waits up to 120 s for the four delivery signals (`recipient_deliver_received fresh`, `recipient_message_persisted`, `recipient_ack_deliver_sent`, one enqueue) before moving on.
+- Between cells: `diag-cmd.sh pin` (both devices) + waits for `diagnostic_pin_active` on both.
+- Idle scenario: natural 300 s foreground wait — NO airplane-mode toggle.
+- Background→foreground: `input keyevent KEYCODE_HOME` + `monkey` — NO `am force-stop`.
 
 ## Reading the report
 
 ```
-open evidence/yota-wss-<UTC-STAMP>/verification-report.md
+open evidence/yota-wss-<UTC>/verification-report.md
 ```
 
-The report contains two independent results:
+Two independent results:
 
-- `evidence_integrity` — bundle completeness. **GREEN** means the WSS_DIAG events were captured cleanly and the schema is intact. Fully-collected failure evidence is `evidence_integrity = GREEN`.
-- `product_outcome` — per-cell classification: `Recovered` (Priority 1) / `Delivered once` (Priority 2) / `Unresolved` (Priority 3) / `BLOCKED` (REST capability off). Aggregate is RED if any non-blocked cell is not `Delivered once` or `Recovered`.
+- `evidence_integrity` — bundle completeness (closed-schema verifier).
+- `product_outcome` — GREEN / RED / PENDING per cell.
 
-`evidence_integrity=GREEN, product_outcome=RED` is a **successful diagnostic run** — architect can now see what's broken.
+Exit codes (`verify-evidence.py`):
+- `0` — integrity GREEN + all cells `Delivered once` or `BLOCKED`.
+- `1` — integrity RED (tooling failure).
+- `2` — integrity GREEN + at least one `Unresolved` cell (product failure, evidence still usable).
+- `3` — integrity GREEN + at least one `PENDING` cell (rerun `verify` after 120 s per envelope).
+
+## Recovered classification — REMOVED
+
+Per §12 P0-7 the first pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. Fallback breadcrumbs (`attempt`, `session_epoch`, watchdog requeue) are NOT emitted in WSS-1 — a later block can add them via a shared/core-transport bridge extension.
 
 ## Tele2 follow-up
 
-Once a Yota bundle is captured cleanly:
-
 - Do NOT re-bootstrap.
-- Switch the phone's default-data SIM to Tele2.
-- Wi-Fi OFF, VPN OFF, other SIM's mobile data OFF.
-- `./run-yota-wss-diagnostic.sh preflight` — the dual-SIM check now reads the Tele2 operator; confirm.
-- `./run-yota-wss-diagnostic.sh matrix` — writes a fresh evidence dir.
-
-Same APK, same identities, same paired conversation — only the radio is different.
+- Switch the phone default-data SIM to Tele2.
+- Repeat radio checklist (Wi-Fi OFF, etc.).
+- `preflight` (dual-SIM check now reads Tele2 numeric; TYPE `TELE2` at the prompt — reject `YOTA`).
+- `matrix`.
 
 ## Hard rules
 
@@ -79,7 +107,8 @@ Same APK, same identities, same paired conversation — only the radio is differ
 - No manual envelope correlation.
 - No `am force-stop`.
 - No airplane-mode toggle.
-- No arbitrary send text (the debug receiver refuses).
-- No operator-supplied contact alias (the debug receiver refuses; conversation is auto-selected).
+- No arbitrary send text (receiver refuses).
+- No operator-supplied contact alias (receiver refuses).
 - No release APK — preflight refuses.
 - No VPS action.
+- No re-bootstrap between Yota and Tele2 (identities + pairing survive; only radio changes).

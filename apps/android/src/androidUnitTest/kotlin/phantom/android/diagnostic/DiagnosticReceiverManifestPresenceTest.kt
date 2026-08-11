@@ -6,41 +6,44 @@ package phantom.android.diagnostic
 import java.io.File
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.fail
 import org.junit.Test
 
 /**
- * Direct WSS Yota-First — §11 lock 4 test #4.
+ * Direct WSS Yota-First — §11 lock 4 test #4, hardened per §12 P1.
  *
- * Introspects the AGP-generated merged manifests to prove:
- *   - `DiagnosticCommandReceiver` IS declared in the debug variant's
- *     merged manifest.
- *   - `DiagnosticCommandReceiver` is ABSENT from the release variant's
- *     merged manifest.
+ * Prior shape silently SKIPPED when the release merged manifest was
+ * absent — a broken test that reported GREEN in the exact scenario
+ * that matters (release APK was never assembled, so nothing checked
+ * whether the debug receiver leaked). Repaired shape:
  *
- * The generated manifest files live under `apps/android/build/
- * intermediates/merged_manifests/{debug|release}/AndroidManifest.xml`
- * after `assembleDebug` / `assembleRelease` runs.
+ *   - The DEBUG-manifest assertion still permits SKIP with a clear
+ *     "run assembleDebug first" message. Skipping is safe there
+ *     because a debug-manifest absence would mean the receiver is
+ *     not shipping in the diagnostic APK at all — the operator
+ *     preflight catches that via `dumpsys package | grep
+ *     DiagnosticCommandReceiver`.
+ *   - The RELEASE-manifest assertion is now MANDATORY: absence is a
+ *     test failure. An explicit opt-out marker file (see below) may
+ *     bypass it in environments that cannot build release (e.g.
+ *     no release keystore available). That marker is the ONLY way
+ *     to bypass — a missing file no longer defaults to pass.
  *
- * The test is conditional: it SKIPS with a clear message when the
- * manifest artefacts have not been generated yet (the test file
- * compiles + runs even before the first `assembleDebug`). Running
- * this test after `assembleDebug` (planned in the WSS-1 handoff)
- * asserts the debug side. The release side asserts only when both
- * variants have been assembled — otherwise it also skips. A CI job
- * that runs `assembleDebug` + `assembleRelease` before this test
- * gets full coverage.
+ * Opt-out marker:
+ *
+ *   `apps/android/build/intermediates/merged_manifests/.release-manifest-not-required.marker`
+ *
+ * The marker's mere presence (empty file allowed) bypasses the
+ * release check. CI must not create this marker; local test runs
+ * that can't build release can `touch` it manually.
  */
 class DiagnosticReceiverManifestPresenceTest {
 
-    private val moduleRoot: File = File("..").canonicalFile.let { root ->
-        // The unit test runs with cwd = `apps/android/` — the module
-        // root sits one up. When invoked from Gradle the cwd is the
-        // project root; either way, the `apps/android/build/…` path
-        // resolves via a small walk.
+    private val moduleRoot: File = run {
         var candidate = File(System.getProperty("user.dir") ?: ".")
         repeat(4) {
             val probe = File(candidate, "apps/android/build/intermediates/merged_manifests")
-            if (probe.exists()) return@let candidate
+            if (probe.exists()) return@run candidate
             candidate = candidate.parentFile ?: candidate
         }
         candidate
@@ -60,6 +63,9 @@ class DiagnosticReceiverManifestPresenceTest {
         return if (alt.exists()) alt else null
     }
 
+    private fun optOutMarker(): File =
+        File(moduleRoot, "apps/android/build/intermediates/merged_manifests/.release-manifest-not-required.marker")
+
     @Test
     fun receiver_present_in_debug_merged_manifest_when_assembleDebug_has_run() {
         val debug = debugManifest() ?: run {
@@ -72,29 +78,40 @@ class DiagnosticReceiverManifestPresenceTest {
         val text = debug.readText()
         assertTrue(
             actual = text.contains("phantom.android.diagnostic.DiagnosticCommandReceiver"),
-            message = "Debug merged manifest MUST contain DiagnosticCommandReceiver — " +
-                "the receiver drives the operator matrix. Manifest: ${debug.path}",
+            message = "Debug merged manifest MUST contain DiagnosticCommandReceiver. Manifest: ${debug.path}",
         )
     }
 
     @Test
-    fun receiver_absent_from_release_merged_manifest_when_assembleRelease_has_run() {
-        val release = releaseManifest() ?: run {
-            println(
-                "SKIPPED: release merged manifest not present — run " +
-                    "`./gradlew :apps:android:assembleRelease` before this test",
+    fun receiver_absent_from_release_merged_manifest_is_mandatory() {
+        val release = releaseManifest()
+        if (release == null) {
+            if (optOutMarker().exists()) {
+                println(
+                    "OPT-OUT: release manifest absent AND opt-out marker present at " +
+                        "${optOutMarker().path} — release-side assertion skipped by explicit " +
+                        "operator/CI decision.",
+                )
+                return
+            }
+            fail(
+                "release merged manifest not present and no opt-out marker: run " +
+                    "`./gradlew :apps:android:assembleRelease` (or `touch " +
+                    "${optOutMarker().path}` for environments without a release keystore) " +
+                    "before this test — a silent skip here would let the debug receiver leak " +
+                    "into a release build undetected.",
             )
-            return
+        } else {
+            val text = release.readText()
+            assertFalse(
+                actual = text.contains("phantom.android.diagnostic.DiagnosticCommandReceiver"),
+                message = "Release merged manifest MUST NOT contain DiagnosticCommandReceiver — " +
+                    "any receiver leaked into release is a diagnostic exfil vector. Manifest: ${release.path}",
+            )
+            assertFalse(
+                actual = text.contains("phantom.android.diagnostic.DiagnosticBootInitProvider"),
+                message = "Release merged manifest MUST NOT contain the debug ContentProvider either.",
+            )
         }
-        val text = release.readText()
-        assertFalse(
-            actual = text.contains("phantom.android.diagnostic.DiagnosticCommandReceiver"),
-            message = "Release merged manifest MUST NOT contain DiagnosticCommandReceiver — " +
-                "any receiver leaked into release is a diagnostic exfil vector. Manifest: ${release.path}",
-        )
-        assertFalse(
-            actual = text.contains("phantom.android.diagnostic.DiagnosticBootInitProvider"),
-            message = "Release merged manifest MUST NOT contain the debug ContentProvider either.",
-        )
     }
 }

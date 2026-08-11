@@ -2,15 +2,18 @@
 <!--
   Direct WSS Yota-First diagnostic — debug-only manifest overlay.
 
-  §11 lock 1 (architect FINAL GREEN): the diagnostic BroadcastReceiver
-  is declared ONLY here (in the debug source set). At release build
-  time the merged manifest does NOT include this receiver — verified by
-  focused test `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest`.
+  §11 lock 1 + §12 P1: the diagnostic BroadcastReceiver is declared
+  ONLY here (debug source set). At release build time the merged
+  manifest does NOT include this receiver — verified by focused test
+  `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest`.
 
-  `android:exported="true"` is required so `am broadcast -n` can invoke
-  the receiver by explicit component from an ADB shell. Combined with
-  explicit-component invocation (no intent-filter), external apps
-  cannot deliver broadcasts to this receiver — only the shell UID.
+  `android:exported="true"` is required so `am broadcast -n` from an
+  ADB shell can invoke the receiver by explicit component. A third-
+  party app that discovers the component name AND fires an explicit
+  broadcast would deliver a message to `onReceive`, so the receiver
+  gates on `Binder.getCallingUid() ∈ {SHELL_UID, ROOT_UID}` and
+  silently rejects everything else. See
+  `DiagnosticCommandReceiver.onReceive` for the enforcement code.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -24,9 +27,11 @@
         <!--
           Zero-touch boot-init provider: instantiated by the Android
           framework BEFORE Application.onCreate() so the shared
-          WssDiagBridge is installed before any messaging code runs.
-          Authority is unique + does not overlap any production
-          provider. `exported="false"` — external apps cannot query.
+          WssDiagBridge is installed AND the persisted diagnostic
+          state (pin + run/cell/emitter) is restored + emitted as a
+          `diagnostic_session_started` WSS_DIAG event, before any
+          messaging code runs. `exported="false"` — external apps
+          cannot query.
         -->
         <provider
             android:name="phantom.android.diagnostic.DiagnosticBootInitProvider"

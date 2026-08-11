@@ -6,6 +6,8 @@ package phantom.android.diagnostic
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Binder
+import android.os.Process
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -18,28 +20,40 @@ import phantom.android.PhantomApplication
 /**
  * Direct WSS Yota-First diagnostic — debug-only broadcast receiver.
  *
- * §11 lock 1 (architect FINAL GREEN): a single [BroadcastReceiver]
- * declared ONLY in the debug `AndroidManifest.xml` overlay. Physically
- * absent from the release APK's merged manifest. Invoked via explicit
- * component:
+ * §11 lock 1: single [BroadcastReceiver] declared ONLY in the debug
+ * `AndroidManifest.xml` overlay. Physically absent from the release
+ * APK's merged manifest.
  *
- * ```
- * adb shell am broadcast -n <APP_ID>/phantom.android.diagnostic.DiagnosticCommandReceiver \
- *     --es subcommand pin --es pin wss --es run_id <UUID> --es cell_id <ID>
- * ```
+ * §12 P1 caller-boundary fix: even though `exported="true"` is required
+ * for `am broadcast -n` to work from an ADB shell, [onReceive] gates on
+ * `Binder.getCallingUid() ∈ {SHELL_UID, ROOT_UID}`. A third-party app
+ * that discovers the component name and fires an explicit broadcast is
+ * silently rejected.
  *
- * Strict-whitelist enforcement of extras (§9.3) + strict-enum
- * enforcement of subcommands (§11 additional test 1). Any deviation
- * exits the receiver red WITHOUT touching `sendMessage`, the pin
- * store, or the chat store.
+ * §12 P0-2 persistence fix: every `pin` and `set_emitter_id` write is
+ * persisted to [DiagnosticTransportPinStore] AND to
+ * [DiagnosticTransportGuard]. Process death is transparent to the
+ * matrix: the debug boot-init provider restores the persisted state
+ * before `Application.onCreate()`.
  *
- * The receiver is the SOLE writer of [DiagnosticTransportGuard] +
- * the SOLE trigger of [DiagnosticSendCoordinator]. Its outputs are
- * `WSS_DIAG` events emitted via [WssDiag].
+ * §12 P0-2 fail-closed send: the `send` subcommand requires the
+ * caller-supplied `cell_id` to match the persisted `cell_id` — a
+ * mid-cell process restart WITHOUT a matching `diagnostic_pin` write
+ * is rejected.
  */
 class DiagnosticCommandReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
+        // §12 P1 — caller UID gate. `Binder.getCallingUid()` returns
+        // the UID of the IPC caller; SHELL (2000) or ROOT (0) are the
+        // only legitimate origins for a matrix broadcast. Rejects
+        // third-party apps that guess the explicit component name.
+        val callerUid = Binder.getCallingUid()
+        if (callerUid != Process.SHELL_UID && callerUid != Process.ROOT_UID) {
+            Log.w(TAG, "rejected: caller uid=$callerUid not shell/root")
+            return
+        }
+
         val extras = intent.extras
         val subcommand = intent.getStringExtra(EXTRA_SUBCOMMAND)
 
@@ -48,33 +62,31 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             return
         }
 
-        // §11 additional test 1: unknown extras are rejected outright.
         val allowedForSub = ALLOWED_EXTRAS_BY_SUBCOMMAND[subcommand] ?: run {
             Log.w(TAG, "rejected: no whitelist configured for subcommand=$subcommand")
             return
         }
         val extraKeys = extras?.keySet().orEmpty()
-        // Kotlin's Bundle always includes `subcommand` itself; strip it.
         val actual = extraKeys - EXTRA_SUBCOMMAND
-        val unknown = actual - allowedForSub - ALLOWED_META_EXTRAS
+        val unknown = actual - allowedForSub
         if (unknown.isNotEmpty()) {
             Log.w(TAG, "rejected: unknown extras=$unknown for subcommand=$subcommand")
             return
         }
 
         when (subcommand) {
-            SUB_PIN -> handlePin(intent)
+            SUB_PIN -> handlePin(context, intent)
             SUB_SEND -> handleSend(context, intent)
             SUB_CANARY -> handleCanary()
-            SUB_SET_EMITTER_ID -> handleSetEmitterId(intent)
+            SUB_SET_EMITTER_ID -> handleSetEmitterId(context, intent)
             SUB_DUAL_SIM_REPORT -> handleDualSimReport(context)
-            SUB_REST_CAPABILITY_PROBE -> handleRestCapabilityProbe()
             SUB_HEALTH -> handleHealth()
+            SUB_CLEAR -> handleClear(context)
             else -> Log.w(TAG, "rejected: dispatch fell through for subcommand=$subcommand")
         }
     }
 
-    private fun handlePin(intent: Intent) {
+    private fun handlePin(context: Context, intent: Intent) {
         val pin = intent.getStringExtra(EXTRA_PIN)
         val runId = intent.getStringExtra(EXTRA_RUN_ID)
         val cellId = intent.getStringExtra(EXTRA_CELL_ID)
@@ -88,15 +100,16 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             "rest" -> DiagnosticTransportGuard.Pin.REST
             else -> return
         }
+        // §12 P0-2 — persist THEN update in-memory. Persistence has
+        // the source-of-truth role after a process restart.
+        DiagnosticTransportPinStore.writePin(context, newPin, runId!!, cellId!!)
         DiagnosticTransportGuard.set(
-            DiagnosticTransportGuard.PinState(pin = newPin, runId = runId!!, cellId = cellId!!),
+            DiagnosticTransportGuard.PinState(pin = newPin, runId = runId, cellId = cellId),
         )
-        // Rebuild pin_active event with the guard now populated so the
-        // wall_utc/monotonic fields are strictly after the write.
         WssDiag.emit(
             event = "diagnostic_pin_active",
             role = WssDiag.Role.MATRIX,
-            outerTransport = WssDiag.OuterTransport.UNKNOWN, // filled by first sender_transport_decision
+            outerTransport = WssDiag.OuterTransport.UNKNOWN,
             innerRoute = when (newPin) {
                 DiagnosticTransportGuard.Pin.WSS -> WssDiag.InnerRoute.WSS
                 DiagnosticTransportGuard.Pin.REST -> WssDiag.InnerRoute.REST
@@ -112,6 +125,20 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         val sequence = intent.getIntExtra(EXTRA_SEQUENCE, -1)
         if (!validRunId(runId) || !validCellId(cellId) || sequence < 1) {
             Log.w(TAG, "rejected: send subcommand invalid input (runId=$runId cellId=$cellId seq=$sequence)")
+            return
+        }
+        // §12 P0-2 — fail-closed if the persisted (pin, run, cell)
+        // does not match the caller. A mid-cell process restart that
+        // discarded the pin surfaces here.
+        val persisted = DiagnosticTransportPinStore.read(context)
+        if (persisted.runId != runId || persisted.cellId != cellId) {
+            Log.w(
+                TAG,
+                "rejected: send extras mismatch persisted state " +
+                    "(caller runId=$runId cellId=$cellId; persisted runId=${persisted.runId} cellId=${persisted.cellId}) — " +
+                    "either the pin was never written for this cell OR the process was restarted; " +
+                    "operator must re-write pin before sending",
+            )
             return
         }
         val app = context.applicationContext as? PhantomApplication ?: run {
@@ -158,12 +185,11 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
     private fun handleCanary() {
         // §9.2 + §11 additional test — canary does NOT enqueue any
         // envelope. It only proves the WSS_DIAG tag emits on this
-        // device. Never touches sendMessage, MessageRepository,
-        // ConversationRepository, or KtorRelayTransport.
+        // device.
         WssDiag.emit(event = "diagnostic_canary", role = WssDiag.Role.MATRIX)
     }
 
-    private fun handleSetEmitterId(intent: Intent) {
+    private fun handleSetEmitterId(context: Context, intent: Intent) {
         val emitterId = intent.getStringExtra(EXTRA_EMITTER_ID)
         val newId = when (emitterId) {
             "phone" -> DiagnosticTransportGuard.EmitterId.PHONE
@@ -173,14 +199,12 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
                 return
             }
         }
+        DiagnosticTransportPinStore.writeEmitter(context, newId)
         DiagnosticTransportGuard.setEmitterId(newId)
         Log.i(TAG, "emitter_id set to=${newId.name.lowercase()}")
     }
 
     private fun handleDualSimReport(context: Context) {
-        // Reports default-data subscription's operator numeric per §8-Q9.
-        // Reads via SubscriptionManager + per-subscription
-        // TelephonyManager. No PII, no phone number, no ICCID.
         val defaultDataSubId = SubscriptionManager.getDefaultDataSubscriptionId()
         val telephony = context.getSystemService(TelephonyManager::class.java)
             .createForSubscriptionId(defaultDataSubId)
@@ -191,22 +215,24 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         )
     }
 
-    private fun handleRestCapabilityProbe() {
-        // Emit a marker event. The actual REST probe is a controlled
-        // fail-closed matrix envelope, driven by the operator script
-        // and observed via sender_rest_post_completed (see §9.6).
-        // This subcommand only prints the intent so the operator
-        // script can synchronise.
-        Log.i(TAG, "rest_capability_probe_marker")
-    }
-
     private fun handleHealth() {
         val guard = DiagnosticTransportGuard.current()
         val id = DiagnosticTransportGuard.currentEmitterId()
         Log.i(
             TAG,
             "health emitter_id=${id.name.lowercase()} pin=${guard.pin.name.lowercase()} " +
-                "run_id=${guard.runId.ifEmpty { "-" }} cell_id=${guard.cellId.ifEmpty { "-" }}",
+                "run_id=${guard.runId.ifEmpty { "-" }} cell_id=${guard.cellId.ifEmpty { "-" }} " +
+                "outer_transport=${DiagnosticTransportGuard.currentOuterArm()}",
+        )
+    }
+
+    private fun handleClear(context: Context) {
+        DiagnosticTransportPinStore.clear(context)
+        DiagnosticTransportGuard.set(DiagnosticTransportGuard.PinState.NONE_UNSET)
+        Log.i(TAG, "diagnostic_state_cleared")
+        WssDiag.emit(
+            event = "diagnostic_state_cleared",
+            role = WssDiag.Role.MATRIX,
         )
     }
 
@@ -231,21 +257,15 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         internal const val SUB_CANARY = "canary"
         internal const val SUB_SET_EMITTER_ID = "set_emitter_id"
         internal const val SUB_DUAL_SIM_REPORT = "dual_sim_report"
-        internal const val SUB_REST_CAPABILITY_PROBE = "rest_capability_probe"
         internal const val SUB_HEALTH = "health"
+        internal const val SUB_CLEAR = "clear"
 
         internal val ALLOWED_SUBCOMMANDS = setOf(
             SUB_PIN, SUB_SEND, SUB_CANARY, SUB_SET_EMITTER_ID,
-            SUB_DUAL_SIM_REPORT, SUB_REST_CAPABILITY_PROBE, SUB_HEALTH,
+            SUB_DUAL_SIM_REPORT, SUB_HEALTH, SUB_CLEAR,
         )
 
         internal val ALLOWED_PINS = setOf("none", "wss", "rest")
-
-        // Every Bundle carries these two system keys; whitelisting
-        // them prevents false rejections.
-        private val ALLOWED_META_EXTRAS = setOf(
-            "phantom_diagnostic_dummy_never_used", // reserved
-        )
 
         internal val ALLOWED_EXTRAS_BY_SUBCOMMAND: Map<String, Set<String>> = mapOf(
             SUB_PIN to setOf(EXTRA_PIN, EXTRA_RUN_ID, EXTRA_CELL_ID),
@@ -253,8 +273,8 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_CANARY to emptySet(),
             SUB_SET_EMITTER_ID to setOf(EXTRA_EMITTER_ID),
             SUB_DUAL_SIM_REPORT to emptySet(),
-            SUB_REST_CAPABILITY_PROBE to emptySet(),
             SUB_HEALTH to emptySet(),
+            SUB_CLEAR to emptySet(),
         )
 
         private val RUN_ID_EXTRA = setOf('.', '_', '-')

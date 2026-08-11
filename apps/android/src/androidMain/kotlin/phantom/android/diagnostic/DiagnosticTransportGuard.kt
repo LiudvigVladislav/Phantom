@@ -56,9 +56,25 @@ object DiagnosticTransportGuard {
     @Volatile
     private var emitterId: EmitterId = EmitterId.UNSET
 
+    /**
+     * Populated by debug boot init with a lambda reading
+     * `AppContainer.transportPreferences.privacyMode`. HRT calls it
+     * to observe the actually-selected outer transport arm at send
+     * time — this is the §12 P0-3 fix. In release the reader is
+     * never installed and the field stays null → HRT logs
+     * `outer_transport=unknown`.
+     *
+     * Returns one of `"direct"`, `"reality"`, `"tor"` — never
+     * throws.
+     */
+    @Volatile
+    var outerArmReader: (() -> String)? = null
+
     fun current(): PinState = pinState
 
     fun currentEmitterId(): EmitterId = emitterId
+
+    fun currentOuterArm(): String = outerArmReader?.invoke() ?: "unknown"
 
     /**
      * Only invoked by [DiagnosticCommandReceiver] in the debug source
@@ -80,5 +96,6 @@ object DiagnosticTransportGuard {
     internal fun reset() {
         pinState = PinState.NONE_UNSET
         emitterId = EmitterId.UNSET
+        outerArmReader = null
     }
 }

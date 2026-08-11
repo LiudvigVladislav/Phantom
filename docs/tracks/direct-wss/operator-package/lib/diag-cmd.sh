@@ -5,6 +5,8 @@
 # Direct WSS Yota-First diagnostic — thin ADB wrapper around the
 # debug-only `DiagnosticCommandReceiver` (§9.3).
 #
+# §12 P1: `eval` is replaced with a Bash argument array.
+#
 # Usage:
 #   diag-cmd.sh <subcommand> --serial <SER> [--pin wss|rest|none]
 #                             [--run-id <ID>] [--cell-id <ID>]
@@ -31,25 +33,23 @@ done
 
 [ -z "$serial" ] && { echo "--serial required" >&2; exit 2; }
 
-# Build `am broadcast --es <k> <v>` args deterministically.
-cmd="adb -s $serial shell am broadcast -n $COMPONENT --es subcommand $subcommand"
+args=(-s "$serial" shell am broadcast -n "$COMPONENT" --es subcommand "$subcommand")
+
 case "$subcommand" in
   pin)
     [ -z "$pin" ] || [ -z "$run_id" ] || [ -z "$cell_id" ] && { echo "pin requires --pin, --run-id, --cell-id" >&2; exit 2; }
-    cmd="$cmd --es pin $pin --es run_id $run_id --es cell_id $cell_id"
+    args+=(--es pin "$pin" --es run_id "$run_id" --es cell_id "$cell_id")
     ;;
   send)
     [ -z "$run_id" ] || [ -z "$cell_id" ] || [ -z "$sequence" ] && { echo "send requires --run-id, --cell-id, --sequence" >&2; exit 2; }
-    cmd="$cmd --es run_id $run_id --es cell_id $cell_id --ei sequence $sequence"
+    args+=(--es run_id "$run_id" --es cell_id "$cell_id" --ei sequence "$sequence")
     ;;
   set_emitter_id)
     [ -z "$emitter_id" ] && { echo "set_emitter_id requires --emitter-id" >&2; exit 2; }
-    cmd="$cmd --es emitter_id $emitter_id"
+    args+=(--es emitter_id "$emitter_id")
     ;;
-  canary|dual_sim_report|rest_capability_probe|health) : ;;
+  canary|dual_sim_report|health|clear) : ;;
   *) echo "unknown subcommand: $subcommand" >&2; exit 2 ;;
 esac
 
-# Fire and print return code + broadcast result (adb prints e.g.
-# "Broadcast completed: result=0" on success).
-eval "$cmd"
+adb "${args[@]}"

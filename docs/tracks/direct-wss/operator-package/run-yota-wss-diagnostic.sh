@@ -4,11 +4,13 @@
 #
 # Direct WSS Yota-First diagnostic — main entry point.
 #
+# §12 P0-4 split: bootstrap and preflight are INDEPENDENT commands.
+#
 # Usage:
-#   ./run-yota-wss-diagnostic.sh preflight
-#   ./run-yota-wss-diagnostic.sh bootstrap --fresh
-#   ./run-yota-wss-diagnostic.sh matrix
-#   ./run-yota-wss-diagnostic.sh verify
+#   ./run-yota-wss-diagnostic.sh bootstrap --fresh    # uninstall+install (standalone)
+#   ./run-yota-wss-diagnostic.sh preflight            # measurement preflight (after onboarding)
+#   ./run-yota-wss-diagnostic.sh matrix               # run 8x5=40 envelopes (needs preflight)
+#   ./run-yota-wss-diagnostic.sh verify [DIR]         # rerun verifier on an evidence dir
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -16,35 +18,29 @@ LIB="$HERE/lib"
 mode="${1:-help}"; shift || true
 
 case "$mode" in
+  bootstrap)
+    exec "$LIB/bootstrap.sh" "${1:---help}"
+    ;;
   preflight)
     exec "$HERE/preflight.sh"
-    ;;
-  bootstrap)
-    last=$(cat "$HERE/evidence/.last_run" 2>/dev/null || true)
-    if [ -z "$last" ] || [ ! -d "$last" ]; then
-      echo "no preflight run found — run: $0 preflight first" >&2; exit 2
-    fi
-    exec "$LIB/bootstrap.sh" "${1:---help}" "$last"
     ;;
   matrix)
     last=$(cat "$HERE/evidence/.last_run" 2>/dev/null || true)
     if [ -z "$last" ] || [ ! -d "$last" ]; then
       echo "no preflight run found — run: $0 preflight first" >&2; exit 2
     fi
-    "$LIB/capture-logs.sh" "$last"
     trap 'if [ -f "$last/log-pids" ]; then xargs kill -TERM 2>/dev/null < "$last/log-pids" || true; fi' EXIT
     "$LIB/run-matrix.sh" "$last"
-    # Stop log streams.
+    # Stop log streams (may already be closed).
     if [ -f "$last/log-pids" ]; then
       xargs kill -TERM 2>/dev/null < "$last/log-pids" || true
     fi
-    # Run verifier.
     python3 "$HERE/verify-evidence.py" "$last"
     ;;
   verify)
     last="${1:-$(cat "$HERE/evidence/.last_run" 2>/dev/null || true)}"
     if [ -z "$last" ] || [ ! -d "$last" ]; then
-      echo "no evidence dir found — pass one explicitly or run preflight" >&2; exit 2
+      echo "no evidence dir found — pass one explicitly" >&2; exit 2
     fi
     python3 "$HERE/verify-evidence.py" "$last"
     ;;
@@ -52,13 +48,13 @@ case "$mode" in
     cat <<HELP
 Direct WSS Yota-First diagnostic — Mac operator entry point.
 
-  preflight   — check env + devices + APK + pins + REST cap + skew
-  bootstrap --fresh   — uninstall + reinstall APK on both devices
-  matrix      — run 8 × 5 = 40 envelopes + verify
-  verify [DIR]   — re-run verifier on an evidence dir
+  bootstrap --fresh  standalone: detect devices + uninstall + reinstall APK
+                     + set emitter_id + print manual onboarding instructions
+  preflight          measurement preflight (after manual onboarding + QR pairing)
+  matrix             run 8 × 5 = 40 envelopes + auto-verify
+  verify [DIR]       re-run verifier
 
-Runs against exactly one physical phone + one emulator. Serials
-auto-detected via getprop ro.kernel.qemu.
+  Order: bootstrap --fresh -> manual onboarding+pairing -> preflight -> matrix
 HELP
     exit 2
     ;;

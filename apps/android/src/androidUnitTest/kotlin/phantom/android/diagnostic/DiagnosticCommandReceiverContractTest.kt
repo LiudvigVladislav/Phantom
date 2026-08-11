@@ -27,7 +27,7 @@ class DiagnosticCommandReceiverContractTest {
     fun allowed_subcommands_enum_is_strict() {
         val expected = setOf(
             "pin", "send", "canary", "set_emitter_id",
-            "dual_sim_report", "rest_capability_probe", "health",
+            "dual_sim_report", "health", "clear",
         )
         assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
     }
@@ -72,9 +72,19 @@ class DiagnosticCommandReceiverContractTest {
     }
 
     @Test
-    fun health_dual_sim_and_rest_probe_accept_no_extras() {
+    fun health_dual_sim_and_clear_accept_no_extras() {
         assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["health"]!!.isEmpty())
         assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["dual_sim_report"]!!.isEmpty())
-        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["rest_capability_probe"]!!.isEmpty())
+        assertTrue(DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND["clear"]!!.isEmpty())
+    }
+
+    // §12 P0-1 — schema stays closed after the repair block; the
+    // rest_capability_probe subcommand from the previous round is
+    // gone (its evidence comes from a controlled fail-closed matrix
+    // envelope during preflight, per §9.6 Method B).
+    @Test
+    fun rest_capability_probe_subcommand_is_no_longer_defined() {
+        assertFalse("rest_capability_probe" in DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
+        assertFalse("rest_capability_probe" in DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND)
     }
 }

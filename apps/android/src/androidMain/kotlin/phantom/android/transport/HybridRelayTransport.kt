@@ -1053,18 +1053,27 @@ class HybridRelayTransport(
     // ── Outbound routing ─────────────────────────────────────────────────────
 
     override suspend fun send(message: RelayMessage.Send): Boolean {
-        // Direct WSS Yota-First diagnostic — §11 lock 2 (Method b).
+        // Direct WSS Yota-First diagnostic — §12 P0-3 fix:
+        // outer_transport is now OBSERVED, not hard-coded. The
+        // debug boot-init provider installs a reader lambda that
+        // reads AppContainer.transportPreferences.privacyMode; in
+        // release the reader is null and the observed value is
+        // "unknown" (harmless — no pin is ever set in release
+        // because the receiver + boot init are absent).
         //
-        // Outer-arm enforcement is delegated to preflight
-        // (`privacy_mode_report` subcommand): the diagnostic matrix
-        // is only allowed to run when `PrivacyMode.Standard` (Direct)
-        // is the active mode. HRT under a pin logs
-        // `outer_transport=direct` on that basis. If a future round
-        // wants HRT to enforce this directly rather than at preflight,
-        // it needs to plumb an `outerArmProvider` into the HRT
-        // constructor — which is not in scope for WSS-1.
+        // §12 P0-3 fail-closed: under any pin, if the observed outer
+        // arm is not "direct" the send is refused and stamped
+        // dispatched=false + outcome_flag=send_error. Verifier reads
+        // this as BLOCKED for the affected envelope.
         val guardState = phantom.android.diagnostic.DiagnosticTransportGuard.current()
         val pinned = guardState.pin != phantom.android.diagnostic.DiagnosticTransportGuard.Pin.NONE
+        val outerArmObserved = phantom.android.diagnostic.DiagnosticTransportGuard.currentOuterArm()
+        val outerEnum = when (outerArmObserved) {
+            "direct" -> phantom.android.diagnostic.WssDiag.OuterTransport.DIRECT
+            "reality" -> phantom.android.diagnostic.WssDiag.OuterTransport.REALITY
+            "tor" -> phantom.android.diagnostic.WssDiag.OuterTransport.TOR
+            else -> phantom.android.diagnostic.WssDiag.OuterTransport.UNKNOWN
+        }
 
         val innerRoutePlanned: phantom.android.diagnostic.WssDiag.InnerRoute = when {
             !pinned && !restCapabilityActive -> phantom.android.diagnostic.WssDiag.InnerRoute.WSS
@@ -1077,14 +1086,26 @@ class HybridRelayTransport(
             else -> phantom.android.diagnostic.WssDiag.InnerRoute.REST
         }
 
+        val outerBlocksPin = pinned && outerEnum != phantom.android.diagnostic.WssDiag.OuterTransport.DIRECT
         phantom.android.diagnostic.WssDiag.emit(
             event = "sender_transport_decision",
             role = phantom.android.diagnostic.WssDiag.Role.SENDER,
             correlationId = message.messageId,
-            outerTransport = phantom.android.diagnostic.WssDiag.OuterTransport.DIRECT,
+            outerTransport = outerEnum,
             innerRoute = innerRoutePlanned,
-            dispatched = true,
+            dispatched = !outerBlocksPin,
         )
+        if (outerBlocksPin) {
+            phantom.android.diagnostic.WssDiag.emit(
+                event = "sender_wss_send_returned",
+                role = phantom.android.diagnostic.WssDiag.Role.SENDER,
+                correlationId = message.messageId,
+                innerRoute = innerRoutePlanned,
+                outcomeFlag = phantom.android.diagnostic.WssDiag.OutcomeFlag.SEND_ERROR,
+                dispatched = false,
+            )
+            return false
+        }
 
         // §11 lock 2 — pinned inner route branches BEFORE the
         // production state-machine consultation, so pins are strictly
@@ -1131,7 +1152,7 @@ class HybridRelayTransport(
 
     /**
      * Direct WSS Yota-First diagnostic — wraps `wsTransport.send`
-     * with a `sender_wss_frame_written` event carrying the
+     * with a `sender_wss_send_returned` event carrying the
      * boolean-return outcome. Every WSS send path through `HRT.send`
      * routes through this helper so pinned + un-pinned WSS branches
      * share the same observability schema.
@@ -1139,7 +1160,7 @@ class HybridRelayTransport(
     private suspend fun wssSendWithDiag(message: RelayMessage.Send): Boolean {
         val ok = wsTransport.send(message)
         phantom.android.diagnostic.WssDiag.emit(
-            event = "sender_wss_frame_written",
+            event = "sender_wss_send_returned",
             role = phantom.android.diagnostic.WssDiag.Role.SENDER,
             correlationId = message.messageId,
             innerRoute = phantom.android.diagnostic.WssDiag.InnerRoute.WSS,
