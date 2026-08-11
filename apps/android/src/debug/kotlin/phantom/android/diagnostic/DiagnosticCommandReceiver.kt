@@ -6,8 +6,6 @@ package phantom.android.diagnostic
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Binder
-import android.os.Process
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
 import android.util.Log
@@ -44,16 +42,14 @@ import phantom.android.PhantomApplication
 class DiagnosticCommandReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        // §12 P1 — caller UID gate. `Binder.getCallingUid()` returns
-        // the UID of the IPC caller; SHELL (2000) or ROOT (0) are the
-        // only legitimate origins for a matrix broadcast. Rejects
-        // third-party apps that guess the explicit component name.
-        val callerUid = Binder.getCallingUid()
-        if (callerUid != Process.SHELL_UID && callerUid != Process.ROOT_UID) {
-            Log.w(TAG, "rejected: caller uid=$callerUid not shell/root")
-            return
-        }
-
+        // §12 Round-1 audit P0-6: caller enforcement moved to the
+        // AMS boundary via `android:permission="android.permission.DUMP"`
+        // in the debug AndroidManifest.xml overlay. Broadcasts from a
+        // caller that does NOT hold DUMP never reach this method.
+        // The prior `Binder.getCallingUid()` gate is removed — it was
+        // unreliable inside `onReceive` because delivery is mediated
+        // by the framework and the reported UID can be system rather
+        // than the original sender.
         val extras = intent.extras
         val subcommand = intent.getStringExtra(EXTRA_SUBCOMMAND)
 
@@ -82,6 +78,8 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_DUAL_SIM_REPORT -> handleDualSimReport(context)
             SUB_HEALTH -> handleHealth()
             SUB_CLEAR -> handleClear(context)
+            SUB_CHECKPOINT -> handleCheckpoint(context)
+            SUB_PAIRED_COUNT_REPORT -> handlePairedCountReport(context)
             else -> Log.w(TAG, "rejected: dispatch fell through for subcommand=$subcommand")
         }
     }
@@ -101,8 +99,16 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             else -> return
         }
         // §12 P0-2 — persist THEN update in-memory. Persistence has
-        // the source-of-truth role after a process restart.
-        DiagnosticTransportPinStore.writePin(context, newPin, runId!!, cellId!!)
+        // the source-of-truth role after a process restart. §12
+        // Round-1 audit P0-5: a failed .commit() must NOT silently
+        // update the in-memory guard — the two would diverge from
+        // the operator's perspective and a subsequent restart would
+        // silently revert.
+        val committed = DiagnosticTransportPinStore.writePin(context, newPin, runId!!, cellId!!)
+        if (!committed) {
+            Log.w(TAG, "rejected: SharedPreferences.commit() returned false for pin write — in-memory NOT updated")
+            return
+        }
         DiagnosticTransportGuard.set(
             DiagnosticTransportGuard.PinState(pin = newPin, runId = runId, cellId = cellId),
         )
@@ -127,17 +133,35 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             Log.w(TAG, "rejected: send subcommand invalid input (runId=$runId cellId=$cellId seq=$sequence)")
             return
         }
-        // §12 P0-2 — fail-closed if the persisted (pin, run, cell)
-        // does not match the caller. A mid-cell process restart that
-        // discarded the pin surfaces here.
+        // §12 P0-2 + Round-1 audit P0-5 — full fail-closed match:
+        //   - persisted pin must NOT be NONE (pin write must have happened)
+        //   - persisted runId + cellId must match the caller
+        //   - in-memory guard state must equal the persisted snapshot
+        //     (a process restart between pin write and send must be
+        //     detectable — session_started with restored=true is
+        //     the operator's cue to re-write the pin before sending)
         val persisted = DiagnosticTransportPinStore.read(context)
-        if (persisted.runId != runId || persisted.cellId != cellId) {
+        val inMemory = DiagnosticTransportGuard.current()
+        val mismatchReason: String? = when {
+            persisted.pin == DiagnosticTransportGuard.Pin.NONE ->
+                "persisted pin=NONE — no pin write covered this send"
+            persisted.runId != runId ->
+                "persisted runId=${persisted.runId} != caller $runId"
+            persisted.cellId != cellId ->
+                "persisted cellId=${persisted.cellId} != caller $cellId"
+            inMemory.pin != persisted.pin ->
+                "in-memory pin=${inMemory.pin} != persisted ${persisted.pin} — process restart drift"
+            inMemory.runId != persisted.runId ->
+                "in-memory runId=${inMemory.runId} != persisted ${persisted.runId} — process restart drift"
+            inMemory.cellId != persisted.cellId ->
+                "in-memory cellId=${inMemory.cellId} != persisted ${persisted.cellId} — process restart drift"
+            else -> null
+        }
+        if (mismatchReason != null) {
             Log.w(
                 TAG,
-                "rejected: send extras mismatch persisted state " +
-                    "(caller runId=$runId cellId=$cellId; persisted runId=${persisted.runId} cellId=${persisted.cellId}) — " +
-                    "either the pin was never written for this cell OR the process was restarted; " +
-                    "operator must re-write pin before sending",
+                "rejected: send fail-closed: $mismatchReason (caller runId=$runId cellId=$cellId) — " +
+                    "operator must re-write pin (diag-cmd pin ...) before sending",
             )
             return
         }
@@ -163,19 +187,79 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             try {
                 val outcome = coordinator.resolveAndSend(cellId!!, sequence)
                 when (outcome) {
-                    is DiagnosticSendCoordinator.Outcome.Sent -> Log.i(
-                        TAG,
-                        "send ok correlation_id=${outcome.correlationId} cell_id=$cellId seq=$sequence",
-                    )
-                    is DiagnosticSendCoordinator.Outcome.NoPairedConversation -> Log.w(
-                        TAG,
-                        "send rejected: no paired conversation (active=${outcome.activeCount})",
-                    )
-                    is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations -> Log.w(
-                        TAG,
-                        "send rejected: multiple paired conversations (count=${outcome.ids.size})",
-                    )
+                    is DiagnosticSendCoordinator.Outcome.Sent -> {
+                        // §12 Round-1 audit P0-1: emit a STRUCTURED
+                        // event on the sole WSS_DIAG tag that carries
+                        // the correlation ID + run/cell/sequence. The
+                        // runner reads this to know which envelope's
+                        // signals to poll. The old plaintext
+                        // "send ok correlation_id=..." on WSS_DIAG_CMD
+                        // is REMOVED — it was not in the capture set.
+                        WssDiag.emit(
+                            event = "diagnostic_send_dispatched",
+                            role = WssDiag.Role.MATRIX,
+                            correlationId = outcome.correlationId,
+                            sequence = sequence,
+                        )
+                    }
+                    is DiagnosticSendCoordinator.Outcome.NoPairedConversation ->
+                        WssDiag.emit(
+                            event = "diagnostic_send_rejected_no_paired_conversation",
+                            role = WssDiag.Role.MATRIX,
+                            sequence = sequence,
+                        )
+                    is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations ->
+                        WssDiag.emit(
+                            event = "diagnostic_send_rejected_multiple_paired_conversations",
+                            role = WssDiag.Role.MATRIX,
+                            sequence = sequence,
+                        )
                 }
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun handleCheckpoint(context: Context) {
+        // Round-1 audit P0-1 (P0-5 baseline): re-emits
+        // diagnostic_session_started so an in-stream capture can
+        // observe it deterministically. Preflight calls this AFTER
+        // capture-logs.sh streams start.
+        val snapshot = DiagnosticTransportPinStore.read(context)
+        val inMemory = DiagnosticTransportGuard.current()
+        val restored = inMemory.pin != snapshot.pin || inMemory.runId != snapshot.runId ||
+            inMemory.cellId != snapshot.cellId
+        WssDiag.emit(
+            event = "diagnostic_session_started",
+            role = WssDiag.Role.MATRIX,
+            pin = snapshot.pin.name.lowercase(),
+            innerRoute = when (snapshot.pin) {
+                DiagnosticTransportGuard.Pin.WSS -> WssDiag.InnerRoute.WSS
+                DiagnosticTransportGuard.Pin.REST -> WssDiag.InnerRoute.REST
+                DiagnosticTransportGuard.Pin.NONE -> WssDiag.InnerRoute.UNKNOWN
+            },
+            emitterIdOverride = snapshot.emitterId.name.lowercase(),
+            restored = restored,
+        )
+    }
+
+    private fun handlePairedCountReport(context: Context) {
+        // Round-1 audit P1: preflight needs an app-owned count of
+        // eligible paired conversations. Returns the count via a
+        // structured event so preflight can enforce exactly 1.
+        val app = context.applicationContext as? PhantomApplication ?: return
+        val container = runCatching { app.container }.getOrNull() ?: return
+        val pendingResult = goAsync()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        scope.launch {
+            try {
+                val active = container.conversationRepo.getActiveConversations()
+                    .filterNot { it.blocked || it.archived }
+                Log.i(
+                    TAG,
+                    "paired_count_report count=${active.size}",
+                )
             } finally {
                 pendingResult.finish()
             }
@@ -199,7 +283,11 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
                 return
             }
         }
-        DiagnosticTransportPinStore.writeEmitter(context, newId)
+        val ok = DiagnosticTransportPinStore.writeEmitter(context, newId)
+        if (!ok) {
+            Log.w(TAG, "rejected: SharedPreferences.commit() returned false for emitter write — in-memory NOT updated")
+            return
+        }
         DiagnosticTransportGuard.setEmitterId(newId)
         Log.i(TAG, "emitter_id set to=${newId.name.lowercase()}")
     }
@@ -227,9 +315,12 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
     }
 
     private fun handleClear(context: Context) {
-        DiagnosticTransportPinStore.clear(context)
+        val ok = DiagnosticTransportPinStore.clear(context)
+        if (!ok) {
+            Log.w(TAG, "rejected: SharedPreferences.commit() returned false for clear — in-memory NOT updated")
+            return
+        }
         DiagnosticTransportGuard.set(DiagnosticTransportGuard.PinState.NONE_UNSET)
-        Log.i(TAG, "diagnostic_state_cleared")
         WssDiag.emit(
             event = "diagnostic_state_cleared",
             role = WssDiag.Role.MATRIX,
@@ -259,10 +350,13 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         internal const val SUB_DUAL_SIM_REPORT = "dual_sim_report"
         internal const val SUB_HEALTH = "health"
         internal const val SUB_CLEAR = "clear"
+        internal const val SUB_CHECKPOINT = "checkpoint"
+        internal const val SUB_PAIRED_COUNT_REPORT = "paired_count_report"
 
         internal val ALLOWED_SUBCOMMANDS = setOf(
             SUB_PIN, SUB_SEND, SUB_CANARY, SUB_SET_EMITTER_ID,
             SUB_DUAL_SIM_REPORT, SUB_HEALTH, SUB_CLEAR,
+            SUB_CHECKPOINT, SUB_PAIRED_COUNT_REPORT,
         )
 
         internal val ALLOWED_PINS = setOf("none", "wss", "rest")

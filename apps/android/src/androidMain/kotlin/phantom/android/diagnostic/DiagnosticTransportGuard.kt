@@ -11,7 +11,7 @@ package phantom.android.diagnostic
  * (`HybridRelayTransport`) can consult the guard without a compile-time
  * dependency on debug-only classes.
  *
- * Writer lives ONLY in `src/debug/` (`DiagnosticCommandReceiver`) — the
+ * Writer lives ONLY in `src/debug/` (`the debug receiver`) — the
  * mutation is invoked exclusively by that receiver, which is declared
  * only in the debug `AndroidManifest.xml` overlay. In a release build the
  * receiver is physically absent from the merged manifest, so the guard
@@ -77,7 +77,7 @@ object DiagnosticTransportGuard {
     fun currentOuterArm(): String = outerArmReader?.invoke() ?: "unknown"
 
     /**
-     * Only invoked by [DiagnosticCommandReceiver] in the debug source
+     * Only invoked by [the debug receiver] in the debug source
      * set. If a release build ever reaches this method, no receiver
      * exists to call it, so it stays inert.
      */

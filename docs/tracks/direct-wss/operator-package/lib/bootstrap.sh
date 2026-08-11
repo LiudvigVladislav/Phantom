@@ -16,6 +16,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck source=portable.sh
+source "$HERE/portable.sh"
 MODE="${1:-help}"
 APP_ID="${APP_ID:-phantom.android}"
 APK="$ROOT/android-debug-diagnostic.apk"
@@ -82,7 +84,7 @@ case "$MODE" in
     tmp_apk="$SCRATCH/base-phone.apk"
     adb -s "$phone" shell pm path "$APP_ID" | tr -d '\r' | sed 's|package:||' | head -1 | \
         xargs -I{} adb -s "$phone" pull "{}" "$tmp_apk" >/dev/null
-    installed_sha=$(sha256sum "$tmp_apk" | awk '{print $1}')
+    installed_sha=$(sha256_file "$tmp_apk")
     expected_sha=$(awk '{print $1}' "$SHA")
     if [ "$installed_sha" != "$expected_sha" ]; then
       echo "bootstrap --verify FAILED: phone installed SHA-256=$installed_sha != expected=$expected_sha" >&2

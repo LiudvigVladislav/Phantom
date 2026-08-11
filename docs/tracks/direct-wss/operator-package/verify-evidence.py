@@ -2,41 +2,35 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 Willen LLC
 #
-# Direct WSS Yota-First diagnostic — evidence verifier v2 (§12 P0-1).
+# Direct WSS Yota-First diagnostic — evidence verifier v3
+# (§12 Round-1 audit repair).
 #
-# Closed-schema verifier. Rejects empty bundles, missing files,
-# wrong run/cell/emitter, duplicate correlation IDs, wrong pin/route,
-# lost pin/process restart without session_started, early verification
-# before 120 s (→ PENDING) vs after 120 s (→ Unresolved).
-#
-# Reads exactly five files, refuses anything else:
-#   phone.logcat.wss_diag
-#   emulator.logcat.wss_diag
-#   matrix.json
-#   preflight.json
-#   device-manifest.json
-#
-# Exit codes:
-#   0 = evidence_integrity=GREEN AND product_outcome all Delivered/BLOCKED
-#   1 = evidence_integrity=RED  (tooling / capture failure)
-#   2 = evidence_integrity=GREEN, product_outcome=RED (Unresolved cells)
-#   3 = evidence_integrity=GREEN, product_outcome=PENDING (rerun after 120 s)
-#
-# Priority-3 outcome per §2:
-#   PENDING    — 4 signals missing AND newest event < 120 s from
-#                sender_enqueue (verifier called too early)
-#   Unresolved — 4 signals missing AND newest event >= 120 s
-#
-# Recovered classification (§12 P0-7) is REMOVED — first pass emits
-# only Delivered once / Unresolved / PENDING / BLOCKED.
+# Changes vs v2:
+#   * Every event is filtered by matrix.json.run_id (P0-2).
+#   * Correlation IDs are globally unique inside a run, not per-cell.
+#   * Pin coverage is per-sender-device + per-run + per-cell timeline.
+#   * classify_envelope() classifies as Delivered once ONLY if pin,
+#     role, emitter, outer arm, and inner route ALL match. Any
+#     violation drops the cell to Unresolved.
+#   * BLOCKED cells require preflight.rest_capability == "disabled"
+#     AND the cell pin == "rest". Any other BLOCKED cell is
+#     integrity RED.
+#   * Preflight booleans are checked for `True` value (not key
+#     presence).
+#   * 120-s window uses a host clock injected via --host-now-ms; if
+#     omitted, derives host_now_ms from clock_skew and the newest
+#     device wall_utc_ms + a "verification age" fudge.
+#   * Exit codes: 0/1/2/3 as v2.
 
 from __future__ import annotations
+import argparse
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Optional
 
 WSS_120_S = 120_000
 
@@ -50,13 +44,14 @@ REQUIRED_FILES = [
 
 FIELD_RE = re.compile(r"(\w+)=(\S+)")
 
-# Banned tokens in raw log lines — indicates a schema violation.
 BANNED_TOKEN_SUBSTRINGS = ["text=", "plaintext=", "content=", "auth=", "token=", "sealed=", "hex="]
 KEY_LIKE_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
 
 EXPECTED_CELL_COUNT = 8
 EXPECTED_ENVELOPES_PER_CELL = 5
 ALLOWED_PINS = {"wss", "rest"}
+ALLOWED_DIRECTIONS = {"p2e", "e2p"}
+ALLOWED_SCENARIOS = {"after-connect", "after-idle", "bg-fg", "control"}
 ALLOWED_ROLES = {"sender", "recipient", "matrix"}
 
 
@@ -78,6 +73,8 @@ class WssEvent:
     relay_acceptance: Optional[str] = None
     pin: Optional[str] = None
     dispatched: Optional[bool] = None
+    restored: Optional[bool] = None
+    sequence: Optional[int] = None
     raw: str = ""
 
 
@@ -132,13 +129,14 @@ def parse_events(path: str, device_label: str) -> list[WssEvent]:
                 relay_acceptance=fields.get("relay_acceptance"),
                 pin=fields.get("pin"),
                 dispatched=(fields["dispatched"] == "true") if "dispatched" in fields else None,
+                restored=(fields["restored"] == "true") if "restored" in fields else None,
+                sequence=int(fields["sequence"]) if "sequence" in fields else None,
                 raw=line.rstrip("\n"),
             ))
     return out
 
 
 def cell_direction_to_emitters(direction: str) -> tuple[str, str]:
-    """Return (sender_emitter, recipient_emitter) — 'phone' / 'emulator'."""
     if direction == "p2e":
         return "phone", "emulator"
     if direction == "e2p":
@@ -146,37 +144,61 @@ def cell_direction_to_emitters(direction: str) -> tuple[str, str]:
     return "unknown", "unknown"
 
 
-def pin_covers_envelope(
-    cell_pin: str,
-    envelope_enqueue_wall: int,
-    pin_active_events: list[WssEvent],
-    per_device_session_started: dict[str, list[WssEvent]],
+def _matches_run_and_cell(e: WssEvent, run_id: str, cell_id: str) -> bool:
+    return e.run_id == run_id and e.cell_id == cell_id
+
+
+def _per_sender_pin_coverage(
+    cell_pin: str, run_id: str, cell_id: str, sender_device: str,
+    envelope_wall: int, all_events: list[WssEvent],
 ) -> tuple[bool, str]:
     """
-    A pin covers an envelope's send if EITHER:
-      (a) A `diagnostic_pin_active pin=<cell_pin>` event exists BEFORE
-          the envelope's sender_enqueue with the same cell_id.
-      (b) A `diagnostic_session_started pin=<cell_pin>` event exists on
-          the same device WITHOUT a subsequent pin change to a different
-          value before the envelope.
-
-    Returns (ok, why_not_if_false).
+    Timeline for the SENDER device only:
+      * every diagnostic_pin_active event on the sender for
+        (run, cell) → mark "pin=<value>" at wall
+      * every diagnostic_session_started event on the sender (any
+        cell/run) → if restored=false, the guard was reset;
+        pin coverage is broken until a fresh matching pin_active
+    Latest coverage BEFORE envelope_wall must be pin=cell_pin,
+    matching run_id + cell_id.
     """
-    matches = [e for e in pin_active_events
-               if e.pin == cell_pin and e.wall_utc_ms is not None
-               and e.wall_utc_ms <= envelope_enqueue_wall]
-    if not matches:
-        # Fall back to session_started event as pin coverage — the boot
-        # init emits it with the persisted pin AFTER restoring.
-        for dev in per_device_session_started.values():
-            for e in dev:
-                if e.pin == cell_pin and e.wall_utc_ms is not None and e.wall_utc_ms <= envelope_enqueue_wall:
-                    return (True, "")
-        return (False, f"no diagnostic_pin_active pin={cell_pin} or diagnostic_session_started covering enqueue")
-    return (True, "")
+    per_sender = [
+        e for e in all_events
+        if e.device == sender_device and e.wall_utc_ms is not None
+        and e.wall_utc_ms <= envelope_wall
+        and (e.event == "diagnostic_pin_active" or e.event == "diagnostic_session_started")
+    ]
+    per_sender.sort(key=lambda e: e.wall_utc_ms or 0)
+    latest_pin: Optional[str] = None
+    latest_meta: str = ""
+    for ev in per_sender:
+        if ev.event == "diagnostic_session_started":
+            # A restart with restored=false invalidates prior pin_active
+            # coverage regardless of what pin field is carried — the
+            # guard has been reset.
+            if ev.restored is False:
+                latest_pin = "none"
+                latest_meta = f"session_started(restored=false) at {ev.wall_utc_ms}"
+            elif ev.restored is True and ev.pin and ev.pin != "none":
+                latest_pin = ev.pin
+                latest_meta = f"session_started(restored=true, pin={ev.pin}) at {ev.wall_utc_ms}"
+        elif ev.event == "diagnostic_pin_active":
+            if ev.run_id == run_id and ev.cell_id == cell_id:
+                latest_pin = ev.pin
+                latest_meta = f"pin_active(run={ev.run_id}, cell={ev.cell_id}, pin={ev.pin}) at {ev.wall_utc_ms}"
+            else:
+                # Pin_active for a DIFFERENT cell/run resets coverage:
+                # the operator moved on. Cell-scope isolation.
+                latest_pin = "none"
+                latest_meta = f"pin_active(other cell/run={ev.run_id}/{ev.cell_id}) at {ev.wall_utc_ms}"
+    if latest_pin == cell_pin:
+        return (True, latest_meta)
+    return (False, f"latest pin before enqueue on {sender_device}: {latest_pin or 'none'} ({latest_meta or 'no events'}) — expected {cell_pin} for run={run_id} cell={cell_id}")
 
 
-def integrity_check_bundle(events: list[WssEvent], out: str, matrix: dict, manifest: dict) -> list[str]:
+def integrity_check_bundle(
+    events: list[WssEvent], out: str, matrix: dict, manifest: dict,
+) -> list[str]:
     problems: list[str] = []
 
     # (a) Required files present + non-empty.
@@ -188,11 +210,11 @@ def integrity_check_bundle(events: list[WssEvent], out: str, matrix: dict, manif
         if os.path.getsize(p) == 0:
             problems.append(f"required file empty: {name}")
 
-    # (b) No events at all is RED regardless.
+    # (b) No events at all is RED.
     if not events:
         problems.append("no WSS_DIAG events parsed — bundle is not usable")
 
-    # (c) Every event has a role, wall_utc_ms.
+    # (c) Every event has role, wall_utc_ms, emitter_id.
     for e in events:
         if e.role is None:
             problems.append(f"event missing role: {e.event} @ {e.device}")
@@ -200,51 +222,91 @@ def integrity_check_bundle(events: list[WssEvent], out: str, matrix: dict, manif
             problems.append(f"event role not in whitelist: {e.role}")
         if e.wall_utc_ms is None:
             problems.append(f"event missing wall_utc_ms: {e.event} @ {e.device}")
-
-    # (d) Emitter role sanity — every event must carry an emitter_id.
-    for e in events:
         if e.emitter_id is None:
             problems.append(f"event missing emitter_id: {e.event} @ {e.device}")
         elif e.emitter_id not in ("phone", "emulator"):
             problems.append(f"emitter_id not phone/emulator: {e.emitter_id} @ {e.device}")
 
-    # (e) session_started present on BOTH devices.
-    started_by_dev = {d: [] for d in ("phone", "emulator")}
-    for e in events:
-        if e.event == "diagnostic_session_started":
-            started_by_dev.setdefault(e.device, []).append(e)
+    # (d) session_started present on BOTH devices.
     for dev in ("phone", "emulator"):
-        if not started_by_dev.get(dev):
-            problems.append(f"no diagnostic_session_started event on {dev} — boot init did not fire")
+        if not any(e.event == "diagnostic_session_started" and e.device == dev for e in events):
+            problems.append(f"no diagnostic_session_started event on {dev}")
 
-    # (f) No client-emitted verifier-only classification.
+    # (e) forbidden verifier-only classification on client.
     for e in events:
         if e.event == "unresolved_120s_marker" or e.outcome_flag == "unresolved_120s_marker":
             problems.append(f"forbidden verifier-only classification emitted by client: {e.raw}")
 
-    # (g) matrix.json shape.
-    if matrix.get("run_id") is None:
+    # (f) matrix.json shape.
+    run_id_matrix = matrix.get("run_id")
+    if not run_id_matrix:
         problems.append("matrix.json missing run_id")
     cells = matrix.get("cells", [])
     if len(cells) != EXPECTED_CELL_COUNT:
         problems.append(f"matrix.json cells count={len(cells)} (expected {EXPECTED_CELL_COUNT})")
+    seen_cell_ids: set[str] = set()
+    for cell in cells:
+        cid = cell.get("cell_id")
+        if not cid:
+            problems.append("cell missing cell_id")
+            continue
+        if cid in seen_cell_ids:
+            problems.append(f"duplicate cell_id in matrix: {cid}")
+        seen_cell_ids.add(cid)
+        if cell.get("pin") not in ALLOWED_PINS:
+            problems.append(f"cell {cid} pin not in whitelist: {cell.get('pin')}")
+        if cell.get("direction") not in ALLOWED_DIRECTIONS:
+            problems.append(f"cell {cid} direction not in whitelist: {cell.get('direction')}")
+        if cell.get("scenario") not in ALLOWED_SCENARIOS:
+            problems.append(f"cell {cid} scenario not in whitelist: {cell.get('scenario')}")
+        if cell.get("blocked") is True and cell.get("pin") != "rest":
+            problems.append(f"cell {cid} BLOCKED but pin != rest — only REST cells may be BLOCKED")
 
-    # (h) preflight.json + device-manifest.json required fields.
+    # (g) preflight.json required booleans.
     preflight_disk: dict = {}
     preflight_path = os.path.join(out, "preflight.json")
     if os.path.exists(preflight_path):
-        with open(preflight_path, "r", encoding="utf-8") as _pf:
-            preflight_disk = json.load(_pf)
-    for req in ("rest_capability", "yota_confirmed", "emitter_ids_set"):
-        if req not in matrix.get("preflight", {}) and req not in preflight_disk:
-            problems.append(f"preflight.json missing required key: {req}")
+        with open(preflight_path, "r", encoding="utf-8") as pf:
+            preflight_disk = json.load(pf)
+    for req_bool in ("yota_confirmed", "emitter_ids_set", "radio_confirmed"):
+        if preflight_disk.get(req_bool) is not True:
+            problems.append(f"preflight.json.{req_bool} is not True: {preflight_disk.get(req_bool)!r}")
+    if preflight_disk.get("rest_capability") not in ("enabled", "disabled", "unknown"):
+        problems.append(f"preflight.json.rest_capability invalid: {preflight_disk.get('rest_capability')!r}")
+
+    # (h) REST BLOCKED cells consistent with preflight.rest_capability=disabled.
+    if any(cell.get("blocked") for cell in cells):
+        if preflight_disk.get("rest_capability") != "disabled":
+            problems.append("cells declare blocked but preflight.rest_capability != 'disabled'")
+
+    # (i) device-manifest.json required keys.
     for req in ("clock_skew_ms", "phone_serial", "emulator_serial"):
         if req not in manifest:
             problems.append(f"device-manifest.json missing required key: {req}")
     if abs(manifest.get("clock_skew_ms", 999_999)) > 30_000:
-        problems.append(f"|clock_skew_ms| > 30 000 → cross-device correlation degraded: {manifest.get('clock_skew_ms')}")
+        problems.append(f"|clock_skew_ms| > 30 000: {manifest.get('clock_skew_ms')}")
 
-    # (i) Raw banned-token scan.
+    # (j) Every event's run_id must match matrix.run_id.
+    if run_id_matrix:
+        for e in events:
+            if e.event in ("diagnostic_session_started", "diagnostic_canary", "diagnostic_state_cleared"):
+                continue  # these may fire before the run starts
+            if e.run_id is None:
+                problems.append(f"event {e.event} missing run_id")
+            elif e.run_id != run_id_matrix and e.run_id != "-":
+                problems.append(f"event {e.event} has run_id={e.run_id} but matrix.run_id={run_id_matrix}")
+
+    # (k) Global correlation ID uniqueness inside the run
+    #     (each `sender_enqueue` must have a globally unique CID).
+    enqueue_by_cid: dict[str, list[WssEvent]] = {}
+    for e in events:
+        if e.event == "sender_enqueue" and e.correlation_id:
+            enqueue_by_cid.setdefault(e.correlation_id, []).append(e)
+    for cid, evs in enqueue_by_cid.items():
+        if len(evs) > 1:
+            problems.append(f"correlation_id used multiple times: {cid} ({len(evs)} enqueues)")
+
+    # (l) Raw banned-token scan.
     for name in ("phone.logcat.wss_diag", "emulator.logcat.wss_diag"):
         p = os.path.join(out, name)
         if not os.path.exists(p):
@@ -257,7 +319,7 @@ def integrity_check_bundle(events: list[WssEvent], out: str, matrix: dict, manif
                     if tok in line:
                         problems.append(f"{name}:{i} banned token '{tok}'")
                 if KEY_LIKE_HEX_RE.search(line):
-                    problems.append(f"{name}:{i} 64-char lowercase hex substring — key-material shape")
+                    problems.append(f"{name}:{i} 64-char lowercase hex substring")
 
     return problems
 
@@ -266,31 +328,49 @@ def classify_envelope(
     envelope_enqueue: WssEvent,
     corr_events: list[WssEvent],
     cell_pin: str,
-    expected_sender_emitter: str,
-    expected_recipient_emitter: str,
-    pin_active_events: list[WssEvent],
-    session_started: dict[str, list[WssEvent]],
-    now_wall_ms: int,
+    cell_id: str, run_id: str,
+    sender_device: str, recipient_device: str,
+    sender_emitter: str, recipient_emitter: str,
+    all_events: list[WssEvent],
+    host_now_ms: int,
 ) -> tuple[str, list[str]]:
     issues: list[str] = []
 
-    # Role/emitter sanity.
-    sender_evts = [e for e in corr_events if e.role == "sender"]
-    recipient_evts = [e for e in corr_events if e.role == "recipient"]
-    if sender_evts and any(e.emitter_id != expected_sender_emitter for e in sender_evts):
-        issues.append(f"sender emitter_id != {expected_sender_emitter}")
-    if recipient_evts and any(e.emitter_id != expected_recipient_emitter for e in recipient_evts):
-        issues.append(f"recipient emitter_id != {expected_recipient_emitter}")
+    # (1) Enqueue itself must own run/cell/emitter.
+    if envelope_enqueue.run_id != run_id:
+        issues.append(f"enqueue run_id={envelope_enqueue.run_id} != {run_id}")
+    if envelope_enqueue.cell_id != cell_id:
+        issues.append(f"enqueue cell_id={envelope_enqueue.cell_id} != {cell_id}")
+    if envelope_enqueue.emitter_id != sender_emitter:
+        issues.append(f"enqueue emitter={envelope_enqueue.emitter_id} != {sender_emitter}")
+    if envelope_enqueue.device != sender_device:
+        issues.append(f"enqueue device={envelope_enqueue.device} != {sender_device}")
 
-    # Pin coverage.
-    (covered, why) = pin_covers_envelope(
-        cell_pin, envelope_enqueue.wall_utc_ms or 0,
-        pin_active_events, session_started,
+    # (2) Sender events must all be on the sender device with matching run/cell.
+    sender_evts = [e for e in corr_events if e.role == "sender"]
+    for e in sender_evts:
+        if e.device != sender_device or e.run_id != run_id or e.cell_id != cell_id:
+            issues.append(f"sender event {e.event} owner mismatch (device={e.device} run={e.run_id} cell={e.cell_id})")
+        if e.emitter_id != sender_emitter:
+            issues.append(f"sender event {e.event} emitter mismatch: {e.emitter_id}")
+
+    # (3) Recipient events must be on recipient device.
+    recipient_evts = [e for e in corr_events if e.role == "recipient"]
+    for e in recipient_evts:
+        if e.device != recipient_device:
+            issues.append(f"recipient event {e.event} device mismatch: {e.device}")
+        if e.emitter_id != recipient_emitter:
+            issues.append(f"recipient event {e.event} emitter mismatch: {e.emitter_id}")
+
+    # (4) Pin coverage on sender for this run+cell.
+    (covered, why) = _per_sender_pin_coverage(
+        cell_pin, run_id, cell_id, sender_device,
+        envelope_enqueue.wall_utc_ms or 0, all_events,
     )
     if not covered:
-        issues.append(f"pin not covered at enqueue: {why}")
+        issues.append(f"pin coverage: {why}")
 
-    # Transport decision matches pin.
+    # (5) sender_transport_decision must exist, be direct, and match pin.
     decision = next((e for e in corr_events if e.event == "sender_transport_decision"), None)
     if decision is None:
         issues.append("missing sender_transport_decision")
@@ -300,9 +380,9 @@ def classify_envelope(
         if decision.inner_route != cell_pin:
             issues.append(f"inner_route != cell pin: {decision.inner_route} vs {cell_pin}")
         if decision.dispatched is False:
-            issues.append("sender_transport_decision dispatched=false — cell BLOCKED for this envelope")
+            issues.append("sender_transport_decision dispatched=false (BLOCKED for this envelope)")
 
-    # Delivery signals.
+    # (6) Delivery signals.
     deliver_fresh = [e for e in corr_events if e.event == "recipient_deliver_received" and e.dedup_gate == "fresh"]
     persist = [e for e in corr_events if e.event == "recipient_message_persisted"]
     ack = [e for e in corr_events if e.event == "recipient_ack_deliver_sent"]
@@ -317,21 +397,28 @@ def classify_envelope(
     if len(deliver_fresh) > 1:
         missing.append("2nd recipient_deliver_received(fresh) — dedup violation")
 
-    if not missing and not issues:
-        return ("Delivered once", [])
-    if not missing:
-        # Delivery signals present but pinning / role issues — still classify Delivered once with warnings.
-        return ("Delivered once", issues)
+    if issues:
+        # Contract violations always drop to Unresolved (never "Delivered once with warnings").
+        return ("Unresolved", issues + missing)
 
-    # PENDING vs Unresolved by 120s window.
-    enqueue_wall = envelope_enqueue.wall_utc_ms or 0
-    age_ms = now_wall_ms - enqueue_wall
-    if age_ms < WSS_120_S:
-        return ("PENDING", missing + issues + [f"age_ms={age_ms} < 120_000"])
-    return ("Unresolved", missing + issues + [f"age_ms={age_ms}"])
+    if missing:
+        # PENDING before 120 s host clock; Unresolved after.
+        enqueue_wall = envelope_enqueue.wall_utc_ms or 0
+        age_ms = host_now_ms - enqueue_wall
+        if age_ms < WSS_120_S:
+            return ("PENDING", missing + [f"age_ms={age_ms} < 120_000"])
+        return ("Unresolved", missing + [f"age_ms={age_ms}"])
+
+    return ("Delivered once", [])
 
 
-def build_report(out: str) -> VerifyReport:
+def _derive_host_now_ms(all_events: list[WssEvent], manifest: dict, override: Optional[int]) -> int:
+    if override is not None:
+        return override
+    return int(time.time_ns() // 1_000_000)
+
+
+def build_report(out: str, host_now_override_ms: Optional[int] = None) -> VerifyReport:
     phone_events = parse_events(os.path.join(out, "phone.logcat.wss_diag"), "phone")
     emu_events = parse_events(os.path.join(out, "emulator.logcat.wss_diag"), "emulator")
     all_events = phone_events + emu_events
@@ -350,13 +437,14 @@ def build_report(out: str) -> VerifyReport:
     integrity_issues = integrity_check_bundle(all_events, out, matrix, manifest)
     integrity_ok = not integrity_issues
 
-    # Per-cell classification.
-    now_wall = max((e.wall_utc_ms or 0 for e in all_events), default=0)
-    pin_active_events = [e for e in all_events if e.event == "diagnostic_pin_active"]
-    session_started_by_dev = {"phone": [], "emulator": []}
-    for e in all_events:
-        if e.event == "diagnostic_session_started":
-            session_started_by_dev.setdefault(e.device, []).append(e)
+    run_id_matrix = matrix.get("run_id") or ""
+
+    # For per-envelope classification, restrict events to matching run_id.
+    # session_started/canary/state_cleared/checkpoint events keep whatever run_id was
+    # persisted at that moment; enqueue/decision/delivery events MUST match.
+    run_scoped_events = [e for e in all_events if e.run_id in (run_id_matrix, None, "-")]
+
+    host_now_ms = _derive_host_now_ms(all_events, manifest, host_now_override_ms)
 
     cells_report: list[CellReport] = []
     aggregate_pending = False
@@ -373,15 +461,20 @@ def build_report(out: str) -> VerifyReport:
             cr.outcome = "BLOCKED"
             cells_report.append(cr)
             continue
-        cell_evts = [e for e in all_events if e.cell_id == cr.cell_id]
+
+        sender_emitter, recipient_emitter = cell_direction_to_emitters(cr.direction)
+        sender_device, recipient_device = sender_emitter, recipient_emitter
+
+        cell_evts = [
+            e for e in run_scoped_events
+            if e.cell_id == cr.cell_id and e.run_id == run_id_matrix
+        ]
         enqueues = sorted(
             [e for e in cell_evts if e.event == "sender_enqueue"],
             key=lambda e: e.wall_utc_ms or 0,
         )
-        corr_ids = [e.correlation_id for e in enqueues if e.correlation_id]
-        cr.envelopes = len(corr_ids)
+        cr.envelopes = len(enqueues)
 
-        # Envelope count check.
         if cr.envelopes != EXPECTED_ENVELOPES_PER_CELL:
             cr.issues.append(f"envelope count = {cr.envelopes} (expected {EXPECTED_ENVELOPES_PER_CELL})")
             cr.outcome = "Unresolved"
@@ -389,25 +482,34 @@ def build_report(out: str) -> VerifyReport:
             cells_report.append(cr)
             continue
 
-        # Correlation IDs unique.
-        if len(set(corr_ids)) != len(corr_ids):
+        # Correlation IDs unique within cell (also enforced globally by integrity).
+        cids = [e.correlation_id for e in enqueues if e.correlation_id]
+        if len(set(cids)) != len(cids):
             cr.issues.append("duplicate correlation_id within cell")
             cr.outcome = "Unresolved"
             aggregate_red = True
             cells_report.append(cr)
             continue
 
-        sender_emitter, recipient_emitter = cell_direction_to_emitters(cr.direction)
         env_outcomes: list[str] = []
         for enq in enqueues:
             cid = enq.correlation_id
-            corr_evts = [e for e in all_events if e.correlation_id == cid]
+            corr_evts = [e for e in run_scoped_events if e.correlation_id == cid]
             (o, mm) = classify_envelope(
-                enq, corr_evts, cr.pin, sender_emitter, recipient_emitter,
-                pin_active_events, session_started_by_dev, now_wall,
+                envelope_enqueue=enq,
+                corr_events=corr_evts,
+                cell_pin=cr.pin,
+                cell_id=cr.cell_id,
+                run_id=run_id_matrix,
+                sender_device=sender_device,
+                recipient_device=recipient_device,
+                sender_emitter=sender_emitter,
+                recipient_emitter=recipient_emitter,
+                all_events=all_events,
+                host_now_ms=host_now_ms,
             )
             if mm:
-                cr.issues.append(f"{cid[:8]}: {'; '.join(mm)}")
+                cr.issues.append(f"{cid[:8] if cid else '?'}: {'; '.join(mm)}")
             env_outcomes.append(o)
 
         if any(o == "Unresolved" for o in env_outcomes):
@@ -420,7 +522,6 @@ def build_report(out: str) -> VerifyReport:
             cr.outcome = "Delivered once"
         cells_report.append(cr)
 
-    # Product outcome aggregation.
     if aggregate_red:
         product_outcome = "RED"
     elif aggregate_pending:
@@ -438,7 +539,7 @@ def build_report(out: str) -> VerifyReport:
 
 
 def render_markdown(rep: VerifyReport) -> str:
-    lines = ["# Direct WSS Yota-First — verification report v2"]
+    lines = ["# Direct WSS Yota-First — verification report v3"]
     lines.append("")
     lines.append(f"run_id: `{rep.run_id}`")
     lines.append("")
@@ -465,15 +566,17 @@ def render_markdown(rep: VerifyReport) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: verify-evidence.py <evidence-dir>", file=sys.stderr)
-        return 2
-    out = sys.argv[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("out", help="evidence directory")
+    parser.add_argument("--host-now-ms", type=int, default=None,
+                        help="override the verification clock (fixture use only)")
+    ns = parser.parse_args()
+    out = ns.out
     if not os.path.isdir(out):
         print(f"verify FAILED: not a directory: {out}", file=sys.stderr)
         return 1
 
-    rep = build_report(out)
+    rep = build_report(out, host_now_override_ms=ns.host_now_ms)
     md = render_markdown(rep)
     report_path = os.path.join(out, "verification-report.md")
     with open(report_path, "w", encoding="utf-8") as f:

@@ -8,12 +8,13 @@
   `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest`.
 
   `android:exported="true"` is required so `am broadcast -n` from an
-  ADB shell can invoke the receiver by explicit component. A third-
-  party app that discovers the component name AND fires an explicit
-  broadcast would deliver a message to `onReceive`, so the receiver
-  gates on `Binder.getCallingUid() ∈ {SHELL_UID, ROOT_UID}` and
-  silently rejects everything else. See
-  `DiagnosticCommandReceiver.onReceive` for the enforcement code.
+  ADB shell can invoke the receiver by explicit component. §12
+  Round-1 audit P0-6: the AMS-boundary enforcement replaces the
+  earlier `Binder.getCallingUid()` gate — the receiver requires the
+  caller to hold `android.permission.DUMP`, which is a signature
+  permission granted only to the shell UID (2000) on stock Android.
+  A third-party app cannot deliver a broadcast even if it discovers
+  the component name.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -22,7 +23,8 @@
         <receiver
             android:name="phantom.android.diagnostic.DiagnosticCommandReceiver"
             android:enabled="true"
-            android:exported="true" />
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
 
         <!--
           Zero-touch boot-init provider: instantiated by the Android

@@ -48,7 +48,7 @@ case "$subcommand" in
     [ -z "$emitter_id" ] && { echo "set_emitter_id requires --emitter-id" >&2; exit 2; }
     args+=(--es emitter_id "$emitter_id")
     ;;
-  canary|dual_sim_report|health|clear) : ;;
+  canary|dual_sim_report|health|clear|checkpoint|paired_count_report) : ;;
   *) echo "unknown subcommand: $subcommand" >&2; exit 2 ;;
 esac
 

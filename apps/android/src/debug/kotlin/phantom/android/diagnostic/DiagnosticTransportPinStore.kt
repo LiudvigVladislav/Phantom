@@ -70,21 +70,19 @@ internal object DiagnosticTransportPinStore {
         )
     }
 
-    fun writePin(context: Context, pin: DiagnosticTransportGuard.Pin, runId: String, cellId: String) {
+    fun writePin(context: Context, pin: DiagnosticTransportGuard.Pin, runId: String, cellId: String): Boolean =
         prefs(context).edit()
             .putString(KEY_PIN, pin.name.lowercase())
             .putString(KEY_RUN_ID, runId)
             .putString(KEY_CELL_ID, cellId)
             .commit()
-    }
 
-    fun writeEmitter(context: Context, id: DiagnosticTransportGuard.EmitterId) {
+    fun writeEmitter(context: Context, id: DiagnosticTransportGuard.EmitterId): Boolean =
         prefs(context).edit()
             .putString(KEY_EMITTER_ID, id.name.lowercase())
             .commit()
-    }
 
-    fun clear(context: Context) {
+    fun clear(context: Context): Boolean =
         prefs(context).edit()
             .putString(KEY_PIN, "none")
             .putString(KEY_RUN_ID, "")
@@ -92,5 +90,4 @@ internal object DiagnosticTransportPinStore {
             .commit()
         // emitter_id survives clear-run intentionally — the device role
         // is a bootstrap-time property, not a per-run property.
-    }
 }

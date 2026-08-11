@@ -87,6 +87,8 @@ object WssDiag {
         dispatched: Boolean? = null,
         pin: String? = null,
         emitterIdOverride: String? = null,
+        restored: Boolean? = null,
+        sequence: Int? = null,
     ) {
         val state = DiagnosticTransportGuard.current()
         val emitterId = emitterIdOverride ?: DiagnosticTransportGuard.currentEmitterId().name.lowercase()
@@ -109,6 +111,8 @@ object WssDiag {
             if (sessionEpoch != null) append(' ').append("session_epoch=").append(sessionEpoch)
             if (dispatched != null) append(' ').append("dispatched=").append(dispatched)
             if (pin != null) append(' ').append("pin=").append(pin)
+            if (restored != null) append(' ').append("restored=").append(restored)
+            if (sequence != null) append(' ').append("sequence=").append(sequence)
         }
         Log.i(TAG, fields)
     }

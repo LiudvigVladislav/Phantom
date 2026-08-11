@@ -28,6 +28,7 @@ class DiagnosticCommandReceiverContractTest {
         val expected = setOf(
             "pin", "send", "canary", "set_emitter_id",
             "dual_sim_report", "health", "clear",
+            "checkpoint", "paired_count_report",
         )
         assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
     }

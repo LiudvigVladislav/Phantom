@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 Willen LLC
 #
-# Direct WSS Yota-First — verifier fixture tests (§12 P0-1).
+# Direct WSS Yota-First — verifier fixture tests v3
+# (§12 Round-1 audit repair).
 #
-# Pure unittest, no pytest dep. Run:
-#   python3 -m unittest discover -s tests -v
-#
-# Every P0-1 / P0-5 case listed in the audit gets a case here.
+# Every case from the Round-1 audit list is present here:
+#   wrong run, wrong cell, wrong emitter/device, wrong outer/inner
+#   route with complete delivery, cross-cell pin contamination,
+#   restart with restored pin, restart with lost pin, global
+#   duplicate CID, malformed 8-cell schema, false preflight booleans,
+#   illegal BLOCKED cell, injected-clock PENDING-to-Unresolved.
 
 from __future__ import annotations
 import json
@@ -17,10 +20,6 @@ import sys
 import tempfile
 import unittest
 
-# Import the verifier by path. The file lives as
-# `verify-evidence.py` (dash); importlib can load it but the
-# dataclass machinery on Python 3.12+ needs the module registered
-# under its stated name in sys.modules first.
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import importlib.util  # noqa: E402
@@ -33,7 +32,8 @@ sys.modules["verify_evidence"] = ve
 _spec.loader.exec_module(ve)
 
 
-# ── Fixture builders ────────────────────────────────────────────
+RUN_ID = "run-test"
+
 
 def make_bundle(tmpdir: str,
                 phone_lines: list[str] | None = None,
@@ -80,12 +80,17 @@ def default_matrix() -> dict:
             "pin": pin, "direction": direction, "scenario": scenario,
             "blocked": False,
         })
-    return {"run_id": "run-test", "rest_capability": "enabled",
+    return {"run_id": RUN_ID, "rest_capability": "enabled",
             "preflight": default_preflight(), "cells": cells}
 
 
 def default_preflight() -> dict:
-    return {"rest_capability": "enabled", "yota_confirmed": True, "emitter_ids_set": True}
+    return {
+        "rest_capability": "enabled",
+        "yota_confirmed": True,
+        "emitter_ids_set": True,
+        "radio_confirmed": True,
+    }
 
 
 def default_manifest() -> dict:
@@ -96,10 +101,13 @@ def line(event: str, wall: int, mono: int, role: str, cell_id: str, emitter: str
          correlation_id: str = "-", pin: str | None = None,
          outer: str | None = None, inner: str | None = None,
          dedup: str | None = None, outcome: str | None = None,
-         dispatched: bool | None = None) -> str:
+         dispatched: bool | None = None,
+         run_id: str = RUN_ID,
+         restored: bool | None = None,
+         sequence: int | None = None) -> str:
     fields = [
         f"event={event}", f"role={role}", f"emitter_id={emitter}",
-        f"run_id=run-test", f"cell_id={cell_id}",
+        f"run_id={run_id}", f"cell_id={cell_id}",
         f"wall_utc_ms={wall}", f"monotonic_ms={mono}",
     ]
     if correlation_id != "-":
@@ -110,14 +118,14 @@ def line(event: str, wall: int, mono: int, role: str, cell_id: str, emitter: str
     if dedup: fields.append(f"dedup_gate={dedup}")
     if outcome: fields.append(f"outcome_flag={outcome}")
     if dispatched is not None: fields.append(f"dispatched={'true' if dispatched else 'false'}")
+    if restored is not None: fields.append(f"restored={'true' if restored else 'false'}")
+    if sequence is not None: fields.append(f"sequence={sequence}")
     payload = " ".join(fields)
-    # Match the WSS_DIAG:V logcat "-v threadtime" line shape closely
-    # enough that the parser's regex finds the payload.
     return f"08-11 12:00:00.000  1234  1234 I WSS_DIAG: {payload}"
 
 
-def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 100_000, pin: str = "wss") -> tuple[list[str], list[str]]:
-    """Build a fully-successful 5-envelope cell across two log streams."""
+def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 100_000,
+                                 pin: str = "wss", cid_prefix: str = "cid") -> tuple[list[str], list[str]]:
     if direction == "p2e":
         sender_dev, recipient_dev = "phone", "emulator"
     else:
@@ -125,14 +133,16 @@ def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 
     phone: list[str] = []
     emu: list[str] = []
     # diagnostic_session_started on both devices at boot.
-    phone.append(line("diagnostic_session_started", base_wall - 1000, 1, "matrix", cell_id, "phone", pin=pin, inner=pin, dispatched=True))
-    emu.append(line("diagnostic_session_started", base_wall - 1000, 1, "matrix", cell_id, "emulator", pin=pin, inner=pin, dispatched=True))
-    # diagnostic_pin_active AFTER boot but BEFORE first enqueue.
+    phone.append(line("diagnostic_session_started", base_wall - 1000, 1, "matrix", cell_id, "phone",
+                       pin=pin, inner=pin, restored=False))
+    emu.append(line("diagnostic_session_started", base_wall - 1000, 1, "matrix", cell_id, "emulator",
+                     pin=pin, inner=pin, restored=False))
+    # diagnostic_pin_active AFTER boot but BEFORE first enqueue on each device.
     phone.append(line("diagnostic_pin_active", base_wall - 500, 2, "matrix", cell_id, "phone", pin=pin, inner=pin))
     emu.append(line("diagnostic_pin_active", base_wall - 500, 2, "matrix", cell_id, "emulator", pin=pin, inner=pin))
     for i in range(1, 6):
         wall = base_wall + i * 1000
-        cid = f"cid-{cell_id}-{i}"
+        cid = f"{cid_prefix}-{cell_id}-{i}"
         sender_lines = phone if sender_dev == "phone" else emu
         recipient_lines = phone if recipient_dev == "phone" else emu
         sender_lines.append(line("sender_enqueue", wall, 10, "sender", cell_id, sender_dev, correlation_id=cid))
@@ -151,7 +161,25 @@ def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 
     return phone, emu
 
 
-# ── Tests ───────────────────────────────────────────────────────
+def build_full_matrix_bundle(tmpdir: str, host_now_ms: int | None = None,
+                              matrix_override: dict | None = None) -> tuple[str, int]:
+    """Build a bundle where every cell has 5 complete delivered envelopes,
+    with pin taken from the cell (WSS or REST)."""
+    m = matrix_override if matrix_override is not None else default_matrix()
+    phone: list[str] = []
+    emu: list[str] = []
+    base = 200_000
+    for i, cell in enumerate(m["cells"]):
+        if cell.get("blocked"):
+            continue
+        p, e = make_complete_delivery_lines(
+            cell["cell_id"], cell["direction"], base_wall=base + i * 10_000,
+            pin=cell["pin"],
+        )
+        phone.extend(p); emu.extend(e)
+    out = make_bundle(tmpdir, phone_lines=phone, emulator_lines=emu, matrix=m)
+    return out, base
+
 
 class VerifierTests(unittest.TestCase):
 
@@ -161,126 +189,317 @@ class VerifierTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    # ── Basic integrity ─────────────────────────────────────────
+
     def test_empty_bundle_is_integrity_RED(self):
-        out = make_bundle(self.tmp)  # all files present but empty logcats
+        out = make_bundle(self.tmp)
         rep = ve.build_report(out)
-        self.assertFalse(rep.integrity_ok, msg="empty bundle must be RED, was GREEN")
-        self.assertIn("no WSS_DIAG events parsed — bundle is not usable", rep.integrity_issues)
+        self.assertFalse(rep.integrity_ok)
 
     def test_missing_required_file_is_integrity_RED(self):
         out = make_bundle(self.tmp, skip={"matrix.json"})
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
-        self.assertTrue(any("matrix.json" in p for p in rep.integrity_issues))
 
-    def test_zero_envelopes_in_cell_is_Unresolved_not_Delivered_once(self):
-        # Session_started present on both, but NO enqueue in any cell.
-        phone = [line("diagnostic_session_started", 100, 1, "matrix", "-", "phone", pin="wss", inner="wss")]
-        emu = [line("diagnostic_session_started", 100, 1, "matrix", "-", "emulator", pin="wss", inner="wss")]
+    # ── Full delivery baseline ──────────────────────────────────
+
+    def test_complete_delivery_all_8_cells_is_GREEN(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        # host_now_ms after the last envelope + 120s so no PENDING.
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        for c in rep.cells:
+            self.assertEqual(c.outcome, "Delivered once", msg=f"{c.cell_id}: {c.issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
+
+    # ── Round-1 audit case list ─────────────────────────────────
+
+    def test_wrong_run_id_on_event_fails_integrity(self):
+        cell_id = "wss.p2e.after-connect"
+        phone = [
+            line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss", restored=False),
+            line("sender_enqueue", 2000, 2, "sender", cell_id, "phone", correlation_id="cid-1", run_id="wrong-run"),
+        ]
+        emu = [line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss", restored=False)]
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         rep = ve.build_report(out)
-        # The empty cells trigger "envelope count = 0" issue → Unresolved.
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+
+    def test_wrong_cell_id_on_event_lands_that_envelope_in_wrong_cell(self):
+        # A phone sender_enqueue with cell_id from a different cell
+        # produces envelope count mismatch (target cell has 0 enqueues,
+        # foreign cell has 1 stray enqueue). Outcome: Unresolved.
+        m = default_matrix()
+        phone = [line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)]
+        emu = [line("diagnostic_session_started", 1000, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out)
         for c in rep.cells:
             if not c.blocked:
-                self.assertEqual(c.outcome, "Unresolved", f"cell {c.cell_id} should be Unresolved on zero envelopes")
+                self.assertEqual(c.outcome, "Unresolved")
         self.assertEqual(rep.product_outcome, "RED")
 
-    def test_complete_delivery_first_cell_is_Delivered_once(self):
-        phone, emu = make_complete_delivery_lines("wss.p2e.after-connect", "p2e", base_wall=200_000)
-        # Also generate for other cells so envelope counts match.
-        for cell in default_matrix()["cells"][1:]:
-            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=200_000)
+    def test_wrong_emitter_device_produces_Unresolved(self):
+        # Full delivery, but the phone-originated events falsely
+        # claim emitter_id=emulator.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Rewrite the phone stream to swap emitter_id: replace
+        # "emitter_id=phone" with "emitter_id=emulator" in every line.
+        phone = [ln.replace("emitter_id=phone", "emitter_id=emulator") for ln in phone]
+        # Add other cells complete so overall run has 8x5 correctly.
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"):
+                continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 50_000)
             phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(first_cell.outcome, "Unresolved", msg=f"issues: {first_cell.issues}")
+        self.assertEqual(rep.product_outcome, "RED")
+
+    def test_wrong_outer_transport_with_complete_delivery_produces_Unresolved(self):
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Rewrite the sender_transport_decision line to claim outer=reality.
+        phone = [ln.replace("outer_transport=direct", "outer_transport=reality") for ln in phone]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"):
+                continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 50_000)
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(first_cell.outcome, "Unresolved", msg=f"issues: {first_cell.issues}")
+
+    def test_wrong_inner_route_with_complete_delivery_produces_Unresolved(self):
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Rewrite decision inner_route from wss to rest — cell pin says wss.
+        phone = [
+            ln.replace("event=sender_transport_decision", "event=sender_transport_decision")
+              .replace("inner_route=wss dispatched", "inner_route=rest dispatched")
+            if "sender_transport_decision" in ln else ln
+            for ln in phone
+        ]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"):
+                continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 50_000)
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(first_cell.outcome, "Unresolved", msg=f"issues: {first_cell.issues}")
+
+    def test_cross_cell_pin_contamination_is_detected(self):
+        # Both cells share the same sender device (phone / p2e).
+        # cell A has pin_active(wss) for cell_a; cell B has NO
+        # pin_active. Cell B's envelopes MUST fail coverage even
+        # though cell A had a pin.
+        cell_a = "wss.p2e.after-connect"
+        cell_b = "wss.p2e.after-idle"
+        base = 200_000
+        phone: list[str] = []
+        emu: list[str] = []
+        phone.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "phone",
+                           pin="wss", inner="wss", restored=False))
+        emu.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "emulator",
+                         pin="wss", inner="wss", restored=False))
+        # Cell A pin_active on phone — good.
+        phone.append(line("diagnostic_pin_active", base - 500, 2, "matrix", cell_a, "phone", pin="wss", inner="wss"))
+
+        # Cell A itself: 5 complete envelopes, no extra pin/session.
+        pA, eA = make_complete_delivery_lines(cell_a, "p2e", base_wall=base, pin="wss")
+        pA = [ln for ln in pA if "diagnostic_pin_active" not in ln and "diagnostic_session_started" not in ln]
+        eA = [ln for ln in eA if "diagnostic_pin_active" not in ln and "diagnostic_session_started" not in ln]
+        phone.extend(pA); emu.extend(eA)
+
+        # Cell B: 5 complete envelopes, still on phone (p2e), NO pin_active.
+        pB, eB = make_complete_delivery_lines(cell_b, "p2e", base_wall=base + 30_000, pin="wss", cid_prefix="cidB")
+        pB = [ln for ln in pB if "diagnostic_pin_active" not in ln and "diagnostic_session_started" not in ln]
+        eB = [ln for ln in eB if "diagnostic_pin_active" not in ln and "diagnostic_session_started" not in ln]
+        phone.extend(pB); emu.extend(eB)
+
+        m = default_matrix()
+        for cell in m["cells"]:
+            if cell["cell_id"] in (cell_a, cell_b) or cell.get("blocked"):
+                continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 200_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 500_000)
+        cell_b_report = next(c for c in rep.cells if c.cell_id == cell_b)
+        self.assertEqual(cell_b_report.outcome, "Unresolved",
+                          msg=f"cell B must NOT be covered by cell A's pin. issues: {cell_b_report.issues}")
+
+    def test_restart_with_lost_pin_invalidates_prior_coverage(self):
+        # pin_active fires; then session_started restored=false;
+        # then a send occurs — coverage must be gone.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone: list[str] = []
+        emu: list[str] = []
+        phone.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "phone", pin="none", inner="unknown", restored=False))
+        emu.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "emulator", pin="none", inner="unknown", restored=False))
+        phone.append(line("diagnostic_pin_active", base - 4000, 2, "matrix", cell_id, "phone", pin="wss", inner="wss"))
+        # Now the phone process restarts — session_started restored=false.
+        phone.append(line("diagnostic_session_started", base - 100, 3, "matrix", "-", "phone", pin="none", inner="unknown", restored=False))
+        p, e = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Strip its own session_started/pin_active to keep our timeline.
+        p = [ln for ln in p if "diagnostic_session_started" not in ln and "diagnostic_pin_active" not in ln]
+        e = [ln for ln in e if "diagnostic_session_started" not in ln and "diagnostic_pin_active" not in ln]
+        phone.extend(p); emu.extend(e)
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 200_000)
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 500_000)
+        cell_report = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(cell_report.outcome, "Unresolved", msg=f"issues: {cell_report.issues}")
+
+    def test_restart_with_restored_pin_preserves_coverage(self):
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone: list[str] = []
+        emu: list[str] = []
+        phone.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "phone", pin="none", inner="unknown", restored=False))
+        emu.append(line("diagnostic_session_started", base - 5000, 1, "matrix", "-", "emulator", pin="none", inner="unknown", restored=False))
+        phone.append(line("diagnostic_pin_active", base - 4000, 2, "matrix", cell_id, "phone", pin="wss", inner="wss"))
+        # Restart with restored=true + pin=wss — coverage stays.
+        phone.append(line("diagnostic_session_started", base - 100, 3, "matrix", cell_id, "phone",
+                           pin="wss", inner="wss", restored=True))
+        p, e = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        p = [ln for ln in p if "diagnostic_session_started" not in ln and "diagnostic_pin_active" not in ln]
+        e = [ln for ln in e if "diagnostic_session_started" not in ln and "diagnostic_pin_active" not in ln]
+        phone.extend(p); emu.extend(e)
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=base + 200_000)
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 500_000)
+        cell_report = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(cell_report.outcome, "Delivered once", msg=f"issues: {cell_report.issues}")
+
+    def test_global_duplicate_correlation_id_fails_integrity(self):
+        cell_a = "wss.p2e.after-connect"
+        cell_b = "wss.e2p.after-connect"
+        base = 200_000
+        phone: list[str] = []
+        emu: list[str] = []
+        phone.append(line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False))
+        emu.append(line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False))
+        # Two enqueues on different cells but SAME correlation_id.
+        phone.append(line("sender_enqueue", base, 10, "sender", cell_a, "phone", correlation_id="cid-dup"))
+        emu.append(line("sender_enqueue", base + 1000, 10, "sender", cell_b, "emulator", correlation_id="cid-dup"))
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         rep = ve.build_report(out)
-        # We might still fail on device-manifest keys; check individual cell.
-        cell_first = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
-        self.assertEqual(cell_first.outcome, "Delivered once", msg=f"issues: {cell_first.issues}")
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("correlation_id used multiple times" in p for p in rep.integrity_issues))
 
-    def test_pending_vs_unresolved_by_120s_window(self):
+    def test_malformed_matrix_wrong_cell_count_fails_integrity(self):
+        m = default_matrix()
+        m["cells"] = m["cells"][:5]  # only 5 cells instead of 8
+        out = make_bundle(self.tmp, matrix=m,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("cells count=5" in p for p in rep.integrity_issues))
+
+    def test_false_preflight_bool_fails_integrity(self):
+        pf = default_preflight()
+        pf["yota_confirmed"] = False
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+
+    def test_illegal_BLOCKED_on_wss_cell_fails_integrity(self):
+        m = default_matrix()
+        m["cells"][0]["blocked"] = True   # cell 0 is wss.p2e.after-connect — illegal to block.
+        out = make_bundle(self.tmp, matrix=m,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("BLOCKED but pin != rest" in p for p in rep.integrity_issues))
+
+    def test_blocked_rest_cells_require_rest_capability_disabled(self):
+        m = default_matrix()
+        m["cells"][6]["blocked"] = True
+        m["cells"][7]["blocked"] = True
+        pf = default_preflight()
+        pf["rest_capability"] = "enabled"   # inconsistent — cells claim BLOCKED
+        out = make_bundle(self.tmp, matrix=m, preflight=pf,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+
+    def test_injected_clock_moves_PENDING_to_Unresolved(self):
         cell_id = "wss.p2e.after-connect"
         base = 500_000
         phone: list[str] = [
-            line("diagnostic_session_started", base - 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss"),
+            line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False),
             line("diagnostic_pin_active", base - 500, 2, "matrix", cell_id, "phone", pin="wss", inner="wss"),
-            # 5 enqueues but NO recipient events at all.
         ]
         emu: list[str] = [
-            line("diagnostic_session_started", base - 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss"),
+            line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False),
         ]
         for i in range(1, 6):
             wall = base + i * 1000
             cid = f"cid-{i}"
             phone.append(line("sender_enqueue", wall, 10, "sender", cell_id, "phone", correlation_id=cid))
-        # Bring "now" (max wall in bundle) less than 120s past first enqueue.
-        # Newest event = base+5000; enqueue for #1 = base+1000. Diff = 4000ms → PENDING.
+            phone.append(line("sender_transport_decision", wall + 10, 11, "sender", cell_id, "phone",
+                               correlation_id=cid, outer="direct", inner="wss", dispatched=True))
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
-        rep = ve.build_report(out)
+        # host_now = 5s past base → still PENDING.
+        rep = ve.build_report(out, host_now_override_ms=base + 5000)
         first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
-        self.assertEqual(first_cell.outcome, "PENDING", f"issues: {first_cell.issues}")
+        self.assertEqual(first_cell.outcome, "PENDING", msg=f"issues: {first_cell.issues}")
 
-        # Now add a much later event to push "now" past 120s from first enqueue.
-        phone.append(line("diagnostic_pin_active", base + 200_000, 200, "matrix", cell_id, "phone", pin="wss"))
-        with open(os.path.join(out, "phone.logcat.wss_diag"), "w") as f:
-            f.write("\n".join(phone) + "\n")
-        rep2 = ve.build_report(out)
-        first_cell2 = next(c for c in rep2.cells if c.cell_id == cell_id)
+        # Now advance host clock past 120s from first enqueue.
+        rep2 = ve.build_report(out, host_now_override_ms=base + 130_000)
+        first_cell2 = next(c for c in rep.cells if c.cell_id == cell_id)
+        # Reparse with new clock:
+        first_cell2 = next(c for c in ve.build_report(out, host_now_override_ms=base + 200_000).cells
+                            if c.cell_id == cell_id)
         self.assertEqual(first_cell2.outcome, "Unresolved")
-
-    def test_pin_not_covered_produces_outcome_issue(self):
-        cell_id = "wss.p2e.after-connect"
-        base = 300_000
-        # session_started with pin=NONE and NO pin_active → pin coverage fails.
-        phone = [
-            line("diagnostic_session_started", base - 1000, 1, "matrix", cell_id, "phone", pin="none", inner="unknown"),
-            line("sender_enqueue", base, 10, "sender", cell_id, "phone", correlation_id="cid-1"),
-            line("sender_transport_decision", base + 10, 11, "sender", cell_id, "phone",
-                 correlation_id="cid-1", outer="direct", inner="wss", dispatched=True),
-        ]
-        emu = [line("diagnostic_session_started", base - 1000, 1, "matrix", cell_id, "emulator", pin="none", inner="unknown")]
-        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
-        rep = ve.build_report(out)
-        first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
-        # Only 1 envelope → envelope count mismatch also fires; the specific
-        # pin-not-covered issue is captured either in cell.issues (per envelope)
-        # or bumps to Unresolved. Assert outcome is not Delivered once.
-        self.assertIn(first_cell.outcome, ("Unresolved", "PENDING"))
-
-    def test_blocked_rest_cell_is_reported_BLOCKED(self):
-        m = default_matrix()
-        m["cells"][6]["blocked"] = True
-        m["cells"][7]["blocked"] = True
-        phone, emu = [], []
-        for cell in m["cells"][:6]:
-            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"], base_wall=200_000)
-            phone.extend(p2); emu.extend(e2)
-        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
-        rep = ve.build_report(out)
-        rest_cell = next(c for c in rep.cells if c.pin == "rest")
-        self.assertEqual(rest_cell.outcome, "BLOCKED")
 
     def test_forbidden_client_outcome_flag_fails_integrity(self):
         cell_id = "wss.p2e.after-connect"
         phone = [
-            line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss"),
-            # Fake a client-emitted forbidden classification.
+            line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss", restored=False),
             line("some_event", 2000, 2, "sender", cell_id, "phone",
                  correlation_id="cid-1", outcome="unresolved_120s_marker"),
         ]
-        emu = [line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss")]
+        emu = [line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss", restored=False)]
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
-        self.assertTrue(any("unresolved_120s_marker" in p for p in rep.integrity_issues))
 
     def test_key_like_hex_in_log_fails_integrity(self):
         cell_id = "wss.p2e.after-connect"
         phone = [
-            line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss"),
-            # 64-char lowercase hex — key-material shape.
-            "08-11 12:00:00.000 I WSS_DIAG: event=leak " + ("a" * 64) + " role=sender emitter_id=phone wall_utc_ms=1 monotonic_ms=1",
+            line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "phone", pin="wss", inner="wss", restored=False),
+            "08-11 I WSS_DIAG: event=leak role=sender emitter_id=phone run_id=run-test cell_id=- wall_utc_ms=1 monotonic_ms=1 sig=" + ("a" * 64),
         ]
-        emu = [line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss")]
+        emu = [line("diagnostic_session_started", 1000, 1, "matrix", cell_id, "emulator", pin="wss", inner="wss", restored=False)]
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)

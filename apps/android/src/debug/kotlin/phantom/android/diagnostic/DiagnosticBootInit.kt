@@ -15,7 +15,8 @@ import kotlinx.coroutines.launch
 import phantom.android.PhantomApplication
 import phantom.core.messaging.WssDiagBridge
 import phantom.core.messaging.WssDiagBridgeHolder
-import phantom.core.transport.PrivacyMode
+import phantom.core.transport.ManagerState
+import phantom.core.transport.TransportKind
 
 /**
  * Direct WSS Yota-First diagnostic — zero-touch boot init for the
@@ -65,18 +66,24 @@ class DiagnosticBootInitProvider : ContentProvider() {
         DiagnosticTransportGuard.setEmitterId(snapshot.emitterId)
 
         // Install the outer-arm reader once AppContainer becomes
-        // available. Runs on a background scope because
-        // AppContainer's initialisation depends on
-        // Application.onCreate() completing.
+        // available. Reads the LIVE TransportManager state — the
+        // actually-selected outer arm after chain-walk completes.
+        // A Standard-policy device that fell through to Reality/Tor
+        // returns those values, NOT "direct".
         scope.launch {
             val app = ctx as? PhantomApplication ?: return@launch
             runCatching { app.ready.await() }
             val container = runCatching { app.container }.getOrNull() ?: return@launch
             DiagnosticTransportGuard.outerArmReader = {
-                when (container.transportPreferences.privacyMode) {
-                    PrivacyMode.Standard -> "direct"
-                    PrivacyMode.Private -> "tor"
-                    PrivacyMode.Ghost -> "reality"
+                when (val s = container.transportManager.state.value) {
+                    is ManagerState.Connected -> when (s.kind) {
+                        TransportKind.Direct -> "direct"
+                        TransportKind.Reality -> "reality"
+                        TransportKind.Tor -> "tor"
+                    }
+                    is ManagerState.Probing -> "probing"
+                    is ManagerState.AllFailed -> "failed"
+                    ManagerState.Idle -> "idle"
                 }
             }
         }
@@ -91,9 +98,10 @@ class DiagnosticBootInitProvider : ContentProvider() {
                 DiagnosticTransportGuard.Pin.NONE -> WssDiag.InnerRoute.UNKNOWN
             },
             emitterIdOverride = snapshot.emitterId.name.lowercase(),
-            dispatched = restored,
+            restored = restored,
         )
-        Log.i(WssDiag.TAG, "diagnostic_boot_init bridge_installed=true restored=$restored")
+        // §12 Round-1 audit: remove the previous raw Log.i line
+        // — the sole WSS_DIAG tag must carry ONLY structured events.
         return true
     }
 

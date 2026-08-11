@@ -27,7 +27,8 @@ class DiagnosticTransportPinStoreTest {
         ApplicationProvider.getApplicationContext()
 
     @Before
-    fun clear() = DiagnosticTransportPinStore.clear(ctx).also {
+    fun clear() {
+        DiagnosticTransportPinStore.clear(ctx)
         // The `clear()` method deliberately does NOT reset emitter_id;
         // wipe it manually per test to give a clean slate.
         DiagnosticTransportPinStore.writeEmitter(ctx, DiagnosticTransportGuard.EmitterId.UNSET)
@@ -90,6 +91,25 @@ class DiagnosticTransportPinStoreTest {
         assertEquals("", s.cellId)
         // Emitter is a bootstrap-time property; NOT cleared by end-of-run.
         assertEquals(DiagnosticTransportGuard.EmitterId.EMULATOR, s.emitterId)
+    }
+
+    // §12 Round-1 audit P0-5: commit result is returned; caller
+    // reacts to a false result. In Robolectric SharedPreferences the
+    // real commit always succeeds; we lock the return-shape here so
+    // any refactor that reverts to Unit fails-red.
+
+    @Test
+    fun write_apis_return_boolean_from_commit() {
+        val a: Boolean = DiagnosticTransportPinStore.writePin(
+            ctx, DiagnosticTransportGuard.Pin.WSS, runId = "r", cellId = "c",
+        )
+        val b: Boolean = DiagnosticTransportPinStore.writeEmitter(
+            ctx, DiagnosticTransportGuard.EmitterId.PHONE,
+        )
+        val c: Boolean = DiagnosticTransportPinStore.clear(ctx)
+        assertEquals(true, a)
+        assertEquals(true, b)
+        assertEquals(true, c)
     }
 
     @Test
