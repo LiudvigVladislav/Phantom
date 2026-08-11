@@ -12,14 +12,14 @@ The following four locks close the choice-points left open in earlier rounds. Th
 
 1. **Command component = BroadcastReceiver only.** The debug command surface is ONE `BroadcastReceiver` declared solely in the debug `AndroidManifest.xml` overlay. `Activity` is NOT used. The receiver runs on explicit component invocation (`am broadcast -n <APP_ID>/.diagnostic.DiagnosticCommandReceiver …`) and is physically absent from the release APK's merged manifest.
 
-2. **Outer Direct enforcement = Method (b) fail-closed check.** `TransportManager` is NOT modified. If the actually-selected outer arm at send time is not `direct`, `HybridRelayTransport.send` refuses to dispatch, emits `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`, and the verifier stamps the matrix cell `BLOCKED`. Every send under a WSS or REST pin MUST log `outer_transport=direct` in the winning `sender_transport_decision` event.
+2. **Outer Direct enforcement = Method (b) fail-closed check.** `TransportManager` is NOT modified. If the actually-selected outer arm at send time is not `direct`, `HybridRelayTransport.send` refuses to dispatch and emits `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`. The verifier classifies the affected envelope(s) as `Unresolved` — NOT `BLOCKED` (which is reserved for whole REST cells skipped when preflight says `rest_capability=disabled`). Every send under a WSS or REST pin MUST log `outer_transport=direct` in the winning `sender_transport_decision` event.
 
 3. **Conversation selection = automatic, not operator-supplied.** The `contact_alias` extra is REMOVED from the receiver whitelist. After a clean bootstrap, each device has exactly ONE paired conversation whose peer is the other device in the matrix. The receiver's `send` subcommand queries the local conversation store, requires exactly one matching paired conversation, and fails-red otherwise. The operator cannot influence which peer receives the send.
 
 4. **Additional focused tests (locked, on top of §5):**
    - `wss_diag_unknown_extras_and_subcommands_are_rejected` — any extra outside the strict whitelist, or any `subcommand` outside the enum, exits the receiver red without touching `sendMessage`.
    - `wss_diag_send_calls_production_api_exactly_once_with_no_external_text` — the `send` subcommand invokes `MessagingService.sendMessage` exactly once with text derived internally as `YOTA-WSS-${cell_id}-${sequence}`; no text extra is accepted or consumed.
-   - `wss_diag_pin_write_read_round_trip_through_app_code` — writes via `DiagnosticCommandReceiver` (in-app EncryptedSharedPreferences) → reads via the same store → observes the value in `DiagnosticTransportGuard`. No ADB file write is possible or supported.
+   - `wss_diag_pin_write_read_round_trip_through_app_code` — writes via `DiagnosticCommandReceiver` (in-app `DiagnosticTransportPinStore`, backed by plain `SharedPreferences` — the earlier `EncryptedSharedPreferences` draft was reverted per the Round-1 Mac audit) → reads via the same store → observes the value in `DiagnosticTransportGuard`. No ADB file write is possible or supported.
    - `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest` — introspects the merged manifest for both variants (via `manifest-merger` output files under `build/intermediates/merged_manifests/`), asserts the receiver appears in debug and NOT in release.
 
 ## §12 — WSS-1 Mac-audit repair block (RED → LOGICAL GREEN)
@@ -697,13 +697,13 @@ The pin has two effects — an OUTER arm constraint AND an INNER route constrain
 
 - Outer arm — TWO acceptable implementations, WSS-1 diff draft picks ONE:
   - (a) **Explicit outer override**: debug-only path forces the `TransportManager` chain to `DIRECT_FIRST` and rejects any transition to a non-Direct arm for the lifetime of the pin. The pin acts as a hard filter, not a preference. Requires touching `TransportManager` — the diff has to add ONE branch that checks the pin state before returning from `reorderChain(...)`.
-  - (b) **Fail-closed check on actually selected arm**: leave `TransportManager` untouched; observe the actually selected outer arm via existing state (which `TransportStrategy` variant ran); if not `direct`, refuse to dispatch the envelope, emit `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`, and mark the row as `dropped_by_capability`. The matrix runner + verifier read this and stamp the cell `BLOCKED` (§9.4).
+  - (b) **Fail-closed check on actually selected arm** (WSS-1 IMPLEMENTED): leave `TransportManager` untouched; observe the actually selected outer arm via `container.transportManager.state.value`; if not `direct`, refuse to dispatch the envelope, emit `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`, and mark the envelope's `outcome_flag=send_error`. The verifier classifies affected envelopes as `Unresolved` — NOT `BLOCKED` (which is reserved for whole REST cells skipped when preflight says `rest_capability=disabled`, see §12.5).
 - Inner route: `HybridRelayTransport.send` (`:1055-1081`) reads the pin FIRST and overrides `stateMachine.current` to force the WSS branch. If the WS session is not connected at send time, the envelope defers to `pendingOutbox` (existing `KRT` behaviour). **Never silently falls through to REST.**
 
 **`Pin.REST` semantics**
 
-- Outer arm: same two options as above — MUST be `direct`; non-Direct → `BLOCKED`.
-- Inner route: `HRT.send` overrides `stateMachine.current` to force REST. **Fail-closed on `DisabledByCapability`**: today's `HRT.kt:1103-1113` falls back to WS when REST orchestrator returns `DisabledByCapability`; **under `Pin.REST` this fallback is disabled** — the send returns `false` and `sender_rest_post_completed relay_acceptance=disabled_by_capability` fires. The verifier stamps the cell `BLOCKED`.
+- Outer arm: MUST be `direct`; non-Direct → same fail-closed as above → `Unresolved` for affected envelopes.
+- Inner route: `HRT.send` overrides `stateMachine.current` to force REST. **Fail-closed on `DisabledByCapability`**: today's `HRT.kt:1103-1113` falls back to WS when REST orchestrator returns `DisabledByCapability`; **under `Pin.REST` this fallback is disabled** — the send returns `false` and `sender_rest_post_completed relay_acceptance=disabled_by_capability` fires. If preflight's REST-capability probe returned `disabled`, the two REST cells (#7, #8) are pre-marked `BLOCKED` in `matrix.json` and skipped entirely (§12.3 P1-1 parity).
 
 **Observability requirement**
 
@@ -823,23 +823,19 @@ done
 
 Canary emission is performed by `preflight.sh` via `diag-cmd.sh canary` (§9.3) — the `diagnostic_canary` event fires INSIDE the app without invoking `sendMessage`, so the tag-emit spot-check does not enqueue any envelope, does not touch the chat store, and does not consume a matrix envelope slot.
 
-### 9.3 Debug command component + matrix runner
+### 9.3 Debug command component + matrix runner — SUPERSEDED
 
-**REDLINE-2 P0-1 fix.** The matrix cannot run without an in-app command surface. The diagnostic APK includes a **debug-only** command component:
+**The REDLINE-2 draft that used to live here is not the current spec.**
+Source of truth is §12 (Round-1 audit repair block, Round-2..5 amendments) plus the code in `apps/android/src/debug/kotlin/phantom/android/diagnostic/`. Corrections vs the pre-Round-1 draft:
 
-- Kotlin lives ONLY under `apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommand*` (any release variant of the app has the file absent from dex — enforced by source-set separation and verified by the release ProGuard rule `verifyR8StripsTestSeams`).
-- Exposed shape (WSS-1 diff draft picks a concrete Android component — `Activity` with `exported=true, enabled=true` gated to the debug manifest merger overlay OR a `BroadcastReceiver` under the same gating). Either shape accepts `am start …` / `am broadcast …` and returns synchronously.
-- **Strict extra whitelist** — the component refuses to run if ANY extra outside this set is present:
-  - `run_id` (opaque string ≤ 64 chars, `[a-zA-Z0-9._-]`)
-  - `cell_id` (opaque string ≤ 128 chars, `[a-zA-Z0-9._:-]`)
-  - `contact_alias` (opaque string ≤ 64 chars, references an ALREADY-PAIRED conversation from onboarding — the component looks it up in the local conversation store; if not found, exits red without touching sendMessage)
-  - `sequence` (integer, 1..N)
-  - `pin` (one of `none|wss|rest` — for the pin-write subcommand)
-  - `subcommand` (one of `pin|send|canary|dual_sim_report|rest_capability_probe|health`)
-- **No arbitrary plaintext** — send text is derived INTERNALLY as `"YOTA-WSS-${cell_id}-${sequence}"`. The operator cannot inject arbitrary text; the ADB caller cannot inject arbitrary text.
-- **No key/QR/username extras.** The whitelist ban is enforced by refusing the whole `am` call on any unknown extra.
-- Every subcommand emits `WSS_DIAG event=diagnostic_pin_active` (for `pin`) / `diagnostic_canary` (for `canary`) / `sender_enqueue` (for `send`) / diagnostic-only events for `dual_sim_report` and `rest_capability_probe`. The `health` subcommand returns a small structured JSON via stdout that `preflight.sh` parses for APK version, pin store round-trip, tag emit health.
-- `lib/diag-cmd.sh` is a thin bash wrapper that translates `diag-cmd.sh <subcommand> --serial <S> --run-id <R> --cell-id <C> --contact-alias <A> --sequence <N>` into the corresponding ADB `am` invocation. No stateful behaviour lives in the shell wrapper.
+- The component is a **`BroadcastReceiver` only** (no Activity alternative). Declared solely in the debug `AndroidManifest.xml` overlay, gated by `android:permission="android.permission.DUMP"` so only ADB shell / root can reach it.
+- The `contact_alias` extra is **removed from the whitelist entirely**. Conversation selection is automatic: the receiver queries the local conversation store, requires exactly ONE paired conversation, and fails-red on zero or many. The operator cannot influence which peer receives the send.
+- Allowed subcommand set (see `DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS`): `pin | send | canary | set_emitter_id | dual_sim_report | health | clear | checkpoint | paired_count_report`. There is NO `rest_capability_probe`; the REST capability probe lives in `preflight.sh` and reuses the ordinary `pin` + `send` machinery under a synthetic `preflight.rest_capability` cell.
+- Extras are still strict-whitelisted per subcommand (see `ALLOWED_EXTRAS_BY_SUBCOMMAND`). Any unknown extra is a silent reject.
+- Send text is still derived INTERNALLY as `"YOTA-WSS-${cell_id}-${sequence}"`.
+- `lib/diag-cmd.sh` wraps `am broadcast -n <component> --es subcommand=<sub> ...` per subcommand; no `--contact-alias` flag exists.
+
+The pre-Round-5 wording is available in git history; the operational contract is §12 + `apps/android/src/debug/kotlin/phantom/android/diagnostic/`.
 
 **Matrix arithmetic** (unchanged from REDLINE-1): 8 directed cells × 5 envelopes = **40 envelopes per pass**.
 
@@ -922,7 +918,7 @@ No manual logcat commands. No manual envelope ID grep. No manual "tap Send five 
 | 4 | Existing vs missing observability table | §3 |
 | 5 | Minimal instrumentation diff plan (schema with `emitter_id`/`role` split; `outer_transport` + `inner_route`; `relay_acceptance` on REST; no `unresolved_120s_marker` event; `recipient_message_persisted`; `diagnostic_canary`) | §4 |
 | 6 | Focused tests list (10 client tests — includes role-derived, REST semantics, WSS/REST fail-closed, canary no-enqueue, no verifier-only field on client) | §5 |
-| 7 | Debug-only runtime pin — EncryptedSharedPreferences via app command, outer Direct enforcement (override OR fail-closed), no ADB file write, no silent fallback | §6 |
+| 7 | Debug-only runtime pin — plain `SharedPreferences` via debug `BroadcastReceiver`, outer Direct enforcement via Method (b) fail-closed on `TransportManager.state`, no ADB file write, no silent fallback | §6 |
 | 8 | Open questions collapsed (Q1–Q10, incl. dual-SIM Q9 + clock-skew Q10 + REST capability Q6 method A/B) | §8 |
 | 9 | Confirmation no runtime fix has been made | §0 + this row — verified |
 | 10 | Mac operator package spec (auto-detect, narrow capture, debug command component with strict whitelist for send, uninstall bootstrap protocol with SHA-256, dual-output verifier with Priority-order classification, mandatory preflight incl. canary + dual-SIM + REST capability method A/B + skew warn-vs-fail) | §9 |

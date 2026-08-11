@@ -10,6 +10,27 @@
 - One physical Android phone with **Yota** as the default-data SIM.
 - One running Android Emulator (any recent API 33+).
 
+## macOS quarantine — REQUIRED first step after download
+
+Anything downloaded via a browser or messenger on macOS is tagged with `com.apple.quarantine`. Bash refuses to exec child scripts under that xattr (`Operation not permitted`), even when the mode is `755`. Clear it BEFORE extracting or as a recursive pass over the extracted directory:
+
+```bash
+# after downloading the tar.gz, before extraction:
+xattr -d com.apple.quarantine final-package.tar.gz
+
+# — OR — after extracting the tar into ./operator-package:
+xattr -dr com.apple.quarantine operator-package
+```
+
+Then verify the archive checksum before proceeding:
+
+```bash
+shasum -a 256 final-package.tar.gz
+# match against the value shipped in SHA256SUMS.txt
+```
+
+If you skip this step, `preflight.sh` and every helper it invokes will fail immediately with `Operation not permitted`.
+
 ## Phone radio setup
 
 Preflight enforces all of the following via TYPED confirmation. Aborts on any negative answer:
