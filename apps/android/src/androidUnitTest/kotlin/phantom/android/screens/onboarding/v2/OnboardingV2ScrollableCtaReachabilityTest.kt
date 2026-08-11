@@ -220,30 +220,22 @@ class OnboardingV2ScrollableCtaReachabilityTest {
     }
 
     @Test
-    fun finale_scrolls_to_copy_button_then_taps_cta_at_320dp_fs2() {
+    fun finale_identity_created_and_continue_cta_reachable_at_320dp_fs2() {
+        // Onboarding-stabilization block 2026-08-11: Finale is now a
+        // plain "Identity created" surface — no scrollable body, no
+        // raw hexes, no Copy buttons. This test proves the title
+        // AND the CTA are BOTH displayed + tappable at the narrow-
+        // width + large-text extreme (320 × 640 dp @ fs=2.0). The
+        // step is intentionally a fixed-layout Column with weight
+        // spacers; if it ever regains scrollable content, this test
+        // still passes because both nodes are present, but a
+        // separate reachability test should be added for the new
+        // below-fold content.
         var clicked = false
-        val syntheticHex = "9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e4c7a9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e"
-        // Truncate/validate the fixture — the test previously used
-        // an intentionally-long 72-char string as a "close enough"
-        // hex; the composable does not validate the arg (the state
-        // model guards the invariant upstream). Same value used
-        // for both keys here is fine — this test asserts CTA
-        // reachability, NOT visual dual-key correctness.
-        val syntheticHex64 = syntheticHex.take(64)
         renderNarrowFs2 {
-            FinaleConfirmationStepV2(
-                signingPublicKeyHex = syntheticHex64,
-                publicKeyHex        = syntheticHex64,
-                onContinueClick = { clicked = true },
-                onKeyCopied = { _ -> },
-            )
+            FinaleConfirmationStepV2(onContinueClick = { clicked = true })
         }
-        // Below-fold anchor: the X25519 Copy button lives at the
-        // bottom of the scrollable body (below the Ed25519 card).
-        // If the body isn't scrollable, this fails. Label
-        // updated for the dual-key labels track 2026-08-10.
-        composeTestRule.onNodeWithText("Copy X25519 encryption key")
-            .performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithText("Identity created").assertIsDisplayed()
         composeTestRule.onNodeWithText("Continue")
             .assertIsDisplayed().performClick()
         check(clicked) { "Finale 'Continue' CTA did not fire" }

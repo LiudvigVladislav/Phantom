@@ -4,6 +4,8 @@
 package phantom.android.ui.designv2.showcase
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.interaction.FocusInteraction
 import androidx.compose.foundation.interaction.Interaction
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -943,16 +945,15 @@ fun ShowcaseOnboardingIdentityKeyPreviewFrame100() {
 }
 
 /**
- * FinaleConfirmationStepV2 rendered with a fixed test-fixture hex so
- * the golden is deterministic. Real users see the actual
- * `IdentityRecord.signingPublicKeyHex` returned by `createOrLoad`.
+ * FinaleConfirmationStepV2 golden host.
+ *
+ * Onboarding-stabilization block 2026-08-11: Finale is now a plain
+ * "Identity created" surface — no raw key material is rendered, so
+ * the showcase has no fixtures to supply and the golden is
+ * deterministic by construction.
  */
 @Composable
 fun ShowcaseOnboardingFinaleConfirmation() {
-    // Fixture: 64 chars, distinct enough that a shift-by-1 bug would
-    // show visually in a golden.
-    // 4 + (16 * 3) + 12 = 64 (Ed25519 public key hex length).
-    val fixtureHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
     phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
         currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.FinaleConfirmation,
         topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
@@ -962,16 +963,46 @@ fun ShowcaseOnboardingFinaleConfirmation() {
         toastMessage = null,
         onToastDismiss = {},
     ) {
-        // Dual-key labels track 2026-08-10: Showcase now provides
-        // BOTH hexes. `publicKeyHex` uses a distinct fixture so the
-        // golden shows visually different values across the two
-        // cards (proves independent field routing to independent
-        // card rendering).
-        val fixturePublicKeyHex = "1234" + "fedcba9876543210".repeat(3) + "1234abcdef56"
         phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2(
-            signingPublicKeyHex = fixtureHex,
-            publicKeyHex = fixturePublicKeyHex,
             onContinueClick = {},
+        )
+    }
+}
+
+// ── Final Stabilization Mini-Block 2026-08-11 §P2 — Profile QR card, Advanced expanded ──
+
+/**
+ * `ProfileScreen.QrKeyCard` rendered with the "Advanced cryptographic
+ * details" section pre-expanded. The golden captures the new
+ * architect-exact explainer text ("These public keys identify your
+ * Phantom account and may be shared for verification. They cannot
+ * unlock it. Never share a private key or recovery backup.") plus
+ * the two labelled Public key rows and their Copy affordances so a
+ * visual reviewer can verify the copy shape without instrumenting
+ * the app.
+ *
+ * Fixture hexes are the same distinctive pair used elsewhere in the
+ * showcase — deterministic goldens.
+ */
+@Composable
+fun ShowcaseProfileQrKeyCardAdvancedExpanded() {
+    val signingHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+    val encHex     = "1234" + "fedcba9876543210".repeat(3) + "1234abcdef56"
+    val scrollState = rememberScrollState()
+    Column(
+        modifier = Modifier
+            .background(Color(0xFF05060A))
+            .fillMaxSize()
+            .verticalScroll(scrollState),
+    ) {
+        phantom.android.screens.profile.QrKeyCard(
+            username = "alice",
+            signingPublicKeyHex = signingHex,
+            publicKeyHex        = encHex,
+            onShare = {},
+            onCopySigningKey = {},
+            onCopyEncryptionKey = {},
+            initialAdvancedExpanded = true,
         )
     }
 }

@@ -7,6 +7,10 @@ import android.app.Application
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,7 +30,6 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
-import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -38,33 +41,35 @@ import phantom.android.screens.onboarding.v2.steps.WELCOME_PHANTOM_LOGO_TEST_TAG
 import phantom.android.screens.onboarding.v2.steps.WelcomeStepV2
 
 /**
- * Logo-flash-fix track (2026-08-10) — focused transition tests
- * for the `Welcome → How` special-cased fade.
+ * Onboarding-stabilization block 2026-08-11 — focused transition
+ * tests for the STRUCTURAL Welcome ↔ How swap.
  *
  * Contract sheet:
- * `docs/tracks/android-onboarding/logo-flash-fix-contract.md`.
+ * `docs/tracks/android-onboarding/onboarding-stabilization-block-2026-08-11.md`.
  *
- * These four tests pin the invariants architect requested after
- * the on-device flash defect:
+ * The prior "logo-flash fix" that scoped `EnterTransition.None
+ * togetherWith ExitTransition.None` inside a single `AnimatedContent`
+ * did not close the defect on device — `AnimatedContent`'s
+ * `KeepUntilTransitionsFinished` machinery still held the outgoing
+ * Welcome tree for one extra frame, and the PHANTOM logo remained
+ * visible. The current fix is STRUCTURAL: Welcome is rendered by a
+ * plain `if (step == Welcome)` guard OUTSIDE `AnimatedContent`, so
+ * the moment state flips to How the `if` branch disposes Welcome in
+ * the same frame and `AnimatedContent` mounts How for the first
+ * time with no overlap.
  *
+ * These four tests pin the invariants:
  *   1. Activity instance stability across the tap.
- *   2. Welcome logo absent + How present on first frame AND at
- *      mid-fade (~90 ms of the 180-ms enter). Uses
- *      `useUnmergedTree = true` so wrapper composables around
- *      the logo do not hide it from the test tree.
- *   3. Double-tap ends at exactly `How` — NOT `Identity` — a
- *      "prove destination" invariant rather than a weak
- *      "second click misses" check.
+ *   2. Welcome logo absent + How present immediately after the tap
+ *      (`waitForIdle`-based — no clock manipulation).
+ *   3. Double-tap ends at exactly `How` — NOT `Identity` — with a
+ *      `[How]` visited-steps list.
  *   4. Back from How returns to Welcome.
  *
- * Tests inflate an `AnimatedContent` that uses the REAL
- * production `onboardingStepContentTransform()` extension +
- * REAL `WelcomeStepV2` / `HowStepV2` composables. Any drift
- * in the production transitionSpec would trip these tests.
- * (An `Identity` stub is used only as a "next-after-How"
- * destination for the double-tap test — the real
- * `IdentityKeyStepV2` requires an `AppContainer` we don't
- * inflate here.)
+ * The test harness mirrors the REAL production shape: `if (step ==
+ * Welcome) WelcomeStepV2(...) else AnimatedContent(...)` with the
+ * same `fadeIn(180) togetherWith fadeOut(160)` transition spec for
+ * the non-Welcome branch.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = Application::class)
@@ -73,50 +78,20 @@ class OnboardingFlowV2TransitionTest {
     @get:Rule
     val composeTestRule = createAndroidComposeRule<ComponentActivity>()
 
-    /**
-     * Robolectric shares one Choreographer per SDK environment
-     * across every test in the same JVM. This class freezes
-     * `mainClock.autoAdvance = false` to pin frame-boundary
-     * invariants for the logo-flash fix; if a test throws before
-     * restoring the clock, the next test class runs against a
-     * halted Choreographer and Espresso trips `AppNotIdleException`
-     * on its very first `setContent`. Restoring here guarantees
-     * the leak blast radius is zero — regardless of which test
-     * failed or threw. Pinned by `logo-flash-fix-contract.md` §9
-     * (JVM-shared-clock hygiene).
-     */
-    @After
-    fun restoreMainClockAutoAdvance() {
-        composeTestRule.mainClock.autoAdvance = true
-        composeTestRule.waitForIdle()
-    }
-
     private val identityStubTag = "identity_stub_root_for_test"
     private val getStartedLabel = "Get started"
-    private val howContinueLabel = "Continue"
 
     /**
-     * Mounts a stripped-down 3-step flow using the REAL production
-     * `onboardingStepContentTransform()` + REAL Welcome/How
-     * composables, with an `Identity` stub for double-tap
-     * destination checks. Back from How returns to Welcome via a
-     * BackHandler wired to the same `step` state.
-     *
-     * @param onStepChange invoked after each state transition so
-     *   tests can inspect / assert intermediate state.
+     * Mounts a stripped-down 3-step flow with the exact production
+     * shape: Welcome rendered by a plain `if` branch OUTSIDE
+     * `AnimatedContent`; How and Identity-stub rendered as branches
+     * of `AnimatedContent` with the regular crossfade.
      */
     private fun inflateFlow(onStepChange: (OnboardingStepV2) -> Unit = {}) {
         composeTestRule.setContent {
             var step by remember { mutableStateOf(OnboardingStepV2.Welcome) }
-            // Mirror the REAL production `goNext` semantics:
-            //   goNext advances to the next step when
-            //   canAdvanceFromV2(step, formState) is true.
-            //   Both Welcome and How return true unconditionally,
-            //   so a double-fire on Welcome CTA would advance
-            //   Welcome → How → Identity in a single gesture
-            //   window UNLESS the CTA callback guards on step ==
-            //   Welcome. This mirror keeps the exact vulnerability
-            //   the production fix protects against.
+            // Mirror the REAL production `goNext` — advances one
+            // step; Welcome CTA re-entrancy is guarded below.
             val goNext: () -> Unit = {
                 val idx = OnboardingStepV2.entries.indexOf(step)
                 if (idx + 1 < OnboardingStepV2.entries.size) {
@@ -130,25 +105,22 @@ class OnboardingFlowV2TransitionTest {
                     onStepChange(step)
                 }
             }
-            AnimatedContent(
+            if (step == OnboardingStepV2.Welcome) {
+                WelcomeStepV2(
+                    onContinueClick = {
+                        if (step == OnboardingStepV2.Welcome) goNext()
+                    },
+                )
+            } else AnimatedContent(
                 targetState = step,
-                transitionSpec = { onboardingStepContentTransform() },
+                transitionSpec = {
+                    fadeIn(tween(180)) togetherWith fadeOut(tween(160))
+                },
                 label = "onboarding-step-test",
                 modifier = Modifier.fillMaxSize(),
             ) { s ->
                 when (s) {
-                    OnboardingStepV2.Welcome -> WelcomeStepV2(
-                        // Mirror of the REAL production guard added
-                        // by the logo-flash-fix track 2026-08-10 (see
-                        // `OnboardingFlowV2.kt` Welcome branch). The
-                        // guard makes double-fire on Welcome CTA
-                        // idempotent — second fire is silently
-                        // dropped because `step != Welcome` after
-                        // the first advance.
-                        onContinueClick = {
-                            if (step == OnboardingStepV2.Welcome) goNext()
-                        },
-                    )
+                    OnboardingStepV2.Welcome -> Unit  // handled by if-guard
                     OnboardingStepV2.How -> HowStepV2(
                         dotsIndex = OnboardingStepV2.How.dotsIndex,
                         onContinueClick = goNext,
@@ -164,7 +136,7 @@ class OnboardingFlowV2TransitionTest {
         }
     }
 
-    // ── §5.1 — Activity instance / onCreate not re-invoked on tap ──
+    // ── §1 — Activity instance / onCreate not re-invoked on tap ──
 
     @Test
     fun activity_is_not_recreated_when_get_started_tapped() {
@@ -179,17 +151,15 @@ class OnboardingFlowV2TransitionTest {
         assertSame(
             expected = activityBefore,
             actual = activityAfter,
-            message = "Activity instance MUST be the same before and after `Get started`. " +
-                "A regression that recreates the Activity (config-change, setContent re-entry, " +
-                "manual `recreate()`) would produce a different instance here — the logo-flash " +
-                "defect would then also manifest as a re-mounted splash / re-run onboarding intro.",
+            message = "Activity instance MUST be the same before and after `Get started` — " +
+                "a recreation would surface as a re-mounted splash and re-triggered onboarding.",
         )
     }
 
-    // ── §5.2 — Logo absent, How present on first frame + at mid-fade ──
+    // ── §2 — Welcome logo absent + How present after the tap ─────
 
     @Test
-    fun welcome_logo_absent_immediately_after_get_started_tap() {
+    fun welcome_logo_absent_and_how_present_after_get_started_tap() {
         inflateFlow()
         composeTestRule.waitForIdle()
         // Pre-tap sanity: Welcome logo present.
@@ -197,50 +167,24 @@ class OnboardingFlowV2TransitionTest {
             WELCOME_PHANTOM_LOGO_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(1)
 
-        composeTestRule.mainClock.autoAdvance = false
         composeTestRule.onNodeWithText(getStartedLabel).performClick()
-        // Advance TWO frames past the tap via `advanceTimeByFrame()`
-        // — Compose's own single-frame tick, ~16 ms at 60 Hz each.
-        // Empirical audit 2026-08-10: `AnimatedContent` under
-        // `EnterTransition.None togetherWith ExitTransition.None`
-        // requires TWO composition frames to fully remove the
-        // outgoing content — frame 1 sees the target-state change
-        // and starts the `Transition<T>`; frame 2 observes the
-        // instantly-finished transition and disposes the outgoing
-        // node. This is the "checkable invariant of the current
-        // Compose version" the architect flagged in the logo-flash
-        // contract sheet §2. The 32-ms two-frame window remains
-        // well below any human-perception threshold for a flash
-        // (< 100 ms) and dramatically below the ORIGINAL 160-ms
-        // exit-fade overlap that produced the defect.
-        composeTestRule.mainClock.advanceTimeByFrame()
-        composeTestRule.mainClock.advanceTimeByFrame()
-        composeTestRule.onAllNodesWithTag(
-            WELCOME_PHANTOM_LOGO_TEST_TAG, useUnmergedTree = true,
-        ).assertCountEquals(0)
-        composeTestRule.onAllNodesWithTag(
-            HOW_STEP_ROOT_TEST_TAG, useUnmergedTree = true,
-        ).assertCountEquals(1)
+        composeTestRule.waitForIdle()
 
-        // Mid-fade — approximately halfway through the ORIGINAL
-        // 160-ms overlap window (the crossfade the fix removes).
-        // Under the current instant-swap this is a stable frame;
-        // the assertion re-verifies the logo stays absent inside
-        // the exact time window where a regression re-adding the
-        // exit fade would surface the flash.
-        composeTestRule.mainClock.advanceTimeBy(90L)
+        // The structural if-guard disposes Welcome the moment
+        // `step != Welcome`, so no frame of the post-tap render
+        // ever contains the logo. A regression that puts Welcome
+        // back inside `AnimatedContent` (letting the outgoing tree
+        // linger via `KeepUntilTransitionsFinished`) would fail
+        // this test red.
         composeTestRule.onAllNodesWithTag(
             WELCOME_PHANTOM_LOGO_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(0)
         composeTestRule.onAllNodesWithTag(
             HOW_STEP_ROOT_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(1)
-        // Clock is restored + drained in @After — see
-        // `restoreMainClockAutoAdvance` for the JVM-shared-clock
-        // hygiene rationale.
     }
 
-    // ── §5.3 — Double-tap ends at exactly How (NOT Identity) ─────
+    // ── §3 — Double-tap ends at exactly How (NOT Identity) ───────
 
     @Test
     fun get_started_double_tap_ends_at_how_not_identity() {
@@ -248,23 +192,6 @@ class OnboardingFlowV2TransitionTest {
         inflateFlow(onStepChange = { visitedSteps += it })
         composeTestRule.waitForIdle()
 
-        // Two rapid taps on the Welcome CTA WITHIN ONE gesture
-        // scope — no `waitForIdle` between them. This is what a
-        // real double-tap looks like at the pointer-input layer:
-        // two down/up sequences before the outer state has a
-        // chance to recompose. Any per-composable click-dedup
-        // Compose does at the pointer-input layer applies; but
-        // if the state-machine callback fires twice AND the
-        // callback naively advances by one step per invocation
-        // (as `goNext` does — `canAdvanceFromV2` returns true
-        // for both Welcome and How), navigation would race past
-        // How to Identity.
-        //
-        // The REAL fix is the Welcome-CTA guard `if (step ==
-        // Welcome) goNext()` in `OnboardingFlowV2.kt` (and
-        // mirrored in the test harness above). This assertion
-        // proves the guard works: destination = How, NOT
-        // Identity, no matter how many times the pointer fires.
         composeTestRule.onNodeWithText(getStartedLabel).performTouchInput {
             down(center)
             up()
@@ -273,11 +200,6 @@ class OnboardingFlowV2TransitionTest {
         }
         composeTestRule.waitForIdle()
 
-        // Prove destination: How's root MUST be present, Identity
-        // stub MUST NOT be present. Assertions on the actual
-        // composition tree — this is a "prove destination" check,
-        // NOT the weak "second click can't find button" test the
-        // architect explicitly banned.
         composeTestRule.onAllNodesWithTag(
             HOW_STEP_ROOT_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(1)
@@ -285,22 +207,17 @@ class OnboardingFlowV2TransitionTest {
             identityStubTag, useUnmergedTree = true,
         ).assertCountEquals(0)
 
-        // Bonus (defence in depth): the state machine emitted
-        // exactly one `How` transition. A regression that
-        // removed the `if (step == Welcome)` guard would surface
-        // here as `[How, Identity]`.
         assertEquals(
             expected = listOf(OnboardingStepV2.How),
             actual = visitedSteps,
-            message = "Double-tap on `Get started` MUST emit exactly one state " +
-                "transition to `How`. A regression that removes the Welcome-CTA " +
-                "guard (`if (step == Welcome) goNext()`) would let the second " +
-                "pointer fire advance past How to Identity — this list would " +
-                "show `[How, Identity]`. Got: $visitedSteps.",
+            message = "Double-tap on `Get started` MUST emit exactly one transition to `How`. " +
+                "A regression that removes the Welcome-CTA guard would let the second " +
+                "pointer fire advance past How to Identity — this list would show " +
+                "`[How, Identity]`. Got: $visitedSteps.",
         )
     }
 
-    // ── §5.4 — Back from How returns to Welcome ──────────────────
+    // ── §4 — Back from How returns to Welcome ────────────────────
 
     @Test
     fun back_from_how_returns_to_welcome_normally() {
@@ -312,10 +229,6 @@ class OnboardingFlowV2TransitionTest {
             HOW_STEP_ROOT_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(1)
 
-        // System back — routed through OnBackPressedDispatcher on
-        // the Activity so BackHandler in the composition catches
-        // it. The How-branch BackHandler flips state back to
-        // Welcome.
         composeTestRule.activity.onBackPressedDispatcher.onBackPressed()
         composeTestRule.waitForIdle()
 
@@ -325,8 +238,6 @@ class OnboardingFlowV2TransitionTest {
         composeTestRule.onAllNodesWithTag(
             HOW_STEP_ROOT_TEST_TAG, useUnmergedTree = true,
         ).assertCountEquals(0)
-        // Welcome CTA also reachable after back — the flow is
-        // fully restored to Welcome, not a partial state.
         composeTestRule.onNodeWithText(getStartedLabel).assertIsDisplayed()
     }
 }

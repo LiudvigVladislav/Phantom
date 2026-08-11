@@ -9,10 +9,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedContentTransitionScope
-import androidx.compose.animation.ContentTransform
-import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -760,37 +756,52 @@ internal fun OnboardingFlowV2Internal(
         // — a fade reads correctly in both directions. The step-dots +
         // top-bar chrome carry the "which way is forward" cue.
         //
-        // Logo-flash-fix track (2026-08-10): the Welcome→How
-        // transition SCOPE-ONLY drops the exit fade to prevent the
-        // PHANTOM logo (rendered by WelcomeStepV2) from being visible
-        // at partial alpha over the fading-in How step during the
-        // 160-ms overlap. All OTHER step transitions keep the
-        // symmetric crossfade. See
-        // `onboardingStepContentTransform` below +
-        // `docs/tracks/android-onboarding/logo-flash-fix-contract.md`.
-        AnimatedContent(
+        // Onboarding-stabilization block 2026-08-11 — structural
+        // logo-flash fix. Prior shape kept Welcome as one branch of
+        // `AnimatedContent { when(step) { ... } }`; even with
+        // `EnterTransition.None togetherWith ExitTransition.None`,
+        // Compose's `KeepUntilTransitionsFinished` machinery held
+        // the outgoing Welcome tree in composition for one extra
+        // frame after the tap, and on-device users still perceived
+        // the PHANTOM logo flash. The fix here is STRUCTURAL: when
+        // `currentStep == Welcome`, render `WelcomeStepV2` OUTSIDE
+        // `AnimatedContent` entirely — the moment state flips to
+        // How, the `if` branch disposes Welcome in the SAME frame
+        // and the `else` branch mounts `AnimatedContent` for the
+        // first time with initial state = How (no fade-in on
+        // first-mount). Zero overlap, zero logo flash. Every other
+        // forward/back transition (How ↔ Identity, Identity ↔
+        // Privacy, etc.) still runs the symmetric crossfade inside
+        // `AnimatedContent`.
+        //
+        // See `docs/tracks/android-onboarding/onboarding-stabilization-block-2026-08-11.md`.
+        if (currentStep == OnboardingStepV2.Welcome) {
+            WelcomeStepV2(
+                // Guard against a double-fire on Get started —
+                // `canAdvanceFromV2` returns true for BOTH Welcome
+                // and How, so without the guard a rapid second fire
+                // would advance nav past How to Identity in the
+                // same gesture window. Pinned by
+                // `OnboardingFlowV2TransitionTest.get_started_double_tap_ends_at_how_not_identity`.
+                onContinueClick = {
+                    if (navigationStep == OnboardingStepV2.Welcome) goNext()
+                },
+            )
+        } else AnimatedContent(
             targetState = currentStep,
-            transitionSpec = { onboardingStepContentTransform() },
+            transitionSpec = {
+                fadeIn(tween(180)) togetherWith fadeOut(tween(160))
+            },
             label = "onboarding-step",
             modifier = Modifier.fillMaxSize(),
         ) { step ->
             when (step) {
-                OnboardingStepV2.Welcome -> WelcomeStepV2(
-                    // Logo-flash-fix track 2026-08-10 §7 pin:
-                    // guard against double-fire on Get started.
-                    // Without this, a rapid double-tap advances
-                    // navigation Welcome→How→Identity in a single
-                    // gesture window (because `canAdvanceFromV2`
-                    // returns true for BOTH Welcome and How, the
-                    // second fire moves nav past How to Identity).
-                    // The guard silently drops the second fire when
-                    // `navigationStep` has already left `Welcome`.
-                    // Pinned by
-                    // `OnboardingFlowV2TransitionTest.get_started_double_tap_ends_at_how_not_identity`.
-                    onContinueClick = {
-                        if (navigationStep == OnboardingStepV2.Welcome) goNext()
-                    },
-                )
+                // Welcome is handled OUTSIDE this AnimatedContent by
+                // the enclosing `if` guard — it is unreachable here.
+                // A defensive no-op keeps the `when` exhaustive so
+                // future step additions still fail-red at compile
+                // time.
+                OnboardingStepV2.Welcome -> Unit
                 OnboardingStepV2.How -> HowStepV2(
                     dotsIndex = step.dotsIndex,
                     onContinueClick = goNext,
@@ -1000,34 +1011,14 @@ internal fun OnboardingFlowV2Internal(
                     )  // PermissionsStepV2 close
                 }  // OnboardingStepV2.Permissions block close
                 OnboardingStepV2.FinaleConfirmation -> FinaleConfirmationStepV2(
-                    // C6-a: hex arrives directly from the sealed
-                    // finalize holder — non-null iff state is
-                    // Completed, and the derived currentStep only
-                    // resolves to FinaleConfirmation in that case
-                    // (see the `val currentStep` expression at the
-                    // top of the composable). Absent the coupling
-                    // through `formState.signingPublicKeyHex`, there
-                    // is no way for a caller to render this step
-                    // with a stale hex.
-                    //
-                    // Dual-key labels track 2026-08-10: BOTH hexes
-                    // pass through the holder's projections.
-                    signingPublicKeyHex = finalizeHolder.signingPublicKeyHex,
-                    publicKeyHex        = finalizeHolder.publicKeyHex,
+                    // Onboarding-stabilization block 2026-08-11:
+                    // Finale is now a plain "Identity created +
+                    // Continue" surface — no raw hexes, no Copy
+                    // affordance, no toast. The keys still travel
+                    // through `finalizeHolder` into the persisted
+                    // `IdentityRecord`; they surface in Profile
+                    // under "Advanced cryptographic details".
                     onContinueClick = onComplete,
-                    onKeyCopied = { _copiedHex ->
-                        // Round-1 REDLINE Commit-3 §P2-1: Copy needs
-                        // acknowledgement per handoff. Route through
-                        // the existing onboarding toast slot so the
-                        // feedback re-uses the flow's Toast composable.
-                        // Dual-key labels track 2026-08-10: the hex
-                        // param identifies WHICH key was copied
-                        // (Ed25519 signing vs X25519 encryption) —
-                        // production toast keeps the generic
-                        // wording; per-key toasts can differentiate
-                        // in a later polish pass if requested.
-                        toastMessage = "Key copied to clipboard."
-                    },
                 )
             }
         }
@@ -1258,51 +1249,12 @@ private suspend fun persistMissingKeyMarkerIfNeeded(
     return ok
 }
 
-/**
- * Step-transition `ContentTransform` used by the shared
- * `AnimatedContent` above. Scoped fix (logo-flash-fix track,
- * 2026-08-10):
- *
- *   - **Welcome → How ONLY**: `EnterTransition.None togetherWith
- *     ExitTransition.None` — instant swap. Neither incoming How
- *     fades in nor outgoing Welcome fades out; the composition
- *     shows Welcome on frame N and How on frame N+1 with no
- *     overlap and no fade artifact. Empirically required on
- *     Compose 1.x (verified 2026-08-10): plain
- *     `fadeIn(180) togetherWith ExitTransition.None` still
- *     keeps the outgoing Welcome content in the tree for at
- *     least the first frame after the tap (see
- *     `AnimatedContent` internals'
- *     `KeepUntilTransitionsFinished` machinery), so the PHANTOM
- *     logo remained visible on that frame. `EnterTransition.None`
- *     is the belt-and-braces fallback specified by the architect
- *     in the logo-flash contract sheet §4. The step-dots +
- *     top-bar chrome remain the direction cue.
- *
- *   - **All other transitions**: retained symmetric crossfade
- *     `fadeIn(180) togetherWith fadeOut(160)` — the previous
- *     behaviour, unchanged. Backward transition (`How →
- *     Welcome` via BackHandler) also uses the crossfade path
- *     since it is NOT the scoped forward branch.
- *
- * The Welcome→How special case is a defect fix, not a design
- * change. The "outgoing Welcome removed on next frame" invariant
- * is pinned by
- * `OnboardingFlowV2TransitionTest.welcome_logo_absent_immediately_after_get_started_tap`.
- * See
- * `docs/tracks/android-onboarding/logo-flash-fix-contract.md`
- * for the empirical audit that established the need for the
- * `EnterTransition.None` fallback.
- *
- * Extracted from an inline lambda so tests can call the same
- * function directly and share the exact transition logic.
- */
-internal fun AnimatedContentTransitionScope<OnboardingStepV2>.onboardingStepContentTransform(): ContentTransform =
-    if (
-        initialState == OnboardingStepV2.Welcome &&
-        targetState == OnboardingStepV2.How
-    ) {
-        EnterTransition.None togetherWith ExitTransition.None
-    } else {
-        fadeIn(tween(180)) togetherWith fadeOut(tween(160))
-    }
+// Onboarding-stabilization block 2026-08-11: the prior
+// `onboardingStepContentTransform` extension (with the Welcome→How
+// scoped no-transition branch) is deleted. Welcome is now rendered
+// OUTSIDE `AnimatedContent` (see the `if (currentStep == Welcome)`
+// guard in `OnboardingFlowV2Internal`), so no cross-step transition
+// ever involves the Welcome branch — the special case is gone. All
+// remaining forward/back transitions run the symmetric
+// `fadeIn(180) togetherWith fadeOut(160)` inline inside
+// `AnimatedContent.transitionSpec` at the call site.
