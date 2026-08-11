@@ -173,22 +173,69 @@ cat > "$sender_log" <<'LOG'
 08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=1000 monotonic_ms=1 correlation_id=CURRENT-CID sequence=1
 LOG
 
-cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 500 "$sender_log" || true)
-assert_eq "CURRENT-CID" "$cid" "find_send_cid_in_log picks current-run line"
+# 6th arg = skew (positive host-ahead-of-device). With skew=0 the
+# comparison stays on device clock only.
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 500 "$sender_log" 0 || true)
+assert_eq "CURRENT-CID" "$cid" "find_send_cid_in_log picks current-run line (skew=0)"
 
 # Same cell + sequence but run-old must give empty (wrong run_id).
-cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-old" "phone" 50 "$sender_log" || true)
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-old" "phone" 50 "$sender_log" 0 || true)
 assert_eq "STALE-CID" "$cid" "find_send_cid_in_log picks run-old when asked (but not run-current)"
 
-# not_before_ms > all matching walls must give empty.
-cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 9999 "$sender_log" || true)
-assert_eq "" "$cid" "find_send_cid_in_log rejects line predating not_before_ms"
+# host_not_before_ms > all matching walls (skew=0) must give empty.
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 9999 "$sender_log" 0 || true)
+assert_eq "" "$cid" "find_send_cid_in_log rejects line predating not_before_ms (skew=0)"
 
 # Wrong emitter must give empty.
-cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "emulator" 500 "$sender_log" || true)
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "emulator" 500 "$sender_log" 0 || true)
 assert_eq "" "$cid" "find_send_cid_in_log rejects wrong emitter"
 
-rm -f "$sender_log"
+# ── Round-4 audit P1-3: skew-corrected wall compare ─────────────
+
+# Scenario 1 (positive skew, host ahead of device).
+# host_not_before_ms=1000, host_to_sender_skew_ms=100 →
+# device_not_before_ms=900. Valid current-run line at device wall=1000.
+# Naive (skew=0) code would take device_not_before=1000 and reject.
+# Skew-aware code takes device_not_before=900 and accepts.
+skew_pos=$(mktemp)
+cat > "$skew_pos" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=1000 monotonic_ms=1 correlation_id=CID-POS sequence=1
+LOG
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 1000 "$skew_pos" 100 || true)
+assert_eq "CID-POS" "$cid" "find_send_cid_in_log accepts current line with positive skew (host ahead)"
+
+# Same scenario, but with skew=0 the same line would be rejected.
+# (Regression guard — proves the correction is what makes it pass.)
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 1000 "$skew_pos" 0 || true)
+assert_eq "CID-POS" "$cid" "find_send_cid_in_log accepts current line at exact device wall (skew=0)"
+
+# Truly stale event MUST still be rejected under positive skew.
+skew_stale=$(mktemp)
+cat > "$skew_stale" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=500 monotonic_ms=1 correlation_id=CID-STALE sequence=1
+LOG
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 1000 "$skew_stale" 100 || true)
+# device_not_before = 1000 - 100 = 900; event wall = 500 < 900 → reject.
+assert_eq "" "$cid" "find_send_cid_in_log rejects truly stale event under positive skew"
+
+# Scenario 2 (negative skew, device ahead of host).
+# host_not_before=1000, skew=-100 → device_not_before=1100.
+# Event at device wall=1050 must be rejected (predates corrected boundary).
+skew_neg=$(mktemp)
+cat > "$skew_neg" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=1050 monotonic_ms=1 correlation_id=CID-NEG-EARLY sequence=1
+LOG
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 1000 "$skew_neg" -100 || true)
+assert_eq "" "$cid" "find_send_cid_in_log rejects device-clock line before corrected not-before (negative skew)"
+
+# Same negative skew but device wall past corrected boundary must accept.
+cat > "$skew_neg" <<'LOG'
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone run_id=run-current cell_id=wss.p2e.after-connect wall_utc_ms=1200 monotonic_ms=1 correlation_id=CID-NEG-OK sequence=1
+LOG
+cid=$(find_send_cid_in_log "wss.p2e.after-connect" "1" "run-current" "phone" 1000 "$skew_neg" -100 || true)
+assert_eq "CID-NEG-OK" "$cid" "find_send_cid_in_log accepts device-clock line past corrected not-before (negative skew)"
+
+rm -f "$sender_log" "$skew_pos" "$skew_stale" "$skew_neg"
 
 # refuse_matrix_rerun: empty dir OK; dir with matrix.json refuses.
 tmpdir=$(mktemp -d)
@@ -204,6 +251,34 @@ else
     echo "PASS: refuse_matrix_rerun blocks dir with existing matrix.json"; pass=$((pass+1))
 fi
 rm -rf "$tmpdir"
+
+# ── Round-4 audit P0-1: LF-only bytes in every packaged file ────
+
+# Runs against the checked-out tree. On a Windows clone with
+# core.autocrlf=true, the .gitattributes scoped rule for
+# operator-package must keep these LF. On the packaged tarball,
+# a separate build-time scan runs before sealing (via the handoff
+# script), but we ALSO run it here so a broken checkout is caught
+# by the shell fixture suite from the operator's Mac.
+cr_offenders=0
+for f in "$PKG/run-yota-wss-diagnostic.sh" \
+         "$PKG/preflight.sh" \
+         "$PKG"/lib/*.sh \
+         "$PKG"/tests/*.sh \
+         "$PKG/verify-evidence.py" \
+         "$PKG"/tests/*.py; do
+    if [ -f "$f" ] && LC_ALL=C grep -l $'\r' "$f" > /dev/null 2>&1; then
+        echo "FAIL: CR bytes present in $f"
+        cr_offenders=$((cr_offenders+1))
+    fi
+done
+if [ "$cr_offenders" -eq 0 ]; then
+    echo "PASS: no CR bytes in any packaged .sh/.py under the operator-package tree"
+    pass=$((pass+1))
+else
+    echo "FAIL: $cr_offenders file(s) carry CR bytes"
+    fail=$((fail+1))
+fi
 
 echo ""
 echo "shell tests: pass=$pass fail=$fail"

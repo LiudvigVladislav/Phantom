@@ -263,8 +263,14 @@ def cell_direction_to_emitters(direction: str) -> tuple[str, str]:
 
 def _per_sender_pin_coverage(
     cell_pin: str, run_id: str, cell_id: str, sender_device: str,
-    envelope_wall: int, all_events: list[WssEvent],
+    sender_emitter: str, envelope_wall: int, all_events: list[WssEvent],
 ) -> tuple[bool, str]:
+    """Round-4 audit P0-3: `session_started` may cover the current
+    envelope ONLY when its `restored=true` AND its run/cell/pin/device/
+    emitter ALL match the current cell/sender. `restored=None` (missing
+    field) or `restored=false` or mismatched metadata invalidates any
+    prior pin_active. `restored=false` sessions and mismatched
+    `restored=true` sessions both count as coverage resets."""
     per_sender = [
         e for e in all_events
         if e.device == sender_device and e.wall_utc_ms is not None
@@ -276,19 +282,36 @@ def _per_sender_pin_coverage(
     latest_meta: str = ""
     for ev in per_sender:
         if ev.event == "diagnostic_session_started":
-            if ev.restored is False:
-                latest_pin = "none"
-                latest_meta = f"session_started(restored=false) at {ev.wall_utc_ms}"
-            elif ev.restored is True and ev.pin and ev.pin != "none":
+            # A session event that does NOT positively cover the current
+            # cell resets pin coverage. This handles restored=false,
+            # restored=None (missing/malformed), and restored=true with
+            # a mismatched run/cell/pin/emitter — none of which can
+            # certify the current envelope.
+            covers = (
+                ev.restored is True
+                and ev.run_id == run_id
+                and ev.cell_id == cell_id
+                and ev.pin == cell_pin
+                and ev.emitter_id == sender_emitter
+            )
+            if covers:
                 latest_pin = ev.pin
-                latest_meta = f"session_started(restored=true, pin={ev.pin}) at {ev.wall_utc_ms}"
+                latest_meta = (f"session_started(restored=true, run={ev.run_id}, "
+                                f"cell={ev.cell_id}, pin={ev.pin}, emitter={ev.emitter_id}) "
+                                f"at {ev.wall_utc_ms}")
+            else:
+                latest_pin = "none"
+                latest_meta = (f"session_started reset (restored={ev.restored}, "
+                                f"run={ev.run_id}, cell={ev.cell_id}, pin={ev.pin}, "
+                                f"emitter={ev.emitter_id}) at {ev.wall_utc_ms}")
         elif ev.event == "diagnostic_pin_active":
-            if ev.run_id == run_id and ev.cell_id == cell_id:
+            if (ev.run_id == run_id and ev.cell_id == cell_id
+                    and ev.emitter_id == sender_emitter):
                 latest_pin = ev.pin
                 latest_meta = f"pin_active(run={ev.run_id}, cell={ev.cell_id}, pin={ev.pin}) at {ev.wall_utc_ms}"
             else:
                 latest_pin = "none"
-                latest_meta = f"pin_active(other cell/run={ev.run_id}/{ev.cell_id}) at {ev.wall_utc_ms}"
+                latest_meta = f"pin_active(other cell/run/emitter={ev.run_id}/{ev.cell_id}/{ev.emitter_id}) at {ev.wall_utc_ms}"
     if latest_pin == cell_pin:
         return (True, latest_meta)
     return (False, f"latest pin before enqueue on {sender_device}: {latest_pin or 'none'} ({latest_meta or 'no events'}) — expected {cell_pin} for run={run_id} cell={cell_id}")
@@ -337,6 +360,13 @@ def _validate_manifest(manifest: dict) -> list[str]:
             problems.append(f"device-manifest.json missing required key: {req}")
     if not isinstance(manifest.get("run_id"), str) or not manifest.get("run_id"):
         problems.append("device-manifest.run_id missing or empty")
+    # Round-4 P1-2: serials MUST be non-empty strings.
+    for k in ("phone_serial", "emulator_serial"):
+        v = manifest.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v:
+            problems.append(f"device-manifest.{k} not a non-empty string: {v!r}")
     for k in ("host_to_phone_skew_ms", "host_to_emulator_skew_ms"):
         v = manifest.get(k)
         if v is None:
@@ -441,13 +471,33 @@ def integrity_check_bundle(
         if not any(e.event == "diagnostic_session_started" and e.device == dev for e in events):
             problems.append(f"no diagnostic_session_started event on {dev}")
 
+    # Round-4 audit P0-3: every diagnostic_session_started must carry a
+    # real boolean `restored` (parser reads only "true"/"false"; a
+    # missing field yields None) AND a whitelisted pin
+    # {none, wss, rest}. Missing / malformed fields are integrity RED —
+    # they must NOT be silently ignored by _per_sender_pin_coverage.
+    for e in events:
+        if e.event != "diagnostic_session_started":
+            continue
+        if e.restored is None:
+            problems.append(
+                f"diagnostic_session_started missing/malformed restored field on {e.device} @ wall={e.wall_utc_ms}",
+            )
+        if e.pin not in ("none", "wss", "rest"):
+            problems.append(
+                f"diagnostic_session_started pin not in whitelist on {e.device} @ wall={e.wall_utc_ms}: {e.pin!r}",
+            )
+
     for e in events:
         if e.event == "unresolved_120s_marker" or e.outcome_flag == "unresolved_120s_marker":
             problems.append(f"forbidden verifier-only classification emitted by client: {e.raw}")
 
-    run_id_matrix = matrix.get("run_id")
-    if not run_id_matrix:
-        problems.append("matrix.json missing run_id")
+    run_id_matrix_raw = matrix.get("run_id")
+    if not isinstance(run_id_matrix_raw, str) or not run_id_matrix_raw:
+        problems.append(f"matrix.json missing or wrong-typed run_id: {run_id_matrix_raw!r}")
+        run_id_matrix: Optional[str] = None
+    else:
+        run_id_matrix = run_id_matrix_raw
     cells_raw = matrix.get("cells")
     if not isinstance(cells_raw, list):
         problems.append(f"matrix.cells missing or wrong type: {type(cells_raw).__name__}")
@@ -456,13 +506,17 @@ def integrity_check_bundle(
         problems.append(f"matrix.json cells count={len(cells_raw)} (expected {EXPECTED_CELL_COUNT})")
     seen_cell_ids: set[str] = set()
     observed_triples: set[tuple[str, str, str]] = set()
-    for cell in cells_raw:
+    for idx, cell in enumerate(cells_raw):
         if not isinstance(cell, dict):
-            problems.append(f"matrix.cells has non-object entry: {cell!r}")
+            problems.append(f"matrix.cells[{idx}] is not an object: {type(cell).__name__}")
             continue
+        # Round-4 P1-2: validate every nested field type BEFORE any set
+        # membership / set insertion / sorting. All strings must be non-
+        # empty and members of their whitelist; `blocked` must be a real
+        # bool. Wrong-typed fields never crash the verifier.
         cid = cell.get("cell_id")
-        if not cid:
-            problems.append("cell missing cell_id")
+        if not isinstance(cid, str) or not cid:
+            problems.append(f"matrix.cells[{idx}].cell_id not a non-empty string: {cid!r}")
             continue
         if cid in seen_cell_ids:
             problems.append(f"duplicate cell_id in matrix: {cid}")
@@ -470,18 +524,26 @@ def integrity_check_bundle(
         pin = cell.get("pin")
         direction = cell.get("direction")
         scenario = cell.get("scenario")
-        if pin not in ALLOWED_PINS:
-            problems.append(f"cell {cid} pin not in whitelist: {pin}")
-        if direction not in ALLOWED_DIRECTIONS:
-            problems.append(f"cell {cid} direction not in whitelist: {direction}")
-        if scenario not in ALLOWED_SCENARIOS:
-            problems.append(f"cell {cid} scenario not in whitelist: {scenario}")
-        if cell.get("blocked") is True and pin != "rest":
+        if not isinstance(pin, str) or pin not in ALLOWED_PINS:
+            problems.append(f"cell {cid} pin not a whitelisted string: {pin!r}")
+        if not isinstance(direction, str) or direction not in ALLOWED_DIRECTIONS:
+            problems.append(f"cell {cid} direction not a whitelisted string: {direction!r}")
+        if not isinstance(scenario, str) or scenario not in ALLOWED_SCENARIOS:
+            problems.append(f"cell {cid} scenario not a whitelisted string: {scenario!r}")
+        # Round-4 P0-2: blocked MUST be a real bool. `"false"` is a string,
+        # not the boolean False; the prior `bool(...)` at report time
+        # coerced any truthy value including non-empty strings and skipped
+        # WSS cells silently.
+        blocked_val = cell.get("blocked")
+        if not isinstance(blocked_val, bool):
+            problems.append(f"cell {cid} blocked must be a JSON boolean, got {type(blocked_val).__name__}: {blocked_val!r}")
+        if blocked_val is True and pin != "rest":
             problems.append(f"cell {cid} BLOCKED but pin != rest — only REST cells may be BLOCKED")
-        if pin and direction and scenario:
+        if (isinstance(pin, str) and isinstance(direction, str)
+                and isinstance(scenario, str)):
             observed_triples.add((pin, direction, scenario))
-        if pin and direction and scenario and cid != f"{pin}.{direction}.{scenario}":
-            problems.append(f"cell {cid} does not match pin.direction.scenario shape ({pin}.{direction}.{scenario})")
+            if cid != f"{pin}.{direction}.{scenario}":
+                problems.append(f"cell {cid} does not match pin.direction.scenario shape ({pin}.{direction}.{scenario})")
 
     for t in sorted(CANONICAL_MATRIX_TRIPLES - observed_triples):
         problems.append(f"canonical matrix triple missing: {t}")
@@ -495,6 +557,7 @@ def integrity_check_bundle(
     # Round-3 audit P1-1: bidirectional REST BLOCKED / rest_capability parity.
     rest_cap = preflight.get("rest_capability")
     rest_cells = [c for c in cells_raw if isinstance(c, dict)
+                  and isinstance(c.get("cell_id"), str)
                   and c.get("cell_id") in CANONICAL_REST_CELL_IDS]
     if rest_cap == "disabled":
         for c in rest_cells:
@@ -607,14 +670,17 @@ def classify_envelope(
                 issues.append(f"recipient event {e.event} owner mismatch (run={e.run_id} cell={e.cell_id})")
 
     (covered, why) = _per_sender_pin_coverage(
-        cell_pin, run_id, cell_id, sender_device,
+        cell_pin, run_id, cell_id, sender_device, sender_emitter,
         envelope_enqueue.wall_utc_ms or 0, all_events,
     )
     if not covered:
         issues.append(f"pin coverage: {why}")
 
-    # Round-3 audit P0-2: inspect ALL sender_transport_decision events,
-    # not next(...). A contradictory second decision is a violation.
+    # Round-3 audit P0-2 + Round-4 audit P1-1: inspect ALL
+    # sender_transport_decision events. A contradictory second decision
+    # is a violation. Every decision MUST be dispatched=True (not
+    # missing, not False), outer=direct, inner=cell pin — the
+    # production emitter always sets all three fields.
     decisions = [e for e in corr_events if e.event == "sender_transport_decision"]
     if not decisions:
         issues.append("missing sender_transport_decision")
@@ -624,8 +690,8 @@ def classify_envelope(
                 issues.append(f"transport decision outer_transport={d.outer_transport} != direct")
             if d.inner_route != cell_pin:
                 issues.append(f"transport decision inner_route={d.inner_route} != cell pin {cell_pin}")
-            if d.dispatched is False:
-                issues.append("transport decision dispatched=false (envelope refused at outer arm)")
+            if d.dispatched is not True:
+                issues.append(f"transport decision dispatched must be true, got {d.dispatched!r}")
         outer_values = {d.outer_transport for d in decisions}
         if len(outer_values) > 1:
             issues.append(f"contradictory sender_transport_decision outer_transport values: {sorted(str(x) for x in outer_values)}")
@@ -633,26 +699,31 @@ def classify_envelope(
         if len(inner_values) > 1:
             issues.append(f"contradictory sender_transport_decision inner_route values: {sorted(str(x) for x in inner_values)}")
 
-    # Round-3 audit P0-2: inspect ALL route-return events. Opposite
-    # route forbidden; at least one successful matching return required.
+    # Round-3 audit P0-2 + Round-4 audit P1-1: inspect ALL route-return
+    # events. Opposite route forbidden. At least one successful
+    # matching return required with dispatched=True (WSS) or
+    # accepted/duplicate acceptance (REST). Missing `inner_route` is
+    # NOT accepted as a successful match — the production emitter
+    # always sets it and its absence indicates a schema drift the
+    # verifier must not ignore.
     wss_returns = [e for e in corr_events if e.event == "sender_wss_send_returned"]
     rest_returns = [e for e in corr_events if e.event == "sender_rest_post_completed"]
     if cell_pin == "wss":
         if rest_returns:
             issues.append(f"WSS cell has {len(rest_returns)} REST completion event(s) — opposite route")
         for w in wss_returns:
-            if w.inner_route not in (None, "wss"):
-                issues.append(f"sender_wss_send_returned inner_route={w.inner_route} != wss")
-        if not any(w.dispatched is True and (w.inner_route in (None, "wss")) for w in wss_returns):
+            if w.inner_route != "wss":
+                issues.append(f"sender_wss_send_returned inner_route must be wss, got {w.inner_route!r}")
+        if not any(w.dispatched is True and w.inner_route == "wss" for w in wss_returns):
             issues.append("missing successful sender_wss_send_returned (dispatched=true, inner_route=wss)")
     elif cell_pin == "rest":
         if wss_returns:
             issues.append(f"REST cell has {len(wss_returns)} WSS return event(s) — opposite route")
         for r in rest_returns:
-            if r.inner_route not in (None, "rest"):
-                issues.append(f"sender_rest_post_completed inner_route={r.inner_route} != rest")
+            if r.inner_route != "rest":
+                issues.append(f"sender_rest_post_completed inner_route must be rest, got {r.inner_route!r}")
         if not any(
-            (r.inner_route in (None, "rest")) and r.relay_acceptance in ("accepted", "duplicate")
+            r.inner_route == "rest" and r.relay_acceptance in ("accepted", "duplicate")
             for r in rest_returns
         ):
             issues.append("missing successful sender_rest_post_completed (inner_route=rest, relay_acceptance ∈ accepted/duplicate)")
@@ -802,12 +873,34 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
     for cell in cells_iter:
         if not isinstance(cell, dict):
             continue
+        # Round-4 P0-2 / P1-2: only strings/bools are allowed. If any
+        # nested field is wrong-typed, integrity_issues already carries
+        # the RED marker; we skip the cell here rather than crash on
+        # a hash / f-string / classification pass.
+        raw_cid = cell.get("cell_id")
+        raw_pin = cell.get("pin")
+        raw_direction = cell.get("direction")
+        raw_scenario = cell.get("scenario")
+        raw_blocked = cell.get("blocked")
+        if not isinstance(raw_cid, str) or not raw_cid:
+            continue
+        if not isinstance(raw_pin, str) or raw_pin not in ALLOWED_PINS:
+            continue
+        if not isinstance(raw_direction, str) or raw_direction not in ALLOWED_DIRECTIONS:
+            continue
+        if not isinstance(raw_scenario, str) or raw_scenario not in ALLOWED_SCENARIOS:
+            continue
         cr = CellReport(
-            cell_id=cell.get("cell_id", "?"),
-            pin=cell.get("pin", "?"),
-            direction=cell.get("direction", "?"),
-            scenario=cell.get("scenario", "?"),
-            blocked=bool(cell.get("blocked")),
+            cell_id=raw_cid,
+            pin=raw_pin,
+            direction=raw_direction,
+            scenario=raw_scenario,
+            # P0-2: `is True` — a string "false" (or "true", 0, 1, list…)
+            # is neither blocked nor unblocked; it must have already
+            # tripped integrity RED above. We treat any non-True value
+            # as NOT blocked here, so a stringly-typed "true" cannot
+            # skip a WSS cell to a false BLOCKED verdict.
+            blocked=(raw_blocked is True),
         )
         if cr.blocked:
             cr.outcome = "BLOCKED"

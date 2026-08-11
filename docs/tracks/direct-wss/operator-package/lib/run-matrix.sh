@@ -40,6 +40,13 @@ emu_log="$OUT/emulator.logcat.wss_diag"
 
 rest_capability=$(python3 -c "import json; print(json.load(open('$OUT/preflight.json')).get('rest_capability','unknown'))")
 
+# §12 Round-4 audit P1-3: read per-device host-to-sender skew so the
+# CID-not-before comparison can be done on a device clock the two
+# agree on. Values are the same ones the verifier consumes; they were
+# measured N=5 in preflight and are echoed here into the runner.
+host_to_phone_skew_ms=$(python3 -c "import json; print(json.load(open('$OUT/preflight.json')).get('host_to_phone_skew_ms',0))")
+host_to_emu_skew_ms=$(python3 -c "import json; print(json.load(open('$OUT/preflight.json')).get('host_to_emulator_skew_ms',0))")
+
 cells=(
   "wss|p2e|after-connect|$phone|$emu"
   "wss|e2p|after-connect|$emu|$phone"
@@ -93,15 +100,18 @@ wait_pin_active_both() {
 }
 
 wait_send_cid_from_sender() {
-  # Round-3 P1-2: reads ONLY the sender's log, requires run_id +
-  # cell_id + sequence + emitter + wall_utc_ms >= command_start_ms.
-  # Prints the correlation_id or empty (return 1) on timeout.
-  local cell_id="$1" sequence="$2" emitter="$3" sender_log="$4" command_start_ms="$5"
+  # Round-3 P1-2 + Round-4 P1-3: reads ONLY the sender's log; requires
+  # run_id + cell_id + sequence + emitter + wall_utc_ms ≥
+  # (command_start_ms - host_to_sender_skew_ms). Prints the
+  # correlation_id or empty (return 1) on timeout.
+  local cell_id="$1" sequence="$2" emitter="$3" sender_log="$4"
+  local command_start_ms="$5" skew_ms="$6"
   local start; start=$(now_ms)
   local deadline_ms=$(( start + 15000 ))
   while : ; do
     local cid
-    cid=$(find_send_cid_in_log "$cell_id" "$sequence" "$RUN_ID" "$emitter" "$command_start_ms" "$sender_log" || true)
+    cid=$(find_send_cid_in_log "$cell_id" "$sequence" "$RUN_ID" "$emitter" \
+                                 "$command_start_ms" "$sender_log" "$skew_ms" || true)
     if [ -n "$cid" ]; then
       printf '%s' "$cid"
       return 0
@@ -140,9 +150,9 @@ for row in "${cells[@]}"; do
 
   # emitter mapping — the SENDER for this cell's direction:
   case "$dir" in
-    p2e) sender_emitter="phone"    ; sender_log="$phone_log" ;;
-    e2p) sender_emitter="emulator" ; sender_log="$emu_log" ;;
-    *)   sender_emitter="unknown"  ; sender_log="/dev/null" ;;
+    p2e) sender_emitter="phone"    ; sender_log="$phone_log" ; sender_skew_ms="$host_to_phone_skew_ms" ;;
+    e2p) sender_emitter="emulator" ; sender_log="$emu_log"   ; sender_skew_ms="$host_to_emu_skew_ms" ;;
+    *)   sender_emitter="unknown"  ; sender_log="/dev/null"  ; sender_skew_ms=0 ;;
   esac
 
   # Write pin on BOTH devices; wait for diagnostic_pin_active on both.
@@ -174,11 +184,11 @@ for row in "${cells[@]}"; do
     command_start_ms=$(now_ms)
     enqueue_wall_ms=$command_start_ms
     "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
-    cid=$(wait_send_cid_from_sender "$cell_id" "$seq" "$sender_emitter" "$sender_log" "$command_start_ms" || true)
+    cid=$(wait_send_cid_from_sender "$cell_id" "$seq" "$sender_emitter" "$sender_log" "$command_start_ms" "$sender_skew_ms" || true)
     if [ -n "$cid" ]; then
       poll_envelope "$cid" "$enqueue_wall_ms"
     else
-      echo "warn: could not read correlation_id for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter, not_before_ms=$command_start_ms)" >&2
+      echo "warn: could not read correlation_id for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter, host_not_before_ms=$command_start_ms, host_to_sender_skew_ms=$sender_skew_ms)" >&2
       sleep 5
     fi
   done

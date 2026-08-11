@@ -995,6 +995,255 @@ class VerifierTests(unittest.TestCase):
         self.assertTrue(any("device-manifest.json" in p and "JSON parse error" in p
                              for p in rep.integrity_issues))
 
+    # ── Round-4 audit repro cases ─────────────────────────────
+
+    # P0-2 — strict boolean blocked: every non-True value must fail
+    # integrity AND must NOT be treated as BLOCKED at report time.
+    def _blocked_value_case(self, bad_value) -> "ve.VerifyReport":
+        m = default_matrix()
+        # Try to sneak a WSS cell out of the run.
+        m["cells"][0]["blocked"] = bad_value
+        out, base = build_full_matrix_bundle(self.tmp, matrix_override=m)
+        return ve.build_report(out, host_now_override_ms=base + 400_000)
+
+    def test_R4_P0_2_blocked_string_false_is_integrity_RED_and_not_BLOCKED(self):
+        rep = self._blocked_value_case("false")
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("blocked must be a JSON boolean" in p for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertNotEqual(cell.outcome, "BLOCKED",
+                            msg=f"stringly-typed blocked must not skip WSS cell; outcome={cell.outcome}")
+
+    def test_R4_P0_2_blocked_string_true_is_integrity_RED(self):
+        rep = self._blocked_value_case("true")
+        self.assertFalse(rep.integrity_ok)
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertNotEqual(cell.outcome, "BLOCKED")
+
+    def test_R4_P0_2_blocked_zero_is_integrity_RED(self):
+        rep = self._blocked_value_case(0)
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P0_2_blocked_one_is_integrity_RED(self):
+        rep = self._blocked_value_case(1)
+        self.assertFalse(rep.integrity_ok)
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertNotEqual(cell.outcome, "BLOCKED")
+
+    def test_R4_P0_2_blocked_null_is_integrity_RED(self):
+        rep = self._blocked_value_case(None)
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P0_2_blocked_list_is_integrity_RED_no_exception(self):
+        rep = self._blocked_value_case([])
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P0_2_blocked_object_is_integrity_RED_no_exception(self):
+        rep = self._blocked_value_case({"k": "v"})
+        self.assertFalse(rep.integrity_ok)
+
+    # P0-3 — strict diagnostic_session_started.
+    def _session_started_control_bundle(self, injected_session_kwargs: dict) -> str:
+        """Full-delivery bundle with a mid-run session_started injected
+        on the phone (sender) BEFORE the first envelope. Kwargs
+        control the injected session's run_id, cell_id, pin, restored,
+        etc. Everything else is a clean full-matrix delivery."""
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Insert an extra session_started on the phone side after the
+        # pin_active but BEFORE the first sender_enqueue.
+        injected = line("diagnostic_session_started", base + 400, 5, "matrix",
+                         injected_session_kwargs.get("cell_id", cell_id), "phone",
+                         pin=injected_session_kwargs.get("pin", "wss"),
+                         inner=injected_session_kwargs.get("pin", "wss"),
+                         run_id=injected_session_kwargs.get("run_id", RUN_ID),
+                         restored=injected_session_kwargs.get("restored"))
+        # Splice it in ordering-wise (verifier sorts by wall_utc_ms so
+        # position in the file is not strictly needed, but keep it neat).
+        phone.append(injected)
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        return make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+
+    def test_R4_P0_3_session_started_missing_restored_is_integrity_RED(self):
+        out = self._session_started_control_bundle({"restored": None})
+        rep = ve.build_report(out, host_now_override_ms=600_000)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("missing/malformed restored" in p for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
+
+    def test_R4_P0_3_session_started_restored_true_wrong_run_does_not_cover(self):
+        out = self._session_started_control_bundle({"restored": True, "run_id": "stale-run"})
+        rep = ve.build_report(out, host_now_override_ms=600_000)
+        # Wrong run_id → run_id mismatch flag on the event globally
+        # (session_started is exempted, but classify_envelope's
+        # coverage check must reject the stale-run restored=true).
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertEqual(cell.outcome, "Unresolved",
+                         msg=f"stale-run restored=true must not cover current cell; issues: {cell.issues}")
+
+    def test_R4_P0_3_session_started_restored_true_wrong_cell_does_not_cover(self):
+        out = self._session_started_control_bundle({"restored": True, "cell_id": "wss.p2e.after-idle"})
+        rep = ve.build_report(out, host_now_override_ms=600_000)
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertEqual(cell.outcome, "Unresolved",
+                         msg=f"wrong-cell restored=true must not cover current cell; issues: {cell.issues}")
+
+    def test_R4_P0_3_session_started_restored_true_wrong_pin_does_not_cover(self):
+        out = self._session_started_control_bundle({"restored": True, "pin": "rest"})
+        rep = ve.build_report(out, host_now_override_ms=600_000)
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertEqual(cell.outcome, "Unresolved",
+                         msg=f"wrong-pin restored=true must not cover current cell; issues: {cell.issues}")
+
+    def test_R4_P0_3_session_started_restored_true_matching_covers(self):
+        # Positive control: matching restored=true preserves coverage.
+        out = self._session_started_control_bundle({"restored": True})
+        rep = ve.build_report(out, host_now_override_ms=600_000)
+        cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
+        self.assertEqual(cell.outcome, "Delivered once",
+                         msg=f"matching restored=true must cover current cell; issues: {cell.issues}")
+
+    def test_R4_P0_3_session_started_pin_not_in_whitelist_is_integrity_RED(self):
+        # Build a bundle with an injected session whose pin is bogus.
+        cell_id = "wss.p2e.after-connect"
+        phone = [line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone", pin="bogus", inner="unknown", restored=False)]
+        emu = [_min_boot("emulator")]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("pin not in whitelist" in p for p in rep.integrity_issues),
+                        msg=f"issues: {rep.integrity_issues}")
+
+    # P1-1 — required transport evidence fields.
+    def test_R4_P1_1_transport_decision_without_dispatched_is_Unresolved(self):
+        target = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(target, "p2e", base_wall=base)
+        # Strip `dispatched=true` from every transport_decision for target cell.
+        import re
+        phone = [
+            re.sub(r" dispatched=(true|false)", "", ln) if "sender_transport_decision" in ln and f"cell_id={target}" in ln else ln
+            for ln in phone
+        ]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        cell = next(c for c in rep.cells if c.cell_id == target)
+        self.assertEqual(cell.outcome, "Unresolved", msg=f"issues: {cell.issues}")
+        self.assertTrue(any("dispatched must be true" in i for i in cell.issues),
+                        msg=f"issues: {cell.issues}")
+
+    def test_R4_P1_1_wss_return_without_inner_route_is_Unresolved(self):
+        target = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(target, "p2e", base_wall=base)
+        import re
+        phone = [
+            re.sub(r" inner_route=wss", "", ln) if "sender_wss_send_returned" in ln and f"cell_id={target}" in ln else ln
+            for ln in phone
+        ]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        cell = next(c for c in rep.cells if c.cell_id == target)
+        self.assertEqual(cell.outcome, "Unresolved", msg=f"issues: {cell.issues}")
+        self.assertTrue(any("inner_route must be wss" in i for i in cell.issues),
+                        msg=f"issues: {cell.issues}")
+
+    def test_R4_P1_1_rest_return_without_inner_route_is_Unresolved(self):
+        target = "rest.p2e.control"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(target, "p2e", base_wall=base, pin="rest")
+        import re
+        phone = [
+            re.sub(r" inner_route=rest", "", ln) if "sender_rest_post_completed" in ln and f"cell_id={target}" in ln else ln
+            for ln in phone
+        ]
+        m = default_matrix()
+        for cell in m["cells"]:
+            if cell["cell_id"] == target or cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        cell = next(c for c in rep.cells if c.cell_id == target)
+        self.assertEqual(cell.outcome, "Unresolved", msg=f"issues: {cell.issues}")
+        self.assertTrue(any("inner_route must be rest" in i for i in cell.issues),
+                        msg=f"issues: {cell.issues}")
+
+    # P1-2 — nested type-safety: wrong-typed fields must integrity RED
+    # and never raise. Table-driven for cell fields and manifest serials.
+    def _nested_type_case(self, cell_field: str, bad_value) -> "ve.VerifyReport":
+        m = default_matrix()
+        m["cells"][0][cell_field] = bad_value
+        out = make_bundle(self.tmp, matrix=m,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        # Must not raise.
+        return ve.build_report(out)
+
+    def test_R4_P1_2_cell_pin_as_list_is_integrity_RED_no_exception(self):
+        rep = self._nested_type_case("pin", [])
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P1_2_cell_id_as_list_is_integrity_RED_no_exception(self):
+        rep = self._nested_type_case("cell_id", [])
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P1_2_cell_direction_as_object_is_integrity_RED_no_exception(self):
+        rep = self._nested_type_case("direction", {"a": 1})
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P1_2_cell_scenario_as_int_is_integrity_RED_no_exception(self):
+        rep = self._nested_type_case("scenario", 42)
+        self.assertFalse(rep.integrity_ok)
+
+    def test_R4_P1_2_manifest_phone_serial_as_list_is_integrity_RED(self):
+        mf = default_manifest(); mf["phone_serial"] = []
+        out = make_bundle(self.tmp, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("phone_serial not a non-empty string" in p
+                             for p in rep.integrity_issues))
+
+    def test_R4_P1_2_manifest_emulator_serial_empty_is_integrity_RED(self):
+        mf = default_manifest(); mf["emulator_serial"] = ""
+        out = make_bundle(self.tmp, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("emulator_serial not a non-empty string" in p
+                             for p in rep.integrity_issues))
+
+    def test_R4_P1_2_matrix_run_id_as_list_is_integrity_RED_no_exception(self):
+        m = default_matrix(); m["run_id"] = []
+        out = make_bundle(self.tmp, matrix=m,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

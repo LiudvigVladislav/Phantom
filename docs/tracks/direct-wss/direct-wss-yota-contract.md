@@ -45,6 +45,112 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.4 — Round-4 audit repair (2026-08-12)
+
+Fourth architect audit closed. Scope strictly limited to
+`verifier + runner + fixtures + docs + LF packaging`. No Android
+runtime, transport, Gradle full suite, APK or ADB touched.
+
+Baseline `ebd23f8f` accepted Round-3 but the physical `tar.gz` was
+CRLF (unrunnable on Mac), and the verifier had five reproducible
+false-GREEN paths that survived Round-3. All six are closed by
+verifier / runner behaviour changes plus new fixtures that fail
+without them.
+
+**P0-1 LF-only packaging.** A scoped `.gitattributes` under
+`operator-package/` pins `*.sh` and `*.py` to `text eol=lf` so a
+Windows clone with `core.autocrlf=true` no longer rewrites them on
+checkout. The handoff tarball is built by `build-handoff-tar.sh`,
+which uses `git archive` to read blobs DIRECTLY from the git index
+(LF, always) — bypassing working-tree normalization entirely.
+Before sealing, the builder binary-scans every packaged `.sh` /
+`.py` for `\r` bytes and refuses to write the tar if any offender
+is found. After sealing, the builder extracts the tar to a scratch
+directory, re-checks executable modes, and re-runs the shell +
+python fixture suites from the extracted copy. `tests/test_shell.sh`
+carries a matching CR-scan fixture so an operator's Mac catches a
+broken checkout with a single `bash tests/test_shell.sh`.
+
+**P0-2 strict boolean `blocked`.** `blocked` must be a real JSON
+boolean. `type(value) is bool` at integrity time; any other value
+(`"false"`, `"true"`, `0`, `1`, `null`, list, object) is integrity
+RED. At report-build time, only `raw_blocked is True` treats a cell
+as BLOCKED — the prior `bool(cell.get("blocked"))` coerced non-empty
+strings to `True` and would silently skip a required WSS cell to a
+false BLOCKED verdict.
+
+**P0-3 strict `diagnostic_session_started`.** Every session event
+must carry a real boolean `restored` field and a whitelisted `pin`
+∈ `{none, wss, rest}`; missing / malformed fields are integrity
+RED. In pin-coverage evaluation, a `restored=true` session event
+covers the current envelope ONLY when its `run_id`, `cell_id`,
+`pin`, source device AND `emitter_id` ALL match the current cell /
+sender. Any later mismatched or `restored=false` session event
+resets pin coverage until a fresh matching `diagnostic_pin_active`
+arrives. `pin_active` events likewise require matching emitter,
+not just matching run/cell.
+
+**P1-1 schema-enforce transport evidence fields.** Every
+`sender_transport_decision` MUST have `dispatched=true` (not
+missing, not `false`), `outer_transport=direct`, and
+`inner_route=<cell pin>`. A successful WSS return requires exactly
+`dispatched=true` AND `inner_route=wss` (missing `inner_route` no
+longer counts). A successful REST return requires
+`inner_route=rest` AND `relay_acceptance ∈ {accepted, duplicate}`
+(missing `inner_route` no longer counts). Missing / weakened
+fields land the cell as `Unresolved`.
+
+**P1-2 nested type-safety.** Every matrix cell field is validated
+BEFORE set membership, set insertion, sorting, or classification:
+`cell_id` a non-empty string; `pin` / `direction` / `scenario`
+strings from their whitelist; `blocked` a real boolean. Manifest
+`phone_serial` / `emulator_serial` are non-empty strings. All
+JSON loading paths return `(value, error)` — a wrong-typed field
+never raises `TypeError`; it lands in `integrity_issues`.
+
+**P1-3 runner skew-corrected wall compare.** `run-matrix.sh` now
+reads `host_to_phone_skew_ms` and `host_to_emulator_skew_ms` from
+`preflight.json`, selects the sender's per-device skew, and passes
+it to `find_send_cid_in_log`. The helper converts the host
+`not_before_ms` (captured just before the send subcommand fires)
+to a device `not_before_ms` by subtracting the skew, then compares
+against the event's device-clock `wall_utc_ms`. Under the
+contract's 30-second skew ceiling, a positive skew (host ahead of
+device) at boundary no longer rejects every genuine current-run
+CID; a truly stale event is still rejected regardless of skew
+direction.
+
+**Docs cleanup / hygiene**
+
+* Contract sheet §9.5 / §9.6 prose that predated Round-1
+  incrementally kept behind while the source of truth moved into
+  the §12.x repair blocks. §12.4 (this section) is now the
+  authoritative record for verifier + runner + package invariants
+  through Round-4.
+* README-OPERATOR.md's `sha256sum` requirement was already
+  removed in Round-3 (Tele2 marked DEFERRED).
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes unchanged: BUILD SUCCESSFUL.
+* Python — 72 fixtures (23 new for Round-4): stringly-typed
+  `blocked` (`"false"`, `"true"`, `0`, `1`, `null`, list, object),
+  `session_started` missing `restored`, `session_started`
+  `restored=true` under wrong run / wrong cell / wrong pin, the
+  matching positive control, `session_started` with bogus `pin`,
+  transport decision without `dispatched`, WSS return without
+  `inner_route`, REST return without `inner_route`, nested type
+  cases for cell `pin` / `cell_id` / `direction` / `scenario`,
+  manifest `phone_serial` as list, empty `emulator_serial`,
+  `matrix.run_id` as list.
+* Shell — 27 fixtures (6 new for Round-4): skew-corrected
+  positive skew accepts current, positive skew rejects truly
+  stale, negative skew rejects device line before corrected
+  not-before, negative skew accepts device line past corrected
+  not-before, exact-wall + skew=0 regression guard, CR-byte scan
+  across every packaged `.sh` / `.py`.
+* `bash -n` + `py_compile` clean.
+
 ### §12.3 — Round-3 audit repair (2026-08-12)
 
 Third architect audit closed. Scope was strictly limited to

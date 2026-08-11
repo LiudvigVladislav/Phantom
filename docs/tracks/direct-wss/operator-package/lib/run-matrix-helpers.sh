@@ -41,23 +41,36 @@ wait_for_pin_active_in_log() {
 
 # find_send_cid_in_log
 #   Arguments: <cell_id> <sequence> <run_id> <expected_emitter>
-#              <not_before_wall_ms> <sender_log>
+#              <not_before_host_ms> <sender_log> <host_to_sender_skew_ms>
 #   Prints    : the correlation_id of the newest matching line, or empty
 #   Returns   : 0 if a matching line exists; 1 otherwise
 #   Match     : event=diagnostic_send_dispatched AND run_id=<run_id> AND
 #                cell_id=<cell_id> AND sequence=<sequence> AND
-#                emitter_id=<expected_emitter> AND wall_utc_ms >= not_before
-#                (reads ONLY the sender's log — recipient's log is off-limits).
+#                emitter_id=<expected_emitter> AND
+#                wall_utc_ms >= (not_before_host_ms - host_to_sender_skew_ms)
+#                — the last term converts the host-clock not-before into
+#                a device-clock not-before so a device up to
+#                host_to_sender_skew_ms behind the Mac still qualifies.
 #
-# Round-3 P1-2: reject stale prior-run lines by requiring both
-# run_id AND a not-before wall_utc_ms >= command_start_ms (the wall
-# captured just BEFORE the current send subcommand was fired).
+# Round-3 P1-2: reject stale prior-run lines by requiring run_id AND
+# a not-before timestamp.
+# Round-4 P1-3: the not-before comparison is now cross-clock aware —
+# the caller passes command_start_ms captured on the Mac plus the
+# preflight-measured host_to_sender_skew_ms, and the helper compares
+# on a device clock the two agree on. Without this, a positive skew
+# (host clock ahead of device) at the contract's 30-second ceiling
+# would reject every genuine current-run CID.
 find_send_cid_in_log() {
   local cell_id="$1" sequence="$2" run_id="$3" emitter="$4"
-  local not_before_ms="$5" sender_log="$6"
+  local not_before_host_ms="$5" sender_log="$6"
+  local host_to_sender_skew_ms="${7:-0}"
   [ -f "$sender_log" ] || return 1
+  # Cross-clock: convert the host not-before into a device not-before.
+  # host_to_sender_skew_ms = host_ms - device_ms at preflight time.
+  # device_now ≈ host_now - host_to_sender_skew_ms.
+  local not_before_device_ms=$(( not_before_host_ms - host_to_sender_skew_ms ))
   # Pick the newest matching line (tail -1); check its wall_utc_ms;
-  # fail if it predates not_before_ms.
+  # fail if it predates the device-clock not-before.
   local line
   line=$(grep -h "event=diagnostic_send_dispatched" "$sender_log" 2>/dev/null \
          | grep " run_id=$run_id " \
@@ -68,11 +81,10 @@ find_send_cid_in_log() {
   [ -n "$line" ] || return 1
   local wall
   wall=$(printf '%s\n' "$line" | grep -oE 'wall_utc_ms=[0-9]+' | tail -1 | cut -d= -f2)
-  # Numeric compare (allow missing wall via _safe fallback = 0).
   if [ -z "$wall" ]; then
     return 1
   fi
-  if [ "$wall" -lt "$not_before_ms" ]; then
+  if [ "$wall" -lt "$not_before_device_ms" ]; then
     return 1
   fi
   # Extract correlation_id.
