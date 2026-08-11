@@ -88,4 +88,32 @@ class DiagnosticCommandReceiverContractTest {
         assertFalse("rest_capability_probe" in DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
         assertFalse("rest_capability_probe" in DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND)
     }
+
+    // §12 Round-2 audit P0-1: receiver's dispatch is gated on the
+    // extras-whitelist map lookup — a subcommand missing from the
+    // map is silently rejected. Every ALLOWED_SUBCOMMAND MUST have
+    // a corresponding entry (potentially empty) in
+    // ALLOWED_EXTRAS_BY_SUBCOMMAND. A regression that adds a new
+    // subcommand and forgets the map entry fails-red here.
+    @Test
+    fun every_allowed_subcommand_has_extras_whitelist_entry() {
+        val missing = DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS.filter { sub ->
+            sub !in DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND
+        }
+        assertTrue(
+            missing.isEmpty(),
+            "subcommands without ALLOWED_EXTRAS_BY_SUBCOMMAND entry (receiver would silently reject them): $missing",
+        )
+    }
+
+    @Test
+    fun no_stale_ALLOWED_EXTRAS_entries_for_removed_subcommands() {
+        val stale = DiagnosticCommandReceiver.ALLOWED_EXTRAS_BY_SUBCOMMAND.keys.filter { key ->
+            key !in DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS
+        }
+        assertTrue(
+            stale.isEmpty(),
+            "ALLOWED_EXTRAS_BY_SUBCOMMAND contains entries for subcommands not in the enum: $stale",
+        )
+    }
 }

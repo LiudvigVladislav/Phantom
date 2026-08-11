@@ -94,7 +94,12 @@ def default_preflight() -> dict:
 
 
 def default_manifest() -> dict:
-    return {"clock_skew_ms": 100, "phone_serial": "P", "emulator_serial": "E"}
+    return {
+        "host_to_phone_skew_ms": 100,
+        "host_to_emulator_skew_ms": 100,
+        "phone_serial": "P",
+        "emulator_serial": "E",
+    }
 
 
 def line(event: str, wall: int, mono: int, role: str, cell_id: str, emitter: str,
@@ -148,8 +153,12 @@ def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 
         sender_lines.append(line("sender_enqueue", wall, 10, "sender", cell_id, sender_dev, correlation_id=cid))
         sender_lines.append(line("sender_transport_decision", wall + 10, 11, "sender", cell_id, sender_dev,
                                   correlation_id=cid, outer="direct", inner=pin, dispatched=True))
-        sender_lines.append(line("sender_wss_send_returned", wall + 20, 12, "sender", cell_id, sender_dev,
-                                  correlation_id=cid, inner=pin, dispatched=True))
+        # Emit the pin-appropriate send-return event.
+        if pin == "wss":
+            sender_lines.append(line("sender_wss_send_returned", wall + 20, 12, "sender", cell_id, sender_dev,
+                                      correlation_id=cid, inner=pin, dispatched=True))
+        else:  # rest
+            sender_lines.append(rest_completed_line(wall + 20, 12, cell_id, sender_dev, cid, acceptance="accepted"))
         sender_lines.append(line("sender_relay_ack_received", wall + 30, 13, "sender", cell_id, sender_dev,
                                   correlation_id=cid, outcome="sender_relay_ack_delivered"))
         recipient_lines.append(line("recipient_deliver_received", wall + 40, 20, "recipient", cell_id, recipient_dev,
@@ -159,6 +168,14 @@ def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 
         recipient_lines.append(line("recipient_ack_deliver_sent", wall + 60, 22, "recipient", cell_id, recipient_dev,
                                      correlation_id=cid))
     return phone, emu
+
+
+def rest_completed_line(wall: int, mono: int, cell_id: str, emitter: str,
+                        correlation_id: str, acceptance: str) -> str:
+    return (f"08-11 12:00:00.000  1234  1234 I WSS_DIAG: "
+            f"event=sender_rest_post_completed role=sender emitter_id={emitter} "
+            f"run_id={RUN_ID} cell_id={cell_id} wall_utc_ms={wall} monotonic_ms={mono} "
+            f"correlation_id={correlation_id} inner_route=rest relay_acceptance={acceptance}")
 
 
 def build_full_matrix_bundle(tmpdir: str, host_now_ms: int | None = None,
@@ -467,6 +484,8 @@ class VerifierTests(unittest.TestCase):
             phone.append(line("sender_enqueue", wall, 10, "sender", cell_id, "phone", correlation_id=cid))
             phone.append(line("sender_transport_decision", wall + 10, 11, "sender", cell_id, "phone",
                                correlation_id=cid, outer="direct", inner="wss", dispatched=True))
+            phone.append(line("sender_wss_send_returned", wall + 20, 12, "sender", cell_id, "phone",
+                               correlation_id=cid, inner="wss", dispatched=True))
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         # host_now = 5s past base → still PENDING.
         rep = ve.build_report(out, host_now_override_ms=base + 5000)
@@ -492,6 +511,136 @@ class VerifierTests(unittest.TestCase):
         out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
+
+    # ── §12 Round-2 audit repro cases ─────────────────────────
+
+    def test_recipient_persisted_with_role_matrix_fails_integrity(self):
+        # Round-2 audit P0-2 case 1: recipient_message_persisted
+        # carrying role=matrix must NOT satisfy the delivery signal.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Swap role on the persist line.
+        emu = [
+            (ln.replace("event=recipient_message_persisted role=recipient",
+                        "event=recipient_message_persisted role=matrix")
+             if "recipient_message_persisted" in ln else ln)
+            for ln in emu
+        ]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        # Integrity RED because the swapped role trips the
+        # RECIPIENT_EVENTS role check globally.
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+
+    def test_recipient_events_for_wrong_cell_id_produce_Unresolved(self):
+        # Round-2 audit P0-2 case 2: recipient events wearing a
+        # different cell_id than the sender's must not count.
+        cell_a = "wss.p2e.after-connect"
+        cell_b = "wss.p2e.after-idle"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_a, "p2e", base_wall=base)
+        # Rewrite recipient events (emu side for p2e) so they claim cell_b.
+        emu = [
+            (ln.replace(f"cell_id={cell_a}", f"cell_id={cell_b}")
+             if any(k in ln for k in ("recipient_deliver_received",
+                                       "recipient_message_persisted",
+                                       "recipient_ack_deliver_sent"))
+             else ln)
+            for ln in emu
+        ]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        first_cell = next(c for c in rep.cells if c.cell_id == cell_a)
+        self.assertEqual(first_cell.outcome, "Unresolved", msg=f"issues: {first_cell.issues}")
+
+    def test_missing_sender_wss_send_returned_produces_Unresolved(self):
+        # Round-2 audit P0-2 case 3: absence of the send-return event
+        # must not be treated as Delivered once even if recipient
+        # signals all fire.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        # Strip sender_wss_send_returned from phone (sender for p2e).
+        phone = [ln for ln in phone if "sender_wss_send_returned" not in ln]
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        first_cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(first_cell.outcome, "Unresolved", msg=f"issues: {first_cell.issues}")
+
+    def test_non_canonical_matrix_fails_integrity(self):
+        # Round-2 audit P0-3: 8 accepted-per-enum cells but not the
+        # canonical set → integrity RED.
+        m = default_matrix()
+        # Replace REST e2p control with a second WSS p2e after-connect
+        # (same triple as cell #0 — this creates a duplicate cell_id).
+        m["cells"][7] = {
+            "cell_id": "wss.p2e.after-connect-dup",  # avoid dup_cell_id trap
+            "pin": "wss", "direction": "p2e", "scenario": "after-connect",
+            "blocked": False,
+        }
+        out = make_bundle(self.tmp, matrix=m,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("canonical matrix triple missing" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_malformed_numeric_field_fails_integrity_no_exception(self):
+        # Round-2 audit P1: bad wall_utc_ms must be integrity RED,
+        # not raise ValueError.
+        cell_id = "wss.p2e.after-connect"
+        # Deliberately break wall_utc_ms with a BSD-date-style
+        # literal "%N" leftover.
+        bad_line = ("08-11 I WSS_DIAG: event=sender_enqueue role=sender "
+                     "emitter_id=phone run_id=run-test cell_id=" + cell_id +
+                     " wall_utc_ms=1786464700%N monotonic_ms=123 correlation_id=cid-x")
+        phone = [
+            line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False),
+            bad_line,
+        ]
+        emu = [line("diagnostic_session_started", 1000, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
+        # Must NOT throw:
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("malformed wall_utc_ms" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_manifest_missing_host_skews_fails_integrity(self):
+        # Round-2 audit P1: manifest missing host_to_phone_skew_ms
+        # OR host_to_emulator_skew_ms must be integrity RED.
+        bad_manifest = {"phone_serial": "P", "emulator_serial": "E"}  # no host skews
+        out = make_bundle(self.tmp, manifest=bad_manifest,
+                           phone_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "phone", pin="wss", inner="wss", restored=False)],
+                           emulator_lines=[line("diagnostic_session_started", 1, 1, "matrix", "-", "emulator", pin="wss", inner="wss", restored=False)])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(any("host_to_phone_skew_ms" in p for p in rep.integrity_issues))
+        self.assertTrue(any("host_to_emulator_skew_ms" in p for p in rep.integrity_issues))
 
     def test_key_like_hex_in_log_fails_integrity(self):
         cell_id = "wss.p2e.after-connect"

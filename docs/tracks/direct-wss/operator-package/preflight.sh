@@ -151,19 +151,30 @@ fi
 "$LIB/diag-cmd.sh" clear --serial "$phone" >/dev/null
 "$LIB/diag-cmd.sh" clear --serial "$emu"   >/dev/null
 
-# 10. Clock skew (N=5 samples using device date + host now).
-skew_sum=0; n=5
+# 10. Clock skews (N=5 samples). §12 Round-2 audit P1: measure
+#     host↔phone AND host↔emulator (Mac clock may itself be drifted
+#     from both devices; comparing device-to-device alone would
+#     hide a shared shift). Positive skew = host clock ahead of
+#     device clock. Verifier adds this offset to device wall_utc_ms
+#     to get an equivalent host time.
+h2p_sum=0; h2e_sum=0; n=5
 for _ in 1 2 3 4 5; do
+    host_ms=$(now_ms)
     phone_ms=$(adb -s "$phone" shell date +%s000 | tr -d '\r')
     emu_ms=$(adb -s "$emu"   shell date +%s000 | tr -d '\r')
-    skew_sum=$(( skew_sum + phone_ms - emu_ms ))
+    h2p_sum=$(( h2p_sum + host_ms - phone_ms ))
+    h2e_sum=$(( h2e_sum + host_ms - emu_ms ))
 done
-skew_ms=$(( skew_sum / n ))
-skew_abs=${skew_ms#-}
-if [ "$skew_abs" -gt 30000 ]; then
-    echo "preflight FAILED: |clock skew| $skew_ms ms > 30 000" >&2; exit 1
-elif [ "$skew_abs" -gt 2000 ]; then
-    echo "preflight WARN: |clock skew| $skew_ms ms > 2 000 — cross-device timing precision reduced"
+host_to_phone_ms=$(( h2p_sum / n ))
+host_to_emu_ms=$(( h2e_sum / n ))
+worst_abs=${host_to_phone_ms#-}
+tmp_abs=${host_to_emu_ms#-}
+if [ "$tmp_abs" -gt "$worst_abs" ]; then worst_abs="$tmp_abs"; fi
+if [ "$worst_abs" -gt 30000 ]; then
+    echo "preflight FAILED: |host↔device skew| exceeds 30 000 ms (host_to_phone=$host_to_phone_ms host_to_emu=$host_to_emu_ms)" >&2
+    exit 1
+elif [ "$worst_abs" -gt 2000 ]; then
+    echo "preflight WARN: |host↔device skew| > 2 000 ms (host_to_phone=$host_to_phone_ms host_to_emu=$host_to_emu_ms)"
 fi
 
 cat > "$OUT/device-manifest.json" <<EOF
@@ -171,7 +182,8 @@ cat > "$OUT/device-manifest.json" <<EOF
   "run_id": "$RUN_ID",
   "phone_serial": "$phone",
   "emulator_serial": "$emu",
-  "clock_skew_ms": $skew_ms,
+  "host_to_phone_skew_ms": $host_to_phone_ms,
+  "host_to_emulator_skew_ms": $host_to_emu_ms,
   "dual_sim_report_operator_numeric": "$op_numeric"
 }
 EOF
@@ -187,7 +199,8 @@ cat > "$OUT/preflight.json" <<EOF
   "paired_conversation_count_ok": true,
   "canary": "ok",
   "rest_capability": "$rest_cap",
-  "clock_skew_ms": $skew_ms
+  "host_to_phone_skew_ms": $host_to_phone_ms,
+  "host_to_emulator_skew_ms": $host_to_emu_ms
 }
 EOF
 

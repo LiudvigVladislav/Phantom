@@ -369,6 +369,11 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_DUAL_SIM_REPORT to emptySet(),
             SUB_HEALTH to emptySet(),
             SUB_CLEAR to emptySet(),
+            // §12 Round-2 audit P0-1: both subcommands MUST have an
+            // entry (even empty) — the receiver's dispatch is gated
+            // on this map lookup and returns silently on `null`.
+            SUB_CHECKPOINT to emptySet(),
+            SUB_PAIRED_COUNT_REPORT to emptySet(),
         )
 
         private val RUN_ID_EXTRA = setOf('.', '_', '-')

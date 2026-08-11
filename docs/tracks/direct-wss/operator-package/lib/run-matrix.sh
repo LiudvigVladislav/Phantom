@@ -104,15 +104,18 @@ poll_envelope() {
 
 wait_for_send_cid() {
     # After a send subcommand fires, poll for the structured
-    # `diagnostic_send_dispatched sequence=<seq>` event and print
-    # its correlation_id. Times out at 15s.
-    local sequence="$1"
+    # `diagnostic_send_dispatched cell_id=<cid> sequence=<seq>`
+    # event and print its correlation_id. §12 Round-2 audit P1:
+    # match on BOTH cell_id AND sequence — sequence alone repeats
+    # across cells and a rejected earlier envelope could otherwise
+    # give the runner a stale correlation_id from a previous cell.
+    local cell_id="$1" sequence="$2"
     local start; start=$(now_ms)
     local deadline_ms=$(( start + 15000 ))
     while : ; do
         local line; line=$(grep -h "event=diagnostic_send_dispatched" \
             "$OUT/phone.logcat.wss_diag" "$OUT/emulator.logcat.wss_diag" 2>/dev/null \
-            | grep "sequence=$sequence" | tail -1)
+            | grep " cell_id=$cell_id " | grep " sequence=$sequence" | tail -1)
         if [ -n "$line" ]; then
             extract_field correlation_id "$line"
             return 0
@@ -158,7 +161,7 @@ for row in "${cells[@]}"; do
     for seq in 1 2 3 4 5; do
         enqueue_wall_ms=$(now_ms)
         "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
-        cid=$(wait_for_send_cid "$seq" || true)
+        cid=$(wait_for_send_cid "$cell_id" "$seq" || true)
         if [ -n "$cid" ]; then
             poll_envelope "$cid" "$enqueue_wall_ms"
         else

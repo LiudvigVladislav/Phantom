@@ -45,6 +45,21 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.2 — Round-2 audit repair (2026-08-12)
+
+Third Mac audit REDLINE closed. Compile + focused tests only.
+
+- **P0-1 receiver silently rejects `checkpoint` and `paired_count_report`.** The extras-whitelist map was missing entries for both subcommands added in the Round-1 repair. Preflight physically could not fire them. Fixed by adding empty-extras entries and pinning the invariant with two new contract tests: (a) every ALLOWED_SUBCOMMAND has an ALLOWED_EXTRAS_BY_SUBCOMMAND entry; (b) no stale entries for removed subcommands.
+- **P0-2 verifier false GREEN in three cases**.
+  - `recipient_message_persisted role=matrix` — added strict role check: recipient-event names (`recipient_deliver_received`, `recipient_message_persisted`, `recipient_ack_deliver_sent`) MUST carry `role=recipient`, and sender-event names MUST carry `role=sender`. Any mismatch → integrity RED.
+  - Recipient events for a wrong `cell_id` — added cell_id scoping to the per-envelope `corr_events` filter. Sender+recipient events now filtered by `correlation_id AND run_id AND cell_id` before classification.
+  - Missing `sender_wss_send_returned` / `sender_rest_post_completed` — added mandatory send-completion event matching cell pin. REST pin also requires `relay_acceptance ∈ {accepted, duplicate}`.
+- **P0-3 non-canonical matrix accepted.** Introduced `CANONICAL_MATRIX_TRIPLES` (frozen 8-tuple set); missing or extra triples → integrity RED. Cell IDs must match `pin.direction.scenario` shape.
+- **P1 numeric-field crash.** Introduced `_safe_int` + `parse_events` returns a `(events, parse_errors)` tuple; malformed `wall_utc_ms` / `monotonic_ms` / `sequence` land in `parse_errors` → integrity RED. Never raises.
+- **P1 CID lookup by sequence alone.** `run-matrix.sh:wait_for_send_cid` now matches on `cell_id AND sequence` — a rejected send in a prior cell no longer contaminates the next.
+- **P1 host↔device skew.** Preflight now records `host_to_phone_skew_ms` + `host_to_emulator_skew_ms` (Mac host_ms − device_ms, N=5 samples each). Verifier reads both and translates each envelope's device wall to host time via the sender's per-device offset before comparing to `host_now_ms`. Legacy `clock_skew_ms` key removed from manifest schema; missing new keys → integrity RED.
+- **P1 exec bits.** All `.sh` and `.py` under `operator-package/` set to `100755` in the git index via `git update-index --chmod=+x`. Mac clone gets executable bits from git without needing a manual `chmod`.
+
 ### §12.1 — Round-1 audit repair (2026-08-12)
 
 Second Mac audit REDLINE closed in one consolidated block. No APK / ADB / device install during repair.
