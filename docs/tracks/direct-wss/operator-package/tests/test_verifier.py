@@ -1834,8 +1834,36 @@ class VerifierTests(unittest.TestCase):
 
     # ── WSS-2 operator parameterization fixtures ─────────────
 
+    # §12 WSS-2 Round-1 audit P1-2: run_id must start with
+    # `run-<operator label lower>-`. Fixtures below build per-carrier
+    # run_ids so the matrix, preflight and manifest all agree.
+
+    YOTA_RUN_ID = "run-yota-fixture"
+    TELE2_RUN_ID = "run-tele2-fixture"
+
+    def _yota_wss2_matrix(self) -> dict:
+        m = default_matrix()
+        m["run_id"] = self.YOTA_RUN_ID
+        return m
+
+    def _yota_wss2_completion(self, cells_ran: int = 8) -> dict:
+        c = default_completion(cells_ran=cells_ran)
+        c["run_id"] = self.YOTA_RUN_ID
+        return c
+
+    def _tele2_wss2_matrix(self) -> dict:
+        m = default_matrix()
+        m["run_id"] = self.TELE2_RUN_ID
+        return m
+
+    def _tele2_wss2_completion(self, cells_ran: int = 8) -> dict:
+        c = default_completion(cells_ran=cells_ran)
+        c["run_id"] = self.TELE2_RUN_ID
+        return c
+
     def _yota_wss2_preflight(self) -> dict:
         pf = default_preflight()
+        pf["run_id"] = self.YOTA_RUN_ID
         pf["operator_label"] = "YOTA"
         pf["expected_operator_numeric"] = "25011"
         pf["operator_confirmed"] = True
@@ -1844,6 +1872,7 @@ class VerifierTests(unittest.TestCase):
 
     def _yota_wss2_manifest(self) -> dict:
         mf = default_manifest()
+        mf["run_id"] = self.YOTA_RUN_ID
         mf["operator_label"] = "YOTA"
         mf["expected_operator_numeric"] = "25011"
         mf["dual_sim_report_operator_numeric"] = "25011"
@@ -1851,6 +1880,7 @@ class VerifierTests(unittest.TestCase):
 
     def _tele2_wss2_preflight(self, expected: str = "25020") -> dict:
         pf = default_preflight()
+        pf["run_id"] = self.TELE2_RUN_ID
         pf["operator_label"] = "TELE2"
         pf["expected_operator_numeric"] = expected
         pf["operator_confirmed"] = True
@@ -1860,10 +1890,38 @@ class VerifierTests(unittest.TestCase):
     def _tele2_wss2_manifest(self, expected: str = "25020",
                               observed: str = "25020") -> dict:
         mf = default_manifest()
+        mf["run_id"] = self.TELE2_RUN_ID
         mf["operator_label"] = "TELE2"
         mf["expected_operator_numeric"] = expected
         mf["dual_sim_report_operator_numeric"] = observed
         return mf
+
+    def _build_wss2_full_bundle(self, matrix: dict, completion: dict,
+                                 base_wall: int = 200_000) -> tuple[str, int]:
+        """Full 8x5 delivery bundle using the WSS-2 matrix (per-
+        carrier run_id). Uses `make_complete_delivery_lines`
+        (which stamps every line with the module-level RUN_ID)
+        then rewrites `run_id=<RUN_ID>` → the WSS-2 run_id in the
+        emitted log lines. Simpler than threading run_id through
+        every `line()` call and gives the same wire shape."""
+        phone: list[str] = []
+        emu: list[str] = []
+        run_id = matrix["run_id"]
+        for i, cell in enumerate(matrix["cells"]):
+            if cell.get("blocked"):
+                continue
+            p, e = make_complete_delivery_lines(
+                cell["cell_id"], cell["direction"],
+                base_wall + i * 10_000, pin=cell["pin"],
+            )
+            phone.extend(p); emu.extend(e)
+        needle = f"run_id={RUN_ID} "
+        replacement = f"run_id={run_id} "
+        phone = [ln.replace(needle, replacement) for ln in phone]
+        emu = [ln.replace(needle, replacement) for ln in emu]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu,
+                           matrix=matrix, completion=completion)
+        return out, base_wall
 
     def test_WSS2_yota_baseline_still_verifiable(self):
         # The archived Yota bundle predates operator_label — it
@@ -1885,7 +1943,9 @@ class VerifierTests(unittest.TestCase):
         # expected==observed=25011).
         pf = self._yota_wss2_preflight()
         mf = self._yota_wss2_manifest()
-        out, base = build_full_matrix_bundle(self.tmp)
+        m = self._yota_wss2_matrix()
+        c = self._yota_wss2_completion()
+        out, base = self._build_wss2_full_bundle(m, c)
         with open(os.path.join(out, "preflight.json"), "w") as f:
             json.dump(pf, f)
         with open(os.path.join(out, "device-manifest.json"), "w") as f:
@@ -1898,7 +1958,9 @@ class VerifierTests(unittest.TestCase):
     def test_WSS2_tele2_accepted_when_expected_equals_observed(self):
         pf = self._tele2_wss2_preflight("25020")
         mf = self._tele2_wss2_manifest("25020", "25020")
-        out, base = build_full_matrix_bundle(self.tmp)
+        m = self._tele2_wss2_matrix()
+        c = self._tele2_wss2_completion()
+        out, base = self._build_wss2_full_bundle(m, c)
         with open(os.path.join(out, "preflight.json"), "w") as f:
             json.dump(pf, f)
         with open(os.path.join(out, "device-manifest.json"), "w") as f:
@@ -2052,20 +2114,25 @@ class VerifierTests(unittest.TestCase):
         pf = self._yota_wss2_preflight()
         pf["yota_confirmed"] = False
         mf = self._yota_wss2_manifest()
+        m = self._yota_wss2_matrix()
+        c = self._yota_wss2_completion()
         out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           matrix=m, completion=c,
                            phone_lines=[_min_boot("phone")],
                            emulator_lines=[_min_boot("emulator")])
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
         self.assertTrue(
-            any("legacy field must stay in sync" in p for p in rep.integrity_issues),
+            any("yota_confirmed=True (legacy wire-compat)" in p for p in rep.integrity_issues),
             msg=f"issues: {rep.integrity_issues}",
         )
 
     def test_WSS2_report_title_includes_operator_label(self):
         pf = self._tele2_wss2_preflight("25020")
         mf = self._tele2_wss2_manifest("25020", "25020")
-        out, base = build_full_matrix_bundle(self.tmp)
+        m = self._tele2_wss2_matrix()
+        c = self._tele2_wss2_completion()
+        out, base = self._build_wss2_full_bundle(m, c)
         with open(os.path.join(out, "preflight.json"), "w") as f:
             json.dump(pf, f)
         with open(os.path.join(out, "device-manifest.json"), "w") as f:
@@ -2073,6 +2140,139 @@ class VerifierTests(unittest.TestCase):
         rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
         md = ve.render_markdown(rep)
         self.assertIn("Direct WSS TELE2 — verification report v4", md)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+
+    # ── WSS-2 Round-1 audit repro cases ─────────────────────
+
+    def test_WSS2_R1_yota_true_plus_operator_confirmed_false_plus_tele2_label_is_RED(self):
+        # Exact reproduction of the audit's fail-open bundle:
+        # yota_confirmed=true, operator_confirmed=false,
+        # operator_label=TELE2, expected_operator_numeric=25011,
+        # matrix.run_id=run-yota-fixture, manifest fields made
+        # consistent. Legacy shape must not carry WSS-2 fields.
+        pf = default_preflight()           # yota_confirmed=True
+        pf["operator_confirmed"] = False   # explicitly FALSE
+        pf["operator_label"] = "TELE2"     # sneaky
+        pf["expected_operator_numeric"] = "25011"
+        mf = default_manifest()
+        mf["operator_label"] = "TELE2"
+        mf["expected_operator_numeric"] = "25011"
+        # dual_sim_report_operator_numeric already 25011 in default
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("WSS-2 companion fields" in p and "operator_confirmed is not True" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
+
+    def test_WSS2_R1_report_title_falls_back_when_integrity_RED(self):
+        # Same bundle as above — its rendered title must NOT
+        # advertise the injected operator_label. Falls back to
+        # "Yota-First".
+        pf = default_preflight()
+        pf["operator_confirmed"] = False
+        pf["operator_label"] = "TELE2"
+        pf["expected_operator_numeric"] = "25011"
+        mf = default_manifest()
+        mf["operator_label"] = "TELE2"
+        mf["expected_operator_numeric"] = "25011"
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        md = ve.render_markdown(rep)
+        self.assertIn("Direct WSS Yota-First — verification report v4", md)
+        self.assertNotIn("Direct WSS TELE2", md)
+
+    def test_WSS2_R1_legacy_yota_with_operator_label_alone_is_RED(self):
+        # `operator_label` present without operator_confirmed=True
+        # must also fail (no cheating — the whole WSS-2 companion
+        # block is disallowed under legacy shape).
+        pf = default_preflight()
+        pf["operator_label"] = "YOTA"   # sneaky legacy addition
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("WSS-2 companion fields" in p and "operator_label" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_R1_unknown_label_carried_under_legacy_confirmation_is_RED(self):
+        # yota_confirmed=True + operator_label=MEGAFON without
+        # operator_confirmed=True — the fail-open guard fires
+        # BEFORE the label check.
+        pf = default_preflight()
+        pf["operator_label"] = "MEGAFON"
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+
+    def test_WSS2_R1_tele2_metadata_with_run_yota_id_is_RED(self):
+        # WSS-2 shape (operator_confirmed=True, label=TELE2) but
+        # matrix.run_id starts with `run-yota-` → RED via the new
+        # prefix binding.
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        m = self._tele2_wss2_matrix()
+        m["run_id"] = "run-yota-mismatch"   # bad prefix
+        pf["run_id"] = "run-yota-mismatch"
+        mf["run_id"] = "run-yota-mismatch"
+        c = default_completion()
+        c["run_id"] = "run-yota-mismatch"
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           matrix=m, completion=c,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("does not start with expected prefix 'run-tele2-'" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_R1_legacy_yota_without_any_companion_field_is_GREEN(self):
+        # The archived Yota baseline predates operator_label — no
+        # companion fields present. Legacy shape → GREEN.
+        pf = default_preflight()   # yota_confirmed=True only
+        mf = default_manifest()    # no operator_label
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        with open(os.path.join(out, "device-manifest.json"), "w") as f:
+            json.dump(mf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
+        # Title falls back to Yota-First since operator_label is None.
+        md = ve.render_markdown(rep)
+        self.assertIn("Direct WSS Yota-First — verification report v4", md)
+
+    def test_WSS2_R1_legacy_yota_may_carry_operator_confirmed_false(self):
+        # An explicit `operator_confirmed=false` on a legacy Yota
+        # bundle is fine (a Round-9 preflight that ran the
+        # legacy path but wrote both booleans). No companion
+        # fields — legacy path stays GREEN.
+        pf = default_preflight()
+        pf["operator_confirmed"] = False   # explicit FALSE, allowed
+        # No operator_label, no expected_operator_numeric.
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
 
     # P0-2 — NOT_EVALUABLE never hides behind RED/GREEN.
     def test_R6_P0_2_NOT_EVALUABLE_replaces_product_outcome_on_integrity_RED(self):

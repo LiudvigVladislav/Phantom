@@ -175,7 +175,7 @@ for want in "$phone|phone" "$emu|emulator"; do
     fi
     if ! printf '%s' "$readiness" | grep -q "published=true"; then
         echo "preflight FAILED: $serial ($role) reports signed_prekey_readiness NOT published — its own signed prekey is not on the relay yet." >&2
-        echo "  do NOT run the matrix — the sender would emit sender_prekey_deferred for every envelope, no transport traffic would happen, and the run would be indistinguishable from a real Yota failure." >&2
+        echo "  do NOT run the matrix — the sender would emit sender_prekey_deferred for every envelope, no transport traffic would happen, and the run would be indistinguishable from a real carrier failure on the selected operator." >&2
         echo "  Wait 30 s and re-run preflight. If it persists, verify the relay is reachable and the app has published its bundle at least once." >&2
         echo "  ($readiness)" >&2
         exit 1

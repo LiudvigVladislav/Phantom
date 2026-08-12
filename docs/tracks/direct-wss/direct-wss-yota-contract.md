@@ -45,6 +45,109 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.10 (Round-1 audit repair, 2026-08-13)
+
+Two P1 findings + one P2 documentation issue after the first
+WSS-2 overlay review. Same scope as §12.10 initial — scripts /
+verifier / docs / tests only. No Android runtime. No Gradle.
+No new APK. No bootstrap.
+
+**P1-1 parser missing-value hang.**
+
+`parse_operator_args`'s value-taking branches used
+`shift 2 || true`. `shift 2` fails when `$#` is 1 (only the
+flag present, no value), but `|| true` swallowed the error
+without consuming the current flag — the outer `while [ $# -gt 0 ]`
+looped forever on the same `--operator` token.
+
+Fix: explicit `$# -lt 2` guard BEFORE reading `$2`; on failure
+return non-zero with a clear message. `--` also rejects any
+trailing positional argument. Five new shell fixtures cover the
+missing-value cases + trailing positional + valid lone `--`,
+all wrapped in a pure-bash `run_bounded` watchdog (3 s) so a
+regression cannot wedge the fixture suite.
+
+**P1-2 verifier disjoint-schema fail-open.**
+
+Reproducible fail-open: copy the real archived Yota evidence,
+change `operator_label=TELE2`, keep `yota_confirmed=true`,
+`operator_confirmed=false`, `run_id` still `run-yota-...`, make
+the manifest consistent — the pre-Round-1 verifier returned
+`evidence_integrity=GREEN`, `product_outcome=GREEN`, title
+`Direct WSS TELE2`. The mixed schema was accepted because the
+WSS-2 companion checks fired only when `operator_confirmed=True`.
+
+Fix: legacy Round-9 and WSS-2 schemas are now STRICTLY DISJOINT.
+
+* **Legacy Round-9 shape** — `yota_confirmed=True` AND every
+  WSS-2 companion field (`operator_confirmed`, `operator_label`,
+  `expected_operator_numeric`) ABSENT (or `operator_confirmed`
+  explicitly `False` with no companion fields).
+* **WSS-2 shape** — `operator_confirmed=True` AND `operator_label`
+  in whitelist AND `expected_operator_numeric` valid AND
+  `matrix.run_id` starts with `run-<label lower>-` AND
+  `yota_confirmed == (label == YOTA)`.
+
+**Any WSS-2 companion field present without
+`operator_confirmed=True` → integrity RED.**
+
+`render_markdown` uses `rep.operator_label` in the title ONLY
+when `integrity_ok` is True. Any RED bundle or a legacy bundle
+falls back to `Direct WSS Yota-First — verification report v4`
+so an injected `operator_label` cannot mislead the reader next
+to an integrity failure.
+
+Seven new Python regression fixtures cover the exact audit
+reproduction + surrounding cases: TELE2 injection into a legacy
+Yota bundle → RED (fail-open guard); title fallback on that RED
+bundle; `operator_label=YOTA` alone under legacy confirmation
+→ RED (companion field alone still trips the guard); unknown
+label under legacy confirmation → RED; TELE2 metadata with
+`run-yota-*` run_id → RED via new prefix binding; archived
+legacy Yota bundle (no companion fields) → GREEN with
+Yota-First title; explicit `operator_confirmed=false` under
+legacy shape (no companion fields) → GREEN.
+
+**P2 README carrier-agnostic cleanup.**
+
+The pre-Round-1 README was still worded as "Direct WSS
+Yota-First — Operator Runbook" with:
+
+* prerequisite "phone with **Yota** as the default-data SIM";
+* radio checklist item "Yota is the DEFAULT DATA subscription";
+* pre-parameterization order (`4. preflight (measurement …
+  + Yota)`);
+* evidence path `evidence/yota-wss-<UTC>/`;
+* "MUST type the literal word `YOTA`";
+* "indistinguishable from a real Yota failure" phrase in the
+  prekey-readiness abort message.
+
+All rewritten to be carrier-agnostic; each carrier-specific
+example still shows the concrete Yota + Tele2 pair for the two
+supported labels. The prekey-readiness abort message now says
+"indistinguishable from a real carrier failure on the selected
+operator". Title bumped to `# Direct WSS — Operator Runbook
+(Mac) v3`.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — unchanged.
+* Python — 118 fixtures (7 new for Round-1): fail-open
+  reproduction, title fallback, legacy shape rejection of
+  companion fields, unknown label under legacy, TELE2 metadata
+  + `run-yota-*` prefix binding, archived Yota-First GREEN,
+  legacy shape with explicit `operator_confirmed=false` GREEN.
+* Shell — 79 fixtures (5 new for Round-1): missing value for
+  `--operator`, missing value for `--expected-operator-numeric`,
+  `--operator YOTA` alone (no companion), trailing positional
+  after `--`, valid lone `--`. All wrapped in a pure-bash
+  `run_bounded` watchdog.
+* `bash -n` + `py_compile` clean.
+
+Fixture `_build_wss2_full_bundle` gives each carrier fixture a
+matching `run_id` (`run-yota-fixture` / `run-tele2-fixture`) so
+the prefix check runs against a realistic value.
+
 ### §12.10 — WSS-2 operator parameterization (2026-08-13)
 
 WSS-1 delivered a Yota baseline (`run-yota-20260812T171418Z`,

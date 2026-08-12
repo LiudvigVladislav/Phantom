@@ -381,19 +381,31 @@ def _per_sender_pin_coverage(
     return (False, f"latest pin before enqueue on {sender_device}: {latest_pin or 'none'} ({latest_meta or 'no events'}) — expected {cell_pin} for run={run_id} cell={cell_id}")
 
 
-def _validate_operator_gate(preflight: dict) -> list[str]:
-    """§12 WSS-2: at least ONE of the two operator-confirmation
-    signals must be True — either the legacy `yota_confirmed`
-    (Round-9 Yota-only bundles + the archived Yota baseline) OR
-    the new `operator_confirmed`. When `operator_confirmed=True`,
-    strict schema applies to the new companion fields; the
-    cross-file consistency check with the manifest lives in
-    `_validate_cross_file_run_consistency`.
+WSS2_COMPANION_FIELDS = (
+    "operator_label",
+    "expected_operator_numeric",
+)
 
-    Neither field True → integrity RED (an unconfirmed operator
-    means the observed default-data SIM was never gated by a
-    typed carrier label, so the whole run can't be attributed to
-    a carrier)."""
+
+def _validate_operator_gate(preflight: dict, matrix: dict) -> list[str]:
+    """§12 WSS-2 (Round-1 audit P1-2): legacy and WSS-2 schemas are
+    STRICTLY DISJOINT. A bundle is confirmed under EXACTLY ONE of:
+
+    - **Legacy Round-9 shape** — `yota_confirmed=True` AND every
+      WSS-2 companion field (`operator_confirmed`, `operator_label`,
+      `expected_operator_numeric`) ABSENT. The archived Yota
+      baseline (`run-yota-20260812T171418Z`) matches this shape.
+
+    - **WSS-2 shape** — `operator_confirmed=True` AND
+      `operator_label` in whitelist AND `expected_operator_numeric`
+      valid AND `matrix.run_id` starts with `run-<label lower>-`
+      AND `yota_confirmed == (label == YOTA)`.
+
+    Any WSS-2 companion field present without
+    `operator_confirmed=True` → integrity RED — a real
+    misconfiguration (someone injected TELE2 metadata into a Yota
+    bundle) reproducibly false-GREENed under the pre-Round-1
+    gate."""
     problems: list[str] = []
 
     yota = preflight.get("yota_confirmed")
@@ -409,14 +421,28 @@ def _validate_operator_gate(preflight: dict) -> list[str]:
     yota_ok = isinstance(yota, bool) and yota is True
     opc_ok = isinstance(opc, bool) and opc is True
 
+    companions_present = [
+        f for f in WSS2_COMPANION_FIELDS if f in preflight
+    ]
+
+    # Fail-open guard: any WSS-2 companion field present without
+    # operator_confirmed=True → RED. This is the exact fixture the
+    # Round-1 audit reproduced: yota_confirmed=true +
+    # operator_confirmed=false + operator_label=TELE2.
+    if companions_present and not opc_ok:
+        problems.append(
+            f"preflight has WSS-2 companion fields {companions_present} but operator_confirmed is not True "
+            "— legacy Round-9 shape (yota_confirmed alone) must not carry WSS-2 fields",
+        )
+
     if not yota_ok and not opc_ok:
         problems.append(
             "preflight has no operator confirmation: neither yota_confirmed nor operator_confirmed is True",
         )
+        return problems
 
-    # When operator_confirmed is True, the WSS-2 companion fields
-    # must be present and well-formed.
     if opc_ok:
+        # WSS-2 shape: full companion validation.
         label = preflight.get("operator_label")
         if not isinstance(label, str) or label not in OPERATOR_LABEL_WHITELIST:
             problems.append(
@@ -427,22 +453,40 @@ def _validate_operator_gate(preflight: dict) -> list[str]:
             problems.append(
                 f"preflight.expected_operator_numeric not a 5-6 digit string: {expected!r}",
             )
-        # A YOTA-labelled operator_confirmed run should also carry
-        # yota_confirmed=true (belt & braces so the legacy consumer
-        # of the bundle still recognises it).
-        if isinstance(label, str) and label == "YOTA" and not yota_ok:
+        # yota_confirmed is a strict function of operator_label.
+        if isinstance(label, str) and label == "YOTA":
+            if yota is not True:
+                problems.append(
+                    "preflight.operator_label=YOTA requires yota_confirmed=True (legacy wire-compat)",
+                )
+        elif isinstance(label, str) and label in OPERATOR_LABEL_WHITELIST:
+            if yota is True:
+                problems.append(
+                    f"preflight.operator_label={label!r} but yota_confirmed=True — labels contradict",
+                )
+        # run_id prefix binds the matrix to the confirmed carrier.
+        run_id = matrix.get("run_id")
+        if isinstance(label, str) and isinstance(run_id, str):
+            expected_prefix = f"run-{label.lower()}-"
+            if not run_id.startswith(expected_prefix):
+                problems.append(
+                    f"matrix.run_id={run_id!r} does not start with expected prefix {expected_prefix!r} for operator_label={label!r}",
+                )
+    else:
+        # Legacy Round-9 shape: `operator_confirmed` must be absent
+        # (present-but-False is also fine — it just means the
+        # preflight didn't run the WSS-2 flow — but the companion
+        # fields, if present, would already have tripped the fail-
+        # open guard above).
+        if "operator_confirmed" in preflight and opc is not None and opc is not False:
             problems.append(
-                "preflight.operator_label=YOTA but yota_confirmed is not True — legacy field must stay in sync for wire-compat",
-            )
-        if isinstance(label, str) and label != "YOTA" and yota is True:
-            problems.append(
-                f"preflight.operator_label={label!r} but yota_confirmed=True — labels contradict",
+                f"legacy Round-9 shape may not carry operator_confirmed={opc!r} — either drop the field or set operator_confirmed=True and add the WSS-2 companion fields",
             )
 
     return problems
 
 
-def _validate_preflight(preflight: dict) -> list[str]:
+def _validate_preflight(preflight: dict, matrix: dict) -> list[str]:
     """Round-3 audit P0-3: every gate the operator's preflight ran
     must be recorded AND set to a passing value. Any missing field
     or wrong value is integrity RED."""
@@ -484,7 +528,7 @@ def _validate_preflight(preflight: dict) -> list[str]:
             )
         elif v is not True:
             problems.append(f"preflight.{req_bool} is not True: {v!r}")
-    problems += _validate_operator_gate(preflight)
+    problems += _validate_operator_gate(preflight, matrix)
 
     if preflight.get("canary") != "ok":
         problems.append(f"preflight.canary != 'ok': {preflight.get('canary')!r}")
@@ -758,7 +802,7 @@ def integrity_check_bundle(
     for t in sorted(observed_triples - CANONICAL_MATRIX_TRIPLES):
         problems.append(f"non-canonical matrix triple present: {t}")
 
-    problems += _validate_preflight(preflight)
+    problems += _validate_preflight(preflight, matrix)
     problems += _validate_manifest(manifest)
     problems += _validate_cross_file_run_consistency(matrix, preflight, manifest)
 
@@ -1396,11 +1440,18 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
 
 
 def render_markdown(rep: VerifyReport) -> str:
-    # §12 WSS-2: report title carries the operator label so a Yota
-    # report and a Tele2 report are visually distinct at a glance.
-    # Falls back to "Yota-First" when operator_label is absent (the
-    # archived Round-9 Yota baseline predates the field).
-    op_label = rep.operator_label or "Yota-First"
+    # §12 WSS-2 (Round-1 audit P1-2): the operator label MAY be
+    # used in the title ONLY when the bundle actually verified
+    # under the WSS-2 schema (integrity GREEN + operator_label
+    # populated). Any integrity failure or a legacy Round-9
+    # bundle falls back to "Yota-First" — otherwise an injected
+    # `operator_label=TELE2` on a Yota-shaped bundle would render
+    # a misleading "Direct WSS TELE2" title next to an integrity
+    # RED report.
+    if rep.integrity_ok and rep.operator_label:
+        op_label = rep.operator_label
+    else:
+        op_label = "Yota-First"
     lines = [f"# Direct WSS {op_label} — verification report v4"]
     lines.append("")
     lines.append(f"run_id: `{rep.run_id}`")

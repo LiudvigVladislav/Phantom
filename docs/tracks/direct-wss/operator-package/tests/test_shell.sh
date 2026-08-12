@@ -774,6 +774,98 @@ else
     echo "PASS: WSS-2 parse_operator_args rejects unknown flag --bogus"; pass=$((pass+1))
 fi
 
+# ── WSS-2 Round-1 audit P1-1: parser must NOT hang on
+#     missing-value flags. Every call below runs in a subshell
+#     under a Python-driven watchdog so a regression can't wedge
+#     the whole fixture suite. Watchdog kills after 3 s; the
+#     expected happy path returns non-zero in well under 1 s.
+
+# Cross-platform watchdog wrapper — pure bash (macOS lacks GNU
+# `timeout`, and shell-out to Python's subprocess on Windows Git
+# Bash routed to WSL and produced spurious failures during
+# development). Exit 124 (GNU `timeout` convention) on kill.
+run_bounded() {
+    local secs="$1"; shift
+    (
+        "$@"
+    ) &
+    local pid=$!
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$secs" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        waited=$((waited+1))
+    done
+    local rc=0
+    wait "$pid" || rc=$?
+    return "$rc"
+}
+
+# Missing value for --operator: must return non-zero WITHOUT
+# hanging.
+rc=0
+run_bounded 3 bash -c 'source "'"$PKG"'/lib/operator-args.sh"; parse_operator_args --operator' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "124" ]; then
+    echo "FAIL: WSS-2 parse_operator_args --operator (no value) HUNG (killed at 3 s)"
+    fail=$((fail+1))
+elif [ "$rc" = "0" ]; then
+    echo "FAIL: WSS-2 parse_operator_args --operator (no value) returned success"
+    fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args --operator (no value) fails immediately"
+    pass=$((pass+1))
+fi
+
+# Missing value for --expected-operator-numeric.
+rc=0
+run_bounded 3 bash -c 'source "'"$PKG"'/lib/operator-args.sh"; parse_operator_args --operator YOTA --expected-operator-numeric' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "124" ]; then
+    echo "FAIL: WSS-2 --expected-operator-numeric (no value) HUNG"
+    fail=$((fail+1))
+elif [ "$rc" = "0" ]; then
+    echo "FAIL: WSS-2 --expected-operator-numeric (no value) returned success"
+    fail=$((fail+1))
+else
+    echo "PASS: WSS-2 --expected-operator-numeric (no value) fails immediately"
+    pass=$((pass+1))
+fi
+
+# --operator alone (no companion flag at all).
+rc=0
+run_bounded 3 bash -c 'source "'"$PKG"'/lib/operator-args.sh"; parse_operator_args --operator YOTA' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "124" ]; then
+    echo "FAIL: WSS-2 --operator YOTA alone HUNG"; fail=$((fail+1))
+elif [ "$rc" = "0" ]; then
+    echo "FAIL: WSS-2 --operator YOTA alone returned success (missing --expected-operator-numeric)"
+    fail=$((fail+1))
+else
+    echo "PASS: WSS-2 --operator YOTA alone fails immediately"; pass=$((pass+1))
+fi
+
+# Trailing positional after -- separator is rejected.
+rc=0
+run_bounded 3 bash -c 'source "'"$PKG"'/lib/operator-args.sh"; parse_operator_args --operator YOTA --expected-operator-numeric 25011 -- stray' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "0" ]; then
+    echo "FAIL: WSS-2 accepted trailing positional 'stray' after --"; fail=$((fail+1))
+elif [ "$rc" = "124" ]; then
+    echo "FAIL: WSS-2 hung on trailing positional after --"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 rejects trailing positional after --"; pass=$((pass+1))
+fi
+
+# Valid inputs with `--` and NO trailing arg — must still pass.
+rc=0
+run_bounded 3 bash -c 'source "'"$PKG"'/lib/operator-args.sh"; parse_operator_args --operator YOTA --expected-operator-numeric 25011 --' >/dev/null 2>&1 || rc=$?
+if [ "$rc" = "0" ]; then
+    echo "PASS: WSS-2 accepts valid input followed by lone --"; pass=$((pass+1))
+else
+    echo "FAIL: WSS-2 rejected valid input with lone -- (rc=$rc)"; fail=$((fail+1))
+fi
+
 echo ""
 echo "shell tests: pass=$pass fail=$fail"
 if [ "$fail" -gt 0 ]; then exit 1; fi

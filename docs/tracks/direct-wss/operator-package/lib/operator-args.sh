@@ -62,6 +62,16 @@ lowercase_label() {
 #   Sets OPERATOR_LABEL, OPERATOR_LABEL_LOWER,
 #   EXPECTED_OPERATOR_NUMERIC on success; prints error + returns 1
 #   on any missing/unknown/malformed input.
+#
+# §12 WSS-2 Round-1 audit P1-1: value-taking flags require an
+# explicit `$# >= 2` guard BEFORE consuming `$2`. The prior
+# `shift 2 || true` swallowed the shift failure without
+# consuming the current flag, so `parse_operator_args --operator`
+# (missing value) looped forever on `$1=--operator`. Now the
+# missing-value branch returns non-zero immediately with a
+# clear message, and any trailing positional argument after
+# `--` is also rejected — the caller must not sneak
+# unexpected values past a lone `--` separator.
 parse_operator_args() {
     OPERATOR_LABEL=""
     EXPECTED_OPERATOR_NUMERIC=""
@@ -69,15 +79,28 @@ parse_operator_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --operator)
-                OPERATOR_LABEL="${2:-}"
-                shift 2 || true
+                if [ $# -lt 2 ]; then
+                    echo "operator-args: --operator requires a value (whitelist: ${OPERATOR_LABEL_WHITELIST[*]})" >&2
+                    return 1
+                fi
+                OPERATOR_LABEL="$2"
+                shift 2
                 ;;
             --expected-operator-numeric)
-                EXPECTED_OPERATOR_NUMERIC="${2:-}"
-                shift 2 || true
+                if [ $# -lt 2 ]; then
+                    echo "operator-args: --expected-operator-numeric requires a value (5-6 digit MCC+MNC)" >&2
+                    return 1
+                fi
+                EXPECTED_OPERATOR_NUMERIC="$2"
+                shift 2
                 ;;
             --)
                 shift
+                # Anything after `--` is a stray positional — reject it.
+                if [ $# -gt 0 ]; then
+                    echo "operator-args: unexpected trailing positional argument after --: $1" >&2
+                    return 1
+                fi
                 break
                 ;;
             *)
