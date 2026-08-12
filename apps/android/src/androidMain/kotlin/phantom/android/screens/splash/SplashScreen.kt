@@ -7,12 +7,10 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -96,12 +94,17 @@ private fun LogoWithSonar() {
         label = "logoPulse",
     )
 
+    // 2026-07-16: switched from R.drawable.phantom_logo (old ghost-themed
+    // rounded app icon) to R.drawable.phantom_splash (new brandmark, high-res
+    // transparent PNG showing the full mark). The previous
+    // .clip(RoundedCornerShape(36.dp)) was appropriate for the old app-icon-
+    // style artwork; the new mark is an unbounded transparent brandmark and
+    // should show uncropped, so the clip has been removed.
     Image(
-        painter = painterResource(R.drawable.phantom_logo),
+        painter = painterResource(R.drawable.phantom_splash),
         contentDescription = "PHANTOM logo",
         modifier = Modifier
-            .size(160.dp)
-            .scale(logoPulse)
-            .clip(RoundedCornerShape(36.dp)),
+            .size(180.dp)
+            .scale(logoPulse),
     )
 }

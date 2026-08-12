@@ -63,7 +63,7 @@ import phantom.core.transport.PrivacyMode
  *
  * Phase 0: TermsScreen — legal gate. Once accepted, never shown again.
  * Phase 1: 3-page intro pager.
- *   Step 1 — Welcome: phantom_logo + "PHANTOM" wordmark + "Private by design."
+ *   Step 1 — Welcome: phantom_splash brandmark + "PHANTOM" wordmark + "Private by design."
  *   Step 2 — Identity Key: ED25519 fingerprint card + username input
  *   Step 3 — Privacy Mode: Standard / Private / Ghost (Ghost = PRO locked)
  *
@@ -195,11 +195,14 @@ private fun WelcomeStep(onContinue: () -> Unit) {
     ) {
         Spacer(Modifier.weight(0.55f))
 
-        // PHANTOM logo — phantom_logo.png used AS-IS. Sized to 60dp per
+        // PHANTOM logo — the new transparent brandmark (2026-07-16). Same
+        // asset the splash uses (phantom_splash.png). Sized to 60dp per
         // FULL_COMPOSE §09 OnboardingScreen reference (Phase 2 React mock
         // uses height: 60px). The earlier 72dp value crowded the wordmark.
+        // width auto-scales — the mark is wider than tall (motion lines
+        // extend to the left of the P), so at height=60dp width ≈ 67dp.
         Image(
-            painter = painterResource(R.drawable.phantom_logo),
+            painter = painterResource(R.drawable.phantom_splash),
             contentDescription = "PHANTOM",
             modifier = Modifier.height(60.dp),
         )
