@@ -39,7 +39,7 @@ use tower::ServiceExt;
 
 fn build_app() -> axum::Router {
     let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 
@@ -48,7 +48,7 @@ fn build_app_with_hold(
 ) -> (axum::Router, Arc<phantom_relay::state::AppState>) {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.poll_hold_secs = hold_secs;
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     let router = phantom_relay::routes::router(Arc::clone(&state));
     (router, state)
 }

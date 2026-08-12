@@ -31,13 +31,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn build_app_with_t2_diag(enabled: bool) -> axum::Router {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.t2_diag_enabled = enabled;
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 

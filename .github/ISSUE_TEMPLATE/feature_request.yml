@@ -1,0 +1,54 @@
+name: Feature request
+description: Propose a user-facing improvement that fits PHANTOM's privacy doctrine.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before proposing an implementation. For security-sensitive reports, use the private process in [SECURITY.md](https://github.com/LiudvigVladislav/Phantom/blob/master/SECURITY.md), not a public issue.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Messaging and media
+        - Transport and censorship resistance
+        - Privacy and security
+        - Relay and self-hosting
+        - User experience and accessibility
+        - Documentation and tooling
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Who experiences the problem, and in what situation?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: What should become possible? Implementation ideas are welcome but optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked ROADMAP.md and existing issues for a similar proposal.
+          required: true
+        - label: This request does not require PHANTOM to read private message contents or add advertising/tracking.
+          required: true

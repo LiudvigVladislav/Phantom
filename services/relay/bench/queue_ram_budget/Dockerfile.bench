@@ -1,0 +1,70 @@
+# PR-2 M5b — queue-ram-budget bench image.
+#
+# Separate from services/relay/Dockerfile so a production image
+# rebuild NEVER accidentally ships the bench binary. The bench
+# feature is opt-in at Cargo level (required-features on the
+# [[bin]] entry) and opt-in at the container level (this
+# Dockerfile is only referenced by bench/queue_ram_budget/run.sh,
+# never by docker-compose.yml).
+#
+# Build context is the REPOSITORY ROOT (same as the production
+# Dockerfile) so the workspace `services/` tree is available.
+
+# -----------------------------------------------------------------------------
+# Stage 1 — builder
+# -----------------------------------------------------------------------------
+FROM --platform=linux/amd64 rust:1.88-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY services/Cargo.toml services/Cargo.lock ./
+COPY services/relay ./relay
+
+# Prune workspace to relay only so the bench build never drags in
+# other crates that would fail without their local sources.
+RUN sed -i -z 's|members = \[[^]]*\]|members = ["relay"]|' Cargo.toml
+
+RUN cargo build --release --package phantom-relay \
+        --features queue-ram-budget-bench \
+        --bin queue_ram_budget_bench \
+    && strip target/release/queue_ram_budget_bench
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime
+# -----------------------------------------------------------------------------
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+
+# Non-root user so the bench container runs under the same
+# security posture as production; makes RSS/cgroup numbers
+# comparable to what an operator would see under
+# docker-compose.yml + the phantom-relay image. Same uid/gid
+# scheme as services/relay/Dockerfile.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 phantom \
+    && useradd --uid 10001 --gid 10001 \
+        --no-create-home --shell /usr/sbin/nologin phantom
+
+# TempDir the bench builds lands under /tmp; the container's
+# writable tmpfs (or the default writable layer) handles it.
+WORKDIR /tmp
+
+COPY --from=builder \
+    /build/target/release/queue_ram_budget_bench \
+    /usr/local/bin/queue_ram_budget_bench
+
+USER phantom
+
+# One container = one scenario. `--scenario X` is passed by
+# `run.sh` per invocation; the bench writes exactly one NDJSON
+# line to stdout on success and exits non-zero on any invariant
+# break.
+ENTRYPOINT ["/usr/local/bin/queue_ram_budget_bench"]

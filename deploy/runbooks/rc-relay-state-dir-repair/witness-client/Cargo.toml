@@ -1,0 +1,28 @@
+[package]
+name = "pr1b-witness-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Round-3 architect: `rand 0.10`, `syn 3` and other transitive deps in
+# the checked-in Cargo.lock require a modern rustc. Pin the MSRV so
+# `cargo build` fails loudly against an older toolchain rather than
+# resolving a stale lock silently.
+rust-version = "1.88"
+description = "PR-1b staging witness — signed HTTP client for the four PR-1b persistence handlers"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

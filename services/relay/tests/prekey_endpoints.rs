@@ -19,7 +19,6 @@ use axum::http::{Request, StatusCode};
 use ed25519_dalek::{Signer, Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -34,7 +33,7 @@ fn build_app() -> (axum::Router, TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir for state_dir");
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.state_dir = tmp.path().to_path_buf();
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     let router = phantom_relay::routes::router(state);
     (router, tmp)
 }

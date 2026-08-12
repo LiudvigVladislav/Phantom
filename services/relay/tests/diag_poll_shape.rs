@@ -28,7 +28,6 @@
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use std::sync::Arc;
 use tower::ServiceExt;
 
 use phantom_relay::diag_poll_shape::{
@@ -39,7 +38,7 @@ use phantom_relay::diag_poll_shape::{
 fn build_app_with_flag(enabled: bool) -> axum::Router {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.diag_poll_shape_echo_enabled = enabled;
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 

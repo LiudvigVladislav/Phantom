@@ -6,6 +6,33 @@ use std::sync::Arc;
 
 use crate::seq_mac::SeqMacRootKey;
 
+/// PR-0 A-5 — errors surfaced by [`RelayConfig::from_env`] when a
+/// configuration value fails the boot-time validation. Currently only
+/// covers `RELAY_STATE_DIR`; future env-var validations (staging
+/// benchmark-derived RAM budget, cgroup memory limit, etc — PR-2
+/// scope) extend this enum with additional variants.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// `RELAY_STATE_DIR` failed the absolute-path + no-`..` guard.
+    /// `raw` is the offending env-var value (or the default constant
+    /// that was rejected — always visible in the FATAL log line so the
+    /// operator can spot a mis-`.env`).
+    InvalidStateDir { raw: String, reason: &'static str },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::InvalidStateDir { raw, reason } => write!(
+                f,
+                "RELAY_STATE_DIR is invalid: {reason} (got: {raw:?})",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 /// Relay configuration loaded from environment variables.
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -448,8 +475,35 @@ impl RelayConfig {
         }
     }
 
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        // PR-0 A-5 — validate RELAY_STATE_DIR before constructing the
+        // config. Reject relative paths (would resolve against Docker's
+        // default CWD `/` and produce state files at unpredictable
+        // locations under read_only rootfs) and any `..` component
+        // (would break the `.lock` singleton invariant PR-1b will add,
+        // since two invocations from different CWDs would resolve
+        // differently). Empty env-var value collapses to the same
+        // "relative" failure mode.
+        let state_dir_raw = std::env::var("RELAY_STATE_DIR")
+            .unwrap_or_else(|_| "/var/phantom".to_string());
+        let state_dir_pb = PathBuf::from(&state_dir_raw);
+        if !state_dir_pb.is_absolute() {
+            return Err(ConfigError::InvalidStateDir {
+                raw: state_dir_raw,
+                reason: "must be an absolute path",
+            });
+        }
+        if state_dir_pb
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(ConfigError::InvalidStateDir {
+                raw: state_dir_raw,
+                reason: "must not contain '..' components",
+            });
+        }
+
+        Ok(Self {
             host: std::env::var("RELAY_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             port: std::env::var("RELAY_PORT")
                 .ok()
@@ -577,18 +631,12 @@ impl RelayConfig {
                     .ok()
                     .as_deref(),
             ),
-            // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: base directory the relay
-            // writes its four state files to. Default `/var/phantom` matches
-            // the compose volume mount and the Dockerfile `WORKDIR`; the env
-            // var lets the operator override in staging without rebuilding
-            // the image. See `docs/tracks/rc-relay-state-dir-repair.md` §4.1
-            // for why this is env-driven (not an absolute const) and §4.1's
-            // rejection of `PHANTOM_STATE_DIR` in favour of the `RELAY_*`
-            // convention.
-            state_dir: std::env::var("RELAY_STATE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/var/phantom")),
-        }
+            // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1 base directory + PR-0
+            // A-5 boot-time validation (absolute + no ParentDir). The
+            // raw env-var value + validation live at the top of this
+            // fn; here we just consume the validated PathBuf.
+            state_dir: state_dir_pb,
+        })
     }
 }
 

@@ -29,6 +29,7 @@ on:
     paths:
       - 'deploy/docker-compose.yml'
       - 'services/relay/Dockerfile'
+      - 'services/relay/src/**'
       - '.github/workflows/deploy-lint.yml'
   pull_request:
     branches: [master]
@@ -64,6 +65,7 @@ jobs:
             if git diff --name-only "$base" "$head" -- \
                 'deploy/docker-compose.yml' \
                 'services/relay/Dockerfile' \
+                'services/relay/src/**' \
                 '.github/workflows/deploy-lint.yml' \
                 | grep -q .; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -177,6 +179,7 @@ jobs:
             if git diff --name-only "$base" "$head" -- \
                 'deploy/docker-compose.yml' \
                 'services/relay/Dockerfile' \
+                'services/relay/src/**' \
                 '.github/workflows/deploy-lint.yml' \
                 | grep -q .; then
               echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -462,17 +465,150 @@ jobs:
                   "which drifts across base-image upgrades."
               )
 
+          # RC-RELAY-STATE-DIR-REPAIR Ops-PR: Inv-8 (relay memory ceiling
+          # + strict value regex). Round-1 architect verdict on Ops PR:
+          # presence-only check accepted `memory: invalid`, `0M`, an
+          # object, or a negative value. Locked v4.2.3 §3 requires the
+          # value to be a positive-integer byte quantity with an M or G
+          # suffix — the regex `^[1-9][0-9]*[MG]$` covers every value
+          # Docker Compose parses into a positive HostConfig.Memory
+          # bytes count, and rejects `0M`, `-1M`, `512`, `1.5G`,
+          # `invalid`, and inline mapping shapes. What Inv-8 gates is
+          # the SHAPE of the field; the exact NUMBER is refined by
+          # PR-2's staging benchmark (which anchors
+          # `RELAY_QUEUE_RAM_BUDGET_BYTES` under the container ceiling).
+          # A deploy-witness in
+          # `deploy/runbooks/rc-relay-state-dir-repair/rotation.md`
+          # §"Triple witness" additionally verifies that the compose
+          # bytes equal `HostConfig.Memory` on the running container
+          # equal the cgroup value — that runtime attestation lives
+          # outside this CI gate.
+          # Round-2 architect P1 #7: `re.match` anchors only at the
+          # beginning; a trailing `\n` slips past `$`. Docker Compose
+          # rejects `"512M\n"` at parse time, so we must too. Use
+          # `fullmatch` — it anchors both ends and refuses any embedded
+          # newline. Self-tests below the regex must include the
+          # trailing-newline case as regression coverage.
+          import re as _re
+          _MEM_RE = _re.compile(r"[1-9][0-9]*[MG]")
+          deploy_block = relay.get("deploy", {}) or {}
+          resources = deploy_block.get("resources", {}) or {}
+          limits = resources.get("limits", {}) or {}
+          memory_limit = limits.get("memory")
+          if not isinstance(memory_limit, str):
+              failures.append(
+                  "Inv-8 (relay memory ceiling shape) — "
+                  "`deploy.resources.limits.memory` must be a STRING "
+                  "matching `^[1-9][0-9]*[MG]$`. Got: "
+                  f"{type(memory_limit).__name__} = {memory_limit!r}."
+              )
+          elif not _MEM_RE.fullmatch(memory_limit):
+              failures.append(
+                  "Inv-8 (relay memory ceiling shape) — "
+                  f"`deploy.resources.limits.memory` = {memory_limit!r} "
+                  "does not fullmatch `^[1-9][0-9]*[MG]$`. Docker Compose "
+                  "would parse `0M`, `-1M`, `1.5G`, `512`, `\"512M\\n\"`, "
+                  "or non-string values into a broken or zero "
+                  "HostConfig.Memory. Locked v4.2.3 §3 requires a "
+                  "positive integer with an M or G suffix and no "
+                  "trailing whitespace (e.g. `512M`, `1G`, `2G`)."
+              )
+
           if failures:
-              print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a state-dir invariants violated:")
+              print("::error::RC-RELAY-STATE-DIR-REPAIR PR-1a/Ops state-dir invariants violated:")
               for f in failures:
                   print(f"::error::  {f}")
               print()
               print("See docs/tracks/rc-relay-state-dir-repair.md §5 for the")
-              print("full contract; §7.2 for these exact assertions.")
+              print("full contract; §7.2 for these exact assertions;")
+              print("deploy/runbooks/rc-relay-state-dir-repair/README.md for")
+              print("the Ops PR extensions (Inv-8).")
               sys.exit(1)
 
-          print("All five state-dir invariants hold. PASS.")
+          print("All six state-dir invariants hold (PR-1a Inv-1..5 + Ops Inv-8). PASS.")
           PYEOF
+
+      # RC-RELAY-STATE-DIR-REPAIR PR-1b §8 CI grep-gate — the two
+      # silent-swallow shapes that hid EROFS in production for months.
+      # Both patterns MUST return zero hits under services/relay/src/
+      # (tests/ intentionally exempt — some tests deliberately probe
+      # the pre-fix shape to prove PR-1b's fail-loud replacement fires).
+      #
+      # Pattern 1: `if let Ok(mut f) = std::fs::OpenOptions::...open(...)`
+      #            — silently drops Err on the open call, which is exactly
+      #            how EROFS was hidden.
+      # Pattern 2: `let _ = writeln!(...)` — silently drops Err on the
+      #            write itself, so a short-write or EROFS-mid-write goes
+      #            unnoticed.
+      #
+      # ripgrep is NOT preinstalled on ubuntu-24.04 (round-1 CI failed
+      # with `rg: command not found`; the runner image dropped `rg` at
+      # some point). Install it via the runner's apt package feed so
+      # the gate below can rely on `rg` being on PATH. `apt-get
+      # install` is fast (~2s) vs `cargo install ripgrep` (30-60s) and
+      # matches the runner's package-manager convention. `-P` in the
+      # gate below uses PCRE2 so we can match the compound "if let
+      # Ok(...) = (std::)?fs::OpenOptions" shape robustly against
+      # whitespace variance. `--type rust` scopes to *.rs and
+      # `--glob '!tests/**'` excludes the tests tree.
+      - name: Install ripgrep for the grep-gate below
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
+          rg --version
+
+      - name: PR-1b §8 grep-gate — no silent-swallow persistence writers
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          cd services/relay/src
+
+          # Round-1 architect P1: explicit exit-code switch.
+          #   rc=0  → matches found; pattern violation, fail the gate.
+          #   rc=1  → no matches; the desired PR-1b state.
+          #   rc>=2 → rg itself failed (PCRE2 error, ENOENT on --type,
+          #          I/O failure) — treat as gate failure, NOT as "clean".
+          # Pre-round-1 shape lumped rc=1 and rc>=2 into a single "OK"
+          # else-branch, so a mistyped pattern or missing `rg` would have
+          # printed a green tick to CI.
+          patterns=(
+            'if\s+let\s+Ok\s*\([^)]+\)\s*=\s*(std::)?fs::OpenOptions'
+            'let\s+_\s*=\s*writeln!'
+          )
+          fail=0
+          for pat in "${patterns[@]}"; do
+            echo "▸ pattern: $pat"
+            set +e
+            rg -P --type rust --glob '!tests/**' "$pat"
+            rc=$?
+            set -e
+            case "$rc" in
+              0)
+                echo "::error::PR-1b §8 grep-gate FAILED — pattern matched: $pat"
+                fail=1
+                ;;
+              1)
+                echo "  OK (0 hits)"
+                ;;
+              *)
+                echo "::error::PR-1b §8 grep-gate FATAL — ripgrep exited $rc for pattern $pat (invalid regex? missing binary? I/O error?)"
+                exit 3
+                ;;
+            esac
+            echo
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::One or more silent-swallow persistence shapes present under services/relay/src/."
+            echo "PR-1b §4.2 requires fail-loud writers: either match on the Err arm"
+            echo "and (audit tier) log+count OR (correctness tier) return an error."
+            echo "See docs/tracks/rc-relay-state-dir-repair.md §4.2 and §8."
+            exit 1
+          fi
+          echo "All PR-1b silent-swallow patterns return zero hits. PASS."
 
       # Image-level smoke — build the runtime image and assert the
       # phantom user actually resolves to uid=10001 AND gid=10001 inside
@@ -505,3 +641,190 @@ jobs:
           [ "$ACTUAL_STATE" = "10001:10001:750" ] \
             || { echo "::error::/var/phantom = $ACTUAL_STATE, expected 10001:10001:750"; exit 1; }
           echo "OK: image-level smoke passed"
+
+  # PR-2 M6-2 -- ram-budget invariants (docker-compose normalised).
+  #
+  # Runs `docker compose config --no-env-resolution --format json`
+  # against `deploy/docker-compose.yml` to obtain a canonical JSON
+  # projection (YAML anchor resolution + `memory: 512M` -> byte-
+  # count merging) that a jq walk can strict-compare against the
+  # Rust constant and the 512 MiB container limit. Stronger than
+  # the regex sweep in the sister `relay-invariants.yml` I3
+  # because it exercises anchor resolution and default-value
+  # merging that a raw YAML walk would miss.
+  #
+  # Two production-file coupling issues the check has to route
+  # around on CI, both handled in the step below:
+  #   (1) `--no-env-resolution` skips `${VAR:-default}`
+  #       interpolation but DOES NOT skip existence checks on
+  #       `env_file:` entries. The compose file references
+  #       `deploy/.env`, which is a production-only side file
+  #       that is intentionally not committed and therefore
+  #       absent on the CI runner.
+  #   (2) The three fields the jq queries read (both RAM budget
+  #       env vars and the relay memory limit) are LITERAL in
+  #       the compose YAML -- no `${VAR}` expansion -- so a
+  #       missing / empty `.env` cannot influence their values,
+  #       and skipping env resolution does not weaken the check.
+  # The step below refuses to run if `deploy/.env` unexpectedly
+  # already exists in the checkout (would indicate a leaked
+  # production secret), then materialises an EMPTY file to
+  # satisfy the compose engine's existence check, and traps
+  # `rm -f` on EXIT so the placeholder never leaks between
+  # steps.
+  #
+  # Fail-loud on: docker missing, `deploy/.env` unexpectedly
+  # committed, compose config non-zero exit, either RAM budget
+  # env absent, either value != 83886080, relay memory limit
+  # != 536870912 (512 MiB).
+  #
+  # No Buildx required -- `docker compose` on ubuntu-latest is
+  # sufficient for `config --format json` (v2 compose plugin
+  # preinstalled since 2023).
+  ram-budget-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect ram-budget-invariants-relevant changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+            if git diff --name-only "$base" "$head" -- \
+                'deploy/docker-compose.yml' \
+                'services/relay/src/main.rs' \
+                '.github/workflows/deploy-lint.yml' \
+                | grep -q .; then
+              echo "relevant=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "relevant=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No ram-budget-invariants-relevant changes -- skipping."
+            fi
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify docker compose is available
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::docker CLI missing on runner"
+            exit 2
+          fi
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "::error::docker compose plugin missing on runner"
+            exit 2
+          fi
+          docker --version
+          docker compose version
+
+      - name: Ram-budget three-way equality (compose normalised)
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          # Extract the Rust constant expression from main.rs.
+          CONST_LINE=$(grep -E '^\s*const\s+DEFAULT_RELAY_RAM_BUDGET_BYTES\s*:\s*u64' services/relay/src/main.rs || true)
+          if [ -z "$CONST_LINE" ]; then
+            echo "::error::DEFAULT_RELAY_RAM_BUDGET_BYTES const missing in services/relay/src/main.rs"
+            exit 1
+          fi
+          RUST_EXPR=$(printf '%s' "$CONST_LINE" | sed -E 's/^.*=\s*([^;]+);.*/\1/' | tr -d '_')
+          if ! printf '%s' "$RUST_EXPR" | grep -Eq '^[[:space:]]*[0-9]+([[:space:]]*\*[[:space:]]*[0-9]+)*[[:space:]]*$'; then
+            echo "::error::DEFAULT_RELAY_RAM_BUDGET_BYTES expr $RUST_EXPR is not a plain int*int*... chain"
+            exit 1
+          fi
+          RUST_VAL=$(awk -v e="$RUST_EXPR" 'BEGIN{n=1; c=split(e, a, "*"); for (i=1; i<=c; i++) n *= a[i]+0; print n}')
+          echo "Rust const DEFAULT_RELAY_RAM_BUDGET_BYTES = $RUST_VAL"
+
+          # Normalise compose (anchor resolution + `memory: 512M`
+          # -> byte-count merging). jq extracts the three fields
+          # we care about; missing fields resolve to jq's `null`
+          # string.
+          #
+          # `--no-env-resolution` disables `${VAR:-default}`
+          # interpolation but DOES NOT skip the compose engine's
+          # existence check on `env_file:` entries. The compose
+          # file references `deploy/.env` as an env_file, and
+          # `deploy/.env` is a production-only side file that is
+          # intentionally not committed and therefore absent on
+          # the CI runner. Without a placeholder the compose
+          # invocation exits non-zero on `deploy/.env not found`
+          # BEFORE jq ever runs.
+          #
+          # The safety pre-check refuses to proceed if
+          # `deploy/.env` unexpectedly appears in a CI checkout
+          # (would indicate an accidental commit of production
+          # secrets). We then create an EMPTY file that satisfies
+          # the compose existence check without providing any
+          # value, and the `trap` on EXIT removes it whether the
+          # step succeeds or fails so no residue leaks between
+          # steps. The three fields the jq queries read are
+          # literal in the compose YAML (no `${VAR}` expansion),
+          # so an empty env file changes nothing about the
+          # verdict.
+          if [ -e deploy/.env ]; then
+            echo "::error::deploy/.env unexpectedly exists in CI checkout -- production secrets must not be committed"
+            exit 1
+          fi
+          : > deploy/.env
+          trap 'rm -f deploy/.env' EXIT
+
+          COMPOSE_JSON=$(docker compose -f deploy/docker-compose.yml \
+            config --no-env-resolution --format json)
+
+          QUEUE_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_QUEUE_RAM_BUDGET_BYTES // "MISSING"')
+          PREFLIGHT_ENV=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.environment.RELAY_PREFLIGHT_RAM_BUDGET // "MISSING"')
+          MEMORY_LIMIT=$(printf '%s' "$COMPOSE_JSON" | jq -r '.services.relay.deploy.resources.limits.memory // "MISSING"')
+
+          echo "compose RELAY_QUEUE_RAM_BUDGET_BYTES = $QUEUE_ENV"
+          echo "compose RELAY_PREFLIGHT_RAM_BUDGET   = $PREFLIGHT_ENV"
+          echo "compose relay memory limit           = $MEMORY_LIMIT"
+
+          for pair in "RELAY_QUEUE_RAM_BUDGET_BYTES:$QUEUE_ENV" "RELAY_PREFLIGHT_RAM_BUDGET:$PREFLIGHT_ENV"; do
+            name="${pair%%:*}"
+            val="${pair#*:}"
+            if [ "$val" = "MISSING" ]; then
+              echo "::error::compose does not set $name"
+              exit 1
+            fi
+            if [ "$val" != "$RUST_VAL" ]; then
+              echo "::error::compose $name=$val != Rust constant=$RUST_VAL"
+              exit 1
+            fi
+          done
+
+          # Compose keeps the raw `memory: 512M` string in the
+          # deploy.resources shape as of docker-compose v2 --
+          # normalise to bytes and strict-compare to 512 MiB.
+          if [ "$MEMORY_LIMIT" = "MISSING" ]; then
+            echo "::error::compose does not set services.relay.deploy.resources.limits.memory"
+            exit 1
+          fi
+          MEMORY_BYTES=$(awk -v s="$MEMORY_LIMIT" '
+            BEGIN {
+              n = length(s)
+              suf = toupper(substr(s, n, 1))
+              if (suf ~ /[0-9]/) { print s+0; exit }
+              base = substr(s, 1, n-1) + 0
+              if (suf == "B") { print base }
+              else if (suf == "K") { print base * 1024 }
+              else if (suf == "M") { print base * 1024 * 1024 }
+              else if (suf == "G") { print base * 1024 * 1024 * 1024 }
+              else                 { print "BAD" }
+            }
+          ')
+          if [ "$MEMORY_BYTES" = "BAD" ]; then
+            echo "::error::relay memory limit '$MEMORY_LIMIT' unparseable"
+            exit 1
+          fi
+          if [ "$MEMORY_BYTES" != "536870912" ]; then
+            echo "::error::relay memory limit=$MEMORY_BYTES != 536870912 (512 MiB); PR-2 M5b calibration is invalid outside this shape"
+            exit 1
+          fi
+          echo "OK: three-way equality holds (Rust const == compose env == $RUST_VAL; container memory limit == $MEMORY_BYTES)"

@@ -12,6 +12,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlin.test.Test
@@ -267,8 +268,15 @@ class PreKeyApiClientTest {
         )
     }
 
+    // fetchStatus tests use `runBlocking` because CLIENT-PREKEY-SELFHEAL
+    // introduced a `withTimeoutOrNull` per-attempt deadline. Under
+    // `runTest` the virtual-time scheduler advances past that deadline
+    // whenever the inner block suspends on a real dispatcher (Ktor's
+    // MockEngine internals), firing the timeout even though the mock
+    // response returns instantly on the wall clock. `runBlocking` uses
+    // the real clock so the deadline behaves as production would.
     @Test
-    fun fetchStatus_200_decodesStatus() = runTest {
+    fun fetchStatus_200_decodesStatus() = runBlocking {
         val client = clientThatReturns(
             HttpStatusCode.OK,
             """{"remaining_opks":42,"signed_prekey_age_days":3}""",
@@ -281,7 +289,7 @@ class PreKeyApiClientTest {
     }
 
     @Test
-    fun fetchStatus_handlesNullSpkAge_forEmptyIdentity() = runTest {
+    fun fetchStatus_handlesNullSpkAge_forEmptyIdentity() = runBlocking {
         val client = clientThatReturns(
             HttpStatusCode.OK,
             """{"remaining_opks":0}""",

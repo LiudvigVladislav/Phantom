@@ -69,8 +69,16 @@ pub struct AbuseReport {
 /// In-memory store for Alpha-0.
 pub struct AppState {
     pub config: RelayConfig,
-    /// recipient_public_key_hex → queue of offline envelopes
-    pub store: RwLock<HashMap<String, Vec<Envelope>>>,
+    /// recipient_public_key_hex → queue of offline envelopes.
+    ///
+    /// Wrapped in `Arc<RwLock<..>>` (RC-RELAY-QUEUE-DURABILITY PR-2
+    /// M3a round-2 review F1) so the shard-worker pool
+    /// ([`crate::rest_workers::ActorContext`]) can hold a
+    /// zero-copy shared owner via `Arc::clone(&state.store)`.
+    /// Every existing call site keeps working because `Arc<T>`
+    /// derefs to `T`, so `state.store.write().await` reads
+    /// identically to the pre-refactor bare-lock form.
+    pub store: Arc<RwLock<HashMap<String, Vec<Envelope>>>>,
     /// identity_hex → (connection_id, sender channel) for live WebSocket clients.
     /// connection_id is a monotonically increasing u64 minted at connect time.
     /// Cleanup only removes the entry if the stored connection_id matches, so a
@@ -139,7 +147,7 @@ pub struct AppState {
     /// Carries the monotonic `seq` counter that /relay/poll uses for
     /// resume (?since_seq=). Shares envelope IDs with `store` so
     /// /relay/ack-deliver removes from both simultaneously.
-    pub rest_store: RwLock<HashMap<String, Vec<RestEnvelope>>>,
+    pub rest_store: Arc<RwLock<HashMap<String, Vec<RestEnvelope>>>>,
     /// Monotonic per-recipient sequence counter for REST poll resume.
     pub rest_seq: SeqCounter,
 
@@ -190,6 +198,53 @@ pub struct AppState {
     /// so the store owns the full path just like it owns its in-memory map.
     /// See `docs/tracks/rc-relay-state-dir-repair.md` §3.2 / §4.1.
     pub state_paths: StatePaths,
+
+    // ── Audit-tier persistence counters (RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2) ──
+    //
+    // Bump on every `append_*_to_disk` outcome from the audit tier. The
+    // paired `_success` counter increments ONLY after `writeln! → sync_data
+    // → parent-dir fsync` all report Ok, so the ratio `_failed / (_failed +
+    // _success)` is a real disk-error rate — not the pre-1b `disk_writes`
+    // shape, which counted attempts. Handler HTTP semantics are unchanged
+    // by the audit tier: a failure logs+counts and the caller still
+    // returns 2xx (§4.2). Correctness-tier prekey counters live on
+    // `PreKeyStore`; see `prekeys.rs`.
+    pub reports_persist_failed: AtomicU64,
+    pub reports_persist_success: AtomicU64,
+    pub blocklist_persist_failed: AtomicU64,
+    pub blocklist_persist_success: AtomicU64,
+    pub push_tokens_persist_failed: AtomicU64,
+    pub push_tokens_persist_success: AtomicU64,
+
+    // ── PR-2 M4-2b atomic activation: mandatory runtime handle ───────────────
+    //
+    // Constructor-injected. No `Option`. Every M4-2b Send/Ack/Sweep
+    // dispatch routes through `runtime.try_send(RestOp::...)` and
+    // the `store` / `rest_store` fields above are the runtime's own
+    // `Arc` handles (round-2 F1 pre-widening was designed for
+    // exactly this handoff).
+    pub runtime: std::sync::Arc<crate::rest_workers::WorkerRuntime>,
+
+    // ── PR-2 M4-2a round-1 REDLINE (P1) test-only lifetime guard ─────────────
+    //
+    // Owned `TempDir` that keeps a test-created `state_dir`
+    // (and any files inside it) alive for the lifetime of
+    // `AppState`. Set by [`build_test_app_state`] when the
+    // helper creates a fresh directory; `None` in production
+    // (where `state_dir` is an operator-supplied absolute
+    // path) and also `None` when a test supplies its own
+    // absolute `cfg.state_dir` (helper preserves it so
+    // round-trip tests like `state_persistence` reuse the
+    // SAME dir across two AppState instances).
+    //
+    // Field is `pub(crate)` — external test callers get their
+    // `Arc<AppState>` back from `build_test_app_state` and
+    // never need to touch this. The M4-2a round-0 shape
+    // returned `(Arc<AppState>, TempDir)` and let the caller
+    // hold the lease, which broke inside every test helper
+    // that returned a `Router` because `_dir` dropped at the
+    // helper's function return.
+    pub(crate) _test_state_dir_guard: Option<tempfile::TempDir>,
 }
 
 /// Joined absolute paths for the three `state.rs`-owned append-log files.
@@ -213,7 +268,18 @@ impl StatePaths {
 }
 
 impl AppState {
-    pub fn new(config: RelayConfig) -> Self {
+    /// **PR-2 M4-2b atomic activation**: constructor is
+    /// mandatory-injection. `runtime` is required; `store` and
+    /// `rest_store` are populated from the runtime's own Arc
+    /// handles (round-2 F1 pre-widening designed for this
+    /// exact handoff).
+    ///
+    /// Tests use [`build_test_app_state`] which internally
+    /// boots a minimal runtime over a per-state `TempDir`.
+    pub fn new(
+        config: RelayConfig,
+        runtime: std::sync::Arc<crate::rest_workers::WorkerRuntime>,
+    ) -> Self {
         // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: compute state-file paths
         // from the injected `state_dir` before spinning up sub-stores.
         let state_paths = StatePaths::from_state_dir(&config.state_dir);
@@ -233,9 +299,14 @@ impl AppState {
             .build()
             .expect("reqwest::Client::build with default rustls should not fail");
         let prekeys = PreKeyStore::new(&config.state_dir);
+        // PR-2 M4-2b: `store` and `rest_store` are the runtime's own
+        // Arc handles, not fresh maps. Round-2 F1 pre-widened both to
+        // `Arc<RwLock<..>>` for exactly this swap.
+        let store = runtime.store();
+        let rest_store = runtime.rest_store();
         Self {
             config,
-            store: RwLock::new(HashMap::new()),
+            store,
             clients: RwLock::new(HashMap::new()),
             conn_counter: AtomicU64::new(0),
             rate_limiter: RwLock::new(HashMap::new()),
@@ -250,7 +321,7 @@ impl AppState {
             rest_tokens: RestTokenStore::new(),
             rest_session_cache: SessionChallengeCache::new(),
             rest_idempotency: IdempotencyCache::new(),
-            rest_store: RwLock::new(HashMap::new()),
+            rest_store,
             rest_seq: SeqCounter::new(),
             // Trek 2 Stage 1 long-poll
             notifiers: RwLock::new(HashMap::new()),
@@ -258,7 +329,26 @@ impl AppState {
             // Media upload (PR-M1r)
             media_store: MediaStore::new(),
             state_paths,
+            // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 audit-tier counters.
+            reports_persist_failed: AtomicU64::new(0),
+            reports_persist_success: AtomicU64::new(0),
+            blocklist_persist_failed: AtomicU64::new(0),
+            blocklist_persist_success: AtomicU64::new(0),
+            push_tokens_persist_failed: AtomicU64::new(0),
+            push_tokens_persist_success: AtomicU64::new(0),
+            runtime,
+            // Production always None. `build_test_app_state`
+            // sets Some(dir) when the helper owns the
+            // per-state hermetic directory.
+            _test_state_dir_guard: None,
         }
+    }
+
+    /// **PR-2 M4-2b**: mandatory accessor for the runtime handle.
+    /// No panic possible — the field is non-optional.
+    #[inline]
+    pub fn runtime(&self) -> &std::sync::Arc<crate::rest_workers::WorkerRuntime> {
+        &self.runtime
     }
 
     /// Seed the in-memory signing-key bindings from the disk-replayed
@@ -364,20 +454,154 @@ pub fn load_blocklist_from_disk(path: &Path) -> std::collections::HashSet<String
     content.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
 }
 
-pub fn append_report_to_disk(path: &Path, report: &AbuseReport) {
-    if let Ok(line) = serde_json::to_string(report) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
-        }
+/// Sanitised shape for audit-tier persist failures. Emitted alongside the
+/// structured `tracing::error!` so the log stream and the counter agree on
+/// what "kind" of failure was observed without ever leaking a path or a
+/// raw OS message. Same taxonomy as the correctness-tier
+/// `PreKeyPersistFailure::shape()` in `prekeys.rs` — kept identical
+/// deliberately so operator dashboards can compare across tiers.
+fn audit_persist_shape(err: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::PermissionDenied => "permission",
+        ErrorKind::NotFound => "not_found",
+        // ENOSPC on Unix / ERROR_HANDLE_DISK_FULL on Windows.
+        // `ErrorKind::StorageFull` is nightly-only; match on `raw_os_error`
+        // instead so this stays stable on stable Rust.
+        _ => match err.raw_os_error() {
+            Some(28) => "storage_full",
+            _ => "io",
+        },
     }
 }
 
-pub fn append_block_to_disk(path: &Path, key: &str) {
+/// Audit-tier append with fail-loud semantics (RC-RELAY-STATE-DIR-REPAIR
+/// PR-1b §4.2 audit tier). Writes `line` + '\n' to `path`, then `sync_data`
+/// on the file, then `sync_all` on the state_dir (parent-dir fsync — makes
+/// the directory entry itself durable, load-bearing for restart-safety on
+/// crash). On any Err at any step: increment `fail_counter`, emit a
+/// structured `ERROR` with sanitised `shape`, return without bumping
+/// `success_counter`. Handler HTTP semantics preserved by the caller;
+/// audit-tier failures do NOT surface as 5xx per §4.2.
+///
+/// `success_counter` is incremented ONLY after ALL three durability steps
+/// (write + `sync_data` + parent-dir fsync) complete, matching the mini-
+/// lock rule that "counter increment only after required syncs".
+fn append_audit_line(
+    path: &Path,
+    line: &str,
+    kind: &'static str,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{}", key);
+    use std::sync::atomic::Ordering;
+
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            fail_counter.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = kind,
+                stage = "open",
+                shape = audit_persist_shape(&e),
+                "state-dir audit-tier persist failed"
+            );
+            return;
+        }
+    };
+    if let Err(e) = writeln!(file, "{}", line) {
+        fail_counter.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            event = "audit_persist_failed",
+            tier = kind,
+            stage = "write",
+            shape = audit_persist_shape(&e),
+            "state-dir audit-tier persist failed"
+        );
+        return;
     }
+    if let Err(e) = file.sync_data() {
+        fail_counter.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            event = "audit_persist_failed",
+            tier = kind,
+            stage = "sync_data",
+            shape = audit_persist_shape(&e),
+            "state-dir audit-tier persist failed"
+        );
+        return;
+    }
+    // Parent-directory fsync so the newly-appended file's directory
+    // entry is durable across a crash. On Windows this is a no-op —
+    // directory-fd fsync semantics differ, so we skip and rely on the
+    // fact that append writes to an existing file don't touch the
+    // directory entry (the durability need is Unix-specific).
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    fail_counter.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        event = "audit_persist_failed",
+                        tier = kind,
+                        stage = "sync_parent_dir",
+                        shape = audit_persist_shape(&e),
+                        "state-dir audit-tier persist failed"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                fail_counter.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    event = "audit_persist_failed",
+                    tier = kind,
+                    stage = "open_parent_dir",
+                    shape = audit_persist_shape(&e),
+                    "state-dir audit-tier persist failed"
+                );
+                return;
+            }
+        }
+    }
+    success_counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn append_report_to_disk(
+    path: &Path,
+    report: &AbuseReport,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    let line = match serde_json::to_string(report) {
+        Ok(l) => l,
+        Err(_) => {
+            // Serialisation failure is a code bug, not a disk error —
+            // count it and move on. Handler still returns 2xx.
+            fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = "reports",
+                stage = "serialize",
+                shape = "io",
+                "audit-tier serialization failed"
+            );
+            return;
+        }
+    };
+    append_audit_line(path, &line, "reports", success_counter, fail_counter);
+}
+
+pub fn append_block_to_disk(
+    path: &Path,
+    key: &str,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    append_audit_line(path, key, "blocklist", success_counter, fail_counter);
 }
 
 pub fn load_push_tokens_from_disk(path: &Path) -> HashMap<String, String> {
@@ -396,11 +620,299 @@ pub fn load_push_tokens_from_disk(path: &Path) -> HashMap<String, String> {
     map
 }
 
-pub fn append_push_token_to_disk(path: &Path, rec: &PushTokenRecord) {
-    use std::io::Write;
-    if let Ok(line) = serde_json::to_string(rec) {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
+pub fn append_push_token_to_disk(
+    path: &Path,
+    rec: &PushTokenRecord,
+    success_counter: &AtomicU64,
+    fail_counter: &AtomicU64,
+) {
+    let line = match serde_json::to_string(rec) {
+        Ok(l) => l,
+        Err(_) => {
+            fail_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                event = "audit_persist_failed",
+                tier = "push_tokens",
+                stage = "serialize",
+                shape = "io",
+                "audit-tier serialization failed"
+            );
+            return;
+        }
+    };
+    append_audit_line(path, &line, "push_tokens", success_counter, fail_counter);
+}
+
+// ── Boot preflight + singleton state-dir lock (RC-RELAY-STATE-DIR-REPAIR PR-1b §6.2) ──
+//
+// Order B (locked by architect + operator sign-off, mini-lock 2026-07-19):
+//
+//   validate cfg          — done in main() before calling this fn
+//   ↓
+//   ensure state_dir exists
+//   ↓
+//   open state_dir/.lock
+//   ↓
+//   fs2::try_lock_exclusive  → exit 2 on contention (no sentinel write,
+//                              no state mutation — second instance never
+//                              races the first over the state files)
+//   ↓
+//   preflight sentinel write + sync_data + parent-dir fsync + unlink
+//                              under the held lock — panic-loud on any Err
+//   ↓
+//   return the locked File; main() binds it to `_state_dir_lock` so the
+//                              lock is held for the ENTIRE process lifetime
+//
+// Distinct exit codes surface distinct failure modes to the operator:
+//   12 → config invalid (RelayConfig::from_env())
+//   2  → another relay is already holding state_dir/.lock
+//   101 → panic (preflight sentinel could not be written / fsynced /
+//          unlinked; state_dir is not writable or its parent isn't fsyncable)
+
+/// Perform the Order B boot-preflight sequence and return the locked
+/// `state_dir/.lock` file. Caller MUST bind the return value in `main`
+/// so the lock stays alive for the process's whole lifetime. Any
+/// unrecoverable step calls `std::process::exit` OR panics — this
+/// function does not return an error.
+pub fn state_dir_preflight(cfg: &RelayConfig) -> std::fs::File {
+    use fs2::FileExt;
+
+    let state_dir = &cfg.state_dir;
+
+    // Step 1 — ensure state_dir exists. Panic-loud on failure; if we
+    // cannot even create the directory, there is no safe way to serve.
+    if let Err(e) = std::fs::create_dir_all(state_dir) {
+        panic!(
+            "FATAL: preflight: cannot create state_dir {}: {}",
+            state_dir.display(),
+            e
+        );
+    }
+
+    // Step 2 — open state_dir/.lock. `create(true)` so a fresh volume
+    // seeds the lock file. `write(true)` (no truncate) so we never wipe
+    // the contents (currently empty, but reserved for a future BOOT
+    // marker without breaking backwards-compat).
+    let lock_path = state_dir.join(".lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => panic!(
+            "FATAL: preflight: cannot open state_dir/.lock {}: {}",
+            lock_path.display(),
+            e
+        ),
+    };
+
+    // Step 3 — try_lock_exclusive. ONLY `ErrorKind::WouldBlock` is
+    // "another process holds the lock" (fs2 maps EAGAIN/EWOULDBLOCK on
+    // Unix and `ERROR_LOCK_VIOLATION` on Windows to `WouldBlock`). Every
+    // OTHER io::Error (EIO on a bad device, EOPNOTSUPP on a filesystem
+    // that doesn't support advisory locks such as some NFS mounts,
+    // permission changes mid-boot) means the LOCK OPERATION itself
+    // failed — treating those as "contention" would mislead the
+    // operator into thinking another relay is running when the real
+    // failure is a boot-preflight defect. Round-1 architect P1.
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "FATAL: another relay instance holds {} — refusing to start",
+                lock_path.display()
+            );
+            std::process::exit(2);
+        }
+        Err(e) => panic!(
+            "FATAL: preflight: try_lock_exclusive on {} failed: {} \
+             (this is NOT lock contention — likely EIO or an unsupported \
+             filesystem)",
+            lock_path.display(),
+            e
+        ),
+    }
+
+    // Step 4 — preflight sentinel: prove the state_dir accepts a
+    // write+fsync+unlink cycle right now, under the held lock. This
+    // catches EROFS / EACCES / ENOSPC before AppState::new starts
+    // returning empty maps on silent-EROFS. Any error → panic-loud.
+    let sentinel_path = state_dir.join(".preflight-sentinel");
+    {
+        let mut sentinel = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sentinel_path)
+        {
+            Ok(f) => f,
+            Err(e) => panic!(
+                "FATAL: preflight: cannot create sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            ),
+        };
+        use std::io::Write;
+        if let Err(e) = writeln!(sentinel, "preflight") {
+            panic!(
+                "FATAL: preflight: cannot write sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            );
+        }
+        if let Err(e) = sentinel.sync_data() {
+            panic!(
+                "FATAL: preflight: cannot fsync sentinel {}: {}",
+                sentinel_path.display(),
+                e
+            );
+        }
+    } // sentinel `File` closes here so remove_file can succeed on Windows
+
+    // Parent-directory fsync so the sentinel's directory entry is
+    // durable; matches the audit-tier writer's durability contract.
+    // Unix-only (Windows doesn't expose fsync on directories the same
+    // way; on Linux this is load-bearing for the "state_dir has ever
+    // received a durable write" preflight guarantee).
+    #[cfg(unix)]
+    {
+        match std::fs::File::open(state_dir) {
+            Ok(dir) => {
+                if let Err(e) = dir.sync_all() {
+                    panic!(
+                        "FATAL: preflight: cannot fsync state_dir {}: {}",
+                        state_dir.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => panic!(
+                "FATAL: preflight: cannot open state_dir for fsync {}: {}",
+                state_dir.display(),
+                e
+            ),
         }
     }
+
+    if let Err(e) = std::fs::remove_file(&sentinel_path) {
+        panic!(
+            "FATAL: preflight: cannot unlink sentinel {}: {}",
+            sentinel_path.display(),
+            e
+        );
+    }
+
+    tracing::info!(
+        event = "state_dir_preflight_ok",
+        state_dir = %state_dir.display(),
+        "state_dir preflight OK (writable + fsyncable + lock held)"
+    );
+
+    lock_file
+}
+
+/// **PR-2 M4-2a test helper** (round-1 REDLINE reshape):
+/// build an `Arc<AppState>` for integration tests. Returns a
+/// bare `Arc<AppState>` — the `TempDir` lease (when the
+/// helper creates one) lives INSIDE the state as
+/// `_test_state_dir_guard`, so integration builders that
+/// return just a `Router` cannot accidentally drop the
+/// lease before the first request.
+///
+/// **Directory strategy** (round-1 REDLINE fix):
+///
+///   * If `cfg.state_dir` is an **absolute** path, use it
+///     verbatim. The helper creates no TempDir. This is what
+///     `state_persistence` round-trip tests rely on — two
+///     back-to-back `build_test_app_state` calls with the
+///     SAME absolute path exercise the disk-load-back replay
+///     contract.
+///   * Otherwise (default `PathBuf::from(".")` from
+///     `RelayConfig::from_env_for_test`, or any relative
+///     path), the helper creates a fresh `TempDir`, assigns
+///     `cfg.state_dir = dir.path().to_path_buf()`, and stores
+///     the `TempDir` in `AppState._test_state_dir_guard` so
+///     it drops when the state does. This gives every
+///     axum-test-router build its own hermetic state_dir
+///     without cross-test contamination on the append-log
+///     files.
+///
+/// **M4-2a semantics**: `AppState.runtime` is `None` — the
+/// legacy shape. Body change to spawn a runtime lands in
+/// M4-2b; the signature stays the same, so no test file
+/// re-edit is needed then either.
+///
+/// Kept as a plain `pub fn` (not `#[cfg(test)]`) because
+/// tests live in a separate crate.
+pub fn build_test_app_state(mut cfg: RelayConfig) -> std::sync::Arc<AppState> {
+    let owned_dir: Option<tempfile::TempDir> = if cfg.state_dir.is_absolute() {
+        // Caller supplied their own absolute path — round-trip
+        // semantics depend on us NOT overriding it.
+        None
+    } else {
+        // Default / relative — build a hermetic per-state
+        // TempDir, redirect cfg.state_dir at it, keep the
+        // guard so the dir outlives the state.
+        let dir = tempfile::TempDir::new().expect("TempDir::new in test");
+        cfg.state_dir = dir.path().to_path_buf();
+        Some(dir)
+    };
+
+    // PR-2 M4-2b: helper body now spawns a real runtime so
+    // AppState.runtime is a live `Arc<WorkerRuntime>`. Boot
+    // uses `cfg.state_dir` as the on-disk queue root; the
+    // per-state TempDir (when the helper owns one) keeps
+    // that dir alive alongside the runtime.
+    let mac_key = cfg.seq_mac_key.clone();
+    // Bootstrap `queue/` + queue-meta if the caller didn't do it.
+    std::fs::create_dir_all(cfg.state_dir.join("queue"))
+        .expect("create queue subdir in test state_dir");
+    let meta_path = cfg.state_dir.join(crate::queue_meta::META_FILENAME);
+    if !meta_path.exists() {
+        let meta = crate::queue_meta::QueueMeta {
+            version: crate::queue_meta::META_VERSION,
+            phase: crate::queue_meta::Phase::Ready,
+            boot_generation: 1,
+            seq_mac_key_fingerprint: mac_key.fingerprint(),
+        };
+        crate::queue_meta::write_meta(&cfg.state_dir, &meta)
+            .expect("write initial queue-meta in test");
+    }
+
+    let boot_cfg = crate::boot_loader::BootConfig {
+        state_dir: cfg.state_dir.clone(),
+        caps: crate::boot_loader::PreflightCaps::for_tests(),
+        tombstone: crate::tombstone_config::TombstoneConfig::from_secs(172_800)
+            .expect("172_800 fits horizon cap"),
+        current_seq_mac_key_fingerprint: mac_key.fingerprint(),
+        ownership: crate::boot_loader::OwnershipExpectation::permissive_for_tests(),
+    };
+    let boot_result = crate::boot_loader::boot(&boot_cfg).expect("test boot() must succeed");
+    let (fatal_tx, _fatal_rx) = tokio::sync::broadcast::channel::<
+        crate::rest_workers::FatalReason,
+    >(16);
+    let caps = crate::capacity_ledger::CapacityCaps {
+        max_envelopes: 100_000,
+        max_bytes: 100 * 1024 * 1024,
+        ram_budget: 100 * 1024 * 1024,
+    };
+    let spec = crate::rest_workers::WorkerRuntimeSpec::from_boot(
+        boot_result,
+        cfg.max_envelopes_per_recipient,
+        std::sync::Arc::clone(&mac_key),
+        caps,
+        fatal_tx,
+    )
+    .expect("test WorkerRuntimeSpec::from_boot must succeed");
+    let runtime = std::sync::Arc::new(
+        crate::rest_workers::spawn_worker_runtime(spec)
+            .expect("test spawn_worker_runtime must succeed"),
+    );
+
+    let mut state = AppState::new(cfg, runtime);
+    state._test_state_dir_guard = owned_dir;
+    std::sync::Arc::new(state)
 }

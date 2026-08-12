@@ -35,7 +35,7 @@ RUST_LOG=phantom_relay=debug ./target/release/phantom-relay
 | `RELAY_MAX_ENVELOPES_PER_RECIPIENT` | `500` | Queue cap per recipient public key |
 | `RELAY_SECRET_TOKEN` | _(unset)_ | Shared secret required on `/ws?token=` and all `/admin/*` endpoints. **Must be set in production.** Unset = open dev mode. |
 | `RELAY_RATE_LIMIT_PER_WINDOW` | `60` | Max messages a sender may send per window |
-| `RELAY_RATE_LIMIT_WINDOW_SECS` | `60` | Sliding window duration in seconds |
+| `RELAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed-window length in seconds (bucket + count; resets on rollover) |
 
 The token is never logged. The startup banner emits `auth=true/false` only.
 
@@ -47,13 +47,16 @@ The token is never logged. The startup banner emits `auth=true/false` only.
 |---|---|---|---|
 | `GET` | `/health` | none | Liveness check — returns `{"status":"ok"}` |
 | `GET` | `/ws?id=<pubkey>&token=<secret>` | token (if set) | WebSocket connection for live delivery and send |
-| `POST` | `/send` | none | REST envelope submission (tooling/testing) |
-| `GET` | `/fetch/{recipient}` | none | Poll stored envelopes for a recipient key |
-| `DELETE` | `/ack/{id}?recipient=<pubkey>` | none | Remove a delivered envelope from the queue |
+| `POST` | `/auth/session` | pubkey signature | Issue a bearer session token for the REST fallback endpoints below |
+| `POST` | `/relay/send` | bearer | Envelope submission via the shard-worker actor path (REST fallback for middlebox environments that drop WS frames) |
+| `POST` | `/relay/poll` | bearer | Long-poll for queued envelopes (Trek 2 Stage 1); hold window controlled by `RELAY_POLL_HOLD_SECS` |
+| `POST` | `/relay/ack-deliver` | bearer | Acknowledge delivery of a previously polled envelope |
 | `POST` | `/report` | none | Submit an abuse report |
 | `GET` | `/admin/reports?token=<secret>` | token required | List all abuse reports |
 | `POST` | `/admin/block?token=<secret>` | token required | Add a public key to the blocklist |
 | `GET` | `/admin/blocklist?token=<secret>` | token required | List all blocked keys |
+
+**Removed in PR-2 M6-3 round-1 (2026-07-31):** the legacy tooling / testing endpoints `POST /send`, `GET /fetch/{recipient}`, and `DELETE /ack/{id}` no longer exist. They were admin-token-guarded convenience routes predating the shard-worker actor cutover and wrote directly to the shared `state.store`, bypassing the per-recipient serialisation contract that `WorkerRuntime` owns. The primary transport paths are the WS handler above and the `/relay/*` REST fallback endpoints. Any tooling still calling `/send`, `/fetch`, or `/ack` now receives HTTP 404; migrate to `/relay/send` / `/relay/poll` / `/relay/ack-deliver` (bearer-authenticated) or use the WS path.
 
 ### WebSocket message types
 
@@ -209,12 +212,31 @@ server {
 - The relay never logs token values or query strings. Full public keys never
   appear in logs — only the first 16 characters are used as correlation hints.
 
-- Rate limiting is enforced per sender identity (sliding window, silent drop).
-  Blocked keys are silently dropped — no error is returned to the sender.
+- Rate limiting is enforced per sender identity via a **fixed-window** counter
+  (`services/relay/src/state.rs::RateEntry`): each identity gets a bucket
+  bounded by `RELAY_RATE_LIMIT_PER_WINDOW` requests per
+  `RELAY_RATE_LIMIT_WINDOW_SECS` seconds. On window rollover the first
+  request after the boundary opens a fresh window with `count = 1`. Blocked
+  keys are silently dropped — no error is returned to the sender.
 
 - The relay stores ciphertext blobs only. It cannot read message content.
   Never pass plaintext or unencrypted metadata through the payload field.
 
-- Expired envelopes are purged from memory every 5 minutes. The in-memory
-  message queue does not survive a restart. Only abuse reports and the
-  blocklist are persisted to disk.
+- **Queue durability (PR-2 RC-RELAY-QUEUE-DURABILITY):** since PR-2 the
+  envelope queue is disk-first, not RAM-only. Every admitted envelope is
+  written via `atomic_write::write_atomic` (staging tempfile → fsync →
+  rename → parent-fsync) under `RELAY_STATE_DIR/queue/<shard>/<recipient>/
+  <sha256_hex(envelope_id)>.json`; the in-memory HashMap is a projection
+  of what's on disk, not the source of truth. A relay restart replays
+  the same directory tree at boot; nothing is lost. Envelope expiry
+  compaction runs on the M4-3 background sweep scheduler inside the
+  shard-worker actors (`RELAY_TOMBSTONE_DEDUP_HORIZON_SECS` controls
+  the tombstone dedup window). Capacity ledger caps
+  (`RELAY_QUEUE_RAM_BUDGET_BYTES`, `RELAY_QUEUE_MAX_BYTES`,
+  `RELAY_QUEUE_MAX_ENVELOPES`) bound total occupancy; the RAM budget
+  default is 80 MiB, calibrated by the M5b benchmark. See
+  `docs/adr/ADR-027-relay-queue-durability-and-ram-budget.md` for the
+  full model.
+  (Abuse reports, blocklist entries, push tokens, and prekey bundles
+  continue to persist as append-only JSONL side files alongside the
+  queue directory; that pre-PR-2 side-store is unchanged.)

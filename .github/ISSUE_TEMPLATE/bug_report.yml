@@ -1,0 +1,113 @@
+name: Bug report
+description: Report reproducible PHANTOM app, transport, or relay behavior.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve PHANTOM. **Do not report security vulnerabilities here.** Follow the private process in [SECURITY.md](https://github.com/LiudvigVladislav/Phantom/blob/master/SECURITY.md) instead.
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Manufacturer and model, or emulator profile.
+      placeholder: Tecno Spark Go 2023
+    validations:
+      required: true
+
+  - type: input
+    id: android_version
+    attributes:
+      label: Android version
+      placeholder: Android 12 / HiOS 12
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: PHANTOM version
+      description: Release tag, commit SHA, or build identifier.
+      placeholder: v0.1.0-alpha.2 or ea66889f
+    validations:
+      required: true
+
+  - type: input
+    id: carrier
+    attributes:
+      label: Carrier or ISP
+      description: Include the country; write "not applicable" for an offline-only issue.
+      placeholder: Tele2, Russia
+    validations:
+      required: true
+
+  - type: dropdown
+    id: network_type
+    attributes:
+      label: Network type
+      options:
+        - Cellular data
+        - Wi-Fi
+        - System-wide VPN
+        - Offline / local only
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport in use
+      options:
+        - Automatic / unknown
+        - Direct WSS
+        - Xray VLESS+REALITY
+        - Tor v3 onion
+        - REST fallback
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: Describe the visible behavior and any relevant timing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Remove usernames, identifiers, tokens, message contents, and other personal data.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked KNOWN_ISSUES.md and existing issues for this behavior.
+          required: true
+        - label: I removed secrets, message contents, and personal information from this report.
+          required: true

@@ -92,6 +92,23 @@ jobs:
       - name: Test :shared:core:messaging (jvm)
         run: ./gradlew :shared:core:messaging:jvmTest --stacktrace --info
 
+      # CLIENT-PREKEY-SELFHEAL PR #386 round-1: run the Android-app JVM unit
+      # test suite (previously not covered by any CI job). Exercises the
+      # PreKeySelfHealHookTest wiring tests + everything else under
+      # apps/android/src/androidUnitTest/.
+      - name: Test :apps:android (debug unit tests)
+        run: ./gradlew :apps:android:testDebugUnitTest --stacktrace --info
+
+      # CLIENT-PREKEY-SELFHEAL PR #386 round-1: enforce the two mechanical
+      # gates. Neither was previously invoked by CI (both are wired to the
+      # `check` task, which Android CI does not currently run). Running
+      # them explicitly here makes drift a build failure.
+      - name: Enforce assertClassifyOnJvmBodiesMatch (transport)
+        run: ./gradlew :shared:core:transport:assertClassifyOnJvmBodiesMatch --stacktrace
+
+      - name: Enforce assertSinglePublishBundleImplementation (messaging)
+        run: ./gradlew :shared:core:messaging:assertSinglePublishBundleImplementation --stacktrace
+
       # Android debug build — exercises full assembly pipeline including
       # SQLDelight code-gen, Compose compiler, AGP 9.1.1.
       - name: Build Android debug APK

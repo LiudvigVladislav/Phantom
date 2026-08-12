@@ -43,7 +43,7 @@ use tower::ServiceExt;
 
 fn build_app() -> axum::Router {
     let cfg = phantom_relay::config::RelayConfig::from_env_for_test();
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     phantom_relay::routes::router(state)
 }
 
@@ -241,7 +241,7 @@ fn build_app_with_hold_and_state(
 ) -> (axum::Router, Arc<phantom_relay::state::AppState>) {
     let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
     cfg.poll_hold_secs = hold_secs;
-    let state = Arc::new(phantom_relay::state::AppState::new(cfg));
+    let state = phantom_relay::state::build_test_app_state(cfg);
     let router = phantom_relay::routes::router(Arc::clone(&state));
     (router, state)
 }
@@ -256,7 +256,7 @@ async fn call_send_with_ts(
     let body = json!({
         "envelope_id": idem_key,
         "to": to,
-        "sealed_sender": "",
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload": "AAAA",
         "sequence_ts": sequence_ts,
     });
@@ -648,7 +648,7 @@ async fn rest_send_rejects_over_sized_envelope_id() {
     let body = json!({
         "envelope_id":   huge_id,
         "to":            identity_hex(202),
-        "sealed_sender": "",
+        "sealed_sender": "SEALED_SENDER_BLOB_BASE64_TEST_FIXTURE",
         "payload":       "AAAA",
         "sequence_ts":   1_700_000_000_000u64,
     });

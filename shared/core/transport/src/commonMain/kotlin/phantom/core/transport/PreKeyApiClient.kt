@@ -10,11 +10,15 @@ import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlin.random.Random
 
 /**
  * HTTP client for the relay's `/prekeys` REST surface (publish, bundle,
@@ -145,7 +149,43 @@ class PreKeyApiClient(
      * channel.
      */
     private val t2DiagPublishTraceEnabled: Boolean = false,
+    /**
+     * CLIENT-PREKEY-SELFHEAL test seam: injectable wall clock so retry
+     * tests can advance virtual time deterministically. Production default
+     * returns `Clock.System.now().toEpochMilliseconds()`.
+     */
+    private val nowMs: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+    /**
+     * CLIENT-PREKEY-SELFHEAL test seam: injectable jitter so tests can
+     * pass `{ it }` (identity) for deterministic delays. Production default
+     * applies ±30% multiplicative jitter to the base backoff.
+     */
+    private val jitter: (Long) -> Long = { base ->
+        val bias = (base * (Random.nextDouble(-0.3, 0.3))).toLong()
+        (base + bias).coerceAtLeast(0L)
+    },
+    /**
+     * CLIENT-PREKEY-SELFHEAL test seam: optional observer that receives
+     * every PREKEY_TRACE marker emitted by this client. Production is
+     * `null` (zero overhead). Tests inject a `MutableList::add`-style
+     * callback to assert marker presence and shape. Never receives a
+     * `Throwable` — sanitised per D8 (class simpleName only, no message).
+     */
+    private val logObserver: ((String) -> Unit)? = null,
 ) : PreKeyApi {
+
+    /**
+     * CLIENT-PREKEY-SELFHEAL D8 observability helper. Every
+     * `PREKEY_TRACE` marker inside this client goes through this method
+     * so tests can capture the exact strings via [logObserver] while
+     * production still receives the marker through [relayLog]. Callers
+     * embed the exception class simpleName inline in the marker; no
+     * throwable / message ever reaches either channel.
+     */
+    private fun trace(marker: String, level: RelayLogLevel = RelayLogLevel.INFO) {
+        relayLog(level, marker)
+        logObserver?.invoke(marker)
+    }
 
     // One in-flight publish per PreKeyApiClient instance at a time.
     //
@@ -223,10 +263,7 @@ class PreKeyApiClient(
         // timeline.
         if (!publishMutex.tryLock()) {
             if (!forceJoinInFlight) {
-                relayLog(
-                    RelayLogLevel.INFO,
-                    "PREKEY_TRACE prekey_publish_debounced",
-                )
+                trace("PREKEY_TRACE prekey_publish_debounced")
                 // Honest result: NOT stored. The in-flight publish may yet
                 // fail. Callers that need a guaranteed publish must retry
                 // with `forceJoinInFlight = true`.
@@ -240,19 +277,10 @@ class PreKeyApiClient(
             // load-bearing one — without it the bundle stays missing from
             // the relay). The two states are indistinguishable from the
             // mutex alone, so we always re-publish on the force path.
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_debounced force_join=true",
-            )
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_force_join_wait",
-            )
+            trace("PREKEY_TRACE prekey_publish_debounced force_join=true")
+            trace("PREKEY_TRACE prekey_publish_force_join_wait")
             publishMutex.lock()
-            relayLog(
-                RelayLogLevel.INFO,
-                "PREKEY_TRACE prekey_publish_force_join_acquired",
-            )
+            trace("PREKEY_TRACE prekey_publish_force_join_acquired")
         }
 
         // Lock acquired via tryLock() OR via the force-join lock() above.
@@ -324,13 +352,14 @@ class PreKeyApiClient(
             // ByteArray via okio.Buffer.writeAll() without any streaming.
             val bodyBytes = bodyJson.encodeToByteArray()
             if (bodyBytes.size >= 7800) {
-                relayLog(
+                trace(
+                    "PREKEY_TRACE prekey_publish_body_near_carrier_limit " +
+                        "bodyBytes=${bodyBytes.size} threshold=7800 attempt=$attempt " +
+                        "note=may_hit_tele2_8192_byte_cut",
                     RelayLogLevel.WARN,
-                    "PREKEY_TRACE prekey_publish_body_near_carrier_limit bodyBytes=${bodyBytes.size} threshold=7800 attempt=$attempt note=may_hit_tele2_8192_byte_cut",
                 )
             }
-            relayLog(
-                RelayLogLevel.INFO,
+            trace(
                 "PREKEY_TRACE prekey_publish_start native=true identity=$identityTag… " +
                     "opks=${request.one_time_pre_keys.size} " +
                     "spk_key_id=${request.signed_pre_key.key_id} " +
@@ -363,6 +392,8 @@ class PreKeyApiClient(
                     bodyBytes = bodyBytes,
                     requestId = t2DiagRequestId,
                 )
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (t: Throwable) {
                 val elapsed = Clock.System.now().toEpochMilliseconds() - attemptStartMs
                 lastException = t
@@ -385,25 +416,23 @@ class PreKeyApiClient(
                             "protocol=unknown_pre_response",
                     )
                 }
-                if (attempt < PUBLISH_MAX_ATTEMPTS && t.isRetryable()) {
-                    val nextDelay = PUBLISH_RETRY_DELAYS_MS[attempt - 1]
-                    relayLog(
-                        RelayLogLevel.WARN,
+                if (attempt < PUBLISH_MAX_ATTEMPTS && t.isRetryableForPublish()) {
+                    val nextDelay = jitter(PUBLISH_RETRY_DELAYS_MS[attempt - 1])
+                    trace(
                         "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
                             "reason=${t::class.simpleName} attempt=$attempt " +
                             "next_delay_ms=$nextDelay elapsedMs=$elapsed",
-                        t,
+                        RelayLogLevel.WARN,
                     )
                     delay(nextDelay)
                     continue
                 } else {
                     val totalElapsed = Clock.System.now().toEpochMilliseconds() - totalStartMs
-                    relayLog(
-                        RelayLogLevel.WARN,
+                    trace(
                         "PREKEY_TRACE prekey_publish_fail_giving_up identity=$identityTag… " +
                             "total_elapsedMs=$totalElapsed attempts=$attempt " +
-                            "last_exception=${t::class.simpleName}: ${t.message ?: "<null>"}",
-                        t,
+                            "last_exception=${t::class.simpleName}",
+                        RelayLogLevel.WARN,
                     )
                     throw t
                 }
@@ -431,24 +460,40 @@ class PreKeyApiClient(
                 )
             }
 
-            // HTTP 408 or 5xx: server-side transient. Retry if budget remains.
-            if ((statusValue == 408 || statusValue in 500..599) &&
+            // CLIENT-PREKEY-SELFHEAL: HTTP 429 → retry-with-wait (jittered)
+            // instead of terminal Failure(RateLimited). No Retry-After
+            // header consumption for the publish path (design D6:
+            // narrowed contract; publish uses only the constant fallback).
+            if (statusValue == 429 && attempt < PUBLISH_MAX_ATTEMPTS) {
+                val nextDelay = jitter(RATE_LIMIT_FALLBACK_MS)
+                trace(
+                    "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
+                        "reason=http429 attempt=$attempt " +
+                        "next_delay_ms=$nextDelay elapsedMs=$elapsed",
+                    RelayLogLevel.WARN,
+                )
+                delay(nextDelay)
+                continue
+            }
+
+            // HTTP transient statuses (408/425/500-504): retry if budget
+            // remains. 425 (Too Early) added per CLIENT-PREKEY-SELFHEAL D6.
+            if (statusValue in HTTP_TRANSIENT_STATUSES &&
                 attempt < PUBLISH_MAX_ATTEMPTS
             ) {
-                val nextDelay = PUBLISH_RETRY_DELAYS_MS[attempt - 1]
-                relayLog(
-                    RelayLogLevel.WARN,
+                val nextDelay = jitter(PUBLISH_RETRY_DELAYS_MS[attempt - 1])
+                trace(
                     "PREKEY_TRACE prekey_publish_retry identity=$identityTag… " +
                         "reason=http$statusValue attempt=$attempt " +
                         "next_delay_ms=$nextDelay elapsedMs=$elapsed",
+                    RelayLogLevel.WARN,
                 )
                 delay(nextDelay)
                 continue
             }
 
             // Non-retryable or final attempt — process the result.
-            relayLog(
-                RelayLogLevel.INFO,
+            trace(
                 "PREKEY_TRACE prekey_publish_ok native=true identity=$identityTag… " +
                     "status=$statusValue elapsedMs=${nativeResp.elapsedMs} attempt=$attempt",
             )
@@ -506,49 +551,30 @@ class PreKeyApiClient(
         // Unreachable: the loop either returns or throws. Satisfy the compiler.
         val totalElapsed = Clock.System.now().toEpochMilliseconds() - totalStartMs
         val ex = lastException ?: IllegalStateException("publishWithRetry exhausted loop without result")
-        relayLog(
-            RelayLogLevel.WARN,
+        trace(
             "PREKEY_TRACE prekey_publish_fail_giving_up identity=$identityTag… " +
                 "total_elapsedMs=$totalElapsed attempts=$PUBLISH_MAX_ATTEMPTS " +
-                "last_exception=${ex::class.simpleName}: ${ex.message ?: "<null>"}",
+                "last_exception=${ex::class.simpleName}",
+            RelayLogLevel.WARN,
         )
         throw ex
     }
 
     /**
-     * Returns true if this throwable should trigger a publish retry.
-     *
-     * Retried:
-     *  - SocketTimeoutException — body upload stall (Tele2 LTE bug, PR-R0)
-     *    or read timeout on response headers.
-     *  - IOException with "connection reset" or "broken pipe" in the message —
-     *    TCP connection torn down by NAT/carrier mid-request.
+     * CLIENT-PREKEY-SELFHEAL: publish-side retry predicate. Delegates to
+     * the platform classifier ([classifyNetworkFailure]) so the whole
+     * client (fetchStatus + publishWithRetry) shares one taxonomy: no
+     * class-name-string matching, no drift between fetch and publish
+     * loops.
      *
      * NOT retried (server says the request itself was bad):
      *  - HTTP 400 Bad Request, 401 Unauthorized, 403 Forbidden, 422
-     *    Unprocessable Entity — retrying with the same payload won't help.
-     *  - These do not reach this function; the HTTP-status branch in
-     *    [publishWithRetry] handles them as non-retryable directly.
-     *
-     * Note: class-name matching is used instead of `is java.io.*` to keep
-     * this function in commonMain (no JVM-only imports). The names
-     * "SocketTimeoutException" and "IOException" are stable across JDK
-     * versions and Android runtime versions.
+     *    Unprocessable Entity — retrying with the same payload won't
+     *    help. These do not reach this function; the HTTP-status branch
+     *    in [publishWithRetry] handles them as non-retryable directly.
      */
-    private fun Throwable.isRetryable(): Boolean {
-        val simpleName = this::class.simpleName ?: ""
-        if (simpleName == "SocketTimeoutException") return true
-        // Match IOException and its subclasses by checking the chain of
-        // class simple names. SocketException, ConnectException, etc. are
-        // all subclasses of IOException; we want them too when their message
-        // indicates a network-layer teardown.
-        val msg = message?.lowercase() ?: ""
-        val isIoLike = simpleName.endsWith("IOException") ||
-            simpleName.endsWith("SocketException") ||
-            simpleName == "EOFException"
-        if (isIoLike && ("connection reset" in msg || "broken pipe" in msg)) return true
-        return false
-    }
+    private fun Throwable.isRetryableForPublish(): Boolean =
+        classifyNetworkFailure(this) == RetryDecision.RetryableTransient
 
     /**
      * Fetch a peer's [PreKeyBundle] — the server atomically consumes one
@@ -572,27 +598,31 @@ class PreKeyApiClient(
             }
         }
         val identityTag = identityPubkeyHex.take(16)
-        relayLog(
-            RelayLogLevel.INFO,
-            "PREKEY_TRACE http_bundle_fetch_start identity=$identityTag… url=$url",
+        val requesterTag = requesterPubkeyHex?.take(16)
+        // CLIENT-PREKEY-SELFHEAL D8: full URL contains the identity/requester
+        // pubkey and query params — redact to path + tags for logs.
+        trace(
+            "PREKEY_TRACE http_bundle_fetch_start identity=$identityTag… " +
+                "requester=${requesterTag ?: "none"}… path=/prekeys/bundle",
         )
         val startMs = Clock.System.now().toEpochMilliseconds()
         val response: HttpResponse = try {
             httpClient.get(url)
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (t: Throwable) {
             val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
-            relayLog(
-                RelayLogLevel.WARN,
+            trace(
                 "PREKEY_TRACE http_bundle_fetch_fail identity=$identityTag… " +
-                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
-                t,
+                    "type=${t::class.simpleName} elapsedMs=$elapsed",
+                RelayLogLevel.WARN,
             )
             throw t
         }
         val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
-        relayLog(
-            RelayLogLevel.INFO,
-            "PREKEY_TRACE http_bundle_fetch_done identity=$identityTag… status=${response.status.value} elapsedMs=$elapsed",
+        trace(
+            "PREKEY_TRACE http_bundle_fetch_done identity=$identityTag… " +
+                "status=${response.status.value} elapsedMs=$elapsed",
         )
         return when (response.status) {
             HttpStatusCode.OK ->
@@ -614,54 +644,292 @@ class PreKeyApiClient(
      * to decide replenish (count < 20) and SPK rotation (age >= 7 days)
      * without uploading anything.
      */
+    /**
+     * CLIENT-PREKEY-SELFHEAL: single-window per-attempt retry loop with
+     * classifier-driven retry taxonomy. Each attempt runs request-send
+     * + body-read under one [withTimeoutOrNull] guard so a broken TLS
+     * cannot leak past [FETCH_STATUS_ATTEMPT_DEADLINE_MS]. Retry counts
+     * per D6 (Retry-After: non-negative delta-seconds only, capped at
+     * 60s pre-conversion, HTTP-date form NOT parsed).
+     *
+     * Fatality shortcuts skip further attempts and emit a
+     * `verify_terminal_shortcut` marker so the operator sees the exact
+     * point the loop bailed. All markers routed through [trace] so a
+     * test observer (via [logObserver]) can assert log ordering
+     * without touching the real logger.
+     */
     override suspend fun fetchStatus(
         identityPubkeyHex: String,
         requesterPubkeyHex: String?,
     ): PreKeyStatus {
-        val url = buildString {
-            append(relayBaseUrl)
-            append("/prekeys/status/")
-            append(identityPubkeyHex)
-            if (requesterPubkeyHex != null) {
-                append("?requester=")
-                append(requesterPubkeyHex)
+        val url = buildStatusUrl(identityPubkeyHex, requesterPubkeyHex)
+        val identityTag = identityPubkeyHex.take(16)
+        val requesterTag = requesterPubkeyHex?.take(16)
+        val cycleStartMs = nowMs()
+        var lastException: Throwable? = null
+
+        for (attempt in 1..FETCH_STATUS_MAX_ATTEMPTS) {
+            val attemptStartMs = nowMs()
+            trace(
+                "PREKEY_TRACE http_status_start identity=$identityTag… " +
+                    "requester=${requesterTag ?: "none"}… path=/prekeys/status " +
+                    "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS",
+            )
+
+            val received: ResponseAndBody? = try {
+                withTimeoutOrNull(FETCH_STATUS_ATTEMPT_DEADLINE_MS) {
+                    val response = httpClient.get(url)
+                    ResponseAndBody(response, response.bodyAsText())
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                // CLIENT-PREKEY-SELFHEAL P0-1: Ktor 3.0.3 client raises this
+                // exact bare `IllegalStateException` from
+                // `io.ktor.client.call.SavedHttpCall.<init>` (via
+                // `checkContentLength` in `io.ktor.client.call.utils.kt`)
+                // when the declared `Content-Length` header differs from
+                // the actual body byte count. It fires BEFORE
+                // `bodyAsText()` runs, so our own `classifyBodyTruncation`
+                // (BodyClass.TruncatedByLength arm) never sees the body.
+                // Ktor's `throw IllegalStateException("Content-Length
+                // mismatch: expected N bytes, but received M bytes")`
+                // carries no cause and no distinct subclass, so the
+                // narrowest safe translation is a message-prefix probe.
+                // Route it into the exact same retry arm as the
+                // BodyClass.Empty / BodyClass.TruncatedByLength branch
+                // (see `reason=body_truncated`) so a middlebox-truncated
+                // 2xx does NOT terminate as `TerminalOther` on attempt 1.
+                //
+                // This is a version-pinned translation: if Ktor changes
+                // the message wording, the T7b regression test in
+                // PreKeyApiClientFetchStatusRetryTest will fail loudly
+                // (and the classifier / retry surface will fall through
+                // to the general `TerminalOther` arm, so behaviour stays
+                // safe — just no longer retryable). No cross-classifier
+                // spread — the recognition is local to fetchStatus.
+                if (t is IllegalStateException &&
+                    t.message?.startsWith("Content-Length mismatch:") == true
+                ) {
+                    if (attempt < FETCH_STATUS_MAX_ATTEMPTS) {
+                        val nextDelay = jitter(FETCH_STATUS_RETRY_DELAYS_MS[attempt - 1])
+                        trace(
+                            "PREKEY_TRACE verify_retry_scheduled " +
+                                "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                                "delay_ms=$nextDelay reason=body_truncated",
+                            RelayLogLevel.WARN,
+                        )
+                        delay(nextDelay)
+                        continue
+                    }
+                    trace(
+                        "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                            "last_reason=body_truncated " +
+                            "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                        RelayLogLevel.WARN,
+                    )
+                    throw PreKeyBodyTruncatedException(attempt)
+                }
+                when (classifyNetworkFailure(t)) {
+                    RetryDecision.TerminalTls -> {
+                        trace(
+                            "PREKEY_TRACE http_status_fatal identity=$identityTag… " +
+                                "type=${t::class.simpleName} " +
+                                "elapsedMs=${nowMs() - attemptStartMs}",
+                            RelayLogLevel.ERROR,
+                        )
+                        trace(
+                            "PREKEY_TRACE verify_terminal_shortcut attempt=$attempt " +
+                                "reason=${t::class.simpleName} " +
+                                "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                            RelayLogLevel.WARN,
+                        )
+                        throw t
+                    }
+                    RetryDecision.TerminalOther -> {
+                        trace(
+                            "PREKEY_TRACE verify_terminal_shortcut attempt=$attempt " +
+                                "reason=${t::class.simpleName} " +
+                                "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                            RelayLogLevel.WARN,
+                        )
+                        throw t
+                    }
+                    RetryDecision.RetryableTransient -> {
+                        if (attempt < FETCH_STATUS_MAX_ATTEMPTS) {
+                            val nextDelay = jitter(FETCH_STATUS_RETRY_DELAYS_MS[attempt - 1])
+                            lastException = t
+                            trace(
+                                "PREKEY_TRACE verify_retry_scheduled " +
+                                    "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                                    "delay_ms=$nextDelay reason=${t::class.simpleName}",
+                                RelayLogLevel.WARN,
+                            )
+                            delay(nextDelay)
+                            continue
+                        }
+                        trace(
+                            "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                                "last_reason=${t::class.simpleName} " +
+                                "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                            RelayLogLevel.WARN,
+                        )
+                        throw t
+                    }
+                }
+                // unreachable — every branch above throws or continues.
+                @Suppress("UNREACHABLE_CODE")
+                null
+            }
+
+            // Own-deadline expiry: withTimeoutOrNull returned null.
+            if (received == null) {
+                if (attempt < FETCH_STATUS_MAX_ATTEMPTS) {
+                    val nextDelay = jitter(FETCH_STATUS_RETRY_DELAYS_MS[attempt - 1])
+                    trace(
+                        "PREKEY_TRACE verify_retry_scheduled " +
+                            "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                            "delay_ms=$nextDelay reason=attempt_deadline",
+                        RelayLogLevel.WARN,
+                    )
+                    delay(nextDelay)
+                    continue
+                }
+                trace(
+                    "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                        "last_reason=attempt_deadline " +
+                        "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                    RelayLogLevel.WARN,
+                )
+                throw FetchStatusDeadlineExceededException()
+            }
+
+            val response = received.response
+            val bodyResult = received.body
+            when (val status = response.status) {
+                HttpStatusCode.OK -> {
+                    when (classifyBodyTruncation(response, bodyResult)) {
+                        BodyClass.Empty, BodyClass.TruncatedByLength -> {
+                            if (attempt < FETCH_STATUS_MAX_ATTEMPTS) {
+                                val nextDelay = jitter(FETCH_STATUS_RETRY_DELAYS_MS[attempt - 1])
+                                trace(
+                                    "PREKEY_TRACE verify_retry_scheduled " +
+                                        "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                                        "delay_ms=$nextDelay reason=body_truncated",
+                                    RelayLogLevel.WARN,
+                                )
+                                delay(nextDelay)
+                                continue
+                            }
+                            trace(
+                                "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                                    "last_reason=body_truncated " +
+                                    "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                                RelayLogLevel.WARN,
+                            )
+                            throw PreKeyBodyTruncatedException(attempt)
+                        }
+                        BodyClass.Complete -> {
+                            val parsed = try {
+                                json.decodeFromString(PreKeyStatus.serializer(), bodyResult)
+                            } catch (se: SerializationException) {
+                                trace(
+                                    "PREKEY_TRACE http_status_decode_fatal " +
+                                        "identity=$identityTag… bodyLen=${bodyResult.length}",
+                                    RelayLogLevel.ERROR,
+                                )
+                                trace(
+                                    "PREKEY_TRACE verify_terminal_shortcut attempt=$attempt " +
+                                        "reason=decode_${se::class.simpleName} " +
+                                        "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                                    RelayLogLevel.WARN,
+                                )
+                                throw se
+                            }
+                            if (attempt > 1) {
+                                trace(
+                                    "PREKEY_TRACE verify_retry_converged attempt=$attempt " +
+                                        "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                                )
+                            }
+                            return parsed
+                        }
+                    }
+                }
+                HttpStatusCode.TooManyRequests -> {
+                    if (attempt < FETCH_STATUS_MAX_ATTEMPTS) {
+                        val serverRetryAfter =
+                            parseRetryAfterMs(response.headers["Retry-After"])
+                        val nextDelay = serverRetryAfter
+                            ?: jitter(RATE_LIMIT_FALLBACK_MS)
+                        trace(
+                            "PREKEY_TRACE verify_retry_scheduled " +
+                                "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                                "delay_ms=$nextDelay reason=http429",
+                            RelayLogLevel.WARN,
+                        )
+                        delay(nextDelay)
+                        continue
+                    }
+                    trace(
+                        "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                            "last_reason=http429 " +
+                            "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                        RelayLogLevel.WARN,
+                    )
+                    throw BundleFetchException.RateLimited(bodyResult)
+                }
+                else -> {
+                    if (status.value in HTTP_TRANSIENT_STATUSES &&
+                        attempt < FETCH_STATUS_MAX_ATTEMPTS
+                    ) {
+                        val nextDelay = jitter(FETCH_STATUS_RETRY_DELAYS_MS[attempt - 1])
+                        trace(
+                            "PREKEY_TRACE verify_retry_scheduled " +
+                                "attempt=$attempt/$FETCH_STATUS_MAX_ATTEMPTS " +
+                                "delay_ms=$nextDelay reason=http${status.value}",
+                            RelayLogLevel.WARN,
+                        )
+                        delay(nextDelay)
+                        continue
+                    }
+                    if (status.value in HTTP_TRANSIENT_STATUSES) {
+                        trace(
+                            "PREKEY_TRACE verify_retry_exhausted total_attempts=$attempt " +
+                                "last_reason=http${status.value} " +
+                                "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                            RelayLogLevel.WARN,
+                        )
+                    } else {
+                        trace(
+                            "PREKEY_TRACE verify_terminal_shortcut attempt=$attempt " +
+                                "reason=http${status.value} " +
+                                "total_elapsed_ms=${nowMs() - cycleStartMs}",
+                            RelayLogLevel.WARN,
+                        )
+                    }
+                    throw BundleFetchException.Unexpected(status.value, bodyResult)
+                }
             }
         }
-        val identityTag = identityPubkeyHex.take(16)
-        relayLog(
-            RelayLogLevel.INFO,
-            "PREKEY_TRACE http_status_start identity=$identityTag… url=$url",
-        )
-        val startMs = Clock.System.now().toEpochMilliseconds()
-        val response: HttpResponse = try {
-            httpClient.get(url)
-        } catch (t: Throwable) {
-            val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
-            relayLog(
-                RelayLogLevel.WARN,
-                "PREKEY_TRACE http_status_fail identity=$identityTag… " +
-                    "type=${t::class.simpleName} elapsedMs=$elapsed message=${t.message ?: "<null>"}",
-                t,
-            )
-            throw t
-        }
-        val elapsed = Clock.System.now().toEpochMilliseconds() - startMs
-        relayLog(
-            RelayLogLevel.INFO,
-            "PREKEY_TRACE http_status_done identity=$identityTag… status=${response.status.value} elapsedMs=$elapsed",
-        )
-        return when (response.status) {
-            HttpStatusCode.OK ->
-                json.decodeFromString(PreKeyStatus.serializer(), response.bodyAsText())
-            HttpStatusCode.TooManyRequests ->
-                throw BundleFetchException.RateLimited(response.bodyAsText())
-            else ->
-                throw BundleFetchException.Unexpected(
-                    response.status.value,
-                    response.bodyAsText(),
-                )
+        throw lastException
+            ?: IllegalStateException("fetchStatus retry loop exit without result")
+    }
+
+    private fun buildStatusUrl(
+        identityPubkeyHex: String,
+        requesterPubkeyHex: String?,
+    ): String = buildString {
+        append(relayBaseUrl)
+        append("/prekeys/status/")
+        append(identityPubkeyHex)
+        if (requesterPubkeyHex != null) {
+            append("?requester=")
+            append(requesterPubkeyHex)
         }
     }
+
+    private data class ResponseAndBody(val response: HttpResponse, val body: String)
 
     companion object {
         /** Total publish attempts (1 initial + 2 retries). PR-R0. */
@@ -670,9 +938,51 @@ class PreKeyApiClient(
         /**
          * Delays in milliseconds between consecutive publish attempts.
          * Index i is the delay BEFORE attempt i+2 (i.e., after attempt i+1 fails).
-         * Length must be >= PUBLISH_MAX_ATTEMPTS - 1. PR-R0.
+         * Length must be >= PUBLISH_MAX_ATTEMPTS - 1.
+         *
+         * CLIENT-PREKEY-SELFHEAL: trimmed from 3 elements to 2. The third
+         * element was dead code — publishWithRetry never indexed past
+         * `PUBLISH_RETRY_DELAYS_MS[PUBLISH_MAX_ATTEMPTS - 2]` (index 1) and
+         * a fresh 3000ms element could not be reached by any code path.
          */
-        val PUBLISH_RETRY_DELAYS_MS: LongArray = longArrayOf(500L, 1500L, 3000L)
+        val PUBLISH_RETRY_DELAYS_MS: LongArray = longArrayOf(500L, 1500L)
+
+        // ── CLIENT-PREKEY-SELFHEAL fetchStatus retry constants ──────────
+        /** Total fetchStatus attempts (1 initial + 2 retries). */
+        const val FETCH_STATUS_MAX_ATTEMPTS: Int = 3
+
+        /**
+         * Delays in milliseconds between consecutive fetchStatus attempts.
+         * Index i is the delay BEFORE attempt i+2 (i.e., after attempt i+1
+         * failed). Length must be FETCH_STATUS_MAX_ATTEMPTS - 1.
+         */
+        val FETCH_STATUS_RETRY_DELAYS_MS: LongArray = longArrayOf(500L, 1500L)
+
+        /**
+         * Per-attempt wall-clock deadline covering the entire attempt
+         * (request-send + body-read together — a single withTimeoutOrNull
+         * window). Chosen to leave slack for cross-attempt jittered
+         * back-offs and a total upper bound near 20s without user-visible
+         * hang.
+         */
+        const val FETCH_STATUS_ATTEMPT_DEADLINE_MS: Long = 15_000L
+
+        /**
+         * Fallback wait applied on HTTP 429 when no valid `Retry-After`
+         * header is present. Value is deliberately conservative: the
+         * relay's rate-limiter windows are seconds, not milliseconds, and
+         * a jittered 5s pause avoids hot-looping without appreciably
+         * delaying legitimate republish.
+         */
+        const val RATE_LIMIT_FALLBACK_MS: Long = 5_000L
+
+        /**
+         * HTTP statuses treated as retryable transient at the publish
+         * layer. 425 (Too Early) added per CLIENT-PREKEY-SELFHEAL D6:
+         * some middleboxes surface early-data replay collisions this way,
+         * and it is safe to retry on a fresh transport.
+         */
+        val HTTP_TRANSIENT_STATUSES: Set<Int> = setOf(408, 425, 500, 502, 503, 504)
     }
 }
 
