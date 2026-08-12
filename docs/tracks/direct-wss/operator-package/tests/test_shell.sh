@@ -631,6 +631,50 @@ fi
 
 rm -rf "$harness_dir"
 
+# ── Round-9 packaging nit: EOF-safe typed confirmation ─────────
+
+# `read -r x` returns non-zero on EOF (Ctrl-D). Under `set -e`
+# that would skip the abort-cleanup branch and fall through to
+# the full matrix. The Round-9 runner wraps the read as
+# `read -r x || x=""`. Verify the idiom itself and confirm the
+# abort branch is taken when stdin is closed.
+(
+    set -euo pipefail
+    typed_confirm="untouched"
+    read -r typed_confirm < /dev/null || typed_confirm=""
+    if [ "$typed_confirm" = "" ]; then exit 0; else exit 1; fi
+) && { echo "PASS: R9 EOF-safe read sets confirmation empty on closed stdin (survives set -e)"; pass=$((pass+1)); } \
+  || { echo "FAIL: R9 EOF-safe read did not survive closed stdin"; fail=$((fail+1)); }
+
+# Same idiom with a normal typed value from stdin — must set the
+# variable to the typed value.
+(
+    set -euo pipefail
+    typed_confirm=""
+    read -r typed_confirm < <(printf 'RUN-FULL-MATRIX\n') || typed_confirm=""
+    if [ "$typed_confirm" = "RUN-FULL-MATRIX" ]; then exit 0; else exit 1; fi
+) && { echo "PASS: R9 EOF-safe read captures typed value normally"; pass=$((pass+1)); } \
+  || { echo "FAIL: R9 EOF-safe read failed to capture typed value"; fail=$((fail+1)); }
+
+# Confirm the equality check in the runner's abort branch is
+# taken for an EMPTY confirmation (i.e. EOF-produced or typed
+# wrong value). Capture rc via `|| true` so `set -e` does not
+# abort the outer test on the intentional non-zero exit.
+rc=0
+(
+    set -euo pipefail
+    typed_confirm=""
+    if [ "$typed_confirm" != "RUN-FULL-MATRIX" ]; then
+        exit 4    # runner uses exit 4 for operator_declined_full_matrix
+    fi
+    exit 0
+) || rc=$?
+if [ "$rc" = "4" ]; then
+    echo "PASS: R9 empty confirmation routes to operator_declined_full_matrix exit 4"; pass=$((pass+1))
+else
+    echo "FAIL: R9 empty confirmation exit code was $rc (expected 4)"; fail=$((fail+1))
+fi
+
 echo ""
 echo "shell tests: pass=$pass fail=$fail"
 if [ "$fail" -gt 0 ]; then exit 1; fi

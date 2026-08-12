@@ -339,10 +339,18 @@ for row in "${cells[@]}"; do
         printf '  * type RUN-FULL-MATRIX to continue with the remaining 39 envelopes\n'
         printf '  * anything else aborts cleanly (pins cleared, matrix_completion recorded)\n'
         printf 'confirmation> '
-        read -r typed_confirm
+        # §12 Round-9 packaging nit: `read -r` returns non-zero on
+        # EOF (Ctrl-D, closed stdin). Under `set -e` that would
+        # skip the abort-cleanup below and fall through — treat
+        # any non-zero read (EOF, error) as an EMPTY confirmation
+        # so the equality check below routes it into the abort
+        # branch. Result: EOF cannot silently proceed to the full
+        # 8×5 matrix.
+        typed_confirm=""
+        read -r typed_confirm || typed_confirm=""
         if [ "$typed_confirm" != "RUN-FULL-MATRIX" ]; then
           ABORT_REASON="operator_declined_full_matrix"
-          echo "ABORT: operator did not type RUN-FULL-MATRIX — clearing pins and exiting." >&2
+          echo "ABORT: operator did not type RUN-FULL-MATRIX (or stdin closed) — clearing pins and exiting." >&2
           "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
           "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
           "$HERE/diag-cmd.sh" clear --serial "$phone" >/dev/null 2>&1 || true

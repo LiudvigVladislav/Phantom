@@ -193,18 +193,21 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         // network work risks ANR or process kill during a diagnosed
         // hang (the exact class of product signal we came to Yota
         // to investigate). Instead: fire the coordinator on its
-        // OWN application-lifetime scope
+        // OWN process-local scope
         // (`DiagnosticSendCoordinator.asyncTrigger` uses
         // `CoroutineScope(SupervisorJob() + Dispatchers.IO)` created
-        // at coordinator construction time), and return from
-        // `onReceive` synchronously — the `diag-cmd.sh send`
-        // wrapper additionally passes `--async` so the ADB reply
-        // does not wait for the broadcast to finish either. The
-        // coordinator's coroutine still runs to completion regardless
-        // (the scope outlives this receiver instance), emitting
+        // at coordinator construction time — scope is bound to the
+        // coordinator instance, which outlives this receiver
+        // invocation; a process kill still loses it, and that
+        // manifests as integrity RED / NOT_EVALUABLE at verifier
+        // time via the missing matrix_completion.json marker), and
+        // return from `onReceive` synchronously — the
+        // `diag-cmd.sh send` wrapper additionally passes `--async`
+        // so the ADB reply does not wait for the broadcast to
+        // finish either. The coordinator's coroutine emits
         // `diagnostic_send_dispatched` immediately and
-        // `diagnostic_send_command_completed` after
-        // `sendMessage` returns / throws.
+        // `diagnostic_send_command_completed` after `sendMessage`
+        // returns / throws — up to the point of a process kill.
         coordinator.asyncTrigger(cellId!!, sequence) { /* no-op */ }
     }
 

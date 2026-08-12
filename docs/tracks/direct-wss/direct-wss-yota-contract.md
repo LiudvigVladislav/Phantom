@@ -78,12 +78,21 @@ ANR or process kill during a diagnosed hang.
 `DiagnosticCommandReceiver.handleSend` now calls
 `coordinator.asyncTrigger(cellId, sequence) { }` and returns
 synchronously — `asyncTrigger` uses `DiagnosticSendCoordinator`'s
-own application-lifetime `CoroutineScope(SupervisorJob() +
-Dispatchers.IO)` which outlives this receiver instance. The
+own process-local `CoroutineScope(SupervisorJob() +
+Dispatchers.IO)` bound to the coordinator instance (which itself
+outlives this receiver invocation). The scope is NOT true
+application-lifetime — an Android process kill (LMK, ANR, etc.)
+loses it. That's acceptable for this diagnostic: process death
+during a diagnosed hang leaves an incomplete evidence bundle,
+and the verifier's `matrix_completion.json` requirement + the
+`sender_send_attempt_started → sender_enqueue → sender_prekey_deferred`
+schema render the incompleteness as integrity RED /
+`product_outcome=NOT_EVALUABLE` (never a silent GREEN). The
 coordinator still emits `diagnostic_send_dispatched` immediately
 (BEFORE calling `sendMessage`) and
-`diagnostic_send_command_completed` after
-return/exception, regardless of how long `sendMessage` takes.
+`diagnostic_send_command_completed` after return/exception,
+regardless of how long `sendMessage` takes — up to the point of
+a process kill.
 
 Combined with the `--async` flag on the ADB side, the smoke path
 is: `diag-cmd.sh send` → ADB replies immediately →
