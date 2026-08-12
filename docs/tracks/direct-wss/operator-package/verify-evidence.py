@@ -68,6 +68,13 @@ REQUIRED_FILES = [
     "matrix.json",
     "preflight.json",
     "device-manifest.json",
+    # §12 Round-6 audit P0-2: atomic matrix-completion marker written
+    # by run-matrix.sh at end-of-run (whether it completed the full
+    # 8×5 matrix or was aborted by the fail-fast gate). Its absence
+    # is integrity RED — a bundle without this marker cannot prove
+    # the matrix reached a defined stopping point rather than being
+    # killed mid-cell by an operator or by a process crash.
+    "matrix_completion.json",
 ]
 
 FIELD_RE = re.compile(r"(\w+)=(\S+)")
@@ -117,9 +124,11 @@ MATRIX_EVENTS = {
     "diagnostic_state_cleared",
     "diagnostic_pin_active",
     "diagnostic_send_dispatched",
+    "diagnostic_send_command_completed",
     "diagnostic_send_rejected_no_paired_conversation",
     "diagnostic_send_rejected_multiple_paired_conversations",
 }
+ALLOWED_COMMAND_RESULTS = frozenset({"accepted", "rejected", "exception"})
 CROSS_RUN_TOLERATED_EVENTS = {
     "diagnostic_session_started",
     "diagnostic_canary",
@@ -149,6 +158,10 @@ class WssEvent:
     dispatched: Optional[bool] = None
     restored: Optional[bool] = None
     sequence: Optional[int] = None
+    # §12 Round-6 audit P0-1: diagnostic_send_command_completed.result
+    # ∈ {accepted, rejected, exception}. Any other value is a schema
+    # violation surfaced by the parser as an integrity issue.
+    result: Optional[str] = None
     raw: str = ""
 
 
@@ -283,6 +296,7 @@ def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str
                 dispatched=dispatched_val,
                 restored=restored_val,
                 sequence=seq,
+                result=fields.get("result"),
                 raw=line.rstrip("\n"),
             ))
     return out, parse_errors
@@ -487,7 +501,7 @@ def _validate_cross_file_run_consistency(
 
 def integrity_check_bundle(
     events: list[WssEvent], out: str, matrix: dict, preflight: dict, manifest: dict,
-    file_load_errors: list[str],
+    completion: dict, file_load_errors: list[str],
 ) -> list[str]:
     problems: list[str] = list(file_load_errors)
 
@@ -660,6 +674,72 @@ def integrity_check_bundle(
                 problems.append(f"event {e.event} missing run_id")
             elif e.run_id != run_id_matrix and e.run_id != "-":
                 problems.append(f"event {e.event} has run_id={e.run_id} but matrix.run_id={run_id_matrix}")
+
+    # §12 Round-6 audit P0-2: matrix_completion.json must exist,
+    # carry a matching run_id, and its cells_ran count must equal
+    # the number of non-blocked cells in matrix.json OR carry an
+    # abort_reason. Aborted runs are always integrity RED — they
+    # produced an incomplete matrix and the runner said so.
+    if not isinstance(completion.get("run_id"), str) or not completion.get("run_id"):
+        problems.append("matrix_completion.json missing or wrong-typed run_id")
+    elif run_id_matrix and completion.get("run_id") != run_id_matrix:
+        problems.append(
+            f"matrix_completion.run_id={completion.get('run_id')!r} != matrix.run_id={run_id_matrix!r}",
+        )
+    non_blocked = [c for c in cells_raw if isinstance(c, dict) and c.get("blocked") is not True]
+    expected_cells_ran = len(non_blocked)
+    cells_ran = completion.get("cells_ran")
+    abort_reason = completion.get("abort_reason")
+    if abort_reason is not None:
+        if not isinstance(abort_reason, str) or not abort_reason:
+            problems.append(f"matrix_completion.abort_reason not a non-empty string: {abort_reason!r}")
+        else:
+            problems.append(
+                f"matrix_completion reports abort_reason={abort_reason!r} — matrix did not run to completion",
+            )
+    else:
+        if not isinstance(cells_ran, int) or isinstance(cells_ran, bool):
+            problems.append(f"matrix_completion.cells_ran not an integer: {cells_ran!r}")
+        elif cells_ran != expected_cells_ran:
+            problems.append(
+                f"matrix_completion.cells_ran={cells_ran} != expected {expected_cells_ran} (non-blocked cells)",
+            )
+
+    # §12 Round-6 audit P0-1: every diagnostic_send_dispatched
+    # correlation_id must have a matching sender_enqueue with the
+    # same CID on the SAME sender device. Round-5 lived Yota run had
+    # 15 dispatched events and ZERO enqueues — a genuine false GREEN
+    # that certified an aborted matrix as evidence_integrity=GREEN.
+    dispatched_by_cid: dict[str, WssEvent] = {}
+    for e in events:
+        if e.event == "diagnostic_send_dispatched" and e.correlation_id:
+            dispatched_by_cid[e.correlation_id] = e
+    enqueue_cids_set: set[str] = {
+        e.correlation_id for e in events
+        if e.event == "sender_enqueue" and e.correlation_id
+    }
+    for cid, disp in dispatched_by_cid.items():
+        if cid not in enqueue_cids_set:
+            # Exclude the preflight REST-capability probe cell — its
+            # dispatched intentionally has no enqueue matching (the
+            # probe classifies via sender_rest_post_completed only).
+            if disp.cell_id == "preflight.rest_capability":
+                continue
+            problems.append(
+                f"diagnostic_send_dispatched cid={cid[:8]}… (cell={disp.cell_id}) "
+                f"has no matching sender_enqueue — production send path never reached",
+            )
+
+    # §12 Round-6 audit P0-1: diagnostic_send_command_completed.result
+    # must be one of {accepted, rejected, exception}. Presence proves
+    # the receiver observed a definitive outcome from the coordinator.
+    for e in events:
+        if e.event == "diagnostic_send_command_completed":
+            if e.result not in ALLOWED_COMMAND_RESULTS:
+                problems.append(
+                    f"diagnostic_send_command_completed has invalid result={e.result!r} "
+                    f"(allowed: {sorted(ALLOWED_COMMAND_RESULTS)})",
+                )
 
     # Round-3 audit P0-1: every sender_enqueue must carry a non-empty
     # correlation_id. A missing CID lets a cell's five envelopes join
@@ -902,19 +982,25 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
     matrix_path = os.path.join(out, "matrix.json")
     manifest_path = os.path.join(out, "device-manifest.json")
     preflight_path = os.path.join(out, "preflight.json")
+    completion_path = os.path.join(out, "matrix_completion.json")
 
     matrix, matrix_err = _load_json(matrix_path, dict)
     manifest, manifest_err = _load_json(manifest_path, dict)
     preflight, preflight_err = _load_json(preflight_path, dict)
-    file_load_errors = [e for e in (matrix_err, manifest_err, preflight_err) if e]
+    completion, completion_err = _load_json(completion_path, dict)
+    file_load_errors = [e for e in (matrix_err, manifest_err, preflight_err, completion_err) if e]
 
     assert isinstance(matrix, dict) and isinstance(manifest, dict) and isinstance(preflight, dict)
+    assert isinstance(completion, dict)
 
     integrity_issues = integrity_check_bundle(
-        all_events, out, matrix, preflight, manifest, file_load_errors,
+        all_events, out, matrix, preflight, manifest, completion, file_load_errors,
     )
     integrity_issues += phone_parse_errors + emu_parse_errors
-    integrity_ok = not integrity_issues
+    # §12 Round-6 audit P0-2: `integrity_ok` is finalized AFTER the
+    # per-cell loop so late-added issues (e.g. `cell X has 0
+    # sender_enqueue events`) are counted before product_outcome is
+    # decided.
 
     run_id_matrix = matrix.get("run_id") or ""
 
@@ -988,8 +1074,19 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
         cr.envelopes = len(enqueues)
 
         if cr.envelopes != EXPECTED_ENVELOPES_PER_CELL:
+            # §12 Round-6 audit P0-2: an incomplete cell (0-4
+            # envelopes in a non-blocked cell) is an INTEGRITY
+            # violation, not a mere product outcome. Round-5 lived
+            # Yota run had envs=0 across all 8 cells and the verifier
+            # still returned integrity_ok=True — a genuine false
+            # GREEN. The cell also lands as Unresolved, but the
+            # aggregate outcome is derived from integrity_ok below.
             cr.issues.append(f"envelope count = {cr.envelopes} (expected {EXPECTED_ENVELOPES_PER_CELL})")
             cr.outcome = "Unresolved"
+            integrity_issues.append(
+                f"cell {cr.cell_id} has {cr.envelopes} sender_enqueue events "
+                f"(expected {EXPECTED_ENVELOPES_PER_CELL}) — incomplete matrix",
+            )
             aggregate_red = True
             cells_report.append(cr)
             continue
@@ -1056,7 +1153,16 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
             cr.outcome = "Delivered once"
         cells_report.append(cr)
 
-    if aggregate_red:
+    integrity_ok = not integrity_issues
+    if not integrity_ok:
+        # §12 Round-6 audit P0-2: a bundle that fails integrity CANNOT
+        # produce an authoritative product verdict — the operator
+        # (and any downstream reader) MUST NOT read a `RED` or
+        # `GREEN` product outcome from an incomplete run. The
+        # sentinel `NOT_EVALUABLE` marks it explicitly and forbids
+        # confusion with a real product signal.
+        product_outcome = "NOT_EVALUABLE"
+    elif aggregate_red:
         product_outcome = "RED"
     elif aggregate_pending:
         product_outcome = "PENDING"
@@ -1091,6 +1197,10 @@ def render_markdown(rep: VerifyReport) -> str:
         lines.append(f"| `{c.cell_id}` | {c.pin} | {c.direction} | {c.scenario} | {c.envelopes} | **{c.outcome}** | {issues} |")
     lines.append("")
     lines.append(f"## Aggregate: product_outcome = **{rep.product_outcome}**")
+    if rep.product_outcome == "NOT_EVALUABLE":
+        lines.append("")
+        lines.append("**`NOT_EVALUABLE` means integrity failed. The product cells above are NOT authoritative** —")
+        lines.append("they are shown for diagnosis only. Do NOT interpret them as pass/fail signals.")
     lines.append("")
     lines.append("Notes: relay ingress / dedup / persistence are NOT verified here")
     lines.append("(client-only first-pass). `recipient_message_persisted` proves")
@@ -1120,6 +1230,11 @@ def main() -> int:
     print(f"product_outcome={rep.product_outcome}")
     print(f"report: {report_path}")
 
+    # Exit codes:
+    #   0 = integrity GREEN + product Delivered once on every non-blocked cell
+    #   1 = integrity RED (product_outcome is NOT_EVALUABLE — do not read it)
+    #   2 = integrity GREEN + product RED
+    #   3 = integrity GREEN + product PENDING (rerun after 120 s)
     if not rep.integrity_ok:
         return 1
     if rep.product_outcome == "PENDING":

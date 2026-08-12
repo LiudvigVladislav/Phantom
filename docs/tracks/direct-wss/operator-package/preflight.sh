@@ -80,8 +80,23 @@ for serial in "$phone" "$emu"; do
     if ! adb -s "$serial" shell pm list packages | tr -d '\r' | grep -q "package:$APP_ID"; then
         echo "preflight FAILED: $APP_ID not installed on $serial — run bootstrap.sh --fresh first" >&2; exit 1
     fi
-    if ! adb -s "$serial" shell dumpsys package "$APP_ID" | tr -d '\r' | grep -q "DiagnosticCommandReceiver"; then
-        echo "preflight FAILED: DiagnosticCommandReceiver missing on $serial — installed variant is not debug" >&2; exit 1
+    # §12 Round-6 audit live-Mac fix: on API 36 `dumpsys package` output
+    # no longer includes the receiver's simple class name in a form
+    # `grep DiagnosticCommandReceiver` can find; the previous check
+    # false-negatived on a valid debug APK. Replace with an ACTIVE,
+    # non-mutating health readback: fire `diag-cmd.sh health` and
+    # confirm a `WSS_DIAG_CMD health emitter_id=` line appears within
+    # 5 seconds. Only the debug variant registers the receiver AND
+    # implements the health subcommand — a release APK would silently
+    # drop the broadcast.
+    adb -s "$serial" logcat -c
+    "$HERE/lib/diag-cmd.sh" health --serial "$serial" >/dev/null || {
+        echo "preflight FAILED: diag-cmd.sh health broadcast to $serial exited non-zero — receiver not present or DUMP permission missing" >&2; exit 1
+    }
+    sleep 2
+    if ! adb -s "$serial" logcat -d WSS_DIAG_CMD:V "*:S" | grep -q "health emitter_id="; then
+        echo "preflight FAILED: no active health readback from $serial after 2s — installed variant is not debug (release APK never registers the DiagnosticCommandReceiver)" >&2
+        exit 1
     fi
     # Pull base.apk (there may be multiple split APKs; the base one is
     # the one containing the receiver — pick the first `base.apk`).

@@ -32,6 +32,30 @@ fi
 
 RUN_ID=$(cat "$OUT/run_id")
 
+# §12 Round-6 audit P0-2: guarantee an atomic matrix-completion
+# marker is written for EVERY exit path (normal completion,
+# fail-fast abort, unexpected error, user Ctrl-C). The verifier
+# refuses a bundle without this marker — otherwise a killed
+# matrix looks identical to a completed one.
+CELLS_RAN=0
+ABORT_REASON=""
+write_matrix_completion() {
+  local now_ms; now_ms=$(now_ms)
+  local body
+  if [ -n "$ABORT_REASON" ]; then
+    body=$(printf '{"run_id":"%s","completed_at_wall_ms":%s,"cells_ran":%s,"abort_reason":"%s"}' \
+                  "$RUN_ID" "$now_ms" "$CELLS_RAN" "$ABORT_REASON")
+  else
+    body=$(printf '{"run_id":"%s","completed_at_wall_ms":%s,"cells_ran":%s}' \
+                  "$RUN_ID" "$now_ms" "$CELLS_RAN")
+  fi
+  # Write atomically via a same-dir tmp + mv (POSIX rename).
+  local tmp="$OUT/.matrix_completion.$$"
+  printf '%s' "$body" > "$tmp"
+  mv "$tmp" "$OUT/matrix_completion.json"
+}
+trap 'write_matrix_completion' EXIT
+
 phone=$(grep '^PHONE=' "$OUT/roles.env" | cut -d= -f2)
 emu=$(grep '^EMULATOR=' "$OUT/roles.env" | cut -d= -f2)
 
@@ -137,6 +161,41 @@ poll_envelope() {
   done
 }
 
+# §12 Round-6 audit P0-3: fail-fast gate. After the first canonical
+# cell fires sequence=1, poll for FOUR instrumentation signals
+# matching the returned CID for up to 15 seconds:
+#   * sender_enqueue        (DefaultMessagingService entry)
+#   * sender_transport_decision (HRT.send decision point)
+#   * one of sender_wss_send_returned | sender_rest_post_completed
+#   * diagnostic_send_command_completed with result != rejected
+# If any is missing after 15 s → tooling / instrumentation failure;
+# abort matrix immediately WITHOUT waiting 120 s per cell for the
+# remaining 39 envelopes.
+gate_first_envelope() {
+  local cid="$1" cell_pin="$2"
+  local start; start=$(now_ms)
+  local deadline_ms=$(( start + 15000 ))
+  while : ; do
+    local enq dec ret cmd
+    enq=$(count_matches "event=sender_enqueue.*correlation_id=$cid" "$phone_log" "$emu_log")
+    dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$phone_log" "$emu_log")
+    if [ "$cell_pin" = "wss" ]; then
+      ret=$(count_matches "event=sender_wss_send_returned.*correlation_id=$cid" "$phone_log" "$emu_log")
+    else
+      ret=$(count_matches "event=sender_rest_post_completed.*correlation_id=$cid" "$phone_log" "$emu_log")
+    fi
+    cmd=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid" "$phone_log" "$emu_log")
+    if [ "$enq" -ge 1 ] && [ "$dec" -ge 1 ] && [ "$ret" -ge 1 ] && [ "$cmd" -ge 1 ]; then
+      return 0
+    fi
+    if [ "$(now_ms)" -ge "$deadline_ms" ]; then
+      echo "gate FAILED after 15s: cid=$cid pin=$cell_pin enq=$enq dec=$dec ret=$ret cmd=$cmd" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 for row in "${cells[@]}"; do
   IFS='|' read -r pin dir scenario sender recipient <<< "$row"
   cell_id="${pin}.${dir}.${scenario}"
@@ -186,6 +245,24 @@ for row in "${cells[@]}"; do
     "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
     cid=$(wait_send_cid_from_sender "$cell_id" "$seq" "$sender_emitter" "$sender_log" "$command_start_ms" "$sender_skew_ms" || true)
     if [ -n "$cid" ]; then
+      # §12 Round-6 audit P0-3: gate the FIRST envelope of the FIRST
+      # cell on all 4 instrumentation signals within 15 s. If the
+      # production send path is not emitting, abort the WHOLE matrix
+      # right here — do NOT burn 120 s × 39 more envelopes producing
+      # an incomplete bundle that would look identical to a real
+      # transport failure.
+      if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
+        if ! gate_first_envelope "$cid" "$pin"; then
+          ABORT_REASON="tooling_instrumentation_failure"
+          echo "ABORT: production send-path instrumentation missing on the first" >&2
+          echo "       canonical envelope. Not spending another 120s×39 envelopes." >&2
+          echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
+          # Best-effort clear pin then exit; trap writes marker.
+          "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          exit 2
+        fi
+      fi
       poll_envelope "$cid" "$enqueue_wall_ms"
     else
       echo "warn: could not read correlation_id for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter, host_not_before_ms=$command_start_ms, host_to_sender_skew_ms=$sender_skew_ms)" >&2
@@ -195,6 +272,7 @@ for row in "${cells[@]}"; do
 
   "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
   "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true
+  CELLS_RAN=$(( CELLS_RAN + 1 ))
 done
 
 "$HERE/diag-cmd.sh" clear --serial "$phone" >/dev/null || true

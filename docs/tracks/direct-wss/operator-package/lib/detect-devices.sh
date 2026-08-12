@@ -15,7 +15,13 @@ mkdir -p "$OUT"
 
 adb devices | awk 'NR>1 && $2 == "device" { print $1 }' | while read -r serial; do
   [ -z "$serial" ] && continue
-  is_emu=$(adb -s "$serial" shell getprop ro.kernel.qemu 2>/dev/null | tr -d '\r\n')
+  # §12 Round-6 audit live-Mac fix: `adb ... shell` inherits stdin
+  # from the surrounding `while read -r serial` loop. On the live
+  # Mac run the nested `adb shell getprop` swallowed the second
+  # serial line from the pipeline, and only the first device got
+  # classified. `< /dev/null` detaches adb's stdin so the outer
+  # while-read continues to see every serial.
+  is_emu=$(adb -s "$serial" shell getprop ro.kernel.qemu 2>/dev/null < /dev/null | tr -d '\r\n')
   if [ "$is_emu" = "1" ]; then
     echo "EMULATOR=$serial" >> "$OUT/roles.env"
   else

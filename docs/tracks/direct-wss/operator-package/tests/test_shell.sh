@@ -320,6 +320,106 @@ else
     echo "PASS: python3 gate rejects synthetic 3.4"; pass=$((pass+1))
 fi
 
+# ── Round-6 audit live-Mac fixes ─────────────────────────────
+
+# count_matches must NOT die on zero-match under set -o pipefail.
+# The live-Mac failure was: `grep` returns exit 1 → set -euo pipefail
+# kills the pipeline → count_matches returns empty → caller's numeric
+# comparison errors out. The `|| true` wrapper fixes it.
+(
+    set -euo pipefail
+    tmp=$(mktemp)
+    printf 'apple\nbanana\n' > "$tmp"
+    n=$(count_matches "cherry" "$tmp")
+    rm -f "$tmp"
+    if [ "$n" = "0" ]; then
+        echo "PASS: count_matches returns 0 under set -euo pipefail on zero matches"; exit 0
+    else
+        echo "FAIL: count_matches under pipefail returned [$n], expected 0"; exit 1
+    fi
+) && pass=$((pass+1)) || fail=$((fail+1))
+
+# detect-devices nested `adb shell getprop` must NOT eat serial lines
+# from the outer while-read pipeline. We simulate it with a fake adb
+# stub that echoes 2 serials for `adb devices`, and captures which
+# serials the outer loop got a chance to call getprop for.
+FAKE_DIR=$(mktemp -d)
+cat > "$FAKE_DIR/adb" <<'FAKE'
+#!/usr/bin/env bash
+# Fake adb:
+#   `adb devices` → prints two serials.
+#   `adb -s <S> shell getprop ro.kernel.qemu` → records <S> and prints "0".
+if [ "$1" = "devices" ]; then
+    printf 'List of devices attached\n%s\tdevice\n%s\tdevice\n\n' "SER-PHONE" "SER-EMU"
+    exit 0
+fi
+if [ "$1" = "-s" ]; then
+    ser="$2"
+    # remaining args: shell getprop ro.kernel.qemu
+    echo "$ser" >> "${FAKE_ADB_LOG:-/tmp/fake-adb-log}"
+    if [ "$ser" = "SER-EMU" ]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+    exit 0
+fi
+exit 0
+FAKE
+chmod +x "$FAKE_DIR/adb"
+export PATH="$FAKE_DIR:$PATH"
+export FAKE_ADB_LOG=$(mktemp)
+tmp_evidence=$(mktemp -d)
+"$PKG/lib/detect-devices.sh" "$tmp_evidence" >/dev/null 2>&1 || true
+called_serials=$(sort -u "$FAKE_ADB_LOG" | tr '\n' ' ')
+if [ "$called_serials" = "SER-EMU SER-PHONE " ]; then
+    echo "PASS: detect-devices consumes phone+emulator serial exactly once (getprop stdin isolated)"
+    pass=$((pass+1))
+else
+    echo "FAIL: detect-devices consumed serials [$called_serials], expected 'SER-EMU SER-PHONE '"
+    fail=$((fail+1))
+fi
+# And roles.env was populated correctly.
+if [ -f "$tmp_evidence/roles.env" ] && \
+    grep -q '^PHONE=SER-PHONE' "$tmp_evidence/roles.env" && \
+    grep -q '^EMULATOR=SER-EMU' "$tmp_evidence/roles.env"; then
+    echo "PASS: detect-devices roles.env classified both serials"; pass=$((pass+1))
+else
+    echo "FAIL: detect-devices roles.env did not classify both serials"
+    cat "$tmp_evidence/roles.env" 2>/dev/null || true
+    fail=$((fail+1))
+fi
+rm -rf "$FAKE_DIR" "$tmp_evidence" "$FAKE_ADB_LOG"
+unset FAKE_ADB_LOG
+# Restore PATH by popping the fake dir prefix.
+PATH="${PATH#*:}"
+export PATH
+
+# ── Round-6 audit P0-3 helper: fail-fast gate signal check ─────
+
+# The gate function in run-matrix.sh looks for four distinct events
+# matching a CID. Simulate a synthetic log with 3-of-4 signals and
+# confirm count_matches reports the missing one as 0 without dying.
+tmp_log=$(mktemp)
+cid="cid-gate-test"
+cat > "$tmp_log" <<LOG
+08-11 I WSS_DIAG: event=sender_enqueue role=sender emitter_id=phone correlation_id=$cid
+08-11 I WSS_DIAG: event=sender_transport_decision role=sender emitter_id=phone correlation_id=$cid outer_transport=direct inner_route=wss dispatched=true
+08-11 I WSS_DIAG: event=diagnostic_send_command_completed role=matrix emitter_id=phone correlation_id=$cid result=accepted
+LOG
+enq=$(count_matches "event=sender_enqueue.*correlation_id=$cid" "$tmp_log")
+dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$tmp_log")
+ret=$(count_matches "event=sender_wss_send_returned.*correlation_id=$cid" "$tmp_log")
+cmd=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid" "$tmp_log")
+if [ "$enq" = "1" ] && [ "$dec" = "1" ] && [ "$ret" = "0" ] && [ "$cmd" = "1" ]; then
+    echo "PASS: fail-fast gate signals — 3-of-4 log correctly reports missing wss_return=0"
+    pass=$((pass+1))
+else
+    echo "FAIL: fail-fast gate signals — enq=$enq dec=$dec ret=$ret cmd=$cmd (expected 1/1/0/1)"
+    fail=$((fail+1))
+fi
+rm -f "$tmp_log"
+
 echo ""
 echo "shell tests: pass=$pass fail=$fail"
 if [ "$fail" -gt 0 ]; then exit 1; fi

@@ -192,32 +192,73 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
                 val outcome = coordinator.resolveAndSend(cellId!!, sequence)
                 when (outcome) {
                     is DiagnosticSendCoordinator.Outcome.Sent -> {
-                        // §12 Round-1 audit P0-1: emit a STRUCTURED
-                        // event on the sole WSS_DIAG tag that carries
-                        // the correlation ID + run/cell/sequence. The
-                        // runner reads this to know which envelope's
-                        // signals to poll. The old plaintext
-                        // "send ok correlation_id=..." on WSS_DIAG_CMD
-                        // is REMOVED — it was not in the capture set.
+                        // §12 Round-1 audit P0-1: STRUCTURED
+                        // event on the sole WSS_DIAG tag that
+                        // carries the correlation ID + sequence.
+                        // The runner reads this to know which
+                        // envelope's signals to poll.
                         WssDiag.emit(
                             event = "diagnostic_send_dispatched",
                             role = WssDiag.Role.MATRIX,
                             correlationId = outcome.correlationId,
                             sequence = sequence,
                         )
+                        // §12 Round-6 audit P0-1: closed-schema
+                        // command-completion event with the same
+                        // correlation_id + sequence, reporting
+                        // what MessagingService.sendMessage
+                        // actually returned. `accepted` vs
+                        // `exception=<ClassSimpleName>` lets the
+                        // verifier separate "app never ran the
+                        // send path" (Round-5 false GREEN) from
+                        // "transport dropped the payload".
+                        val (result, exception) = when (
+                            val sr = outcome.sendResult
+                        ) {
+                            is DiagnosticSendCoordinator.SendResult.Accepted ->
+                                "accepted" to null
+                            is DiagnosticSendCoordinator.SendResult.Failed ->
+                                "exception" to sr.exceptionClassName
+                        }
+                        WssDiag.emit(
+                            event = "diagnostic_send_command_completed",
+                            role = WssDiag.Role.MATRIX,
+                            correlationId = outcome.correlationId,
+                            sequence = sequence,
+                            result = result,
+                            outcomeFlag = if (exception != null) {
+                                WssDiag.OutcomeFlag.SEND_ERROR
+                            } else {
+                                WssDiag.OutcomeFlag.NONE
+                            },
+                        )
                     }
-                    is DiagnosticSendCoordinator.Outcome.NoPairedConversation ->
+                    is DiagnosticSendCoordinator.Outcome.NoPairedConversation -> {
                         WssDiag.emit(
                             event = "diagnostic_send_rejected_no_paired_conversation",
                             role = WssDiag.Role.MATRIX,
                             sequence = sequence,
                         )
-                    is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations ->
+                        WssDiag.emit(
+                            event = "diagnostic_send_command_completed",
+                            role = WssDiag.Role.MATRIX,
+                            sequence = sequence,
+                            result = "rejected",
+                        )
+                    }
+                    is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations -> {
                         WssDiag.emit(
                             event = "diagnostic_send_rejected_multiple_paired_conversations",
                             role = WssDiag.Role.MATRIX,
                             sequence = sequence,
                         )
+                        WssDiag.emit(
+                            event = "diagnostic_send_command_completed",
+                            role = WssDiag.Role.MATRIX,
+                            sequence = sequence,
+                            result = "rejected",
+                        )
+                    }
                 }
             } finally {
                 pendingResult.finish()

@@ -114,16 +114,26 @@ def default_matrix() -> dict:
     }
 
 
+def default_completion(cells_ran: int = 8, abort_reason: str | None = None) -> dict:
+    """§12 Round-6 audit P0-2 default matrix_completion.json helper."""
+    d = {"run_id": RUN_ID, "completed_at_wall_ms": 1_786_500_000_000, "cells_ran": cells_ran}
+    if abort_reason is not None:
+        d["abort_reason"] = abort_reason
+    return d
+
+
 def make_bundle(tmpdir: str,
                 phone_lines: list[str] | None = None,
                 emulator_lines: list[str] | None = None,
                 matrix: dict | None = None,
                 preflight: dict | None = None,
                 manifest: dict | None = None,
+                completion: dict | None = None,
                 skip: set[str] | None = None,
                 raw_matrix: str | None = None,
                 raw_preflight: str | None = None,
-                raw_manifest: str | None = None) -> str:
+                raw_manifest: str | None = None,
+                raw_completion: str | None = None) -> str:
     out = os.path.join(tmpdir, "evidence")
     os.makedirs(out, exist_ok=True)
     skip = skip or set()
@@ -151,6 +161,12 @@ def make_bundle(tmpdir: str,
                 f.write(raw_manifest)
             else:
                 json.dump(manifest if manifest is not None else default_manifest(), f)
+    if "matrix_completion.json" not in skip:
+        with open(os.path.join(out, "matrix_completion.json"), "w") as f:
+            if raw_completion is not None:
+                f.write(raw_completion)
+            else:
+                json.dump(completion if completion is not None else default_completion(), f)
     return out
 
 
@@ -306,7 +322,11 @@ class VerifierTests(unittest.TestCase):
         for c in rep.cells:
             if not c.blocked:
                 self.assertEqual(c.outcome, "Unresolved")
-        self.assertEqual(rep.product_outcome, "RED")
+        # §12 Round-6 audit P0-2: incomplete matrix (envs=0 across all
+        # non-blocked cells) trips integrity RED, so the product outcome
+        # is NOT_EVALUABLE — never an authoritative RED/GREEN signal.
+        self.assertFalse(rep.integrity_ok)
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
 
     def test_wrong_emitter_device_produces_integrity_RED(self):
         # Under Round-3 P0-2, phone-log lines with emitter_id=emulator
@@ -699,7 +719,8 @@ class VerifierTests(unittest.TestCase):
         # Aggregate cell outcome also not GREEN.
         cell_a = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
         self.assertNotEqual(cell_a.outcome, "Delivered once")
-        self.assertEqual(rep.product_outcome, "RED")
+        # §12 Round-6 audit P0-2: integrity RED ⇒ NOT_EVALUABLE.
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
 
     def test_R3_P0_1_missing_dispatched_events_produces_Unresolved(self):
         out, base = build_full_matrix_bundle(self.tmp)
@@ -712,6 +733,9 @@ class VerifierTests(unittest.TestCase):
         rep = ve.build_report(out, host_now_override_ms=base + 400_000)
         cell = next(c for c in rep.cells if c.cell_id == "wss.p2e.after-connect")
         self.assertEqual(cell.outcome, "Unresolved", msg=f"issues: {cell.issues}")
+        # Missing dispatched leaves enqueues intact → integrity stays
+        # GREEN and product_outcome = RED (real product signal).
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
         self.assertEqual(rep.product_outcome, "RED")
 
     def test_R3_P0_1_wrong_dispatched_sequence_set_produces_Unresolved(self):
@@ -1368,6 +1392,235 @@ class VerifierTests(unittest.TestCase):
         self.assertTrue(any("diagnostic_apk_sha256" in p and "not a 64-char lowercase hex" in p
                              for p in rep.integrity_issues),
                         msg=f"issues: {rep.integrity_issues}")
+
+    # ── Round-6 audit cases ────────────────────────────────────
+
+    # P0-1 — dispatched without matching sender_enqueue = integrity RED.
+    def test_R6_P0_1_dispatched_without_enqueue_is_integrity_RED(self):
+        # Mimics the live Yota failure: dispatched CIDs are logged but
+        # no matching sender_enqueue anywhere (production send path
+        # never reached).
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        # Emit only pin_active + session_started + 5 diagnostic_send_dispatched;
+        # NO sender_enqueue. This is exactly the shape of the live Yota
+        # bundle for the first canonical cell.
+        phone: list[str] = [
+            line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "phone",
+                 pin="wss", inner="wss", restored=False),
+            line("diagnostic_pin_active", base - 500, 2, "matrix", cell_id, "phone",
+                 pin="wss", inner="wss"),
+        ]
+        emu: list[str] = [
+            line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "emulator",
+                 pin="wss", inner="wss", restored=False),
+            line("diagnostic_pin_active", base - 500, 2, "matrix", cell_id, "emulator",
+                 pin="wss", inner="wss"),
+        ]
+        for i in range(1, 6):
+            phone.append(line("diagnostic_send_dispatched", base + i * 1000, 9,
+                               "matrix", cell_id, "phone",
+                               correlation_id=f"cid-orphan-{i}", sequence=i))
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("has no matching sender_enqueue" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
+
+    def test_R6_P0_1_preflight_rest_probe_dispatched_without_enqueue_is_OK(self):
+        # The preflight REST-capability probe intentionally has a
+        # dispatched with no matching enqueue — it classifies through
+        # sender_rest_post_completed.relay_acceptance instead.
+        base = 200_000
+        phone, emu = make_complete_delivery_lines("wss.p2e.after-connect", "p2e", base_wall=base)
+        # Add a dispatched for preflight.rest_capability with NO enqueue.
+        phone.append(line("diagnostic_send_dispatched", base - 10_000, 9, "matrix",
+                           "preflight.rest_capability", "phone",
+                           correlation_id="cid-preflight-probe", sequence=1))
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+
+    # P0-1 — diagnostic_send_command_completed schema.
+    def test_R6_P0_1_command_completed_invalid_result_is_integrity_RED(self):
+        cell_id = "wss.p2e.after-connect"
+        phone = [
+            line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone",
+                 pin="wss", inner="wss", restored=False),
+            # send_command_completed carries result="bogus" (schema violation)
+            "08-11 I WSS_DIAG: event=diagnostic_send_command_completed role=matrix "
+            "emitter_id=phone run_id=run-test cell_id=" + cell_id +
+            " wall_utc_ms=2000 monotonic_ms=2 correlation_id=cid-x sequence=1 result=bogus",
+        ]
+        emu = [_min_boot("emulator")]
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu)
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("invalid result='bogus'" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R6_P0_1_command_completed_valid_results_accepted(self):
+        # accepted / rejected / exception must all be OK values.
+        for good in ("accepted", "rejected", "exception"):
+            cell_id = "wss.p2e.after-connect"
+            phone = [
+                line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone",
+                     pin="wss", inner="wss", restored=False),
+                "08-11 I WSS_DIAG: event=diagnostic_send_command_completed role=matrix "
+                "emitter_id=phone run_id=run-test cell_id=" + cell_id +
+                f" wall_utc_ms=2000 monotonic_ms=2 correlation_id=cid-x sequence=1 result={good}",
+            ]
+            emu = [_min_boot("emulator")]
+            out = make_bundle(
+                os.path.join(self.tmp, f"good-{good}"),
+                phone_lines=phone, emulator_lines=emu,
+            )
+            rep = ve.build_report(out)
+            issues = [p for p in rep.integrity_issues if "invalid result" in p]
+            self.assertEqual(issues, [], msg=f"unexpected schema issues: {issues}")
+
+    # P0-2 — envs != 5 in non-blocked cell is integrity RED.
+    def test_R6_P0_2_incomplete_cell_zero_envelopes_is_integrity_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        # Strip ALL events for one non-blocked cell.
+        target = "wss.p2e.after-connect"
+        p_path = os.path.join(out, "phone.logcat.wss_diag")
+        with open(p_path, "r") as f:
+            data = f.read().splitlines()
+        with open(p_path, "w") as f:
+            f.write("\n".join(ln for ln in data if f"cell_id={target}" not in ln) + "\n")
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("has 0 sender_enqueue events" in p and target in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
+
+    # P0-2 — matrix_completion.json required + shape.
+    def test_R6_P0_2_missing_matrix_completion_is_integrity_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        os.remove(os.path.join(out, "matrix_completion.json"))
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertTrue(
+            any("matrix_completion.json" in p and "missing" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R6_P0_2_matrix_completion_wrong_run_id_is_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        comp = default_completion()
+        comp["run_id"] = "other-run"
+        with open(os.path.join(out, "matrix_completion.json"), "w") as f:
+            json.dump(comp, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("matrix_completion.run_id" in p and "!= matrix.run_id" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R6_P0_2_matrix_completion_abort_reason_is_RED(self):
+        # Aborted matrix (fail-fast gate) must never be GREEN.
+        out, base = build_full_matrix_bundle(self.tmp)
+        comp = default_completion(abort_reason="tooling_instrumentation_failure")
+        with open(os.path.join(out, "matrix_completion.json"), "w") as f:
+            json.dump(comp, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("abort_reason='tooling_instrumentation_failure'" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
+
+    def test_R6_P0_2_matrix_completion_wrong_cells_ran_is_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        comp = default_completion(cells_ran=3)
+        with open(os.path.join(out, "matrix_completion.json"), "w") as f:
+            json.dump(comp, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("cells_ran=3 != expected 8" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    # P0-2 — real Yota bundle regression. Minimized copy of the live
+    # failure evidence: 16 diagnostic_send_dispatched, 15 pin_active,
+    # 8 session_started, ZERO enqueue / decision / recipient events.
+    def test_R6_P0_2_real_yota_bundle_regression_is_integrity_RED(self):
+        real_run_id = "run-yota-20260812T082016Z"
+        m = default_matrix(); m["run_id"] = real_run_id
+        pf = default_preflight(); pf["run_id"] = real_run_id
+        mf = default_manifest(); mf["run_id"] = real_run_id
+        # No matrix_completion means the runner was killed mid-run.
+        phone: list[str] = []
+        emu: list[str] = []
+        # session_started × 8 (both boots)
+        for i in range(4):
+            phone.append(line("diagnostic_session_started", 1000 + i, 1, "matrix", "-",
+                               "phone", pin="wss", inner="wss", restored=False, run_id=real_run_id))
+            emu.append(line("diagnostic_session_started", 1000 + i, 1, "matrix", "-",
+                             "emulator", pin="wss", inner="wss", restored=False, run_id=real_run_id))
+        # pin_active × ~15 (per cell / per device) — abbreviate to first 3 cells
+        for cell_id in ("wss.p2e.after-connect", "wss.e2p.after-connect", "wss.p2e.after-idle"):
+            phone.append(line("diagnostic_pin_active", 2000, 2, "matrix", cell_id, "phone",
+                               pin="wss", inner="wss", run_id=real_run_id))
+            emu.append(line("diagnostic_pin_active", 2000, 2, "matrix", cell_id, "emulator",
+                             pin="wss", inner="wss", run_id=real_run_id))
+        # 15 matrix dispatch + 1 preflight probe dispatch, ZERO enqueue.
+        phone.append(line("diagnostic_send_dispatched", 3000, 3, "matrix",
+                           "preflight.rest_capability", "phone",
+                           correlation_id="cid-probe", sequence=1, run_id=real_run_id))
+        cells_dispatched = [
+            "wss.p2e.after-connect", "wss.e2p.after-connect", "wss.p2e.after-idle",
+        ]
+        for cid_idx, cell_id in enumerate(cells_dispatched):
+            for seq in range(1, 6):
+                dev = "phone" if cell_id.startswith("wss.p2e") else "emulator"
+                (phone if dev == "phone" else emu).append(
+                    line("diagnostic_send_dispatched", 4000 + cid_idx * 100 + seq, 4,
+                         "matrix", cell_id, dev,
+                         correlation_id=f"cid-{cell_id}-{seq}",
+                         sequence=seq, run_id=real_run_id),
+                )
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu,
+                           matrix=m, preflight=pf, manifest=mf,
+                           skip={"matrix_completion.json"})
+        rep = ve.build_report(out)
+        # Multiple RED triggers: missing matrix_completion, envs=0 cells,
+        # 15 dispatched without matching enqueues.
+        self.assertFalse(rep.integrity_ok)
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE",
+                          msg="NOT_EVALUABLE: an aborted, evidence-less run must never surface a product signal")
+
+    # P0-2 — NOT_EVALUABLE never hides behind RED/GREEN.
+    def test_R6_P0_2_NOT_EVALUABLE_replaces_product_outcome_on_integrity_RED(self):
+        out, base = build_full_matrix_bundle(self.tmp)
+        # Delete matrix_completion to force integrity RED.
+        os.remove(os.path.join(out, "matrix_completion.json"))
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        self.assertFalse(rep.integrity_ok)
+        self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
+        self.assertNotEqual(rep.product_outcome, "GREEN")
+        self.assertNotEqual(rep.product_outcome, "RED")
 
 
 if __name__ == "__main__":

@@ -1545,6 +1545,20 @@ class DefaultMessagingService(
             MessagingLogLevel.INFO,
             "SEND_TRACE send_start id=${message.id.take(12)}… conv=$convTag textLen=${message.text.length}",
         )
+        // §12 Round-6 audit P0-1: emit `sender_enqueue` on the SEND ENTRY,
+        // not inside `afterEncrypt`. The prior placement hid EVERY
+        // fresh-pair `PeerBundleMissingException` (encryption bailed
+        // before reaching afterEncrypt → no diagnostic emit → verifier
+        // saw a dispatched CID with zero downstream evidence and
+        // certified an empty matrix as GREEN). Firing the event here
+        // proves the diagnostic reached the shared messaging service
+        // for the given correlation id, independent of whether
+        // encryption succeeds.
+        WssDiagBridgeHolder.instance?.emit(
+            event = "sender_enqueue",
+            correlationId = message.id,
+            role = WssDiagBridge.Role.SENDER,
+        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = message.text,
@@ -1571,6 +1585,11 @@ class DefaultMessagingService(
                 afterEncrypt = { wireFrame ->
                     val ct = json.encodeToString(wireFrame).encodeToByteArray()
                     ciphertextBytes = ct
+                    // §12 Round-6 audit P0-1: `sender_enqueue` moved to
+                    // sendMessage entry (above) so it fires on every
+                    // send attempt, not only when encryption reaches
+                    // afterEncrypt. Do NOT re-emit here — global
+                    // correlation_id uniqueness would trip integrity RED.
                     messageRepository.insertMessage(
                         MessageEntity(
                             id = message.id,
@@ -1581,14 +1600,7 @@ class DefaultMessagingService(
                             status = MessageStatus.QUEUED,
                             createdAt = insertedAtMs,
                             expiresAtMs = outgoingExpiresAtMs,
-                        ).also {
-                            // Direct WSS Yota-First diagnostic §4 — sender_enqueue.
-                            WssDiagBridgeHolder.instance?.emit(
-                                event = "sender_enqueue",
-                                correlationId = message.id,
-                                role = WssDiagBridge.Role.SENDER,
-                            )
-                        }
+                        )
                     )
                 },
             )

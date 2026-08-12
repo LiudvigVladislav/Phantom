@@ -29,10 +29,16 @@ sha256_file() {
 # count_matches <pattern> <file...>: prints ONE integer counting
 # total matching lines across all files. Works around GNU `grep -c`'s
 # per-file-plus-newline output shape.
+#
+# §12 Round-6 audit live-Mac fix: grep exits status 1 when there are
+# ZERO matches. Under `set -o pipefail` (used by every caller), that
+# non-zero status kills the pipeline and the caller sees an empty
+# string / broken numeric compare. Wrap in `|| true` so the pipeline
+# always continues and awk emits `0`.
 count_matches() {
     local pattern="$1"; shift
     if [ $# -eq 0 ]; then echo 0; return; fi
-    grep -h -c "$pattern" "$@" 2>/dev/null | awk '{s+=$1} END{print s+0}'
+    { grep -h -c "$pattern" "$@" 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}'
 }
 
 # extract_field <field-name> <line>: prints the value of a

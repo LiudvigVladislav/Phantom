@@ -45,6 +45,141 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.6 — Round-6 audit repair (2026-08-12, first live Yota run)
+
+First live Yota-pass ran from a signed final tar with APK
+sha `cb8f86114ad3f42873b6c2548c5e2b0fd3a368818d7bc9fa0cf822ded8af6345`
+on TECNO BF7 (default-data Yota, 25011) + Pixel_8_Pro emulator.
+Preflight passed; three matrix cells + a partial fourth ran; each
+of 15 matrix `send` broadcasts wait-timed out on the 120-second
+ceiling, the operator killed the run, and the resulting bundle
+carried:
+
+* 16 `diagnostic_send_dispatched` (1 preflight probe + 15 matrix)
+* 15 `diagnostic_pin_active` / 8 `diagnostic_session_started` /
+  2 `diagnostic_state_cleared`
+* ZERO `sender_enqueue`, `sender_transport_decision`, route-return
+  events, or recipient events.
+
+Verifier still reported `evidence_integrity=GREEN`. That is a
+genuine tooling false-GREEN on top of an aborted matrix that
+produced no product signal at all. This block closes the
+tooling failure at source, at the verifier, at the runner, and
+across three live-Mac operator-side script bugs.
+
+**Root cause (source-level trace).**
+
+* [`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt:handleSend`][] fires
+  `coordinator.resolveAndSend` and unconditionally emits
+  `diagnostic_send_dispatched` on `Outcome.Sent` — even when
+  `MessagingService.sendMessage` returned `Result.failure(...)`
+  or threw.
+* [`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt:resolveAndSend`][]
+  called `messagingService.sendMessage(message)` and DISCARDED
+  the `Result<Unit>`. Any failure — including
+  `PeerBundleMissingException` on a fresh pair whose prekey
+  bundle publish has not yet propagated to the other peer —
+  was invisible to the operator.
+* [`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt:1585-1590`][]
+  emitted `sender_enqueue` only INSIDE the `afterEncrypt` callback
+  of `encryptUnderLock`. Under `PeerBundleMissingException` the
+  callback never runs, the placeholder `WAITING` row is inserted
+  in the `catch` block at :1595, and no `sender_enqueue` is
+  emitted. The verifier then sees a dispatched CID with no matching
+  enqueue and — pre-Round-6 — treats the whole bundle as GREEN.
+
+**Fix (bounded — no ADB, no APK, no full Gradle suite).**
+
+* **P0-1 `sender_enqueue` at send entry.** Moved the emit to the
+  top of `DefaultMessagingService.sendMessage`, right after the
+  `SEND_TRACE send_start` log. Every send attempt now emits enqueue
+  regardless of whether encryption succeeds. Kept the existing
+  `insertMessage` call in `afterEncrypt` intact (no double emit —
+  global CID uniqueness would trip integrity RED).
+* **P0-1 `diagnostic_send_command_completed` event.** New closed-
+  schema event emitted by the receiver on every `handleSend`
+  outcome, carrying the same `correlation_id` + `sequence` plus
+  `result ∈ {accepted, rejected, exception}`. `SendResult.Failed`
+  captures ONLY the exception class simple name — no exception
+  text, no message text, no usernames, no keys, no tokens or PII.
+  `Outcome.Sent` was extended to carry `sendResult: SendResult`
+  so the receiver can pick the right `result` value.
+* **P0-2 `matrix_completion.json` atomic marker.** `run-matrix.sh`
+  installs a bash `trap ... EXIT` that writes an atomic
+  `matrix_completion.json` to the evidence dir on EVERY exit path
+  (normal completion, fail-fast abort, unexpected error, user
+  Ctrl-C). Fields: `run_id`, `completed_at_wall_ms`, `cells_ran`,
+  optional `abort_reason`. Verifier requires the file and matches
+  its `run_id` + `cells_ran` against the matrix; presence of
+  `abort_reason` is integrity RED.
+* **P0-2 integrity RED on incomplete matrix.** `envs != 5` in a
+  non-blocked cell is now an integrity issue (was cell-level
+  Unresolved only). Missing `sender_enqueue` for any
+  `diagnostic_send_dispatched` correlation_id (except the
+  `preflight.rest_capability` probe) is integrity RED. Missing
+  `matrix_completion.json` is integrity RED.
+* **P0-2 `product_outcome = NOT_EVALUABLE` when integrity RED.**
+  A bundle that fails integrity cannot produce an authoritative
+  product verdict. The verifier now emits `NOT_EVALUABLE` (not
+  `GREEN`, not `RED`) so no reader can misread an incomplete run
+  as a real Yota result. Exit code `1` on integrity RED, unchanged.
+* **P0-3 runner fail-fast gate.** After the FIRST canonical cell
+  fires `sequence=1`, `run-matrix.sh:gate_first_envelope` polls
+  for four production signals matching the returned CID for up
+  to 15 seconds: `sender_enqueue`, `sender_transport_decision`,
+  `sender_wss_send_returned` OR `sender_rest_post_completed`,
+  and `diagnostic_send_command_completed`. If any is missing
+  after 15 s → `ABORT_REASON=tooling_instrumentation_failure`,
+  runner exits, trap writes `matrix_completion.json` with the
+  reason. No extra smoke-message is added — the gate reuses the
+  first canonical envelope so measurement is not contaminated.
+
+**Three live-Mac operator-side bugs carried into source.**
+
+* `lib/detect-devices.sh` — nested `adb ... shell getprop
+  ro.kernel.qemu` inside `while read -r serial | adb devices | awk`
+  was consuming the next serial line from the outer pipeline;
+  only the first device got classified. Added `< /dev/null` to
+  detach adb's stdin.
+* `preflight.sh` — API 36 `dumpsys package | grep DiagnosticCommandReceiver`
+  no longer matches a legitimate debug APK. Replaced with an
+  active `diag-cmd.sh health` broadcast and an assertion that a
+  `WSS_DIAG_CMD health emitter_id=` line appears within 2 s.
+  Only the debug variant registers the receiver AND implements
+  health; a release APK silently drops the broadcast.
+* `lib/portable.sh` — `count_matches` under `set -euo pipefail`
+  died when `grep` had zero matches (exit 1 → pipefail → empty
+  stdout). Wrapped with `|| true` so awk always sees a number.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes: BUILD SUCCESSFUL.
+* Python — 89 fixtures (11 new for Round-6): dispatched without
+  matching enqueue → RED, preflight probe dispatch without enqueue
+  is OK (exempt), `diagnostic_send_command_completed` schema
+  (invalid result → RED; accepted/rejected/exception accepted),
+  envs=0 in one cell → RED, missing `matrix_completion.json` →
+  RED, wrong `run_id` in completion → RED, `abort_reason` → RED,
+  wrong `cells_ran` → RED, real-Yota-bundle regression minimized
+  from the live evidence file (envs=0 across all cells + 15
+  orphan dispatched CIDs + missing completion) → RED, `NOT_EVALUABLE`
+  replaces RED/GREEN when integrity fails.
+* Shell — 34 fixtures (4 new for Round-6): `count_matches` returns
+  0 under `set -euo pipefail` on zero matches, `detect-devices`
+  consumes both serials exactly once with the stdin fix,
+  `detect-devices` `roles.env` classifies both, fail-fast gate
+  signal count.
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per process constraints: `assembleDebug` +
+Mac dry-run only AFTER architect LOGICAL GREEN on this block;
+next device run starts with `bootstrap --fresh`; VPS / PR / push
+on HOLD.**
+
+[`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt:handleSend`]: apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt
+[`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt:resolveAndSend`]: apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt
+[`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt:1585-1590`]: shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt
+
 ### §12.5 — Round-5 audit repair (2026-08-12)
 
 Fifth architect audit closed. Scope strictly limited to

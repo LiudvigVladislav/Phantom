@@ -43,9 +43,25 @@ internal class DiagnosticSendCoordinator(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     sealed interface Outcome {
-        data class Sent(val correlationId: String, val conversationId: String) : Outcome
+        data class Sent(
+            val correlationId: String,
+            val conversationId: String,
+            val sendResult: SendResult,
+        ) : Outcome
         data class NoPairedConversation(val activeCount: Int) : Outcome
         data class MultiplePairedConversations(val ids: List<String>) : Outcome
+    }
+
+    /**
+     * §12 Round-6 audit P0-1: capture what `MessagingService.sendMessage`
+     * actually returned so the receiver can emit
+     * `diagnostic_send_command_completed result=accepted|exception`.
+     * No exception text, message text, usernames, keys, tokens or PII —
+     * only the exception class simple name.
+     */
+    sealed interface SendResult {
+        object Accepted : SendResult
+        data class Failed(val exceptionClassName: String) : SendResult
     }
 
     /**
@@ -74,8 +90,30 @@ internal class DiagnosticSendCoordinator(
                     recipientPublicKeyHex = peer.theirPublicKeyHex,
                     text = derivedTextFor(cellId, sequence),
                 )
-                messagingService.sendMessage(message)
-                Outcome.Sent(correlationId = correlationId, conversationId = peer.id)
+                // §12 Round-6 audit P0-1: capture what sendMessage
+                // actually returned so the receiver can emit
+                // `diagnostic_send_command_completed`. sendMessage is
+                // `runCatching`-wrapped so it should never throw, but
+                // an outer try/catch defends against a bug in that
+                // contract without leaking any exception payload —
+                // only the class simple name flows into diagnostics.
+                val sendResult: SendResult = try {
+                    val r = messagingService.sendMessage(message)
+                    if (r.isSuccess) {
+                        SendResult.Accepted
+                    } else {
+                        SendResult.Failed(
+                            r.exceptionOrNull()?.let { it::class.simpleName } ?: "UnknownFailure",
+                        )
+                    }
+                } catch (t: Throwable) {
+                    SendResult.Failed(t::class.simpleName ?: "UnknownThrowable")
+                }
+                Outcome.Sent(
+                    correlationId = correlationId,
+                    conversationId = peer.id,
+                    sendResult = sendResult,
+                )
             }
         }
     }
