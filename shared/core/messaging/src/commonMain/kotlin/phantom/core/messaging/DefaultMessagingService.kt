@@ -1545,17 +1545,23 @@ class DefaultMessagingService(
             MessagingLogLevel.INFO,
             "SEND_TRACE send_start id=${message.id.take(12)}… conv=$convTag textLen=${message.text.length}",
         )
-        // §12 Round-6 audit P0-1: emit `sender_enqueue` on the SEND ENTRY,
-        // not inside `afterEncrypt`. The prior placement hid EVERY
-        // fresh-pair `PeerBundleMissingException` (encryption bailed
-        // before reaching afterEncrypt → no diagnostic emit → verifier
-        // saw a dispatched CID with zero downstream evidence and
-        // certified an empty matrix as GREEN). Firing the event here
-        // proves the diagnostic reached the shared messaging service
-        // for the given correlation id, independent of whether
-        // encryption succeeds.
+        // §12 Round-7 audit P1-1: `sender_send_attempt_started` is a
+        // NEW event on the SEND ENTRY. It replaces the Round-6 move
+        // of `sender_enqueue` (which would have redefined enqueue's
+        // semantic from "row inserted into DB with QUEUED status" to
+        // "send attempt began"). `sender_enqueue` is restored to its
+        // afterEncrypt site below so the two signals stay distinct:
+        //   * `sender_send_attempt_started` — sendMessage entered
+        //     for this correlation_id (proves diagnostic reached the
+        //     shared messaging service).
+        //   * `sender_enqueue` — the DB row was inserted with QUEUED
+        //     status after successful encryption (real queue boundary).
+        // Under `PeerBundleMissingException` on a fresh pair, the
+        // attempt-started event fires but no enqueue — the catch
+        // block below then emits `sender_prekey_deferred` so the
+        // verifier can attribute the missing enqueue correctly.
         WssDiagBridgeHolder.instance?.emit(
-            event = "sender_enqueue",
+            event = "sender_send_attempt_started",
             correlationId = message.id,
             role = WssDiagBridge.Role.SENDER,
         )
@@ -1585,11 +1591,16 @@ class DefaultMessagingService(
                 afterEncrypt = { wireFrame ->
                     val ct = json.encodeToString(wireFrame).encodeToByteArray()
                     ciphertextBytes = ct
-                    // §12 Round-6 audit P0-1: `sender_enqueue` moved to
-                    // sendMessage entry (above) so it fires on every
-                    // send attempt, not only when encryption reaches
-                    // afterEncrypt. Do NOT re-emit here — global
-                    // correlation_id uniqueness would trip integrity RED.
+                    // §12 Round-7 audit P1-1: `sender_enqueue` restored
+                    // to the real queue/persistence boundary — it fires
+                    // AFTER encryption succeeded and BEFORE the row is
+                    // handed to the transport. The Round-6 misplacement
+                    // to sendMessage entry conflated intent with real
+                    // queue observation. Under PeerBundleMissingException
+                    // this callback is not reached; the catch block emits
+                    // `sender_prekey_deferred` for the same CID so the
+                    // verifier can distinguish "encryption never ran" from
+                    // "network dropped the payload".
                     messageRepository.insertMessage(
                         MessageEntity(
                             id = message.id,
@@ -1600,7 +1611,13 @@ class DefaultMessagingService(
                             status = MessageStatus.QUEUED,
                             createdAt = insertedAtMs,
                             expiresAtMs = outgoingExpiresAtMs,
-                        )
+                        ).also {
+                            WssDiagBridgeHolder.instance?.emit(
+                                event = "sender_enqueue",
+                                correlationId = message.id,
+                                role = WssDiagBridge.Role.SENDER,
+                            )
+                        }
                     )
                 },
             )
@@ -1635,6 +1652,21 @@ class DefaultMessagingService(
                     "reason=${e.reason.toLogTag()} ${e.reason.toLogDetails()}. " +
                     "Message saved with WAITING status; retryWaitingMessages() " +
                     "will retry on next reconnect / ticker tick.",
+            )
+            // §12 Round-7 audit P0-1: `sender_prekey_deferred` — closed-
+            // schema signal that this send did NOT reach the transport
+            // because the peer's prekey bundle was missing. Emits ONLY
+            // the correlation_id + role — no exception text, no reason
+            // tag, no recipient hex, no message text or PII of any
+            // kind. `runCatching` returns Result.success below (the
+            // WAITING placeholder is real product behaviour and must
+            // stay), but the presence of this event lets the verifier
+            // classify the envelope as deferred — never as
+            // authoritatively delivered.
+            WssDiagBridgeHolder.instance?.emit(
+                event = "sender_prekey_deferred",
+                correlationId = message.id,
+                role = WssDiagBridge.Role.SENDER,
             )
             return@runCatching Unit
         }

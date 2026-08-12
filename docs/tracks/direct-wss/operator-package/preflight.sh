@@ -134,6 +134,37 @@ for want in "$phone|phone" "$emu|emulator"; do
 done
 emitter_ids_set=true
 
+# 4b. §12 Round-7 audit P1-2: signed prekey readiness on relay.
+#     The debug receiver's `signed_prekey_readiness` subcommand fires
+#     `PreKeyApi.fetchStatus(identity, identity)` — a NON-consuming
+#     GET /prekeys/status — and logs `signed_prekey_readiness
+#     published=<true|false> signed_prekey_age_days=<n|null>
+#     remaining_opks=<n>` to WSS_DIAG_CMD. Preflight refuses to run
+#     the matrix if either device's own signed prekey has not yet
+#     been published to the relay (fresh-pair prekey publish latency
+#     was the root cause of the Round-6 tooling failure: sendMessage
+#     bailed on `PeerBundleMissingException` and every dispatched CID
+#     lacked downstream evidence).
+for serial in "$phone" "$emu"; do
+    adb -s "$serial" logcat -c
+    "$LIB/diag-cmd.sh" signed_prekey_readiness --serial "$serial" >/dev/null
+    sleep 5
+    readiness=$(adb -s "$serial" logcat -d WSS_DIAG_CMD:V "*:S" \
+                 | grep "signed_prekey_readiness " | tail -1 || true)
+    if [ -z "$readiness" ]; then
+        echo "preflight FAILED: no signed_prekey_readiness output from $serial within 5s — receiver not present or PreKeyApi not wired" >&2
+        exit 1
+    fi
+    if ! printf '%s' "$readiness" | grep -q "published=true"; then
+        echo "preflight FAILED: $serial reports signed_prekey_readiness NOT published — its own signed prekey is not on the relay yet." >&2
+        echo "  Root cause is prekey publish latency; do NOT run the matrix — the sender would emit sender_prekey_deferred for every envelope, no transport traffic would happen, and the run would be indistinguishable from a real Yota failure." >&2
+        echo "  Wait 30 s and re-run preflight. If it persists, verify the relay is reachable and the app has published its bundle at least once." >&2
+        echo "  ($readiness)" >&2
+        exit 1
+    fi
+    echo "$serial: $readiness"
+done
+
 # 5. Paired conversation count == 1 on both devices (Round-1 audit P1).
 for serial in "$phone" "$emu"; do
     adb -s "$serial" logcat -c

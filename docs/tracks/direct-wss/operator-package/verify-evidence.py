@@ -111,10 +111,12 @@ RECIPIENT_EVENTS = {
     "recipient_ack_deliver_sent",
 }
 SENDER_EVENTS = {
+    "sender_send_attempt_started",
     "sender_enqueue",
     "sender_transport_decision",
     "sender_wss_send_returned",
     "sender_rest_post_completed",
+    "sender_prekey_deferred",
     "sender_relay_ack_received",
     "sender_ack_watchdog_requeued",
 }
@@ -128,7 +130,7 @@ MATRIX_EVENTS = {
     "diagnostic_send_rejected_no_paired_conversation",
     "diagnostic_send_rejected_multiple_paired_conversations",
 }
-ALLOWED_COMMAND_RESULTS = frozenset({"accepted", "rejected", "exception"})
+ALLOWED_COMMAND_RESULTS = frozenset({"handled", "rejected", "exception", "deferred"})
 CROSS_RUN_TOLERATED_EVENTS = {
     "diagnostic_session_started",
     "diagnostic_canary",
@@ -705,29 +707,36 @@ def integrity_check_bundle(
                 f"matrix_completion.cells_ran={cells_ran} != expected {expected_cells_ran} (non-blocked cells)",
             )
 
-    # §12 Round-6 audit P0-1: every diagnostic_send_dispatched
-    # correlation_id must have a matching sender_enqueue with the
-    # same CID on the SAME sender device. Round-5 lived Yota run had
-    # 15 dispatched events and ZERO enqueues — a genuine false GREEN
-    # that certified an aborted matrix as evidence_integrity=GREEN.
+    # §12 Round-7 audit P0-1 (revised from Round-6): every
+    # `diagnostic_send_dispatched` correlation_id must have a matching
+    # `sender_send_attempt_started` on the SAME sender device. That
+    # event is the entry-point signal from `DefaultMessagingService`
+    # (fires before encryption). `sender_enqueue` is NOT the right
+    # binding target — it fires only inside `afterEncrypt` and is
+    # legitimately absent when a `PeerBundleMissingException` is
+    # caught (a `sender_prekey_deferred` event then fires instead).
+    # Round-5 lived Yota run had 15 dispatched events and ZERO
+    # enqueues — under the Round-7 rule both attempt_started and
+    # enqueue would be absent, and the missing attempt_started is
+    # what proves the production send path was not reached.
     dispatched_by_cid: dict[str, WssEvent] = {}
     for e in events:
         if e.event == "diagnostic_send_dispatched" and e.correlation_id:
             dispatched_by_cid[e.correlation_id] = e
-    enqueue_cids_set: set[str] = {
+    attempt_started_cids_set: set[str] = {
         e.correlation_id for e in events
-        if e.event == "sender_enqueue" and e.correlation_id
+        if e.event == "sender_send_attempt_started" and e.correlation_id
     }
     for cid, disp in dispatched_by_cid.items():
-        if cid not in enqueue_cids_set:
+        if cid not in attempt_started_cids_set:
             # Exclude the preflight REST-capability probe cell — its
-            # dispatched intentionally has no enqueue matching (the
-            # probe classifies via sender_rest_post_completed only).
+            # dispatched intentionally has no attempt_started matching
+            # (the probe classifies via sender_rest_post_completed only).
             if disp.cell_id == "preflight.rest_capability":
                 continue
             problems.append(
                 f"diagnostic_send_dispatched cid={cid[:8]}… (cell={disp.cell_id}) "
-                f"has no matching sender_enqueue — production send path never reached",
+                f"has no matching sender_send_attempt_started — production send path never reached",
             )
 
     # §12 Round-6 audit P0-1: diagnostic_send_command_completed.result
@@ -741,9 +750,27 @@ def integrity_check_bundle(
                     f"(allowed: {sorted(ALLOWED_COMMAND_RESULTS)})",
                 )
 
-    # Round-3 audit P0-1: every sender_enqueue must carry a non-empty
-    # correlation_id. A missing CID lets a cell's five envelopes join
-    # through a single delivery triplet via `cid=None`.
+    # Round-3 audit P0-1 (Round-7 revision): apply the missing-CID +
+    # global-uniqueness rules to `sender_send_attempt_started` —
+    # that event fires once per send attempt (including deferred
+    # ones), while `sender_enqueue` only fires on successful
+    # encryption, so keying uniqueness on enqueue would miss
+    # deferred-attempt collisions. Enqueue keeps its own
+    # missing-CID + duplicate check as a defence in depth (the two
+    # events share the same CID by design).
+    attempt_by_cid: dict[str, list[WssEvent]] = {}
+    for e in events:
+        if e.event == "sender_send_attempt_started":
+            if not e.correlation_id or e.correlation_id == "-":
+                problems.append(
+                    f"sender_send_attempt_started missing correlation_id on {e.device} @ wall_utc_ms={e.wall_utc_ms} cell_id={e.cell_id}",
+                )
+                continue
+            attempt_by_cid.setdefault(e.correlation_id, []).append(e)
+    for cid, evs in attempt_by_cid.items():
+        if len(evs) > 1:
+            problems.append(f"correlation_id used multiple times: {cid} ({len(evs)} send attempts)")
+
     enqueue_by_cid: dict[str, list[WssEvent]] = {}
     for e in events:
         if e.event == "sender_enqueue":
@@ -905,6 +932,23 @@ def classify_envelope(
     if len(deliver_fresh) > 1:
         missing.append("2nd recipient_deliver_received(fresh) — dedup violation")
 
+    # §12 Round-7 audit P0-1: presence of `sender_prekey_deferred`
+    # for this envelope's correlation_id means the send never reached
+    # transport (fresh-pair prekey publish latency, catch block wrote
+    # a WAITING placeholder, sendMessage returned success-shaped
+    # Result). The envelope cannot be authoritatively delivered even
+    # if every other signal is present. Reporter downgrades it to
+    # Unresolved with a `deferred` reason so the reader knows the
+    # cause was tooling / prekey timing, not transport failure.
+    deferred_for_cid = [
+        e for e in corr_events if e.event == "sender_prekey_deferred"
+    ]
+    if deferred_for_cid:
+        issues.append(
+            "sender_prekey_deferred: envelope did not reach transport "
+            "(peer prekey missing at send time)",
+        )
+
     if issues:
         return ("Unresolved", issues + missing)
 
@@ -920,14 +964,21 @@ def classify_envelope(
 
 
 def _check_cell_dispatched_binding(
-    cr: CellReport, enqueues: list[WssEvent], cell_evts: list[WssEvent],
+    cr: CellReport, send_attempts: list[WssEvent], cell_evts: list[WssEvent],
     sender_device: str, sender_emitter: str,
 ) -> None:
-    """Round-3 audit P0-1 (cell-level): exactly 5 diagnostic_send_dispatched
-    events on the sender device; each has a non-empty correlation_id
-    matching one enqueue's CID one-to-one; sequences are exactly
-    {1,2,3,4,5}. Populates cr.issues with problems — the caller sets
-    cr.outcome based on this being nonempty."""
+    """Round-3 audit P0-1 + Round-7 revision (cell-level): exactly 5
+    diagnostic_send_dispatched events on the sender device; each has
+    a non-empty correlation_id matching one send_attempt_started's
+    CID one-to-one; sequences are exactly {1,2,3,4,5}. Populates
+    cr.issues with problems — the caller sets cr.outcome based on
+    this being nonempty.
+
+    Round-7 note: the binding key is now `sender_send_attempt_started`
+    (the send-entry signal), not `sender_enqueue` — under a
+    PeerBundleMissingException, enqueue is legitimately absent while
+    attempt_started is present and every attempt still has a
+    dispatched pair."""
     dispatched = [e for e in cell_evts if e.event == "diagnostic_send_dispatched"]
 
     for d in dispatched:
@@ -940,18 +991,18 @@ def _check_cell_dispatched_binding(
 
     dispatch_cids = {e.correlation_id for e in dispatched
                      if e.correlation_id and e.correlation_id != "-"}
-    enqueue_cids = {e.correlation_id for e in enqueues
-                    if e.correlation_id and e.correlation_id != "-"}
-    if dispatch_cids != enqueue_cids:
-        missing_here = enqueue_cids - dispatch_cids
-        extra_here = dispatch_cids - enqueue_cids
+    attempt_cids = {e.correlation_id for e in send_attempts
+                     if e.correlation_id and e.correlation_id != "-"}
+    if dispatch_cids != attempt_cids:
+        missing_here = attempt_cids - dispatch_cids
+        extra_here = dispatch_cids - attempt_cids
         if missing_here:
             cr.issues.append(
-                f"enqueue CIDs without matching diagnostic_send_dispatched: {sorted(list(missing_here))[:5]}",
+                f"send_attempt_started CIDs without matching diagnostic_send_dispatched: {sorted(list(missing_here))[:5]}",
             )
         if extra_here:
             cr.issues.append(
-                f"diagnostic_send_dispatched CIDs without matching enqueue: {sorted(list(extra_here))[:5]}",
+                f"diagnostic_send_dispatched CIDs without matching send_attempt_started: {sorted(list(extra_here))[:5]}",
             )
 
     observed_sequences = sorted(
@@ -1067,47 +1118,82 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
             e for e in run_scoped_events
             if e.cell_id == cr.cell_id and e.run_id == run_id_matrix
         ]
+        # §12 Round-7 audit P1-1: cell-completion is measured by
+        # `sender_send_attempt_started` count — the send-entry signal
+        # from DefaultMessagingService. `sender_enqueue` is the real
+        # queue/persistence boundary and stays a separate, weaker
+        # signal (a deferred attempt has send_attempt_started but no
+        # enqueue).
+        send_attempts = sorted(
+            [e for e in cell_evts if e.event == "sender_send_attempt_started"],
+            key=lambda e: e.wall_utc_ms or 0,
+        )
         enqueues = sorted(
             [e for e in cell_evts if e.event == "sender_enqueue"],
             key=lambda e: e.wall_utc_ms or 0,
         )
-        cr.envelopes = len(enqueues)
+        # Envelopes count (reported in the cell report) reflects
+        # attempts observed by the diagnostic — that is the measure
+        # the operator can act on. Enqueues remain a distinct product
+        # signal available per envelope below.
+        cr.envelopes = len(send_attempts)
 
         if cr.envelopes != EXPECTED_ENVELOPES_PER_CELL:
-            # §12 Round-6 audit P0-2: an incomplete cell (0-4
-            # envelopes in a non-blocked cell) is an INTEGRITY
-            # violation, not a mere product outcome. Round-5 lived
-            # Yota run had envs=0 across all 8 cells and the verifier
-            # still returned integrity_ok=True — a genuine false
-            # GREEN. The cell also lands as Unresolved, but the
-            # aggregate outcome is derived from integrity_ok below.
+            # §12 Round-6 audit P0-2 (Round-7 revised): an incomplete
+            # cell (fewer than 5 send attempts in a non-blocked cell)
+            # is an INTEGRITY violation. Under Round-7 the metric is
+            # send_attempts, not enqueues.
             cr.issues.append(f"envelope count = {cr.envelopes} (expected {EXPECTED_ENVELOPES_PER_CELL})")
             cr.outcome = "Unresolved"
             integrity_issues.append(
-                f"cell {cr.cell_id} has {cr.envelopes} sender_enqueue events "
+                f"cell {cr.cell_id} has {cr.envelopes} sender_send_attempt_started events "
                 f"(expected {EXPECTED_ENVELOPES_PER_CELL}) — incomplete matrix",
             )
             aggregate_red = True
             cells_report.append(cr)
             continue
 
-        cids = [e.correlation_id for e in enqueues if e.correlation_id and e.correlation_id != "-"]
-        if len(cids) != EXPECTED_ENVELOPES_PER_CELL:
-            cr.issues.append(f"only {len(cids)} of {EXPECTED_ENVELOPES_PER_CELL} enqueues carry a correlation_id")
+        # §12 Round-7 audit P1-1: the 5-count metric is send_attempts,
+        # not enqueues (enqueue can legitimately be < 5 under deferred
+        # attempts). Enqueue CIDs still get their own uniqueness check
+        # as defence in depth, but a low enqueue count is a product
+        # signal, not an integrity violation.
+        attempt_cids = [
+            e.correlation_id for e in send_attempts
+            if e.correlation_id and e.correlation_id != "-"
+        ]
+        if len(attempt_cids) != EXPECTED_ENVELOPES_PER_CELL:
+            cr.issues.append(
+                f"only {len(attempt_cids)} of {EXPECTED_ENVELOPES_PER_CELL} sender_send_attempt_started carry a correlation_id",
+            )
             cr.outcome = "Unresolved"
             aggregate_red = True
             cells_report.append(cr)
             continue
-        if len(set(cids)) != len(cids):
-            cr.issues.append("duplicate correlation_id within cell")
+        if len(set(attempt_cids)) != len(attempt_cids):
+            cr.issues.append("duplicate correlation_id across sender_send_attempt_started within cell")
             cr.outcome = "Unresolved"
             aggregate_red = True
             cells_report.append(cr)
             continue
+        # Enqueue uniqueness within cell (weaker check — only the
+        # enqueues that fired need unique CIDs).
+        enqueue_cids = [
+            e.correlation_id for e in enqueues
+            if e.correlation_id and e.correlation_id != "-"
+        ]
+        if len(set(enqueue_cids)) != len(enqueue_cids):
+            cr.issues.append("duplicate correlation_id across sender_enqueue within cell")
+            cr.outcome = "Unresolved"
+            aggregate_red = True
+            cells_report.append(cr)
+            continue
+        cids = attempt_cids  # used by the loop below
 
-        # Round-3 audit P0-1: 5 dispatched events matching the enqueues.
+        # Round-3 audit P0-1 (Round-7 rev): 5 dispatched events
+        # matching the 5 send_attempts (not enqueues — see helper).
         pre_dispatch_issues = list(cr.issues)
-        _check_cell_dispatched_binding(cr, enqueues, cell_evts, sender_device, sender_emitter)
+        _check_cell_dispatched_binding(cr, send_attempts, cell_evts, sender_device, sender_emitter)
         if len(cr.issues) > len(pre_dispatch_issues):
             cr.outcome = "Unresolved"
             aggregate_red = True
@@ -1117,7 +1203,10 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
         sender_offset_ms = host_to_phone_ms if sender_device == "phone" else host_to_emu_ms
 
         env_outcomes: list[str] = []
-        for enq in enqueues:
+        # §12 Round-7 audit P1-1: iterate over send_attempts (the
+        # per-envelope entry signal), not enqueues (which may be
+        # legitimately absent for deferred envelopes).
+        for enq in send_attempts:
             cid = enq.correlation_id
             corr_evts = [
                 e for e in run_scoped_events

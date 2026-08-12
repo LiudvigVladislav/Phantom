@@ -53,14 +53,28 @@ internal class DiagnosticSendCoordinator(
     }
 
     /**
-     * §12 Round-6 audit P0-1: capture what `MessagingService.sendMessage`
+     * §12 Round-7 audit P0-1: capture what `MessagingService.sendMessage`
      * actually returned so the receiver can emit
-     * `diagnostic_send_command_completed result=accepted|exception`.
-     * No exception text, message text, usernames, keys, tokens or PII —
-     * only the exception class simple name.
+     * `diagnostic_send_command_completed result=handled|exception`.
+     *
+     * `Handled` (was `Accepted` in Round-6) is deliberately NEUTRAL —
+     * `sendMessage` returned without throwing, but that alone does
+     * NOT prove the envelope reached the network: e.g. a
+     * `PeerBundleMissingException` on a fresh pair is caught inside
+     * `DefaultMessagingService`, a WAITING placeholder is written,
+     * and `Result.success(Unit)` returned. The verifier separately
+     * looks for `sender_prekey_deferred` on the same correlation id
+     * to distinguish "coordinator saw a definitive result" from
+     * "envelope actually reached the transport". The closed schema
+     * also reserves `deferred` for the verifier report; the
+     * coordinator itself never emits it (that comes from the
+     * `sender_prekey_deferred` event site).
+     *
+     * No exception text, message text, usernames, keys, tokens or
+     * PII — only the exception class simple name.
      */
     sealed interface SendResult {
-        object Accepted : SendResult
+        object Handled : SendResult
         data class Failed(val exceptionClassName: String) : SendResult
     }
 
@@ -100,7 +114,7 @@ internal class DiagnosticSendCoordinator(
                 val sendResult: SendResult = try {
                     val r = messagingService.sendMessage(message)
                     if (r.isSuccess) {
-                        SendResult.Accepted
+                        SendResult.Handled
                     } else {
                         SendResult.Failed(
                             r.exceptionOrNull()?.let { it::class.simpleName } ?: "UnknownFailure",

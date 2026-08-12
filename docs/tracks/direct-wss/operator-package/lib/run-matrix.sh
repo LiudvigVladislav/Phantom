@@ -161,35 +161,47 @@ poll_envelope() {
   done
 }
 
-# §12 Round-6 audit P0-3: fail-fast gate. After the first canonical
-# cell fires sequence=1, poll for FOUR instrumentation signals
-# matching the returned CID for up to 15 seconds:
-#   * sender_enqueue        (DefaultMessagingService entry)
-#   * sender_transport_decision (HRT.send decision point)
-#   * one of sender_wss_send_returned | sender_rest_post_completed
-#   * diagnostic_send_command_completed with result != rejected
-# If any is missing after 15 s → tooling / instrumentation failure;
-# abort matrix immediately WITHOUT waiting 120 s per cell for the
-# remaining 39 envelopes.
+# §12 Round-7 audit P0-2 (revised from Round-6): fail-fast gate.
+# The Round-6 gate required a route-return (sender_wss_send_returned
+# or sender_rest_post_completed) within 15 s — but a route-return
+# timeout is a legitimate PRODUCT signal (the Yota case we came to
+# investigate). Round-7 narrows the gate to instrumentation-only
+# checks so a hung route call does NOT get misreported as tooling
+# failure.
+#
+# Gate passes when ALL of the following are true for the first
+# canonical envelope within 15 s:
+#   * diagnostic_send_dispatched              (receiver dispatched)
+#   * sender_send_attempt_started             (DMS entry reached)
+#   * one of:
+#       - sender_transport_decision           (send reached HRT)
+#       - a local terminal outcome for the CID:
+#           * sender_prekey_deferred          (prekey missing — WAITING)
+#           * diagnostic_send_command_completed result=rejected|exception
+#
+# If none of the "decision-or-terminal" set appears, the send never
+# even reached the transport decision point — that's tooling. If
+# sender_transport_decision is present, the gate is GREEN and the
+# ordinary 120-s poll_envelope classifies missing route returns /
+# recipient events as PENDING / Unresolved (real product signal).
 gate_first_envelope() {
-  local cid="$1" cell_pin="$2"
+  local cid="$1"
   local start; start=$(now_ms)
   local deadline_ms=$(( start + 15000 ))
   while : ; do
-    local enq dec ret cmd
-    enq=$(count_matches "event=sender_enqueue.*correlation_id=$cid" "$phone_log" "$emu_log")
+    local disp attempt dec deferred cmd_terminal
+    disp=$(count_matches "event=diagnostic_send_dispatched.*correlation_id=$cid" "$phone_log" "$emu_log")
+    attempt=$(count_matches "event=sender_send_attempt_started.*correlation_id=$cid" "$phone_log" "$emu_log")
     dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$phone_log" "$emu_log")
-    if [ "$cell_pin" = "wss" ]; then
-      ret=$(count_matches "event=sender_wss_send_returned.*correlation_id=$cid" "$phone_log" "$emu_log")
-    else
-      ret=$(count_matches "event=sender_rest_post_completed.*correlation_id=$cid" "$phone_log" "$emu_log")
-    fi
-    cmd=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid" "$phone_log" "$emu_log")
-    if [ "$enq" -ge 1 ] && [ "$dec" -ge 1 ] && [ "$ret" -ge 1 ] && [ "$cmd" -ge 1 ]; then
+    deferred=$(count_matches "event=sender_prekey_deferred.*correlation_id=$cid" "$phone_log" "$emu_log")
+    # local terminal from receiver side (rejected/exception on this cid).
+    cmd_terminal=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid.*result=\\(rejected\\|exception\\)" "$phone_log" "$emu_log")
+    local terminal_or_decision=$(( dec + deferred + cmd_terminal ))
+    if [ "$disp" -ge 1 ] && [ "$attempt" -ge 1 ] && [ "$terminal_or_decision" -ge 1 ]; then
       return 0
     fi
     if [ "$(now_ms)" -ge "$deadline_ms" ]; then
-      echo "gate FAILED after 15s: cid=$cid pin=$cell_pin enq=$enq dec=$dec ret=$ret cmd=$cmd" >&2
+      echo "gate FAILED after 15s: cid=$cid disp=$disp attempt=$attempt dec=$dec deferred=$deferred cmd_terminal=$cmd_terminal" >&2
       return 1
     fi
     sleep 1
@@ -252,10 +264,11 @@ for row in "${cells[@]}"; do
       # an incomplete bundle that would look identical to a real
       # transport failure.
       if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
-        if ! gate_first_envelope "$cid" "$pin"; then
+        if ! gate_first_envelope "$cid"; then
           ABORT_REASON="tooling_instrumentation_failure"
           echo "ABORT: production send-path instrumentation missing on the first" >&2
-          echo "       canonical envelope. Not spending another 120s×39 envelopes." >&2
+          echo "       canonical envelope (no transport_decision, no prekey_deferred, no" >&2
+          echo "       receiver-side rejected/exception). Not spending another 120s×39 envelopes." >&2
           echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
           # Best-effort clear pin then exit; trap writes marker.
           "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true

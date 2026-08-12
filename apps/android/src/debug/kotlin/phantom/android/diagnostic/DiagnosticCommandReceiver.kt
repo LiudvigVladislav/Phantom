@@ -84,6 +84,7 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_CLEAR -> handleClear(context)
             SUB_CHECKPOINT -> handleCheckpoint(context)
             SUB_PAIRED_COUNT_REPORT -> handlePairedCountReport(context)
+            SUB_SIGNED_PREKEY_READINESS -> handleSignedPrekeyReadiness(context)
             else -> Log.w(TAG, "rejected: dispatch fell through for subcommand=$subcommand")
         }
     }
@@ -215,8 +216,8 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
                         val (result, exception) = when (
                             val sr = outcome.sendResult
                         ) {
-                            is DiagnosticSendCoordinator.SendResult.Accepted ->
-                                "accepted" to null
+                            is DiagnosticSendCoordinator.SendResult.Handled ->
+                                "handled" to null
                             is DiagnosticSendCoordinator.SendResult.Failed ->
                                 "exception" to sr.exceptionClassName
                         }
@@ -287,6 +288,61 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             emitterIdOverride = snapshot.emitterId.name.lowercase(),
             restored = restored,
         )
+    }
+
+    private fun handleSignedPrekeyReadiness(context: Context) {
+        // §12 Round-7 audit P1-2: non-consuming relay-side prekey
+        // publication check. Uses `preKeyApi.fetchStatus(...)` — which
+        // GETs `/prekeys/status` and returns `(signed_prekey_age_days,
+        // remaining_opks)` WITHOUT consuming an OPK. `fetchBundle`
+        // (which does consume an OPK) is deliberately NOT called here;
+        // Ct  preflight's job is to prove readiness, not to burn a
+        // one-time prekey. Reports back via `WSS_DIAG_CMD` so
+        // preflight can parse a single line per device.
+        val app = context.applicationContext as? PhantomApplication ?: return
+        val container = runCatching { app.container }.getOrNull() ?: run {
+            Log.i(TAG, "signed_prekey_readiness ok=false reason=container_not_ready")
+            return
+        }
+        val identity = container.identityState.value ?: run {
+            Log.i(TAG, "signed_prekey_readiness ok=false reason=no_identity")
+            return
+        }
+        val api = container.preKeyApi ?: run {
+            Log.i(TAG, "signed_prekey_readiness ok=false reason=prekey_api_not_ready")
+            return
+        }
+        val pendingResult = goAsync()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        scope.launch {
+            try {
+                val status = runCatching {
+                    api.fetchStatus(
+                        identityPubkeyHex = identity.publicKeyHex,
+                        requesterPubkeyHex = identity.publicKeyHex,
+                    )
+                }
+                if (status.isFailure) {
+                    Log.i(
+                        TAG,
+                        "signed_prekey_readiness ok=false reason=fetch_status_exception " +
+                            "exception=${status.exceptionOrNull()?.let { it::class.simpleName } ?: "Unknown"}",
+                    )
+                    return@launch
+                }
+                val s = status.getOrThrow()
+                val age = s.signed_prekey_age_days
+                val opks = s.remaining_opks
+                val published = age != null
+                Log.i(
+                    TAG,
+                    "signed_prekey_readiness published=$published " +
+                        "signed_prekey_age_days=${age ?: "null"} remaining_opks=$opks",
+                )
+            } finally {
+                pendingResult.finish()
+            }
+        }
     }
 
     private fun handlePairedCountReport(context: Context) {
@@ -397,11 +453,13 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         internal const val SUB_CLEAR = "clear"
         internal const val SUB_CHECKPOINT = "checkpoint"
         internal const val SUB_PAIRED_COUNT_REPORT = "paired_count_report"
+        internal const val SUB_SIGNED_PREKEY_READINESS = "signed_prekey_readiness"
 
         internal val ALLOWED_SUBCOMMANDS = setOf(
             SUB_PIN, SUB_SEND, SUB_CANARY, SUB_SET_EMITTER_ID,
             SUB_DUAL_SIM_REPORT, SUB_HEALTH, SUB_CLEAR,
             SUB_CHECKPOINT, SUB_PAIRED_COUNT_REPORT,
+            SUB_SIGNED_PREKEY_READINESS,
         )
 
         internal val ALLOWED_PINS = setOf("none", "wss", "rest")
@@ -419,6 +477,7 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             // on this map lookup and returns silently on `null`.
             SUB_CHECKPOINT to emptySet(),
             SUB_PAIRED_COUNT_REPORT to emptySet(),
+            SUB_SIGNED_PREKEY_READINESS to emptySet(),
         )
 
         private val RUN_ID_EXTRA = setOf('.', '_', '-')

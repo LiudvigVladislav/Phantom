@@ -395,27 +395,68 @@ unset FAKE_ADB_LOG
 PATH="${PATH#*:}"
 export PATH
 
-# ── Round-6 audit P0-3 helper: fail-fast gate signal check ─────
+# ── Round-7 audit P0-2 revised gate: instrumentation-only ──────
 
-# The gate function in run-matrix.sh looks for four distinct events
-# matching a CID. Simulate a synthetic log with 3-of-4 signals and
-# confirm count_matches reports the missing one as 0 without dying.
+# Round-6 gate required a route-return within 15 s — but a hung
+# route call IS the product signal we came to investigate. Round-7
+# narrows the gate to: dispatched + send_attempt_started +
+# (transport_decision OR local terminal outcome). Once
+# transport_decision fires, missing route-return is a PRODUCT
+# signal handled by the 120-s poll_envelope loop.
+#
+# Case 1: full instrumentation — gate GREEN.
 tmp_log=$(mktemp)
-cid="cid-gate-test"
+cid="cid-gate-r7-ok"
 cat > "$tmp_log" <<LOG
-08-11 I WSS_DIAG: event=sender_enqueue role=sender emitter_id=phone correlation_id=$cid
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone correlation_id=$cid sequence=1
+08-11 I WSS_DIAG: event=sender_send_attempt_started role=sender emitter_id=phone correlation_id=$cid
 08-11 I WSS_DIAG: event=sender_transport_decision role=sender emitter_id=phone correlation_id=$cid outer_transport=direct inner_route=wss dispatched=true
-08-11 I WSS_DIAG: event=diagnostic_send_command_completed role=matrix emitter_id=phone correlation_id=$cid result=accepted
 LOG
-enq=$(count_matches "event=sender_enqueue.*correlation_id=$cid" "$tmp_log")
+disp=$(count_matches "event=diagnostic_send_dispatched.*correlation_id=$cid" "$tmp_log")
+att=$(count_matches "event=sender_send_attempt_started.*correlation_id=$cid" "$tmp_log")
 dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$tmp_log")
-ret=$(count_matches "event=sender_wss_send_returned.*correlation_id=$cid" "$tmp_log")
-cmd=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid" "$tmp_log")
-if [ "$enq" = "1" ] && [ "$dec" = "1" ] && [ "$ret" = "0" ] && [ "$cmd" = "1" ]; then
-    echo "PASS: fail-fast gate signals — 3-of-4 log correctly reports missing wss_return=0"
+if [ "$disp" = "1" ] && [ "$att" = "1" ] && [ "$dec" = "1" ]; then
+    echo "PASS: R7 gate GREEN — dispatched + send_attempt + transport_decision present"
     pass=$((pass+1))
 else
-    echo "FAIL: fail-fast gate signals — enq=$enq dec=$dec ret=$ret cmd=$cmd (expected 1/1/0/1)"
+    echo "FAIL: R7 gate GREEN case — disp=$disp att=$att dec=$dec"
+    fail=$((fail+1))
+fi
+
+# Case 2: no route-return, no transport_decision either, but a
+# local terminal outcome (sender_prekey_deferred) — gate still
+# GREEN (this is the fresh-pair prekey path; verifier will report
+# the envelope as deferred).
+cat > "$tmp_log" <<LOG
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone correlation_id=$cid sequence=1
+08-11 I WSS_DIAG: event=sender_send_attempt_started role=sender emitter_id=phone correlation_id=$cid
+08-11 I WSS_DIAG: event=sender_prekey_deferred role=sender emitter_id=phone correlation_id=$cid
+LOG
+disp=$(count_matches "event=diagnostic_send_dispatched.*correlation_id=$cid" "$tmp_log")
+att=$(count_matches "event=sender_send_attempt_started.*correlation_id=$cid" "$tmp_log")
+dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$tmp_log")
+def=$(count_matches "event=sender_prekey_deferred.*correlation_id=$cid" "$tmp_log")
+if [ "$disp" = "1" ] && [ "$att" = "1" ] && [ "$dec" = "0" ] && [ "$def" = "1" ]; then
+    echo "PASS: R7 gate GREEN — dispatched + send_attempt + prekey_deferred as terminal (no transport_decision needed)"
+    pass=$((pass+1))
+else
+    echo "FAIL: R7 gate deferred case — disp=$disp att=$att dec=$dec def=$def"
+    fail=$((fail+1))
+fi
+
+# Case 3: dispatched only — no send_attempt_started, no
+# transport_decision, no terminal. This is the live Yota failure
+# shape. Gate must FAIL.
+cat > "$tmp_log" <<LOG
+08-11 I WSS_DIAG: event=diagnostic_send_dispatched role=matrix emitter_id=phone correlation_id=$cid sequence=1
+LOG
+disp=$(count_matches "event=diagnostic_send_dispatched.*correlation_id=$cid" "$tmp_log")
+att=$(count_matches "event=sender_send_attempt_started.*correlation_id=$cid" "$tmp_log")
+if [ "$disp" = "1" ] && [ "$att" = "0" ]; then
+    echo "PASS: R7 gate FAIL — dispatched without send_attempt_started (live Yota shape)"
+    pass=$((pass+1))
+else
+    echo "FAIL: R7 gate live-Yota case — disp=$disp att=$att"
     fail=$((fail+1))
 fi
 rm -f "$tmp_log"

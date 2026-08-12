@@ -29,6 +29,7 @@ class DiagnosticCommandReceiverContractTest {
             "pin", "send", "canary", "set_emitter_id",
             "dual_sim_report", "health", "clear",
             "checkpoint", "paired_count_report",
+            "signed_prekey_readiness",
         )
         assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
     }

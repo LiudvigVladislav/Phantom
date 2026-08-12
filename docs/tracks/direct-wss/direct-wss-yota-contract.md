@@ -45,6 +45,134 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.7 — Round-7 audit repair (2026-08-12, Round-6 REDLINE follow-up)
+
+Round-6 (`3d7ad16e`) accepted the diagnosis but the delivered
+patch had four residual defects the architect caught before an
+APK build: (a) `PeerBundleMissingException` returns a
+success-shaped `Result<Unit>`, so `command_completed result=accepted`
+would silently certify a WAITING placeholder as transport
+acceptance; (b) the fail-fast gate required a route-return in
+15 s, conflating a hung route call (a legitimate product signal)
+with a tooling failure; (c) the Round-6 move of `sender_enqueue`
+to the send-entry point redefined enqueue's semantic away from
+"row inserted with QUEUED status"; (d) the next clean bootstrap
+would hit the same prekey-publish-latency window with no
+preventative check. Round-7 closes all four.
+
+Scope: Python/shell/docs + minimal Android for the new events
+and the new debug subcommand. No APK build. No ADB. No full
+Gradle suite. Compile + focused tests only.
+
+**P0-1 restore `sender_enqueue`; add `sender_send_attempt_started`
+and `sender_prekey_deferred`.**
+
+* `shared/core/messaging/.../DefaultMessagingService.kt` restores
+  the `sender_enqueue` emit inside `afterEncrypt` (real queue
+  boundary — row inserted with `QUEUED` status). New event
+  `sender_send_attempt_started` fires at the top of `sendMessage`
+  BEFORE `encryptUnderLock` — it is the "send attempt began"
+  signal and always fires. New event `sender_prekey_deferred`
+  fires inside the `catch (e: PeerBundleMissingException)` block,
+  carrying only `correlation_id` + `role` (no exception text,
+  reason tag, recipient hex, message text or PII). Production
+  WAITING behaviour is unchanged.
+* `SendResult.Accepted` renamed to `SendResult.Handled` — the
+  value is deliberately neutral. `command_completed result=handled`
+  means "coordinator saw a definitive result without throw"; it
+  does NOT prove transport acceptance. The closed-schema result
+  set is now `{handled, rejected, exception, deferred}` — the
+  fourth value is reserved for verifier reports and the receiver
+  side does not emit it (the corresponding signal is
+  `sender_prekey_deferred`).
+* Verifier binds `diagnostic_send_dispatched` to
+  `sender_send_attempt_started` (not `sender_enqueue`) — a
+  deferred attempt legitimately has attempt_started + deferred
+  and no enqueue. Missing `sender_send_attempt_started` for a
+  dispatched CID is integrity RED (production send path never
+  reached — the live Yota failure shape). Presence of
+  `sender_prekey_deferred` for any envelope's CID downgrades the
+  envelope to `Unresolved` with a `deferred` reason — it can
+  NEVER be counted as authoritatively delivered.
+
+**P0-2 fail-fast gate rewrite — instrumentation vs product signal.**
+
+The Round-6 gate required a route-return
+(`sender_wss_send_returned` or `sender_rest_post_completed`)
+within 15 s. A hung route call IS the product signal we come to
+Yota to investigate — misreporting it as tooling failure would
+lose evidence. Round-7 narrows the gate to instrumentation-only
+checks. `gate_first_envelope` passes when ALL of the following
+appear within 15 s for the first canonical envelope:
+
+* `diagnostic_send_dispatched` (receiver accepted the command),
+* `sender_send_attempt_started` (DMS entry reached), AND
+* at least one of the "decision-or-terminal" set:
+  * `sender_transport_decision` (send reached HRT — instrumentation
+    proven; missing route return is a product signal from here on),
+  * `sender_prekey_deferred` (local terminal, WAITING placeholder),
+  * `diagnostic_send_command_completed` with
+    `result ∈ {rejected, exception}` (receiver-side terminal).
+
+If `sender_transport_decision` is present the gate is GREEN and
+`poll_envelope`'s ordinary 120-s window classifies missing route
+returns / recipient events as `PENDING` / `Unresolved` (real
+product signal). If none of the "decision-or-terminal" set fires
+within 15 s → `ABORT_REASON=tooling_instrumentation_failure`.
+
+**P1-1 verifier: cell-completion metric switched to
+`sender_send_attempt_started`.**
+
+The 5-per-cell metric is now the send-entry event, not the
+queue-boundary event. `sender_enqueue` keeps its afterEncrypt
+semantic and is a distinct per-envelope signal that may be
+legitimately absent under a deferred attempt. Global CID
+uniqueness now keys on `sender_send_attempt_started` (a deferred
+attempt has attempt_started + no enqueue; keying uniqueness on
+enqueue would miss deferred-attempt collisions). Enqueue keeps
+its own per-cell uniqueness check as defence in depth.
+
+**P1-2 preflight `signed_prekey_readiness` (non-consuming).**
+
+New debug subcommand `signed_prekey_readiness` reads the device's
+own `identity.publicKeyHex` and calls
+`PreKeyApi.fetchStatus(identity, identity)` — a GET
+`/prekeys/status` that returns `(signed_prekey_age_days,
+remaining_opks)` WITHOUT consuming an OPK. The receiver logs
+`signed_prekey_readiness published=<true|false>
+signed_prekey_age_days=<n|null> remaining_opks=<n>` to
+`WSS_DIAG_CMD`. `preflight.sh` refuses to run the matrix if
+either device reports `published=false` — the operator waits
+30 s and re-runs preflight. `fetchBundle` (which DOES consume an
+OPK) is deliberately not called. `AppContainer.preKeyApi` exposed
+for the receiver only; release APK never registers the receiver
+so no production access path exists.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes: BUILD SUCCESSFUL (contract test
+  updated for the new `signed_prekey_readiness` subcommand).
+* Python — 92 fixtures (3 new for Round-7):
+  `sender_prekey_deferred` makes the cell `Unresolved` with a
+  `deferred` reason; `command_completed result=handled` paired
+  with `sender_prekey_deferred` is NOT transport acceptance;
+  `sender_enqueue` and `sender_send_attempt_started` are distinct
+  signals (5 attempts, 4 enqueues → envs=5, product RED, integrity
+  GREEN). The 89 Round-6 fixtures were reworked to emit
+  `sender_send_attempt_started` alongside `sender_enqueue` in the
+  full-delivery helper. All 92 pass.
+* Shell — 36 fixtures (2 new for Round-7): gate GREEN with
+  transport_decision; gate GREEN with prekey_deferred as terminal
+  (no transport_decision required); gate FAIL for the live Yota
+  shape (dispatched without send_attempt_started). The Round-6
+  route-return signal fixture was replaced by these three cases.
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per process constraints: reviewer sees
+`round6-3d7ad16e.patch` + `round7-<hash>.patch` + focused test
+logs. Single `assembleDebug` and destructive `bootstrap --fresh`
+gated on architect LOGICAL GREEN.**
+
 ### §12.6 — Round-6 audit repair (2026-08-12, first live Yota run)
 
 First live Yota-pass ran from a signed final tar with APK

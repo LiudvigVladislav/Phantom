@@ -225,6 +225,10 @@ def make_complete_delivery_lines(cell_id: str, direction: str, base_wall: int = 
         cid = f"{cid_prefix}-{cell_id}-{i}"
         sender_lines = phone if sender_dev == "phone" else emu
         recipient_lines = phone if recipient_dev == "phone" else emu
+        # §12 Round-7 audit P1-1: send_attempt_started at entry;
+        # sender_enqueue keeps its afterEncrypt semantic; both share
+        # the same CID.
+        sender_lines.append(line("sender_send_attempt_started", wall - 1, 9, "sender", cell_id, sender_dev, correlation_id=cid))
         sender_lines.append(line("sender_enqueue", wall, 10, "sender", cell_id, sender_dev, correlation_id=cid))
         sender_lines.append(line("sender_transport_decision", wall + 10, 11, "sender", cell_id, sender_dev,
                                   correlation_id=cid, outer="direct", inner=pin, dispatched=True))
@@ -534,6 +538,8 @@ class VerifierTests(unittest.TestCase):
         for i in range(1, 6):
             wall = base + i * 1000
             cid = f"cid-{i}"
+            # §12 Round-7 audit P1-1: send_attempt_started at entry.
+            phone.append(line("sender_send_attempt_started", wall - 1, 9, "sender", cell_id, "phone", correlation_id=cid))
             phone.append(line("sender_enqueue", wall, 10, "sender", cell_id, "phone", correlation_id=cid))
             phone.append(line("sender_transport_decision", wall + 10, 11, "sender", cell_id, "phone",
                                correlation_id=cid, outer="direct", inner="wss", dispatched=True))
@@ -1396,15 +1402,12 @@ class VerifierTests(unittest.TestCase):
     # ── Round-6 audit cases ────────────────────────────────────
 
     # P0-1 — dispatched without matching sender_enqueue = integrity RED.
-    def test_R6_P0_1_dispatched_without_enqueue_is_integrity_RED(self):
-        # Mimics the live Yota failure: dispatched CIDs are logged but
-        # no matching sender_enqueue anywhere (production send path
-        # never reached).
+    def test_R6_P0_1_dispatched_without_send_attempt_started_is_integrity_RED(self):
+        # Mimics the live Yota failure exactly: dispatched CIDs are
+        # logged but no matching sender_send_attempt_started anywhere
+        # (production send path never reached).
         cell_id = "wss.p2e.after-connect"
         base = 200_000
-        # Emit only pin_active + session_started + 5 diagnostic_send_dispatched;
-        # NO sender_enqueue. This is exactly the shape of the live Yota
-        # bundle for the first canonical cell.
         phone: list[str] = [
             line("diagnostic_session_started", base - 1000, 1, "matrix", "-", "phone",
                  pin="wss", inner="wss", restored=False),
@@ -1425,15 +1428,16 @@ class VerifierTests(unittest.TestCase):
         rep = ve.build_report(out)
         self.assertFalse(rep.integrity_ok)
         self.assertTrue(
-            any("has no matching sender_enqueue" in p for p in rep.integrity_issues),
+            any("has no matching sender_send_attempt_started" in p
+                for p in rep.integrity_issues),
             msg=f"issues: {rep.integrity_issues}",
         )
         self.assertEqual(rep.product_outcome, "NOT_EVALUABLE")
 
-    def test_R6_P0_1_preflight_rest_probe_dispatched_without_enqueue_is_OK(self):
+    def test_R6_P0_1_preflight_rest_probe_dispatched_without_attempt_started_is_OK(self):
         # The preflight REST-capability probe intentionally has a
-        # dispatched with no matching enqueue — it classifies through
-        # sender_rest_post_completed.relay_acceptance instead.
+        # dispatched with no matching send_attempt_started — it
+        # classifies through sender_rest_post_completed only.
         base = 200_000
         phone, emu = make_complete_delivery_lines("wss.p2e.after-connect", "p2e", base_wall=base)
         # Add a dispatched for preflight.rest_capability with NO enqueue.
@@ -1471,8 +1475,9 @@ class VerifierTests(unittest.TestCase):
         )
 
     def test_R6_P0_1_command_completed_valid_results_accepted(self):
-        # accepted / rejected / exception must all be OK values.
-        for good in ("accepted", "rejected", "exception"):
+        # §12 Round-7 audit P0-1: accepted renamed to handled; deferred
+        # reserved in the closed schema for post-processing.
+        for good in ("handled", "rejected", "exception", "deferred"):
             cell_id = "wss.p2e.after-connect"
             phone = [
                 line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone",
@@ -1503,7 +1508,7 @@ class VerifierTests(unittest.TestCase):
         rep = ve.build_report(out, host_now_override_ms=base + 400_000)
         self.assertFalse(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
         self.assertTrue(
-            any("has 0 sender_enqueue events" in p and target in p
+            any("has 0 sender_send_attempt_started events" in p and target in p
                 for p in rep.integrity_issues),
             msg=f"issues: {rep.integrity_issues}",
         )
@@ -1610,6 +1615,148 @@ class VerifierTests(unittest.TestCase):
         self.assertFalse(rep.integrity_ok)
         self.assertEqual(rep.product_outcome, "NOT_EVALUABLE",
                           msg="NOT_EVALUABLE: an aborted, evidence-less run must never surface a product signal")
+
+    # ── Round-7 audit repro cases ────────────────────────────
+
+    # P0-1 — PeerBundleMissingException produces a success-shaped
+    # Result. `handled` from command_completed MUST NOT be treated
+    # as transport acceptance when `sender_prekey_deferred` is
+    # present for the same correlation_id.
+    def test_R7_P0_1_prekey_deferred_makes_cell_Unresolved_not_delivered(self):
+        # Full-delivery baseline for the target cell, then mutate ONE
+        # envelope's evidence: replace its sender_enqueue with a
+        # sender_prekey_deferred (encryption bailed on
+        # PeerBundleMissingException, catch block wrote the deferred
+        # event, sendMessage returned Result.success). Recipient
+        # signals remain absent for that envelope. Verifier MUST
+        # NOT report the cell as Delivered once.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        target_cid = f"cid-{cell_id}-1"
+        # Strip enqueue + transport_decision + wss_send_returned +
+        # recipient events for the target CID; add a
+        # sender_prekey_deferred instead.
+        strip_pat = (
+            "sender_enqueue", "sender_transport_decision",
+            "sender_wss_send_returned", "sender_relay_ack_received",
+            "recipient_deliver_received", "recipient_message_persisted",
+            "recipient_ack_deliver_sent",
+        )
+        phone = [
+            ln for ln in phone
+            if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)
+        ]
+        emu = [
+            ln for ln in emu
+            if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)
+        ]
+        # Insert the deferred event on the sender's log.
+        phone.append(line(
+            "sender_prekey_deferred", base + 1_500, 15, "sender", cell_id, "phone",
+            correlation_id=target_cid,
+        ))
+        # Fill the remaining cells so integrity holds elsewhere.
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        # Integrity stays GREEN (all 5 send_attempts still present,
+        # all schema valid). Product outcome: RED — one envelope in
+        # the target cell is Unresolved with `deferred` reason.
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertEqual(cell.outcome, "Unresolved",
+                          msg=f"prekey-deferred envelope must NOT be Delivered once: {cell.issues}")
+        self.assertTrue(
+            any("sender_prekey_deferred" in i for i in cell.issues),
+            msg=f"cell.issues must mention prekey deferral: {cell.issues}",
+        )
+        self.assertEqual(rep.product_outcome, "RED")
+
+    def test_R7_P0_1_command_completed_result_handled_alone_is_not_transport_acceptance(self):
+        # command_completed.result=handled is closed schema OK on its
+        # own. But when paired with sender_prekey_deferred for the
+        # same CID it MUST NOT be misread as transport acceptance —
+        # the cell is Unresolved via the deferred path.
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        target_cid = f"cid-{cell_id}-1"
+        # Add command_completed handled + prekey_deferred both for the
+        # same CID (no delivery signals). Strip the normal enqueue
+        # + delivery signals for that CID.
+        strip_pat = (
+            "sender_enqueue", "sender_transport_decision",
+            "sender_wss_send_returned", "sender_relay_ack_received",
+            "recipient_deliver_received", "recipient_message_persisted",
+            "recipient_ack_deliver_sent",
+        )
+        phone = [ln for ln in phone if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)]
+        emu = [ln for ln in emu if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)]
+        phone.append(line(
+            "sender_prekey_deferred", base + 1_500, 15, "sender", cell_id, "phone",
+            correlation_id=target_cid,
+        ))
+        phone.append(
+            "08-11 I WSS_DIAG: event=diagnostic_send_command_completed role=matrix "
+            "emitter_id=phone run_id=run-test cell_id=" + cell_id +
+            f" wall_utc_ms={base + 1_600} monotonic_ms=16 "
+            f"correlation_id={target_cid} sequence=1 result=handled",
+        )
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        self.assertNotEqual(cell.outcome, "Delivered once",
+                             msg=f"handled+deferred must NOT be Delivered once: {cell.issues}")
+
+    # P1-1 — sender_enqueue and sender_send_attempt_started are
+    # distinct signals. A cell that fires 5 attempts but only 4
+    # enqueues (one deferred) still has envelopes=5 and product
+    # outcome = RED (via the deferred envelope's Unresolved
+    # classification), NOT integrity RED.
+    def test_R7_P1_1_send_attempt_started_and_enqueue_are_distinct_signals(self):
+        cell_id = "wss.p2e.after-connect"
+        base = 200_000
+        phone, emu = make_complete_delivery_lines(cell_id, "p2e", base_wall=base)
+        target_cid = f"cid-{cell_id}-1"
+        strip_pat = (
+            "sender_enqueue", "sender_transport_decision",
+            "sender_wss_send_returned", "sender_relay_ack_received",
+            "recipient_deliver_received", "recipient_message_persisted",
+            "recipient_ack_deliver_sent",
+        )
+        phone = [ln for ln in phone if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)]
+        emu = [ln for ln in emu if not any(p in ln and f"correlation_id={target_cid}" in ln for p in strip_pat)]
+        phone.append(line(
+            "sender_prekey_deferred", base + 1_500, 15, "sender", cell_id, "phone",
+            correlation_id=target_cid,
+        ))
+        m = default_matrix()
+        for cell in m["cells"][1:]:
+            if cell.get("blocked"): continue
+            p2, e2 = make_complete_delivery_lines(cell["cell_id"], cell["direction"],
+                                                    base_wall=base + 50_000, pin=cell["pin"])
+            phone.extend(p2); emu.extend(e2)
+        out = make_bundle(self.tmp, phone_lines=phone, emulator_lines=emu, matrix=m)
+        rep = ve.build_report(out, host_now_override_ms=base + 400_000)
+        cell = next(c for c in rep.cells if c.cell_id == cell_id)
+        # 5 send_attempts fired → envs=5, integrity stays GREEN, but
+        # cell is Unresolved because the deferred envelope isn't
+        # authoritatively delivered.
+        self.assertEqual(cell.envelopes, 5, msg=f"expected 5 attempts, got {cell.envelopes}")
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(cell.outcome, "Unresolved")
 
     # P0-2 — NOT_EVALUABLE never hides behind RED/GREEN.
     def test_R6_P0_2_NOT_EVALUABLE_replaces_product_outcome_on_integrity_RED(self):
