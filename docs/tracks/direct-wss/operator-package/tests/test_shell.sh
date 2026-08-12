@@ -675,6 +675,105 @@ else
     echo "FAIL: R9 empty confirmation exit code was $rc (expected 4)"; fail=$((fail+1))
 fi
 
+# ── WSS-2 operator-args helper ──────────────────────────────
+
+# shellcheck source=../lib/operator-args.sh
+source "$PKG/lib/operator-args.sh"
+
+# validate_operator_label: whitelist YOTA/TELE2.
+for good in YOTA TELE2; do
+    if validate_operator_label "$good"; then
+        echo "PASS: WSS-2 validate_operator_label accepts $good"; pass=$((pass+1))
+    else
+        echo "FAIL: WSS-2 validate_operator_label rejected $good"; fail=$((fail+1))
+    fi
+done
+for bad in yota Tele2 "" MEGAFON MTS Beeline "TELE 2" "TELE-2"; do
+    if validate_operator_label "$bad"; then
+        echo "FAIL: WSS-2 validate_operator_label accepted [$bad]"; fail=$((fail+1))
+    else
+        echo "PASS: WSS-2 validate_operator_label rejects [$bad]"; pass=$((pass+1))
+    fi
+done
+
+# validate_operator_numeric: 5-6 digit ASCII.
+for good in 25011 25020 999999 12345; do
+    if validate_operator_numeric "$good"; then
+        echo "PASS: WSS-2 validate_operator_numeric accepts $good"; pass=$((pass+1))
+    else
+        echo "FAIL: WSS-2 validate_operator_numeric rejected $good"; fail=$((fail+1))
+    fi
+done
+for bad in "" 1234 1234567 25011abc "25 011" "2501a" "25011%N"; do
+    if validate_operator_numeric "$bad"; then
+        echo "FAIL: WSS-2 validate_operator_numeric accepted [$bad]"; fail=$((fail+1))
+    else
+        echo "PASS: WSS-2 validate_operator_numeric rejects [$bad]"; pass=$((pass+1))
+    fi
+done
+
+# parse_operator_args: good YOTA path.
+if parse_operator_args --operator YOTA --expected-operator-numeric 25011 2>/dev/null; then
+    if [ "$OPERATOR_LABEL" = "YOTA" ] \
+        && [ "$OPERATOR_LABEL_LOWER" = "yota" ] \
+        && [ "$EXPECTED_OPERATOR_NUMERIC" = "25011" ]; then
+        echo "PASS: WSS-2 parse_operator_args YOTA sets globals correctly"; pass=$((pass+1))
+    else
+        echo "FAIL: WSS-2 parse YOTA globals wrong: label=$OPERATOR_LABEL lower=$OPERATOR_LABEL_LOWER num=$EXPECTED_OPERATOR_NUMERIC"
+        fail=$((fail+1))
+    fi
+else
+    echo "FAIL: WSS-2 parse_operator_args YOTA rejected valid input"; fail=$((fail+1))
+fi
+
+# parse_operator_args: good TELE2 path.
+if parse_operator_args --operator TELE2 --expected-operator-numeric 25020 2>/dev/null; then
+    if [ "$OPERATOR_LABEL" = "TELE2" ] \
+        && [ "$OPERATOR_LABEL_LOWER" = "tele2" ] \
+        && [ "$EXPECTED_OPERATOR_NUMERIC" = "25020" ]; then
+        echo "PASS: WSS-2 parse_operator_args TELE2 sets globals correctly"; pass=$((pass+1))
+    else
+        echo "FAIL: WSS-2 parse TELE2 globals wrong"; fail=$((fail+1))
+    fi
+else
+    echo "FAIL: WSS-2 parse_operator_args TELE2 rejected valid input"; fail=$((fail+1))
+fi
+
+# parse_operator_args: missing --operator.
+if parse_operator_args --expected-operator-numeric 25011 2>/dev/null; then
+    echo "FAIL: WSS-2 parse_operator_args accepted missing --operator"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args rejects missing --operator"; pass=$((pass+1))
+fi
+
+# parse_operator_args: missing --expected-operator-numeric.
+if parse_operator_args --operator YOTA 2>/dev/null; then
+    echo "FAIL: WSS-2 parse_operator_args accepted missing --expected-operator-numeric"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args rejects missing --expected-operator-numeric"; pass=$((pass+1))
+fi
+
+# parse_operator_args: unknown --operator label.
+if parse_operator_args --operator MEGAFON --expected-operator-numeric 25002 2>/dev/null; then
+    echo "FAIL: WSS-2 parse_operator_args accepted MEGAFON"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args rejects unknown label MEGAFON"; pass=$((pass+1))
+fi
+
+# parse_operator_args: malformed numeric.
+if parse_operator_args --operator TELE2 --expected-operator-numeric abc 2>/dev/null; then
+    echo "FAIL: WSS-2 parse_operator_args accepted non-digit numeric"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args rejects non-digit numeric"; pass=$((pass+1))
+fi
+
+# parse_operator_args: unknown flag.
+if parse_operator_args --operator YOTA --expected-operator-numeric 25011 --bogus 2>/dev/null; then
+    echo "FAIL: WSS-2 parse_operator_args accepted unknown flag --bogus"; fail=$((fail+1))
+else
+    echo "PASS: WSS-2 parse_operator_args rejects unknown flag --bogus"; pass=$((pass+1))
+fi
+
 echo ""
 echo "shell tests: pass=$pass fail=$fail"
 if [ "$fail" -gt 0 ]; then exit 1; fi

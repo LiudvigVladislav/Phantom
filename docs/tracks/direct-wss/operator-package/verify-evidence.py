@@ -92,6 +92,10 @@ ALLOWED_ROLES = {"sender", "recipient", "matrix"}
 ALLOWED_DEVICES = {"phone", "emulator"}
 OPERATOR_NUMERIC_RE = re.compile(r"^\d{5,6}$")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+# §12 WSS-2: operator-parameterization label whitelist. Additions
+# require both an operator-numeric mapping and a new
+# `--operator <LABEL>` accepted by `lib/operator-args.sh`.
+OPERATOR_LABEL_WHITELIST = frozenset({"YOTA", "TELE2"})
 
 CANONICAL_MATRIX_TRIPLES = frozenset({
     ("wss", "p2e", "after-connect"),
@@ -190,7 +194,11 @@ class VerifyReport:
     integrity_ok: bool
     integrity_issues: list[str]
     cells: list[CellReport]
-    product_outcome: str          # GREEN | RED | PENDING
+    product_outcome: str          # GREEN | RED | PENDING | NOT_EVALUABLE
+    # §12 WSS-2: operator label carried into the rendered report
+    # title. None on legacy Yota-only bundles that predate the
+    # operator-parameterization field.
+    operator_label: Optional[str] = None
 
 
 def _safe_int(v: Optional[str]) -> Optional[int]:
@@ -373,6 +381,67 @@ def _per_sender_pin_coverage(
     return (False, f"latest pin before enqueue on {sender_device}: {latest_pin or 'none'} ({latest_meta or 'no events'}) — expected {cell_pin} for run={run_id} cell={cell_id}")
 
 
+def _validate_operator_gate(preflight: dict) -> list[str]:
+    """§12 WSS-2: at least ONE of the two operator-confirmation
+    signals must be True — either the legacy `yota_confirmed`
+    (Round-9 Yota-only bundles + the archived Yota baseline) OR
+    the new `operator_confirmed`. When `operator_confirmed=True`,
+    strict schema applies to the new companion fields; the
+    cross-file consistency check with the manifest lives in
+    `_validate_cross_file_run_consistency`.
+
+    Neither field True → integrity RED (an unconfirmed operator
+    means the observed default-data SIM was never gated by a
+    typed carrier label, so the whole run can't be attributed to
+    a carrier)."""
+    problems: list[str] = []
+
+    yota = preflight.get("yota_confirmed")
+    opc = preflight.get("operator_confirmed")
+
+    # Type gates — accept only real JSON booleans or absent.
+    for key, v in (("yota_confirmed", yota), ("operator_confirmed", opc)):
+        if v is not None and not isinstance(v, bool):
+            problems.append(
+                f"preflight.{key} must be a JSON boolean or absent, got {type(v).__name__}: {v!r}",
+            )
+
+    yota_ok = isinstance(yota, bool) and yota is True
+    opc_ok = isinstance(opc, bool) and opc is True
+
+    if not yota_ok and not opc_ok:
+        problems.append(
+            "preflight has no operator confirmation: neither yota_confirmed nor operator_confirmed is True",
+        )
+
+    # When operator_confirmed is True, the WSS-2 companion fields
+    # must be present and well-formed.
+    if opc_ok:
+        label = preflight.get("operator_label")
+        if not isinstance(label, str) or label not in OPERATOR_LABEL_WHITELIST:
+            problems.append(
+                f"preflight.operator_label not a whitelisted string ({sorted(OPERATOR_LABEL_WHITELIST)}): {label!r}",
+            )
+        expected = preflight.get("expected_operator_numeric")
+        if not isinstance(expected, str) or not OPERATOR_NUMERIC_RE.match(expected):
+            problems.append(
+                f"preflight.expected_operator_numeric not a 5-6 digit string: {expected!r}",
+            )
+        # A YOTA-labelled operator_confirmed run should also carry
+        # yota_confirmed=true (belt & braces so the legacy consumer
+        # of the bundle still recognises it).
+        if isinstance(label, str) and label == "YOTA" and not yota_ok:
+            problems.append(
+                "preflight.operator_label=YOTA but yota_confirmed is not True — legacy field must stay in sync for wire-compat",
+            )
+        if isinstance(label, str) and label != "YOTA" and yota is True:
+            problems.append(
+                f"preflight.operator_label={label!r} but yota_confirmed=True — labels contradict",
+            )
+
+    return problems
+
+
 def _validate_preflight(preflight: dict) -> list[str]:
     """Round-3 audit P0-3: every gate the operator's preflight ran
     must be recorded AND set to a passing value. Any missing field
@@ -396,7 +465,15 @@ def _validate_preflight(preflight: dict) -> list[str]:
     # `"true"`, `1`, `None`, list …) the verifier rejects the bundle.
     # `type(v) is bool` + `v is True` — same strict semantics as the
     # matrix `blocked` field (§12.4 P0-2).
-    for req_bool in ("yota_confirmed", "emitter_ids_set", "radio_confirmed",
+    #
+    # §12 WSS-2 operator parameterization: the operator-confirmation
+    # gate now accepts EITHER the legacy `yota_confirmed` field
+    # (still True on YOTA-labelled runs; the archived Yota bundle
+    # from `run-yota-20260812T171418Z` also carries only this
+    # field) OR the new `operator_confirmed` field. The two are
+    # cross-verified in `_validate_operator_gate` below and must
+    # not contradict when both are present.
+    for req_bool in ("emitter_ids_set", "radio_confirmed",
                      "paired_conversation_count_ok",
                      "phone_signed_prekey_ready",
                      "emulator_signed_prekey_ready"):
@@ -407,6 +484,7 @@ def _validate_preflight(preflight: dict) -> list[str]:
             )
         elif v is not True:
             problems.append(f"preflight.{req_bool} is not True: {v!r}")
+    problems += _validate_operator_gate(preflight)
 
     if preflight.get("canary") != "ok":
         problems.append(f"preflight.canary != 'ok': {preflight.get('canary')!r}")
@@ -516,6 +594,35 @@ def _validate_cross_file_run_consistency(
         problems.append(
             f"preflight.diagnostic_apk_sha256={pa!r} != device-manifest.diagnostic_apk_sha256={da!r}",
         )
+
+    # §12 WSS-2 operator parameterization: cross-file consistency
+    # for the new operator fields — the same operator_label +
+    # expected_operator_numeric MUST appear in both files, and
+    # the observed `dual_sim_report_operator_numeric` in the
+    # manifest MUST equal the expected value. This is what
+    # prevents an operator from re-using a Yota manifest under a
+    # Tele2 preflight prompt (or vice versa).
+    p_label = preflight.get("operator_label")
+    d_label = manifest.get("operator_label")
+    if p_label is not None or d_label is not None:
+        if p_label != d_label:
+            problems.append(
+                f"preflight.operator_label={p_label!r} != device-manifest.operator_label={d_label!r}",
+            )
+    p_exp = preflight.get("expected_operator_numeric")
+    d_exp = manifest.get("expected_operator_numeric")
+    if p_exp is not None or d_exp is not None:
+        if p_exp != d_exp:
+            problems.append(
+                f"preflight.expected_operator_numeric={p_exp!r} != device-manifest.expected_operator_numeric={d_exp!r}",
+            )
+    observed = manifest.get("dual_sim_report_operator_numeric")
+    if isinstance(p_exp, str) and isinstance(observed, str):
+        if OPERATOR_NUMERIC_RE.match(p_exp) and OPERATOR_NUMERIC_RE.match(observed):
+            if p_exp != observed:
+                problems.append(
+                    f"preflight.expected_operator_numeric={p_exp!r} != device-manifest.dual_sim_report_operator_numeric={observed!r}",
+                )
     return problems
 
 
@@ -1276,17 +1383,25 @@ def build_report(out: str, host_now_override_ms: Optional[int] = None) -> Verify
     else:
         product_outcome = "GREEN"
 
+    op_label_raw = preflight.get("operator_label")
+    operator_label = op_label_raw if isinstance(op_label_raw, str) else None
     return VerifyReport(
         run_id=matrix.get("run_id"),
         integrity_ok=integrity_ok,
         integrity_issues=integrity_issues,
         cells=cells_report,
         product_outcome=product_outcome,
+        operator_label=operator_label,
     )
 
 
 def render_markdown(rep: VerifyReport) -> str:
-    lines = ["# Direct WSS Yota-First — verification report v4"]
+    # §12 WSS-2: report title carries the operator label so a Yota
+    # report and a Tele2 report are visually distinct at a glance.
+    # Falls back to "Yota-First" when operator_label is absent (the
+    # archived Round-9 Yota baseline predates the field).
+    op_label = rep.operator_label or "Yota-First"
+    lines = [f"# Direct WSS {op_label} — verification report v4"]
     lines.append("")
     lines.append(f"run_id: `{rep.run_id}`")
     lines.append("")

@@ -66,11 +66,29 @@ Requires typing `BOOTSTRAP-CONFIRM` before uninstalling. Verifies the APK's SHA-
 - On both devices, open Profile → My Phantom QR → Share my Phantom contact → scan the other device's QR.
 - Confirm each device shows exactly ONE conversation with the other.
 
-### 4. Preflight
+### 4. Preflight — operator-parameterized
 
 ```bash
-./run-yota-wss-diagnostic.sh preflight
+# Yota baseline (existing WSS-1 run)
+./run-yota-wss-diagnostic.sh preflight \
+    --operator YOTA  --expected-operator-numeric 25011
+
+# Tele2 comparison (WSS-2)
+./run-yota-wss-diagnostic.sh preflight \
+    --operator TELE2 --expected-operator-numeric <NNNNN>
 ```
+
+`--operator` accepts `YOTA` or `TELE2`. The observed
+default-data `operator_numeric` on the phone must equal
+`--expected-operator-numeric`; a mismatch fails closed
+before the prompt so a mistyped numeric cannot silently
+pass. The prompt then requires you to type the label
+literally (`YOTA` or `TELE2`); anything else, including
+Ctrl-D, aborts.
+
+Evidence goes into `evidence/<label-lower>-wss-<UTC>/` and
+`run_id` is `run-<label-lower>-<UTC>` — Yota and Tele2 runs
+land in distinct directories.
 
 Creates a fresh evidence directory `evidence/yota-wss-<UTC>/` and populates `preflight.json` + `device-manifest.json` with:
 
@@ -115,9 +133,33 @@ Exit codes (`verify-evidence.py`):
 
 Per §12 P0-7 the first pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. Fallback breadcrumbs (`attempt`, `session_epoch`, watchdog requeue) are NOT emitted in WSS-1 — a later block can add them via a shared/core-transport bridge extension.
 
-## Tele2 follow-up — DEFERRED
+## Tele2 (or any other carrier) follow-up — WSS-2
 
-Not runnable from this operator package. Preflight currently hard-codes the typed `YOTA` confirmation and rejects any other operator numeric — there is no `TELE2` branch or `--operator` parameter yet. A later block will add operator parametrization; until then, do not attempt a Tele2 pass from this package (it would abort at the Yota prompt).
+Do NOT re-bootstrap between carriers — the same installed APK
++ same identities + same pairing + same emulator + same Mac VPN
++ same relay are the point of the comparison.
+
+1. On the phone, switch the default-data SIM to the new carrier
+   via Android's SIM/data settings. Do NOT touch onboarding or
+   QR pairing.
+2. Repeat the radio checklist (Wi-Fi OFF, VPN OFF, private DNS
+   OFF, auto-data-switching OFF, other-SIM mobile data OFF).
+3. Re-run preflight with the new operator label and its
+   MCC+MNC:
+   ```bash
+   ./run-yota-wss-diagnostic.sh preflight \
+       --operator TELE2 --expected-operator-numeric <NNNNN>
+   ```
+   Preflight fails closed if the observed default-data
+   `operator_numeric` on the phone does not equal
+   `--expected-operator-numeric`, or if you don't type
+   `TELE2` at the confirmation prompt.
+4. `./run-yota-wss-diagnostic.sh matrix` (smoke gate + typed
+   `RUN-FULL-MATRIX` unchanged).
+
+Evidence lands in `evidence/tele2-wss-<UTC>/` — the Yota
+directory from step 4 of the earlier baseline is untouched, so
+you can `diff` the two verification reports side-by-side.
 
 ## Hard rules
 

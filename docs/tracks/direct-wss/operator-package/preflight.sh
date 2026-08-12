@@ -26,11 +26,25 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 LIB="$HERE/lib"
 # shellcheck source=lib/portable.sh
 source "$LIB/portable.sh"
+# shellcheck source=lib/operator-args.sh
+source "$LIB/operator-args.sh"
+
+# §12 WSS-2 operator parameterization: parse + validate the
+# carrier CLI first so a malformed / missing / unknown label
+# or numeric fails BEFORE any adb / mktemp / interactive
+# prompt work. The rest of preflight uses OPERATOR_LABEL,
+# OPERATOR_LABEL_LOWER, EXPECTED_OPERATOR_NUMERIC as
+# read-only globals.
+parse_operator_args "$@" || {
+    echo "" >&2
+    echo "usage: preflight.sh --operator <YOTA|TELE2> --expected-operator-numeric <NNNNN>" >&2
+    exit 2
+}
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-OUT="$HERE/evidence/yota-wss-$STAMP"
+OUT="$HERE/evidence/${OPERATOR_LABEL_LOWER}-wss-$STAMP"
 mkdir -p "$OUT"
-RUN_ID="run-yota-$STAMP"
+RUN_ID="run-${OPERATOR_LABEL_LOWER}-$STAMP"
 echo "$RUN_ID" > "$OUT/run_id"
 APP_ID="${APP_ID:-phantom.android}"
 APK="$HERE/android-debug-diagnostic.apk"
@@ -209,13 +223,38 @@ if [ -z "$op_numeric" ] || [ "${#op_numeric}" -lt 5 ]; then
 fi
 echo "phone default-data operator_numeric=$op_numeric"
 
-# TYPED YOTA confirmation. Non-YOTA aborts.
-printf '\nIs the phone default-data operator YOTA (operator_numeric=%s)? Type YOTA to confirm: ' "$op_numeric"
-read -r yota_typed
-if [ "$yota_typed" != "YOTA" ]; then
-    echo "preflight FAILED: operator did not type YOTA" >&2; exit 1
+# §12 WSS-2: observed numeric MUST match the expected numeric the
+# operator supplied on the command line. Fail closed BEFORE the
+# prompt — otherwise a mistyped `--expected-operator-numeric`
+# would silently succeed on a device with a different SIM.
+if [ "$op_numeric" != "$EXPECTED_OPERATOR_NUMERIC" ]; then
+    echo "preflight FAILED: observed default-data operator_numeric=$op_numeric" >&2
+    echo "  does NOT match expected --expected-operator-numeric=$EXPECTED_OPERATOR_NUMERIC" >&2
+    echo "  (operator label passed on CLI was $OPERATOR_LABEL — check that the phone's" >&2
+    echo "   default-data SIM is actually $OPERATOR_LABEL and that --expected-operator-numeric is right)" >&2
+    exit 1
 fi
-yota_confirmed=true
+
+# TYPED <LABEL> confirmation. Non-<LABEL> aborts. Wrap the read
+# so EOF (Ctrl-D / closed stdin) routes into the abort branch
+# instead of skipping it under `set -e` (§12 Round-9 packaging nit).
+printf '\nIs the phone default-data operator %s (operator_numeric=%s)? Type %s to confirm: ' \
+        "$OPERATOR_LABEL" "$op_numeric" "$OPERATOR_LABEL"
+operator_typed=""
+read -r operator_typed || operator_typed=""
+if [ "$operator_typed" != "$OPERATOR_LABEL" ]; then
+    echo "preflight FAILED: operator did not type $OPERATOR_LABEL (or stdin closed)" >&2; exit 1
+fi
+operator_confirmed=true
+# Keep the legacy `yota_confirmed` field ONLY when the operator
+# label is YOTA — so the archived pre-WSS-2 Yota bundle from
+# `run-yota-20260812T171418Z` and any freshly-recorded YOTA run
+# stay wire-comparable via both the legacy and the WSS-2 fields.
+if [ "$OPERATOR_LABEL" = "YOTA" ]; then
+    yota_confirmed=true
+else
+    yota_confirmed=false
+fi
 
 # Radio checklist.
 for item in "Wi-Fi OFF" "VPN OFF" "Private DNS OFF" "Auto-data-switching OFF" "Other-SIM mobile data OFF"; do
@@ -287,7 +326,9 @@ cat > "$OUT/device-manifest.json" <<EOF
   "host_to_phone_skew_ms": $host_to_phone_ms,
   "host_to_emulator_skew_ms": $host_to_emu_ms,
   "dual_sim_report_operator_numeric": "$op_numeric",
-  "diagnostic_apk_sha256": "$bundled_apk_sha"
+  "diagnostic_apk_sha256": "$bundled_apk_sha",
+  "operator_label": "$OPERATOR_LABEL",
+  "expected_operator_numeric": "$EXPECTED_OPERATOR_NUMERIC"
 }
 EOF
 
@@ -304,6 +345,9 @@ cat > "$OUT/preflight.json" <<EOF
   "apk_variant": "debug",
   "emitter_ids_set": $emitter_ids_set,
   "yota_confirmed": $yota_confirmed,
+  "operator_label": "$OPERATOR_LABEL",
+  "expected_operator_numeric": "$EXPECTED_OPERATOR_NUMERIC",
+  "operator_confirmed": $operator_confirmed,
   "radio_confirmed": $radio_confirmed,
   "paired_conversation_count_ok": true,
   "canary": "ok",

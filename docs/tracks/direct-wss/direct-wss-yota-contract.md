@@ -45,6 +45,147 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.10 — WSS-2 operator parameterization (2026-08-13)
+
+WSS-1 delivered a Yota baseline (`run-yota-20260812T171418Z`,
+30/30 WSS + 10/10 REST Delivered once, evidence archive
+`f33a138728…6266`). WSS-2 runs the identical 8×5 matrix on
+another carrier (Tele2 first) with the same APK, identities,
+pairing, emulator, Mac VPN and relay — the only variable is the
+phone's default-data SIM. This block is scripts / verifier /
+docs / tests only. No Android runtime changes. No Gradle. No
+new APK. No bootstrap. Reuse the installed APK sha
+`8802b063…b84c`. Round-9 smoke gate + typed `RUN-FULL-MATRIX`
+preserved unchanged.
+
+**CLI — `preflight` is now operator-parameterized.**
+
+```
+run-yota-wss-diagnostic.sh preflight \
+    --operator <YOTA|TELE2> \
+    --expected-operator-numeric <NNNNN>
+```
+
+`lib/operator-args.sh` provides three pure helpers
+(`validate_operator_label`, `validate_operator_numeric`,
+`parse_operator_args`) that the shell fixture suite drives
+directly. Missing / unknown label / non-digit numeric / unknown
+flag fail closed BEFORE any adb / mktemp / interactive prompt.
+
+Evidence directory + `run_id` are derived from the operator
+label — `evidence/tele2-wss-<STAMP>` and
+`run-tele2-<STAMP>` for Tele2, `evidence/yota-wss-<STAMP>` and
+`run-yota-<STAMP>` for Yota — so a Yota run and a Tele2 run
+land in distinct directories and neither can accidentally
+overwrite the other.
+
+**Observed vs expected numeric check.**
+
+After `dual_sim_report` reads the phone's default-data
+`operator_numeric`, preflight compares it against the
+`--expected-operator-numeric` CLI value BEFORE the typed
+confirmation prompt. A mismatch fails closed — a mistyped
+`--expected-operator-numeric` (e.g. Yota's 25011 passed to a
+Tele2 preflight) cannot pass. The prompt then requires the
+operator to type `<LABEL>` literally (`TELE2` for Tele2, `YOTA`
+for Yota); anything else, including EOF (Round-9 packaging nit
+protection), aborts.
+
+**Evidence schema additions.**
+
+`preflight.json`:
+- `operator_label`             — `YOTA` | `TELE2`
+- `expected_operator_numeric`  — 5-6 digit MCC+MNC
+- `operator_confirmed`         — real JSON boolean, `true` on success
+- `yota_confirmed`             — `true` when label=YOTA, `false` otherwise (legacy field kept for wire compat with the archived Round-9 baseline)
+
+`device-manifest.json`:
+- `operator_label`
+- `expected_operator_numeric`
+- (existing `dual_sim_report_operator_numeric` stays — must equal `expected_operator_numeric`)
+
+Verifier `_validate_operator_gate` accepts EITHER:
+- legacy Round-9 shape: `yota_confirmed == True` (no
+  `operator_label` — the archived `run-yota-20260812T171418Z`
+  bundle stays verifiable and its report still renders as
+  `Direct WSS Yota-First — verification report v4`), OR
+- WSS-2 shape: `operator_confirmed == True` + whitelisted
+  `operator_label` + valid `expected_operator_numeric`.
+
+Cross-file consistency (in `_validate_cross_file_run_consistency`):
+- `preflight.operator_label` == `manifest.operator_label`
+- `preflight.expected_operator_numeric` ==
+  `manifest.expected_operator_numeric`
+- `preflight.expected_operator_numeric` ==
+  `manifest.dual_sim_report_operator_numeric`
+- `operator_label==YOTA` requires `yota_confirmed==True`
+  (belt & braces for legacy readers)
+- `operator_label!=YOTA` with `yota_confirmed==True` → RED
+  (labels contradict)
+
+All new fields go through the same strict `type(v) is bool` /
+`isinstance(v, str)` gates as `blocked` (§12.4 P0-2). Stringly-
+typed values (`"true"`, `1`, list, dict) are RED.
+
+**Report title.**
+
+`verify-evidence.py:render_markdown` now takes the operator
+label from `preflight.json` and renders `Direct WSS <LABEL> —
+verification report v4`. The legacy Yota baseline (no
+`operator_label`) falls back to `Direct WSS Yota-First —
+verification report v4` for exact wire-compat with the
+archived report.
+
+**No changes to matrix logic, Android runtime, WSS_DIAG event
+schema, smoke gate, or `RUN-FULL-MATRIX` confirmation.**
+
+**Fixtures.**
+
+* Kotlin — unchanged (no runtime changes).
+* Python — 111 fixtures (14 new for WSS-2):
+  - archived Yota baseline still verifiable (`yota_confirmed`
+    alone, no `operator_label`);
+  - YOTA in WSS-2 shape verifiable;
+  - TELE2 accepted when expected == observed;
+  - wrong `dual_sim_report_operator_numeric` → RED;
+  - missing `operator_label` → RED;
+  - unknown label (`MEGAFON`) → RED;
+  - no confirmation at all → RED;
+  - stringly-typed `operator_confirmed` (`"true"`) → RED;
+  - stringly-typed `expected_operator_numeric` (int) → RED;
+  - `operator_label` mismatch preflight vs manifest → RED;
+  - `expected_operator_numeric` mismatch preflight vs manifest → RED;
+  - TELE2 with `yota_confirmed=True` → RED (labels contradict);
+  - YOTA label with `yota_confirmed=False` → RED (legacy field
+    must stay in sync);
+  - report title includes operator label.
+* Shell — 74 fixtures (28 new for WSS-2):
+  - `validate_operator_label` — 2 accept + 7 reject (lower case,
+    mixed case, empty, other carriers, space/dash variants);
+  - `validate_operator_numeric` — 4 accept + 7 reject (empty,
+    too short, too long, letters, spaces, `%N` leftover);
+  - `parse_operator_args` — YOTA / TELE2 happy paths + 5
+    fail-closed paths (missing `--operator`, missing
+    `--expected-operator-numeric`, unknown label, malformed
+    numeric, unknown flag).
+* `bash -n` + `py_compile` clean.
+
+**Order of operations for the actual WSS-2 pass (documented in
+`README-OPERATOR.md`).**
+
+1. Reuse the same installed APK. Do NOT re-run
+   `bootstrap --fresh` — that would destroy the pairing.
+2. Do NOT re-do onboarding or QR pairing.
+3. On the phone, switch default-data SIM to the target carrier
+   via Android's SIM/data settings.
+4. Repeat the radio checklist for the new carrier (Wi-Fi OFF,
+   VPN OFF, private DNS OFF, auto-data-switching OFF, other-SIM
+   mobile data OFF).
+5. `run-yota-wss-diagnostic.sh preflight --operator TELE2
+   --expected-operator-numeric <NNNNN>`.
+6. `run-yota-wss-diagnostic.sh matrix` (smoke gate + typed
+   `RUN-FULL-MATRIX` confirmation unchanged).
+
 ### §12.9 — Round-9 audit repair (2026-08-12, last mini before APK)
 
 Round-8 (`337ac19e`) accepted the CID-before-send + enqueue-after-

@@ -1832,6 +1832,248 @@ class VerifierTests(unittest.TestCase):
             msg=f"issues: {rep.integrity_issues}",
         )
 
+    # ── WSS-2 operator parameterization fixtures ─────────────
+
+    def _yota_wss2_preflight(self) -> dict:
+        pf = default_preflight()
+        pf["operator_label"] = "YOTA"
+        pf["expected_operator_numeric"] = "25011"
+        pf["operator_confirmed"] = True
+        pf["yota_confirmed"] = True
+        return pf
+
+    def _yota_wss2_manifest(self) -> dict:
+        mf = default_manifest()
+        mf["operator_label"] = "YOTA"
+        mf["expected_operator_numeric"] = "25011"
+        mf["dual_sim_report_operator_numeric"] = "25011"
+        return mf
+
+    def _tele2_wss2_preflight(self, expected: str = "25020") -> dict:
+        pf = default_preflight()
+        pf["operator_label"] = "TELE2"
+        pf["expected_operator_numeric"] = expected
+        pf["operator_confirmed"] = True
+        pf["yota_confirmed"] = False       # legacy field explicitly OFF for Tele2
+        return pf
+
+    def _tele2_wss2_manifest(self, expected: str = "25020",
+                              observed: str = "25020") -> dict:
+        mf = default_manifest()
+        mf["operator_label"] = "TELE2"
+        mf["expected_operator_numeric"] = expected
+        mf["dual_sim_report_operator_numeric"] = observed
+        return mf
+
+    def test_WSS2_yota_baseline_still_verifiable(self):
+        # The archived Yota bundle predates operator_label — it
+        # carries only `yota_confirmed=True`. Must still verify GREEN.
+        pf = default_preflight()   # yota_confirmed=True, no operator_label
+        mf = default_manifest()    # no operator_label
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        with open(os.path.join(out, "device-manifest.json"), "w") as f:
+            json.dump(mf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
+
+    def test_WSS2_yota_new_shape_verifiable(self):
+        # A YOTA run in the WSS-2 shape (both yota_confirmed and
+        # operator_confirmed true; operator_label=YOTA;
+        # expected==observed=25011).
+        pf = self._yota_wss2_preflight()
+        mf = self._yota_wss2_manifest()
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        with open(os.path.join(out, "device-manifest.json"), "w") as f:
+            json.dump(mf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
+        self.assertEqual(rep.operator_label, "YOTA")
+
+    def test_WSS2_tele2_accepted_when_expected_equals_observed(self):
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        with open(os.path.join(out, "device-manifest.json"), "w") as f:
+            json.dump(mf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
+        self.assertEqual(rep.product_outcome, "GREEN")
+        self.assertEqual(rep.operator_label, "TELE2")
+
+    def test_WSS2_wrong_dual_sim_numeric_is_integrity_RED(self):
+        # expected 25020 but observed on device 25011 → RED.
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25011")
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("expected_operator_numeric" in p and "dual_sim_report_operator_numeric" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_missing_operator_label_when_operator_confirmed_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        pf.pop("operator_label")           # missing
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        mf.pop("operator_label")
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("operator_label" in p and "whitelisted string" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_unknown_operator_label_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        pf["operator_label"] = "MEGAFON"   # not in whitelist
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        mf["operator_label"] = "MEGAFON"
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("operator_label" in p and "MEGAFON" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_no_confirmation_at_all_is_RED(self):
+        # Both yota_confirmed and operator_confirmed false / absent
+        # ⇒ integrity RED (no operator gate at all).
+        pf = default_preflight()
+        pf["yota_confirmed"] = False
+        # operator_confirmed also absent
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("no operator confirmation" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_stringly_typed_operator_confirmed_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        pf["operator_confirmed"] = "true"   # string not bool
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("operator_confirmed must be a JSON boolean" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_stringly_typed_expected_numeric_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        pf["expected_operator_numeric"] = 25020   # int not string
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("expected_operator_numeric not a 5-6 digit string" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_operator_label_mismatch_preflight_vs_manifest_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        mf["operator_label"] = "YOTA"   # inconsistent
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("preflight.operator_label" in p and "device-manifest.operator_label" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_expected_numeric_mismatch_preflight_vs_manifest_is_RED(self):
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        mf["expected_operator_numeric"] = "25011"   # inconsistent
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("preflight.expected_operator_numeric" in p and
+                "device-manifest.expected_operator_numeric" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_tele2_with_yota_confirmed_true_is_RED(self):
+        # operator_label=TELE2 must NOT co-exist with yota_confirmed=True.
+        pf = self._tele2_wss2_preflight("25020")
+        pf["yota_confirmed"] = True   # contradicts label
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("labels contradict" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_yota_label_requires_yota_confirmed_true(self):
+        # operator_confirmed=True with operator_label=YOTA MUST also
+        # carry yota_confirmed=True (legacy-consumer belt & braces).
+        pf = self._yota_wss2_preflight()
+        pf["yota_confirmed"] = False
+        mf = self._yota_wss2_manifest()
+        out = make_bundle(self.tmp, preflight=pf, manifest=mf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("legacy field must stay in sync" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_WSS2_report_title_includes_operator_label(self):
+        pf = self._tele2_wss2_preflight("25020")
+        mf = self._tele2_wss2_manifest("25020", "25020")
+        out, base = build_full_matrix_bundle(self.tmp)
+        with open(os.path.join(out, "preflight.json"), "w") as f:
+            json.dump(pf, f)
+        with open(os.path.join(out, "device-manifest.json"), "w") as f:
+            json.dump(mf, f)
+        rep = ve.build_report(out, host_now_override_ms=base + 200_000 + 120_000)
+        md = ve.render_markdown(rep)
+        self.assertIn("Direct WSS TELE2 — verification report v4", md)
+
     # P0-2 — NOT_EVALUABLE never hides behind RED/GREEN.
     def test_R6_P0_2_NOT_EVALUABLE_replaces_product_outcome_on_integrity_RED(self):
         out, base = build_full_matrix_bundle(self.tmp)

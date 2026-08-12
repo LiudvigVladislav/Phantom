@@ -22,7 +22,10 @@ case "$mode" in
     exec "$LIB/bootstrap.sh" "${1:---help}"
     ;;
   preflight)
-    exec "$HERE/preflight.sh"
+    # §12 WSS-2: pass operator flags through unchanged. Preflight
+    # itself validates and fails closed on missing/unknown/malformed
+    # inputs (see lib/operator-args.sh).
+    exec "$HERE/preflight.sh" "$@"
     ;;
   matrix)
     last=$(cat "$HERE/evidence/.last_run" 2>/dev/null || true)
@@ -46,15 +49,34 @@ case "$mode" in
     ;;
   *)
     cat <<HELP
-Direct WSS Yota-First diagnostic — Mac operator entry point.
+Direct WSS diagnostic — Mac operator entry point.
 
-  bootstrap --fresh  standalone: detect devices + uninstall + reinstall APK
-                     + set emitter_id + print manual onboarding instructions
-  preflight          measurement preflight (after manual onboarding + QR pairing)
-  matrix             run 8 × 5 = 40 envelopes + auto-verify
-  verify [DIR]       re-run verifier
+  bootstrap --fresh
+      standalone: detect devices + uninstall + reinstall APK + set
+      emitter_id + print manual onboarding instructions
 
-  Order: bootstrap --fresh -> manual onboarding+pairing -> preflight -> matrix
+  preflight --operator <YOTA|TELE2> --expected-operator-numeric <NNNNN>
+      measurement preflight (after manual onboarding + QR pairing).
+      Fails closed if the observed default-data operator_numeric on
+      the phone does not equal <NNNNN>, or the operator does not
+      type <LABEL> at the confirmation prompt. Evidence dir + run_id
+      are labelled by <LABEL> so a Yota run and a Tele2 run land in
+      distinct directories.
+
+  matrix
+      run 8 × 5 = 40 envelopes + smoke gate + typed RUN-FULL-MATRIX
+      confirmation + auto-verify
+
+  verify [DIR]
+      re-run verifier
+
+Order:  bootstrap --fresh
+     -> manual onboarding+pairing
+     -> preflight --operator YOTA  --expected-operator-numeric 25011
+     -> matrix
+     -> (switch phone default-data SIM to Tele2, no re-bootstrap)
+     -> preflight --operator TELE2 --expected-operator-numeric <NNNNN>
+     -> matrix
 HELP
     exit 2
     ;;
