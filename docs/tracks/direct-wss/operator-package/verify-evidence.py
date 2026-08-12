@@ -385,10 +385,23 @@ def _validate_preflight(preflight: dict) -> list[str]:
             if env.get(tool) != "ok":
                 problems.append(f"preflight.env.{tool} != 'ok': {env.get(tool)!r}")
 
+    # §12 Round-8 audit P1: the signed-prekey readiness gate must be
+    # PROVEN by the evidence, not just asserted at preflight time. If
+    # the boolean is missing or is any non-True value (`false`,
+    # `"true"`, `1`, `None`, list …) the verifier rejects the bundle.
+    # `type(v) is bool` + `v is True` — same strict semantics as the
+    # matrix `blocked` field (§12.4 P0-2).
     for req_bool in ("yota_confirmed", "emitter_ids_set", "radio_confirmed",
-                     "paired_conversation_count_ok"):
-        if preflight.get(req_bool) is not True:
-            problems.append(f"preflight.{req_bool} is not True: {preflight.get(req_bool)!r}")
+                     "paired_conversation_count_ok",
+                     "phone_signed_prekey_ready",
+                     "emulator_signed_prekey_ready"):
+        v = preflight.get(req_bool)
+        if not isinstance(v, bool):
+            problems.append(
+                f"preflight.{req_bool} must be a JSON boolean, got {type(v).__name__}: {v!r}",
+            )
+        elif v is not True:
+            problems.append(f"preflight.{req_bool} is not True: {v!r}")
 
     if preflight.get("canary") != "ok":
         problems.append(f"preflight.canary != 'ok': {preflight.get('canary')!r}")

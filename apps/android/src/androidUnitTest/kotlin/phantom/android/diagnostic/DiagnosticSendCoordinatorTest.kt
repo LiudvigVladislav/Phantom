@@ -10,7 +10,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import phantom.core.messaging.IncomingMessage
 import phantom.core.messaging.MessagePayload
@@ -30,6 +33,13 @@ import phantom.core.storage.TrustTier
  * argument, no operator-supplied peer.
  */
 class DiagnosticSendCoordinatorTest {
+
+    // §12 Round-8 audit P1: coordinator now emits WssDiag events on
+    // resolveAndSend. Under a plain JVM unit test (no Robolectric)
+    // Log.i throws UnsatisfiedLinkError. Install a no-op sink to
+    // bypass Log entirely for tests that don't inspect emit order.
+    @Before fun installNoopSink() { WssDiag.testSink = { _ -> } }
+    @After  fun resetSink()       { WssDiag.testSink = null }
 
     /**
      * Minimal ConversationRepository fake — implements every abstract
@@ -152,6 +162,86 @@ class DiagnosticSendCoordinatorTest {
         assertTrue(outcome is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations)
         assertEquals(0, svc.callCount.get())
         assertEquals(0, svc.sends.size)
+    }
+
+    /**
+     * §12 Round-8 audit P0: verify that
+     * `diagnostic_send_dispatched` is emitted BEFORE
+     * `messagingService.sendMessage` completes — a hung WSS/REST
+     * call must still leave the CID visible to the runner.
+     *
+     * Fake sendMessage suspends until the test signals; the test
+     * observes WssDiag events on the running Logcat via a fake
+     * WssDiag sink. This proves ORDER, not just presence.
+     */
+    @Test
+    fun dispatched_event_emits_BEFORE_sendMessage_completes() = runTest {
+        val suspendGate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val svc = object : MessagingService {
+            val started = kotlinx.coroutines.CompletableDeferred<Unit>()
+            override val bootstrapReady: StateFlow<Boolean> = MutableStateFlow(true)
+            override val incomingMessages: Flow<IncomingMessage> = MutableSharedFlow()
+            override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> {
+                started.complete(Unit)
+                suspendGate.await()               // hang until the test releases
+                return Result.success(Unit)
+            }
+            override suspend fun sendAudio(conversationId: String, audioBytes: ByteArray, durationMs: Long, mimeType: String) = error("must not be called")
+            override suspend fun startReceiving() = error("must not be called")
+            override suspend fun retryWaitingMessages(source: String): Result<Int> = error("must not be called")
+            override suspend fun markConversationRead(conversationId: String, theirPublicKeyHex: String, sendReceipt: Boolean) = error("must not be called")
+            override suspend fun deleteMessageForBoth(messageId: String, conversationId: String, recipientPublicKeyHex: String) = error("must not be called")
+            override suspend fun editMessageForBoth(messageId: String, newText: String, conversationId: String, recipientPublicKeyHex: String) = error("must not be called")
+            override suspend fun sendDisappearingTimerUpdate(timerSecs: Long, conversationId: String, recipientPublicKeyHex: String) = error("must not be called")
+            override suspend fun sendReaction(messageId: String, conversationId: String, recipientPublicKeyHex: String, emoji: String) = error("must not be called")
+            override suspend fun pinMessageForBoth(messageId: String, conversationId: String, recipientPublicKeyHex: String, pinned: Boolean) = error("must not be called")
+            override suspend fun sendCallSignal(recipientPublicKeyHex: String, payload: MessagePayload) = error("must not be called")
+            override suspend fun sendGroupControlMessage(toPubKeyHex: String, payload: MessagePayload) = error("must not be called")
+        }
+        val repo = MinimalConversationRepository(listOf(pairedConversation()))
+        val coord = DiagnosticSendCoordinator(repo, svc)
+
+        val events = mutableListOf<String>()
+        // @Before installed a no-op sink; swap in the capturing one
+        // for this test and let @After reset both.
+        WssDiag.testSink = { line -> synchronized(events) { events += line } }
+        try {
+            val running = backgroundScope.async {
+                coord.resolveAndSend(cellId = "wss.p2e.after-connect", sequence = 1)
+            }
+            // Wait until the fake sendMessage has been entered — that
+            // proves the coordinator got past the dispatched emit AND
+            // is currently suspended inside sendMessage.
+            svc.started.await()
+
+            // At this moment: sendMessage has NOT completed. Verify
+            // dispatched has already been logged.
+            val snapshot = synchronized(events) { events.toList() }
+            val hasDispatched = snapshot.any {
+                it.contains("event=diagnostic_send_dispatched") && it.contains("sequence=1")
+            }
+            val hasCompleted = snapshot.any {
+                it.contains("event=diagnostic_send_command_completed")
+            }
+            assertTrue(hasDispatched, "diagnostic_send_dispatched must be emitted BEFORE sendMessage completes")
+            assertTrue(!hasCompleted, "diagnostic_send_command_completed must NOT be emitted while sendMessage is still running")
+
+            // Now release the hang and let the coordinator finish.
+            suspendGate.complete(Unit)
+            running.await()
+
+            val finalSnapshot = synchronized(events) { events.toList() }
+            assertTrue(
+                finalSnapshot.any {
+                    it.contains("event=diagnostic_send_command_completed") &&
+                        it.contains("result=handled") &&
+                        it.contains("sequence=1")
+                },
+                "diagnostic_send_command_completed result=handled must fire after sendMessage returns",
+            )
+        } finally {
+            WssDiag.testSink = { _ -> }
+        }
     }
 
     @Test

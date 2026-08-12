@@ -90,46 +90,110 @@ internal class DiagnosticSendCoordinator(
      */
     suspend fun resolveAndSend(cellId: String, sequence: Int): Outcome {
         val paired = eligiblePairedConversations()
-        return when {
-            paired.isEmpty() -> Outcome.NoPairedConversation(activeCount = 0)
-            paired.size > 1 -> Outcome.MultiplePairedConversations(
-                ids = paired.map { it.id },
-            )
-            else -> {
-                val peer = paired.single()
-                val correlationId = uuid4().toString()
-                val message = OutgoingMessage(
-                    id = correlationId,
-                    conversationId = peer.id,
-                    recipientPublicKeyHex = peer.theirPublicKeyHex,
-                    text = derivedTextFor(cellId, sequence),
+        when {
+            paired.isEmpty() -> {
+                // §12 Round-8 audit P0: emit BOTH the rejected event
+                // and the closed-schema completed event from HERE, not
+                // from the receiver. Rejected paths never touch
+                // MessagingService.sendMessage so no hang is possible;
+                // the completed event carries no correlation_id.
+                WssDiag.emit(
+                    event = "diagnostic_send_rejected_no_paired_conversation",
+                    role = WssDiag.Role.MATRIX,
+                    sequence = sequence,
                 )
-                // §12 Round-6 audit P0-1: capture what sendMessage
-                // actually returned so the receiver can emit
-                // `diagnostic_send_command_completed`. sendMessage is
-                // `runCatching`-wrapped so it should never throw, but
-                // an outer try/catch defends against a bug in that
-                // contract without leaking any exception payload —
-                // only the class simple name flows into diagnostics.
-                val sendResult: SendResult = try {
-                    val r = messagingService.sendMessage(message)
-                    if (r.isSuccess) {
-                        SendResult.Handled
-                    } else {
-                        SendResult.Failed(
-                            r.exceptionOrNull()?.let { it::class.simpleName } ?: "UnknownFailure",
-                        )
-                    }
-                } catch (t: Throwable) {
-                    SendResult.Failed(t::class.simpleName ?: "UnknownThrowable")
-                }
-                Outcome.Sent(
-                    correlationId = correlationId,
-                    conversationId = peer.id,
-                    sendResult = sendResult,
+                WssDiag.emit(
+                    event = "diagnostic_send_command_completed",
+                    role = WssDiag.Role.MATRIX,
+                    sequence = sequence,
+                    result = "rejected",
                 )
+                return Outcome.NoPairedConversation(activeCount = 0)
+            }
+            paired.size > 1 -> {
+                WssDiag.emit(
+                    event = "diagnostic_send_rejected_multiple_paired_conversations",
+                    role = WssDiag.Role.MATRIX,
+                    sequence = sequence,
+                )
+                WssDiag.emit(
+                    event = "diagnostic_send_command_completed",
+                    role = WssDiag.Role.MATRIX,
+                    sequence = sequence,
+                    result = "rejected",
+                )
+                return Outcome.MultiplePairedConversations(ids = paired.map { it.id })
             }
         }
+        val peer = paired.single()
+        val correlationId = uuid4().toString()
+
+        // §12 Round-8 audit P0: emit `diagnostic_send_dispatched`
+        // BEFORE calling `messagingService.sendMessage`. If the
+        // production WSS/REST call hangs indefinitely the runner
+        // still sees the CID and can either poll delivery for it
+        // (real product signal) or, if all four gate signals miss,
+        // abort as tooling failure. In Round-7 this event fired
+        // AFTER sendMessage returned; a hung send would leave the
+        // runner with no CID and the gate could not distinguish
+        // "network dropped" from "receiver never dispatched".
+        WssDiag.emit(
+            event = "diagnostic_send_dispatched",
+            role = WssDiag.Role.MATRIX,
+            correlationId = correlationId,
+            sequence = sequence,
+        )
+
+        val message = OutgoingMessage(
+            id = correlationId,
+            conversationId = peer.id,
+            recipientPublicKeyHex = peer.theirPublicKeyHex,
+            text = derivedTextFor(cellId, sequence),
+        )
+        // §12 Round-7 audit P0-1: capture what sendMessage actually
+        // returned. sendMessage is `runCatching`-wrapped so it
+        // should never throw, but an outer try/catch defends
+        // against a bug in that contract without leaking any
+        // exception payload — only the class simple name flows into
+        // diagnostics.
+        val sendResult: SendResult = try {
+            val r = messagingService.sendMessage(message)
+            if (r.isSuccess) {
+                SendResult.Handled
+            } else {
+                SendResult.Failed(
+                    r.exceptionOrNull()?.let { it::class.simpleName } ?: "UnknownFailure",
+                )
+            }
+        } catch (t: Throwable) {
+            SendResult.Failed(t::class.simpleName ?: "UnknownThrowable")
+        }
+        // §12 Round-8 audit P0: emit `diagnostic_send_command_completed`
+        // AFTER return/exception. The result value plus the
+        // separate `sender_prekey_deferred` event let the verifier
+        // distinguish "coordinator saw a definitive result" from
+        // "envelope actually reached transport".
+        val (result, exception) = when (sendResult) {
+            is SendResult.Handled -> "handled" to null
+            is SendResult.Failed -> "exception" to sendResult.exceptionClassName
+        }
+        WssDiag.emit(
+            event = "diagnostic_send_command_completed",
+            role = WssDiag.Role.MATRIX,
+            correlationId = correlationId,
+            sequence = sequence,
+            result = result,
+            outcomeFlag = if (exception != null) {
+                WssDiag.OutcomeFlag.SEND_ERROR
+            } else {
+                WssDiag.OutcomeFlag.NONE
+            },
+        )
+        return Outcome.Sent(
+            correlationId = correlationId,
+            conversationId = peer.id,
+            sendResult = sendResult,
+        )
     }
 
     private suspend fun eligiblePairedConversations(): List<ConversationEntity> =

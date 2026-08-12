@@ -74,6 +74,10 @@ def default_preflight() -> dict:
         "host_to_phone_skew_ms": 100,
         "host_to_emulator_skew_ms": 100,
         "diagnostic_apk_sha256": FAKE_APK_SHA256,
+        # §12 Round-8 audit P1: preflight writes per-device readiness
+        # booleans so the verifier can enforce the gate at report time.
+        "phone_signed_prekey_ready": True,
+        "emulator_signed_prekey_ready": True,
     }
 
 
@@ -1757,6 +1761,74 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(cell.envelopes, 5, msg=f"expected 5 attempts, got {cell.envelopes}")
         self.assertTrue(rep.integrity_ok, msg=f"issues: {rep.integrity_issues}")
         self.assertEqual(cell.outcome, "Unresolved")
+
+    # ── Round-8 audit repro cases ────────────────────────────
+
+    # P1 — missing per-device readiness boolean = integrity RED.
+    def test_R8_P1_missing_phone_signed_prekey_ready_is_integrity_RED(self):
+        pf = default_preflight(); pf.pop("phone_signed_prekey_ready")
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("phone_signed_prekey_ready" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R8_P1_missing_emulator_signed_prekey_ready_is_integrity_RED(self):
+        pf = default_preflight(); pf.pop("emulator_signed_prekey_ready")
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("emulator_signed_prekey_ready" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R8_P1_false_signed_prekey_ready_is_integrity_RED(self):
+        pf = default_preflight(); pf["phone_signed_prekey_ready"] = False
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("phone_signed_prekey_ready is not True" in p for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R8_P1_stringly_typed_signed_prekey_ready_is_integrity_RED(self):
+        # `"true"` (string) MUST be rejected — closed schema is JSON bool.
+        pf = default_preflight(); pf["phone_signed_prekey_ready"] = "true"
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("phone_signed_prekey_ready must be a JSON boolean" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
+
+    def test_R8_P1_int_signed_prekey_ready_is_integrity_RED(self):
+        # `1` (int) MUST be rejected — closed schema is JSON bool.
+        # Also confirms `type(v) is bool` (not `isinstance(v, int)`).
+        pf = default_preflight(); pf["emulator_signed_prekey_ready"] = 1
+        out = make_bundle(self.tmp, preflight=pf,
+                           phone_lines=[_min_boot("phone")],
+                           emulator_lines=[_min_boot("emulator")])
+        rep = ve.build_report(out)
+        self.assertFalse(rep.integrity_ok)
+        self.assertTrue(
+            any("emulator_signed_prekey_ready must be a JSON boolean" in p
+                for p in rep.integrity_issues),
+            msg=f"issues: {rep.integrity_issues}",
+        )
 
     # P0-2 — NOT_EVALUABLE never hides behind RED/GREEN.
     def test_R6_P0_2_NOT_EVALUABLE_replaces_product_outcome_on_integrity_RED(self):

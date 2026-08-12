@@ -23,6 +23,18 @@ object WssDiag {
     const val TAG: String = "WSS_DIAG"
 
     /**
+     * §12 Round-8 audit P1 test seam. When non-null, each emit
+     * invokes this before falling through to `Log.i`. Tests set it
+     * to capture the exact `key=value key=value …` payload for
+     * ORDER assertions (e.g. proving `diagnostic_send_dispatched`
+     * fires BEFORE a suspending `sendMessage` returns). Production
+     * paths leave it null → zero overhead. Reset to `null` after
+     * every test.
+     */
+    @Volatile
+    var testSink: ((String) -> Unit)? = null
+
+    /**
      * `role` field values — derived per event site, NOT per device
      * direction. `phone` and `emulator` are `emitter_id` values,
      * NEVER `role` values.
@@ -116,6 +128,14 @@ object WssDiag {
             if (sequence != null) append(' ').append("sequence=").append(sequence)
             if (result != null) append(' ').append("result=").append(result)
         }
-        Log.i(TAG, fields)
+        val sink = testSink
+        if (sink != null) {
+            // Test path — bypass Android's Log entirely so JVM unit
+            // tests (no Robolectric) do not hit
+            // `Log.println_native` UnsatisfiedLinkError.
+            sink.invoke(fields)
+        } else {
+            Log.i(TAG, fields)
+        }
     }
 }

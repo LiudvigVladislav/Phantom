@@ -256,31 +256,41 @@ for row in "${cells[@]}"; do
     enqueue_wall_ms=$command_start_ms
     "$HERE/diag-cmd.sh" send --serial "$sender" --run-id "$RUN_ID" --cell-id "$cell_id" --sequence "$seq" >/dev/null || true
     cid=$(wait_send_cid_from_sender "$cell_id" "$seq" "$sender_emitter" "$sender_log" "$command_start_ms" "$sender_skew_ms" || true)
-    if [ -n "$cid" ]; then
-      # §12 Round-6 audit P0-3: gate the FIRST envelope of the FIRST
-      # cell on all 4 instrumentation signals within 15 s. If the
-      # production send path is not emitting, abort the WHOLE matrix
-      # right here — do NOT burn 120 s × 39 more envelopes producing
-      # an incomplete bundle that would look identical to a real
-      # transport failure.
-      if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
-        if ! gate_first_envelope "$cid"; then
-          ABORT_REASON="tooling_instrumentation_failure"
-          echo "ABORT: production send-path instrumentation missing on the first" >&2
-          echo "       canonical envelope (no transport_decision, no prekey_deferred, no" >&2
-          echo "       receiver-side rejected/exception). Not spending another 120s×39 envelopes." >&2
-          echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
-          # Best-effort clear pin then exit; trap writes marker.
-          "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
-          "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
-          exit 2
-        fi
-      fi
-      poll_envelope "$cid" "$enqueue_wall_ms"
-    else
-      echo "warn: could not read correlation_id for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter, host_not_before_ms=$command_start_ms, host_to_sender_skew_ms=$sender_skew_ms)" >&2
-      sleep 5
+    if [ -z "$cid" ]; then
+      # §12 Round-8 audit P0: missing CID after wait_send_cid_from_sender's
+      # 15 s deadline is unambiguous tooling failure. The Round-8
+      # coordinator emits diagnostic_send_dispatched BEFORE calling
+      # sendMessage, so even a hung WSS/REST call MUST produce the CID
+      # within 15 s of the broadcast. If it doesn't, the debug receiver
+      # never dispatched the coordinator (or the WssDiag emit itself
+      # is broken). Do NOT continue the matrix — every following cell
+      # would waste time on the same fault.
+      ABORT_REASON="tooling_instrumentation_failure"
+      echo "ABORT: no diagnostic_send_dispatched CID appeared within 15s of the send" >&2
+      echo "       command for cell=$cell_id seq=$seq (run_id=$RUN_ID, emitter=$sender_emitter," >&2
+      echo "       host_not_before_ms=$command_start_ms, host_to_sender_skew_ms=$sender_skew_ms)." >&2
+      echo "       Not spending another 120s×N envelopes on a receiver that never dispatched." >&2
+      echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
+      "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+      "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+      exit 2
     fi
+    # §12 Round-6 audit P0-3 (Round-7 revised): gate the FIRST envelope
+    # of the FIRST cell on instrumentation signals within 15 s. Route
+    # hangs after transport_decision are product signal, not tooling.
+    if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
+      if ! gate_first_envelope "$cid"; then
+        ABORT_REASON="tooling_instrumentation_failure"
+        echo "ABORT: production send-path instrumentation missing on the first" >&2
+        echo "       canonical envelope (no transport_decision, no prekey_deferred, no" >&2
+        echo "       receiver-side rejected/exception). Not spending another 120s×39 envelopes." >&2
+        echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
+        "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+        "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+        exit 2
+      fi
+    fi
+    poll_envelope "$cid" "$enqueue_wall_ms"
   done
 
   "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true

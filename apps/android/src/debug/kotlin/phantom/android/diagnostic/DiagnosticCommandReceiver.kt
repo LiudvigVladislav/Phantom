@@ -190,77 +190,17 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope.launch {
             try {
-                val outcome = coordinator.resolveAndSend(cellId!!, sequence)
-                when (outcome) {
-                    is DiagnosticSendCoordinator.Outcome.Sent -> {
-                        // §12 Round-1 audit P0-1: STRUCTURED
-                        // event on the sole WSS_DIAG tag that
-                        // carries the correlation ID + sequence.
-                        // The runner reads this to know which
-                        // envelope's signals to poll.
-                        WssDiag.emit(
-                            event = "diagnostic_send_dispatched",
-                            role = WssDiag.Role.MATRIX,
-                            correlationId = outcome.correlationId,
-                            sequence = sequence,
-                        )
-                        // §12 Round-6 audit P0-1: closed-schema
-                        // command-completion event with the same
-                        // correlation_id + sequence, reporting
-                        // what MessagingService.sendMessage
-                        // actually returned. `accepted` vs
-                        // `exception=<ClassSimpleName>` lets the
-                        // verifier separate "app never ran the
-                        // send path" (Round-5 false GREEN) from
-                        // "transport dropped the payload".
-                        val (result, exception) = when (
-                            val sr = outcome.sendResult
-                        ) {
-                            is DiagnosticSendCoordinator.SendResult.Handled ->
-                                "handled" to null
-                            is DiagnosticSendCoordinator.SendResult.Failed ->
-                                "exception" to sr.exceptionClassName
-                        }
-                        WssDiag.emit(
-                            event = "diagnostic_send_command_completed",
-                            role = WssDiag.Role.MATRIX,
-                            correlationId = outcome.correlationId,
-                            sequence = sequence,
-                            result = result,
-                            outcomeFlag = if (exception != null) {
-                                WssDiag.OutcomeFlag.SEND_ERROR
-                            } else {
-                                WssDiag.OutcomeFlag.NONE
-                            },
-                        )
-                    }
-                    is DiagnosticSendCoordinator.Outcome.NoPairedConversation -> {
-                        WssDiag.emit(
-                            event = "diagnostic_send_rejected_no_paired_conversation",
-                            role = WssDiag.Role.MATRIX,
-                            sequence = sequence,
-                        )
-                        WssDiag.emit(
-                            event = "diagnostic_send_command_completed",
-                            role = WssDiag.Role.MATRIX,
-                            sequence = sequence,
-                            result = "rejected",
-                        )
-                    }
-                    is DiagnosticSendCoordinator.Outcome.MultiplePairedConversations -> {
-                        WssDiag.emit(
-                            event = "diagnostic_send_rejected_multiple_paired_conversations",
-                            role = WssDiag.Role.MATRIX,
-                            sequence = sequence,
-                        )
-                        WssDiag.emit(
-                            event = "diagnostic_send_command_completed",
-                            role = WssDiag.Role.MATRIX,
-                            sequence = sequence,
-                            result = "rejected",
-                        )
-                    }
-                }
+                // §12 Round-8 audit P0: coordinator emits ALL the
+                // structured events (diagnostic_send_dispatched
+                // BEFORE sendMessage, diagnostic_send_command_completed
+                // AFTER return/exception, and the rejected/completed
+                // pair on the no-paired / multiple-paired branches).
+                // Receiver is now a thin dispatch layer — it does
+                // NOT emit WSS_DIAG events for the send path. This
+                // guarantees the CID is visible to the runner even
+                // if `messagingService.sendMessage` never returns
+                // (hung WSS/REST call).
+                coordinator.resolveAndSend(cellId!!, sequence)
             } finally {
                 pendingResult.finish()
             }

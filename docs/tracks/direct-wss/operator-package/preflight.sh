@@ -134,18 +134,22 @@ for want in "$phone|phone" "$emu|emulator"; do
 done
 emitter_ids_set=true
 
-# 4b. §12 Round-7 audit P1-2: signed prekey readiness on relay.
-#     The debug receiver's `signed_prekey_readiness` subcommand fires
-#     `PreKeyApi.fetchStatus(identity, identity)` — a NON-consuming
-#     GET /prekeys/status — and logs `signed_prekey_readiness
-#     published=<true|false> signed_prekey_age_days=<n|null>
-#     remaining_opks=<n>` to WSS_DIAG_CMD. Preflight refuses to run
-#     the matrix if either device's own signed prekey has not yet
-#     been published to the relay (fresh-pair prekey publish latency
-#     was the root cause of the Round-6 tooling failure: sendMessage
-#     bailed on `PeerBundleMissingException` and every dispatched CID
-#     lacked downstream evidence).
-for serial in "$phone" "$emu"; do
+# 4b. §12 Round-7 + Round-8 audit P1-2: signed prekey readiness on
+#     relay. The debug receiver's `signed_prekey_readiness` subcommand
+#     fires `PreKeyApi.fetchStatus(identity, identity)` — a
+#     NON-consuming GET /prekeys/status — and logs
+#     `signed_prekey_readiness published=<true|false>
+#     signed_prekey_age_days=<n|null> remaining_opks=<n>` to
+#     WSS_DIAG_CMD. Preflight refuses to run the matrix if either
+#     device's own signed prekey has not yet been published to the
+#     relay AND writes per-device booleans into preflight.json so
+#     the verifier can enforce the gate at report time (Round-8 audit
+#     P1: the Round-7 preflight ran the check but did not persist the
+#     result — verifier had no way to prove this gate was ever run).
+phone_signed_prekey_ready="false"
+emu_signed_prekey_ready="false"
+for want in "$phone|phone" "$emu|emulator"; do
+    serial="${want%|*}"; role="${want#*|}"
     adb -s "$serial" logcat -c
     "$LIB/diag-cmd.sh" signed_prekey_readiness --serial "$serial" >/dev/null
     sleep 5
@@ -156,13 +160,18 @@ for serial in "$phone" "$emu"; do
         exit 1
     fi
     if ! printf '%s' "$readiness" | grep -q "published=true"; then
-        echo "preflight FAILED: $serial reports signed_prekey_readiness NOT published — its own signed prekey is not on the relay yet." >&2
-        echo "  Root cause is prekey publish latency; do NOT run the matrix — the sender would emit sender_prekey_deferred for every envelope, no transport traffic would happen, and the run would be indistinguishable from a real Yota failure." >&2
+        echo "preflight FAILED: $serial ($role) reports signed_prekey_readiness NOT published — its own signed prekey is not on the relay yet." >&2
+        echo "  do NOT run the matrix — the sender would emit sender_prekey_deferred for every envelope, no transport traffic would happen, and the run would be indistinguishable from a real Yota failure." >&2
         echo "  Wait 30 s and re-run preflight. If it persists, verify the relay is reachable and the app has published its bundle at least once." >&2
         echo "  ($readiness)" >&2
         exit 1
     fi
-    echo "$serial: $readiness"
+    if [ "$role" = "phone" ]; then
+        phone_signed_prekey_ready="true"
+    else
+        emu_signed_prekey_ready="true"
+    fi
+    echo "$serial ($role): $readiness"
 done
 
 # 5. Paired conversation count == 1 on both devices (Round-1 audit P1).
@@ -301,7 +310,9 @@ cat > "$OUT/preflight.json" <<EOF
   "rest_capability": "$rest_cap",
   "host_to_phone_skew_ms": $host_to_phone_ms,
   "host_to_emulator_skew_ms": $host_to_emu_ms,
-  "diagnostic_apk_sha256": "$bundled_apk_sha"
+  "diagnostic_apk_sha256": "$bundled_apk_sha",
+  "phone_signed_prekey_ready": $phone_signed_prekey_ready,
+  "emulator_signed_prekey_ready": $emu_signed_prekey_ready
 }
 EOF
 

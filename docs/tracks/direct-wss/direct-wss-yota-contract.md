@@ -45,6 +45,119 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.8 — Round-8 audit repair (2026-08-12, Round-7 REDLINE follow-up)
+
+Round-7 (`de037ead`) accepted the diagnosis but the line-level
+review found four remaining defects. Round-8 closes all four.
+Scope: Python/shell/docs + minimal Android for event ordering
+and one test seam. No APK. No ADB. No tar/repack. No full
+Gradle suite. Compile + focused tests only.
+
+**P0 CID must be visible during a hung send.**
+
+The Round-7 receiver awaited `resolveAndSend` before emitting
+`diagnostic_send_dispatched`. If `messagingService.sendMessage`
+never returned (a hung WSS/REST call — the exact class of
+product signal we come to Yota to investigate) the CID would
+never appear and the runner's gate could not tell the hang
+apart from an instrumentation failure. Fix:
+
+* `DiagnosticSendCoordinator.resolveAndSend` now generates the
+  correlation_id AND emits `diagnostic_send_dispatched` BEFORE
+  calling `messagingService.sendMessage`.
+* `diagnostic_send_command_completed` is emitted AFTER
+  `sendMessage` returns or throws, with the same `correlation_id`
+  + `sequence` and `result ∈ {handled, rejected, exception}`.
+* Rejected paths (no-paired-conversation, multiple-paired) emit
+  both the specific `diagnostic_send_rejected_*` event and the
+  closed-schema `command_completed result=rejected` (no CID —
+  no `sendMessage` was called, no hang possible).
+* `DiagnosticCommandReceiver.handleSend` is now a thin dispatch
+  layer — it delegates to the coordinator and does NOT emit any
+  WSS_DIAG events on the send path.
+* Runner `run-matrix.sh`: missing CID after
+  `wait_send_cid_from_sender`'s 15 s deadline is now an
+  unambiguous `ABORT_REASON=tooling_instrumentation_failure`
+  (was warn+sleep+continue). The Round-8 coordinator MUST emit
+  dispatched within 15 s of the broadcast; if it doesn't, the
+  receiver never dispatched.
+* Focused Kotlin test with a suspending fake `sendMessage`:
+  `diagnostic_send_dispatched` is observed BEFORE the fake
+  releases the hang, `diagnostic_send_command_completed
+  result=handled` fires AFTER release. Proves ORDER, not just
+  presence.
+
+**P1 `sender_enqueue` after successful `insertMessage`.**
+
+The Round-7 emit sat inside `MessageEntity(...).also { emit(...) }`,
+which runs when the entity is constructed — BEFORE `insertMessage`
+sees the row. If `insertMessage` throws, the emit fires anyway
+and the log falsely claims queue acceptance. Fix:
+
+* `DefaultMessagingService.sendMessage` now:
+  `val entity = MessageEntity(...); messageRepository.insertMessage(entity);
+  WssDiagBridgeHolder.instance?.emit("sender_enqueue", …)`.
+* Two focused tests in `DefaultMessagingServiceTest`:
+  * successful insert → `sender_enqueue` emitted for the CID;
+  * `FakeMessageRepository(insertMessageException=IllegalStateException(...))`
+    → `sender_enqueue` NOT emitted, row not persisted.
+
+**P1 prekey readiness persisted in evidence.**
+
+Round-7 preflight ran the readiness check but only greps'd
+logcat and did not write the result to disk. The verifier had
+no way to prove the gate was ever run. Fix:
+
+* `preflight.sh` now captures per-device readiness state and
+  writes two closed-schema boolean fields to `preflight.json`:
+  `phone_signed_prekey_ready` and `emulator_signed_prekey_ready`.
+  No keys, identity, or PII flow into evidence — only booleans.
+* Verifier requires both fields present, `type(v) is bool`, and
+  `v is True`. Missing / `False` / `"true"` / `1` / `None` /
+  wrong-typed → integrity RED (same strict semantics as the
+  matrix `blocked` field, §12.4 P0-2).
+* Five focused Python fixtures (`test_R8_P1_*`) cover
+  each rejection path.
+
+**P1 Kotlin `--rerun-tasks` in handoff.**
+
+Round-7 handoff log showed every task `UP-TO-DATE` — Gradle had
+cached the previous run and the reported focused tests did not
+actually execute. Round-8 handoff invokes
+`./gradlew :apps:android:testDebugUnitTest --rerun-tasks` on
+the 8 diagnostic classes plus
+`:shared:core:messaging:jvmTest --rerun-tasks` on the two new
+DMS ordering tests so the log reflects a live rerun.
+
+**P2 §12.7 root-cause wording softened.**
+
+Prepended a Root-cause note to §12.7 stating that the live
+Yota bundle did NOT contain the downstream telemetry needed to
+prove `PeerBundleMissingException` was the specific cause —
+only that the empty-matrix shape is consistent with it. Source
+review confirms the real success-shaped failure path; the
+Round-7 fix set treats "failure paths that never reached
+transport" as a class rather than binding to one specific cause.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes + 2 messaging tests: BUILD
+  SUCCESSFUL with `--rerun-tasks`.
+  * `DiagnosticSendCoordinatorTest.dispatched_event_emits_BEFORE_sendMessage_completes`
+    — new: proves emit ORDER via a suspending fake sendMessage
+    and a `WssDiag.testSink` seam.
+  * `DefaultMessagingServiceTest.sendMessage_emits_sender_enqueue_AFTER_insertMessage_succeeds`
+    — new: enqueue fires only after row is persisted.
+  * `DefaultMessagingServiceTest.sendMessage_does_NOT_emit_sender_enqueue_when_insertMessage_fails`
+    — new: `FakeMessageRepository(insertMessageException=...)` proves
+    the emit is guarded by insertMessage return.
+* Python — 97 fixtures (5 new for Round-8): missing
+  `phone_signed_prekey_ready`, missing
+  `emulator_signed_prekey_ready`, `False`, stringly-typed
+  `"true"`, int `1`.
+* Shell — 36 fixtures unchanged.
+* `bash -n` + `py_compile` clean.
+
 ### §12.7 — Round-7 audit repair (2026-08-12, Round-6 REDLINE follow-up)
 
 Round-6 (`3d7ad16e`) accepted the diagnosis but the delivered
@@ -66,6 +179,22 @@ Gradle suite. Compile + focused tests only.
 
 **P0-1 restore `sender_enqueue`; add `sender_send_attempt_started`
 and `sender_prekey_deferred`.**
+
+_Root-cause note (softened per §12.8 P2)._ The live Yota bundle
+`yota-wss-20260812T082016Z-instrumentation-failure` did not
+contain the downstream sender-side telemetry that would prove
+`PeerBundleMissingException` was the specific cause of the empty
+matrix. It proves only that dispatched CIDs had NO
+`sender_enqueue` / `sender_transport_decision` / route-return /
+recipient events at all. Source review confirms
+`DefaultMessagingService.sendMessage` has a real success-shaped
+failure path (`catch (PeerBundleMissingException) → return@runCatching Unit`)
+that would produce exactly this shape — a strong hypothesis but
+not a proven live root cause. The Round-7 fix set treats
+"failure paths that never reached transport" as a class and
+covers PeerBundleMissing plus any future addition of the same
+shape via `sender_prekey_deferred` (schema-open at the event
+site, closed at the classification site).
 
 * `shared/core/messaging/.../DefaultMessagingService.kt` restores
   the `sender_enqueue` emit inside `afterEncrypt` (real queue

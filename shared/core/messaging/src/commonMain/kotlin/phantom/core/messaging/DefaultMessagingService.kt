@@ -1591,33 +1591,35 @@ class DefaultMessagingService(
                 afterEncrypt = { wireFrame ->
                     val ct = json.encodeToString(wireFrame).encodeToByteArray()
                     ciphertextBytes = ct
-                    // §12 Round-7 audit P1-1: `sender_enqueue` restored
-                    // to the real queue/persistence boundary — it fires
-                    // AFTER encryption succeeded and BEFORE the row is
-                    // handed to the transport. The Round-6 misplacement
-                    // to sendMessage entry conflated intent with real
-                    // queue observation. Under PeerBundleMissingException
-                    // this callback is not reached; the catch block emits
-                    // `sender_prekey_deferred` for the same CID so the
-                    // verifier can distinguish "encryption never ran" from
-                    // "network dropped the payload".
-                    messageRepository.insertMessage(
-                        MessageEntity(
-                            id = message.id,
-                            conversationId = message.conversationId,
-                            ciphertext = ct,
-                            plaintextCache = message.text,
-                            sent = true,
-                            status = MessageStatus.QUEUED,
-                            createdAt = insertedAtMs,
-                            expiresAtMs = outgoingExpiresAtMs,
-                        ).also {
-                            WssDiagBridgeHolder.instance?.emit(
-                                event = "sender_enqueue",
-                                correlationId = message.id,
-                                role = WssDiagBridge.Role.SENDER,
-                            )
-                        }
+                    // §12 Round-7 audit P1-1 + Round-8 audit P1:
+                    // `sender_enqueue` fires AFTER the row is
+                    // successfully persisted, not from an `.also{}`
+                    // side-effect on the entity constructor (which
+                    // runs BEFORE insertMessage sees the row). If
+                    // insertMessage throws, the enqueue event MUST
+                    // NOT fire — otherwise the log would falsely
+                    // claim queue acceptance for a row that never
+                    // landed. Under PeerBundleMissingException this
+                    // callback is not reached; the catch block emits
+                    // `sender_prekey_deferred` for the same CID.
+                    val entity = MessageEntity(
+                        id = message.id,
+                        conversationId = message.conversationId,
+                        ciphertext = ct,
+                        plaintextCache = message.text,
+                        sent = true,
+                        status = MessageStatus.QUEUED,
+                        createdAt = insertedAtMs,
+                        expiresAtMs = outgoingExpiresAtMs,
+                    )
+                    messageRepository.insertMessage(entity)
+                    // insertMessage returned without throwing — the
+                    // row is durably persisted; only now do we log
+                    // the queue-boundary event.
+                    WssDiagBridgeHolder.instance?.emit(
+                        event = "sender_enqueue",
+                        correlationId = message.id,
+                        role = WssDiagBridge.Role.SENDER,
                     )
                 },
             )
