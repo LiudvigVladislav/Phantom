@@ -161,29 +161,24 @@ poll_envelope() {
   done
 }
 
-# §12 Round-7 audit P0-2 (revised from Round-6): fail-fast gate.
-# The Round-6 gate required a route-return (sender_wss_send_returned
-# or sender_rest_post_completed) within 15 s — but a route-return
-# timeout is a legitimate PRODUCT signal (the Yota case we came to
-# investigate). Round-7 narrows the gate to instrumentation-only
-# checks so a hung route call does NOT get misreported as tooling
-# failure.
+# §12 Round-9 audit P1 (revised from Round-7): tri-state gate.
+# The Round-7 gate accepted `sender_prekey_deferred` as GREEN — a
+# local terminal outcome proves the coordinator handed off, but
+# NOT that the production transport route was actually reached.
+# For smoke-check purposes we need positive proof of transport
+# reach, so the gate is tri-state now:
 #
-# Gate passes when ALL of the following are true for the first
-# canonical envelope within 15 s:
-#   * diagnostic_send_dispatched              (receiver dispatched)
-#   * sender_send_attempt_started             (DMS entry reached)
-#   * one of:
-#       - sender_transport_decision           (send reached HRT)
-#       - a local terminal outcome for the CID:
-#           * sender_prekey_deferred          (prekey missing — WAITING)
-#           * diagnostic_send_command_completed result=rejected|exception
+#   rc=0  transport_decision seen        → smoke GREEN, proceed
+#   rc=2  local terminal outcome seen    → setup/command failure
+#         (prekey_deferred | receiver-side rejected | exception).
+#         The evidence is enough to diagnose but the transport
+#         route was NOT reached — do NOT run the rest of the
+#         matrix.
+#   rc=1  none of the above within 15 s  → tooling / instrumentation
+#         failure (the send never reached HRT and no local terminal
+#         fired either).
 #
-# If none of the "decision-or-terminal" set appears, the send never
-# even reached the transport decision point — that's tooling. If
-# sender_transport_decision is present, the gate is GREEN and the
-# ordinary 120-s poll_envelope classifies missing route returns /
-# recipient events as PENDING / Unresolved (real product signal).
+# Only rc=0 unlocks the RUN-FULL-MATRIX prompt.
 gate_first_envelope() {
   local cid="$1"
   local start; start=$(now_ms)
@@ -194,14 +189,27 @@ gate_first_envelope() {
     attempt=$(count_matches "event=sender_send_attempt_started.*correlation_id=$cid" "$phone_log" "$emu_log")
     dec=$(count_matches "event=sender_transport_decision.*correlation_id=$cid" "$phone_log" "$emu_log")
     deferred=$(count_matches "event=sender_prekey_deferred.*correlation_id=$cid" "$phone_log" "$emu_log")
-    # local terminal from receiver side (rejected/exception on this cid).
     cmd_terminal=$(count_matches "event=diagnostic_send_command_completed.*correlation_id=$cid.*result=\\(rejected\\|exception\\)" "$phone_log" "$emu_log")
-    local terminal_or_decision=$(( dec + deferred + cmd_terminal ))
-    if [ "$disp" -ge 1 ] && [ "$attempt" -ge 1 ] && [ "$terminal_or_decision" -ge 1 ]; then
-      return 0
+    if [ "$disp" -ge 1 ] && [ "$attempt" -ge 1 ]; then
+      if [ "$dec" -ge 1 ]; then
+        # rc=0: transport was actually reached → smoke GREEN.
+        return 0
+      fi
+      local terminal=$(( deferred + cmd_terminal ))
+      if [ "$terminal" -ge 1 ]; then
+        # rc=2: local terminal outcome proves the coordinator
+        # handed off but the transport route was NOT reached —
+        # setup/command failure. Enough evidence to diagnose,
+        # NOT enough to run the rest of the matrix.
+        echo "gate SETUP FAILURE: cid=$cid disp=$disp attempt=$attempt dec=$dec deferred=$deferred cmd_terminal=$cmd_terminal" >&2
+        return 2
+      fi
     fi
     if [ "$(now_ms)" -ge "$deadline_ms" ]; then
-      echo "gate FAILED after 15s: cid=$cid disp=$disp attempt=$attempt dec=$dec deferred=$deferred cmd_terminal=$cmd_terminal" >&2
+      # rc=1: no dispatched, no attempt_started, no terminal
+      # outcome → the send never reached HRT AND no local
+      # terminal fired → tooling / instrumentation failure.
+      echo "gate TOOLING FAILURE after 15s: cid=$cid disp=$disp attempt=$attempt dec=$dec deferred=$deferred cmd_terminal=$cmd_terminal" >&2
       return 1
     fi
     sleep 1
@@ -275,22 +283,74 @@ for row in "${cells[@]}"; do
       "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
       exit 2
     fi
-    # §12 Round-6 audit P0-3 (Round-7 revised): gate the FIRST envelope
-    # of the FIRST cell on instrumentation signals within 15 s. Route
-    # hangs after transport_decision are product signal, not tooling.
+    # §12 Round-6 audit P0-3 (Round-7 revised, Round-9 tri-state):
+    # gate the FIRST envelope of the FIRST cell.
+    #   rc=0 → smoke GREEN, poll_envelope this envelope, then
+    #          prompt for typed RUN-FULL-MATRIX confirmation.
+    #   rc=1 → tooling failure.
+    #   rc=2 → setup/command failure (local terminal reached, but
+    #          transport route NOT reached).
     if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
-      if ! gate_first_envelope "$cid"; then
-        ABORT_REASON="tooling_instrumentation_failure"
-        echo "ABORT: production send-path instrumentation missing on the first" >&2
-        echo "       canonical envelope (no transport_decision, no prekey_deferred, no" >&2
-        echo "       receiver-side rejected/exception). Not spending another 120s×39 envelopes." >&2
-        echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
-        "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
-        "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
-        exit 2
-      fi
+      set +e
+      gate_first_envelope "$cid"
+      gate_rc=$?
+      set -e
+      case "$gate_rc" in
+        0)
+          echo "gate SMOKE GREEN: transport route reached." >&2
+          ;;
+        2)
+          ABORT_REASON="setup_or_command_failure"
+          echo "ABORT: first-envelope gate hit a local terminal outcome" >&2
+          echo "       (prekey_deferred | rejected | exception) — the coordinator" >&2
+          echo "       handed off but the production transport route was NOT" >&2
+          echo "       reached. Do NOT run the rest of the matrix; the evidence" >&2
+          echo "       collected so far is enough to diagnose the setup failure." >&2
+          "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          exit 3
+          ;;
+        *)
+          ABORT_REASON="tooling_instrumentation_failure"
+          echo "ABORT: production send-path instrumentation missing on the first" >&2
+          echo "       canonical envelope (no transport_decision, no prekey_deferred, no" >&2
+          echo "       receiver-side rejected/exception). Not spending another 120s×39 envelopes." >&2
+          echo "       Verifier will report evidence_integrity=RED and product_outcome=NOT_EVALUABLE." >&2
+          "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          exit 2
+          ;;
+      esac
     fi
     poll_envelope "$cid" "$enqueue_wall_ms"
+
+    # §12 Round-9 audit P1: after the smoke envelope finishes its
+    # 120-second poll_envelope window, require typed
+    # `RUN-FULL-MATRIX` confirmation before continuing. Without
+    # it, clear pins and exit gracefully — the trap still writes
+    # matrix_completion.json with an abort_reason so the verifier
+    # knows to report NOT_EVALUABLE for the unproduced cells.
+    # Skippable in unattended dry-runs via WSS_DIAG_SKIP_MATRIX_CONFIRM=1
+    # (test fixtures only — never set in a live Yota pass).
+    if [ "$CELLS_RAN" -eq 0 ] && [ "$seq" -eq 1 ]; then
+      if [ "${WSS_DIAG_SKIP_MATRIX_CONFIRM:-0}" != "1" ]; then
+        printf '\nsmoke envelope complete on the first canonical cell.\n'
+        printf '  * evidence for this envelope is now in %s\n' "$OUT"
+        printf '  * type RUN-FULL-MATRIX to continue with the remaining 39 envelopes\n'
+        printf '  * anything else aborts cleanly (pins cleared, matrix_completion recorded)\n'
+        printf 'confirmation> '
+        read -r typed_confirm
+        if [ "$typed_confirm" != "RUN-FULL-MATRIX" ]; then
+          ABORT_REASON="operator_declined_full_matrix"
+          echo "ABORT: operator did not type RUN-FULL-MATRIX — clearing pins and exiting." >&2
+          "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" pin --serial "$recipient" --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" clear --serial "$phone" >/dev/null 2>&1 || true
+          "$HERE/diag-cmd.sh" clear --serial "$emu"   >/dev/null 2>&1 || true
+          exit 4
+        fi
+      fi
+    fi
   done
 
   "$HERE/diag-cmd.sh" pin --serial "$sender"    --pin none --run-id "$RUN_ID" --cell-id "$cell_id" >/dev/null || true

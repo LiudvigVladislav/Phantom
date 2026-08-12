@@ -45,6 +45,128 @@ Findings resolved:
 
 - **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
 
+### §12.9 — Round-9 audit repair (2026-08-12, last mini before APK)
+
+Round-8 (`337ac19e`) accepted the CID-before-send + enqueue-after-
+insert + readiness-in-evidence work but the line-level review found
+five items to close before an APK build. Round-9 closes all five.
+Scope: minimal Android for two ordering changes + Python/shell/docs.
+No APK. No ADB. No tar/repack. No full Gradle suite.
+
+**P0-1 `diag-cmd.sh send` uses `am broadcast --async`.**
+
+Android's `am broadcast` waits for the receiver to `finish()`
+unless `--async` is passed. Under Round-8 the Mac wrapper waited
+for the full ADB reply before entering `wait_send_cid_from_sender`
+— so a hung `sendMessage` (the exact class of product signal we
+came to Yota to investigate) would leave the Mac stuck at the ADB
+call and the CID would appear in logcat but not be looked up.
+
+`lib/diag-cmd.sh` now passes `--async` for the `send` subcommand
+only. Every other subcommand (`pin`, `canary`, `set_emitter_id`,
+`dual_sim_report`, `health`, `clear`, `checkpoint`,
+`paired_count_report`, `signed_prekey_readiness`) stays
+synchronous — their receiver-side work is short and the runner
+relies on the sync ADB return.
+
+**P0-2 receiver no longer holds `goAsync()` around long
+`sendMessage`.**
+
+Android documents that `goAsync()` extends the broadcast timeout
+only in bounded ways — using it for arbitrary network work risks
+ANR or process kill during a diagnosed hang.
+`DiagnosticCommandReceiver.handleSend` now calls
+`coordinator.asyncTrigger(cellId, sequence) { }` and returns
+synchronously — `asyncTrigger` uses `DiagnosticSendCoordinator`'s
+own application-lifetime `CoroutineScope(SupervisorJob() +
+Dispatchers.IO)` which outlives this receiver instance. The
+coordinator still emits `diagnostic_send_dispatched` immediately
+(BEFORE calling `sendMessage`) and
+`diagnostic_send_command_completed` after
+return/exception, regardless of how long `sendMessage` takes.
+
+Combined with the `--async` flag on the ADB side, the smoke path
+is: `diag-cmd.sh send` → ADB replies immediately →
+`onReceive` returns immediately → the coordinator's coroutine
+emits dispatched → `wait_send_cid_from_sender` picks it up →
+`sendMessage` may hang indefinitely without blocking either the
+broadcast pipeline or the Mac wrapper.
+
+**P1 first-envelope gate is now tri-state.**
+
+Round-8 gate accepted `sender_prekey_deferred` (and other local
+terminal outcomes) as GREEN. A local terminal proves the
+coordinator handed off but NOT that the production transport
+route was reached. Round-9:
+
+* `rc=0` — `sender_transport_decision` seen → smoke GREEN,
+  proceed with typed confirmation.
+* `rc=2` — a local terminal outcome (`sender_prekey_deferred`
+  OR `diagnostic_send_command_completed
+  result ∈ {rejected, exception}`) → setup / command failure.
+  Enough evidence to diagnose but the transport route was NOT
+  reached — do NOT run the rest of the matrix. `ABORT_REASON=
+  setup_or_command_failure`.
+* `rc=1` — nothing within 15 s → tooling / instrumentation
+  failure. `ABORT_REASON=tooling_instrumentation_failure`.
+
+**P1 typed `RUN-FULL-MATRIX` confirmation after smoke GREEN.**
+
+After the gate returns `rc=0` and the first envelope's 120-s
+`poll_envelope` window closes, `run-matrix.sh` prints a summary
+and prompts:
+
+```
+smoke envelope complete on the first canonical cell.
+  * evidence for this envelope is now in <OUT>
+  * type RUN-FULL-MATRIX to continue with the remaining 39 envelopes
+  * anything else aborts cleanly (pins cleared, matrix_completion recorded)
+confirmation>
+```
+
+If the operator types anything other than the literal
+`RUN-FULL-MATRIX`, the runner clears pins on both devices,
+issues `diag-cmd.sh clear` on both, and exits with
+`ABORT_REASON=operator_declined_full_matrix`. The
+`matrix_completion.json` trap still runs so the verifier
+correctly reports NOT_EVALUABLE for the unproduced cells.
+
+An escape hatch for fixture dry-runs is available via
+`WSS_DIAG_SKIP_MATRIX_CONFIRM=1` — used only in tests, never
+in a live Yota pass.
+
+**P2 `deferred` removed from `ALLOWED_COMMAND_RESULTS`.**
+
+Round-7 reserved `deferred` in the closed schema for a
+verifier post-processing step that never materialised.
+Production emits only `handled | rejected | exception` from the
+receiver, and the deferred state is already represented by a
+distinct sender event (`sender_prekey_deferred`). Keeping
+`deferred` in the result schema without a producing code path
+would extend the closed schema beyond code that generates it.
+The verifier now rejects `deferred` as an unknown value.
+
+**Fixtures (all GREEN with `--rerun-tasks`).**
+
+* Kotlin — 8 diag classes + 2 DMS ordering tests: BUILD
+  SUCCESSFUL.
+* Python — 97 fixtures unchanged (the R6 valid-results iteration
+  loop updated: `deferred` dropped).
+* Shell — 43 fixtures (7 new for Round-9):
+  * `diag-cmd.sh send` passes `--async` to `am broadcast`;
+  * `diag-cmd.sh health` / `pin` do NOT pass `--async`
+    (stay synchronous);
+  * wrapper returns quickly (no long shell sleep around adb);
+  * tri-state gate rc=0 when transport_decision seen;
+  * tri-state gate rc=2 for `prekey_deferred` (setup failure);
+  * tri-state gate rc=2 for `command_completed result=rejected`
+    (setup failure).
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per audit exit criteria: after LOGICAL
+GREEN — one `assembleDebug`, clean bootstrap, preflight, smoke
+gate, typed operator confirmation, then full matrix.**
+
 ### §12.8 — Round-8 audit repair (2026-08-12, Round-7 REDLINE follow-up)
 
 Round-7 (`de037ead`) accepted the diagnosis but the line-level

@@ -41,8 +41,21 @@ case "$subcommand" in
     args+=(--es pin "$pin" --es run_id "$run_id" --es cell_id "$cell_id")
     ;;
   send)
+    # §12 Round-9 audit P0-1: `am broadcast` waits for the receiver
+    # to `finish()` unless `--async` is passed. `send` is the ONLY
+    # subcommand whose receiver-side work (`sendMessage`) can hang
+    # indefinitely under a hung WSS/REST call — without `--async`
+    # the Mac-side `wait_send_cid_from_sender` would not even
+    # start until the receiver had fully returned. Passing `--async`
+    # decouples the AM callback from the ADB reply so `diag-cmd.sh
+    # send` returns as soon as the broadcast is delivered; the CID
+    # still lands in logcat via the coordinator's `WssDiag.emit`
+    # BEFORE `sendMessage` is called. The other subcommands stay
+    # synchronous — their receiver-side work is short and their
+    # readback is derived from the ADB return, not from a logcat
+    # event.
     [ -z "$run_id" ] || [ -z "$cell_id" ] || [ -z "$sequence" ] && { echo "send requires --run-id, --cell-id, --sequence" >&2; exit 2; }
-    args+=(--es run_id "$run_id" --es cell_id "$cell_id" --ei sequence "$sequence")
+    args+=(--async --es run_id "$run_id" --es cell_id "$cell_id" --ei sequence "$sequence")
     ;;
   set_emitter_id)
     [ -z "$emitter_id" ] && { echo "set_emitter_id requires --emitter-id" >&2; exit 2; }

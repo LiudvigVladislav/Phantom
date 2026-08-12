@@ -65,10 +65,11 @@ internal class DiagnosticSendCoordinator(
      * and `Result.success(Unit)` returned. The verifier separately
      * looks for `sender_prekey_deferred` on the same correlation id
      * to distinguish "coordinator saw a definitive result" from
-     * "envelope actually reached the transport". The closed schema
-     * also reserves `deferred` for the verifier report; the
-     * coordinator itself never emits it (that comes from the
-     * `sender_prekey_deferred` event site).
+     * "envelope actually reached the transport". `deferred` was
+     * reserved in the Round-7 closed schema but §12 Round-9 audit
+     * P2 removed it — production only emits handled | rejected |
+     * exception; `sender_prekey_deferred` is a distinct sender
+     * event, not a command_completed result value.
      *
      * No exception text, message text, usernames, keys, tokens or
      * PII — only the exception class simple name.

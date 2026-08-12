@@ -130,7 +130,12 @@ MATRIX_EVENTS = {
     "diagnostic_send_rejected_no_paired_conversation",
     "diagnostic_send_rejected_multiple_paired_conversations",
 }
-ALLOWED_COMMAND_RESULTS = frozenset({"handled", "rejected", "exception", "deferred"})
+# §12 Round-9 audit P2: production emits only handled | rejected |
+# exception; deferred is already represented by a separate event
+# (`sender_prekey_deferred`). Reserving `deferred` in this closed
+# schema without a corresponding emit site would extend the schema
+# beyond code that produces it.
+ALLOWED_COMMAND_RESULTS = frozenset({"handled", "rejected", "exception"})
 CROSS_RUN_TOLERATED_EVENTS = {
     "diagnostic_session_started",
     "diagnostic_canary",

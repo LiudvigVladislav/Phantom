@@ -1479,9 +1479,11 @@ class VerifierTests(unittest.TestCase):
         )
 
     def test_R6_P0_1_command_completed_valid_results_accepted(self):
-        # §12 Round-7 audit P0-1: accepted renamed to handled; deferred
-        # reserved in the closed schema for post-processing.
-        for good in ("handled", "rejected", "exception", "deferred"):
+        # §12 Round-7 audit P0-1: accepted renamed to handled.
+        # §12 Round-9 audit P2: `deferred` removed from the closed
+        # schema — production emits only handled|rejected|exception;
+        # `sender_prekey_deferred` is a separate event.
+        for good in ("handled", "rejected", "exception"):
             cell_id = "wss.p2e.after-connect"
             phone = [
                 line("diagnostic_session_started", 1000, 1, "matrix", "-", "phone",

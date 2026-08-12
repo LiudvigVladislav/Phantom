@@ -186,25 +186,26 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             conversationRepository = container.conversationRepo,
             messagingService = messaging,
         )
-        val pendingResult = goAsync()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        scope.launch {
-            try {
-                // §12 Round-8 audit P0: coordinator emits ALL the
-                // structured events (diagnostic_send_dispatched
-                // BEFORE sendMessage, diagnostic_send_command_completed
-                // AFTER return/exception, and the rejected/completed
-                // pair on the no-paired / multiple-paired branches).
-                // Receiver is now a thin dispatch layer — it does
-                // NOT emit WSS_DIAG events for the send path. This
-                // guarantees the CID is visible to the runner even
-                // if `messagingService.sendMessage` never returns
-                // (hung WSS/REST call).
-                coordinator.resolveAndSend(cellId!!, sequence)
-            } finally {
-                pendingResult.finish()
-            }
-        }
+        // §12 Round-9 audit P0-2: do NOT hold `goAsync()` around a
+        // potentially long `sendMessage`. Android's BroadcastReceiver
+        // API documents that `goAsync()` extends the broadcast
+        // timeout only in bounded ways — using it for arbitrary
+        // network work risks ANR or process kill during a diagnosed
+        // hang (the exact class of product signal we came to Yota
+        // to investigate). Instead: fire the coordinator on its
+        // OWN application-lifetime scope
+        // (`DiagnosticSendCoordinator.asyncTrigger` uses
+        // `CoroutineScope(SupervisorJob() + Dispatchers.IO)` created
+        // at coordinator construction time), and return from
+        // `onReceive` synchronously — the `diag-cmd.sh send`
+        // wrapper additionally passes `--async` so the ADB reply
+        // does not wait for the broadcast to finish either. The
+        // coordinator's coroutine still runs to completion regardless
+        // (the scope outlives this receiver instance), emitting
+        // `diagnostic_send_dispatched` immediately and
+        // `diagnostic_send_command_completed` after
+        // `sendMessage` returns / throws.
+        coordinator.asyncTrigger(cellId!!, sequence) { /* no-op */ }
     }
 
     private fun handleCheckpoint(context: Context) {
