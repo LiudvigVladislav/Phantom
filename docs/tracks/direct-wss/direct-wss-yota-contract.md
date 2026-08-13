@@ -1,0 +1,1720 @@
+# Direct WSS Diagnosis — Yota-First — Contract Sheet
+
+**Branch:** `android/direct-wss-diagnostics-2026-08-11` (client, off Phantom-android-ui HEAD `86c2de99`).
+**Relay tree examined:** `D:/VL Stories Studio/Phantom` HEAD `d63366b6` on branch `fix/relay-queue-durability-pr2` — the PR #397 (M6-3 queue-durability) code. Per architect 2026-08-11 answer to §8-Q1, PR #397 IS merged into upstream `master` (this local `master@fadc5c9c` is stale). VPS-side deployment is still unconfirmed.
+**Gate:** WSS-0 review required before any runtime change, APK build, VPS action, push, or long test.
+
+**§0 — status.** WSS-0 doc-only rounds landed as `bc7051ed` (initial), `4e841b5b` (REDLINE-1), `bf748db3` (REDLINE-2 — architect FINAL GREEN). WSS-1 implementation round is now in progress under architect implementation locks (see §11).
+
+## §11 — Implementation locks (architect FINAL GREEN on REDLINE-2)
+
+The following four locks close the choice-points left open in earlier rounds. They are BINDING for WSS-1 implementation — no re-litigation without a new architect direction.
+
+1. **Command component = BroadcastReceiver only.** The debug command surface is ONE `BroadcastReceiver` declared solely in the debug `AndroidManifest.xml` overlay. `Activity` is NOT used. The receiver runs on explicit component invocation (`am broadcast -n <APP_ID>/.diagnostic.DiagnosticCommandReceiver …`) and is physically absent from the release APK's merged manifest.
+
+2. **Outer Direct enforcement = Method (b) fail-closed check.** `TransportManager` is NOT modified. If the actually-selected outer arm at send time is not `direct`, `HybridRelayTransport.send` refuses to dispatch and emits `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`. The verifier classifies the affected envelope(s) as `Unresolved` — NOT `BLOCKED` (which is reserved for whole REST cells skipped when preflight says `rest_capability=disabled`). Every send under a WSS or REST pin MUST log `outer_transport=direct` in the winning `sender_transport_decision` event.
+
+3. **Conversation selection = automatic, not operator-supplied.** The `contact_alias` extra is REMOVED from the receiver whitelist. After a clean bootstrap, each device has exactly ONE paired conversation whose peer is the other device in the matrix. The receiver's `send` subcommand queries the local conversation store, requires exactly one matching paired conversation, and fails-red otherwise. The operator cannot influence which peer receives the send.
+
+4. **Additional focused tests (locked, on top of §5):**
+   - `wss_diag_unknown_extras_and_subcommands_are_rejected` — any extra outside the strict whitelist, or any `subcommand` outside the enum, exits the receiver red without touching `sendMessage`.
+   - `wss_diag_send_calls_production_api_exactly_once_with_no_external_text` — the `send` subcommand invokes `MessagingService.sendMessage` exactly once with text derived internally as `WSS-DIAG-${cell_id}-${sequence}` (carrier-neutral prefix — the earlier `YOTA-WSS-` name was renamed for the WSS-2 Yota+Tele2 matrix); no text extra is accepted or consumed.
+   - `wss_diag_pin_write_read_round_trip_through_app_code` — writes via `DiagnosticCommandReceiver` (in-app `DiagnosticTransportPinStore`, backed by plain `SharedPreferences` — the earlier `EncryptedSharedPreferences` draft was reverted per the Round-1 Mac audit) → reads via the same store → observes the value in `DiagnosticTransportGuard`. No ADB file write is possible or supported.
+   - `wss_diag_receiver_present_in_debug_manifest_and_absent_from_release_manifest` — introspects the merged manifest for both variants (via `manifest-merger` output files under `build/intermediates/merged_manifests/`), asserts the receiver appears in debug and NOT in release.
+
+## §12 — WSS-1 Mac-audit repair block (RED → LOGICAL GREEN)
+
+Architect Mac audit on `c910dee6` returned **RED / NO ADB INSTALL / NO YOTA MATRIX**. This block closes every finding in ONE consolidated repair. During repair the loop is compile + focused tests only — NO full suite, Paparazzi, APK, ADB, device install, or repeated handoff pack. After LOGICAL GREEN: one `assembleDebug --rerun-tasks`, one APK, one checksum, one final operator package + Mac dry-run against synthetic fixtures. Only then may the destructive bootstrap + Yota pass begin.
+
+Findings resolved:
+
+- **P0-1 (verifier false GREEN).** `verify-evidence.py` rewritten as closed-schema. Required files, expected 8-cell matrix (with BLOCKED marker for REST when preflight said `disabled`), exactly 5 unique correlation IDs per non-blocked cell, `run_id` match, expected `emitter_id` per device role, no duplicate correlation IDs, pin coverage over each envelope's wall-clock window, actually-observed `outer_transport=direct`, `inner_route` matching the cell's pin, presence of `diagnostic_session_started` on both devices. Exit codes: `0` = evidence GREEN + product OK; `2` = evidence GREEN + product RED (successful diagnostic capture); `1` = integrity/tooling failure. Fixture-driven Python tests cover every case P0-1 through P0-5.
+
+- **P0-2 (pin can disappear silently).** Debug-only `DiagnosticTransportPinStore` persists `pin + run_id + cell_id + emitter_id` via plain `SharedPreferences` (`diagnostic_transport_pin` file, `MODE_PRIVATE`, debug source set only). `DiagnosticBootInitProvider` restores the state before messaging init and emits `WSS_DIAG event=diagnostic_session_started restored=true|false pin=… …`. Every `send` subcommand validates that the caller's `cell_id` matches the persisted `cell_id` and fails-red otherwise. Matrix runner + verifier reject a session restart without a matching `diagnostic_session_started` covering the envelope's wall-clock window. `diag-cmd.sh clear` explicitly clears the persisted state at end-of-run.
+
+- **P0-3 (outer_transport asserted, not observed).** `DiagnosticTransportGuard.outerArmReader` is a nullable `() -> String` populated by debug boot init with a lambda reading `container.transportManager.state.value` and mapping the actually-selected `ManagerState.Connected(TransportKind)` to `direct` | `reality` | `tor` (never derived from any privacy-mode preference — that mapping was WRONG and is removed). `HRT.send` calls the reader and emits the observed value on `sender_transport_decision`. Under `Pin.WSS` or `Pin.REST`, if the observed value is not `direct`, the send is refused: `dispatched=false`, `outcome_flag=send_error`. Production chain order in `TransportManager` is not modified. See §12 (Round-1 audit P0-8 + Round-2..5 amendments) for the authoritative current story.
+
+- **P0-4 (bootstrap ordering impossible).** Split into three entry points that do not require each other's completion:
+  1. `run-yota-wss-diagnostic.sh bootstrap --fresh` runs standalone — detects devices, creates a `bootstrap` scratch dir, uninstalls, SHA-256-verifies the APK, installs, sets `emitter_id` on each via `diag-cmd.sh set_emitter_id`, prints manual onboarding + QR-pairing instructions, exits.
+  2. Operator manually onboards + pairs.
+  3. `run-yota-wss-diagnostic.sh preflight` (measurement preflight) creates a fresh evidence directory, verifies the debug variant, exactly one paired conversation per device, dual-SIM Yota confirmation (typed), radio checklist confirmation (typed), REST capability probe (Method B), clock skew. Fails-red on any mismatch.
+
+- **P0-5 (120-s contract not implemented).** `run-matrix.sh` polls per-envelope: after firing each envelope's `send` subcommand it reads the joined logs, waits until the four delivery signals are present OR the wall-clock difference between `sender_enqueue.wall_utc_ms` and `now` exceeds 120 000 ms, whichever comes first. The verifier classifies missing signals as `PENDING` when the newest event is under 120 s from `sender_enqueue`; only after 120 s is the classification `Unresolved`. Cell arithmetic stays exactly 5 envelopes.
+
+- **P0-6 (emitter + Yota not enforced).** Preflight (bootstrap phase) calls `diag-cmd.sh set_emitter_id --emitter-id phone` on the phone serial and `--emitter-id emulator` on the emulator serial, then verifies via `diag-cmd.sh health` that the values stick. Measurement preflight requires the operator to type the literal word `YOTA` at the dual-SIM confirmation prompt to proceed. The radio checklist (Wi-Fi OFF / VPN OFF / private DNS OFF / auto-switch OFF / other-SIM data OFF) is enumerated interactively; each item requires typed confirmation and lands in `preflight.json`. Verifier rejects any envelope whose `emitter_id` does not match the device role expected by the cell direction.
+
+- **P0-7 (Recovered evidence absent).** `Recovered` classification is REMOVED from the WSS-1 verifier. First-pass distinguishes only `Delivered once` / `Unresolved` / `PENDING` / `BLOCKED`. `attempt` + `session_epoch` + `sender_ack_watchdog_requeued` remain undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence. A follow-up block may introduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension — not in scope here.
+
+### §12.10 (Round-1 audit repair, 2026-08-13)
+
+Two P1 findings + one P2 documentation issue after the first
+WSS-2 overlay review. Same scope as §12.10 initial — scripts /
+verifier / docs / tests only. No Android runtime. No Gradle.
+No new APK. No bootstrap.
+
+**P1-1 parser missing-value hang.**
+
+`parse_operator_args`'s value-taking branches used
+`shift 2 || true`. `shift 2` fails when `$#` is 1 (only the
+flag present, no value), but `|| true` swallowed the error
+without consuming the current flag — the outer `while [ $# -gt 0 ]`
+looped forever on the same `--operator` token.
+
+Fix: explicit `$# -lt 2` guard BEFORE reading `$2`; on failure
+return non-zero with a clear message. `--` also rejects any
+trailing positional argument. Five new shell fixtures cover the
+missing-value cases + trailing positional + valid lone `--`,
+all wrapped in a pure-bash `run_bounded` watchdog (3 s) so a
+regression cannot wedge the fixture suite.
+
+**P1-2 verifier disjoint-schema fail-open.**
+
+Reproducible fail-open: copy the real archived Yota evidence,
+change `operator_label=TELE2`, keep `yota_confirmed=true`,
+`operator_confirmed=false`, `run_id` still `run-yota-...`, make
+the manifest consistent — the pre-Round-1 verifier returned
+`evidence_integrity=GREEN`, `product_outcome=GREEN`, title
+`Direct WSS TELE2`. The mixed schema was accepted because the
+WSS-2 companion checks fired only when `operator_confirmed=True`.
+
+Fix: legacy Round-9 and WSS-2 schemas are now STRICTLY DISJOINT.
+
+* **Legacy Round-9 shape** — `yota_confirmed=True` AND every
+  WSS-2 companion field (`operator_confirmed`, `operator_label`,
+  `expected_operator_numeric`) ABSENT (or `operator_confirmed`
+  explicitly `False` with no companion fields).
+* **WSS-2 shape** — `operator_confirmed=True` AND `operator_label`
+  in whitelist AND `expected_operator_numeric` valid AND
+  `matrix.run_id` starts with `run-<label lower>-` AND
+  `yota_confirmed == (label == YOTA)`.
+
+**Any WSS-2 companion field present without
+`operator_confirmed=True` → integrity RED.**
+
+`render_markdown` uses `rep.operator_label` in the title ONLY
+when `integrity_ok` is True. Any RED bundle or a legacy bundle
+falls back to `Direct WSS Yota-First — verification report v4`
+so an injected `operator_label` cannot mislead the reader next
+to an integrity failure.
+
+Seven new Python regression fixtures cover the exact audit
+reproduction + surrounding cases: TELE2 injection into a legacy
+Yota bundle → RED (fail-open guard); title fallback on that RED
+bundle; `operator_label=YOTA` alone under legacy confirmation
+→ RED (companion field alone still trips the guard); unknown
+label under legacy confirmation → RED; TELE2 metadata with
+`run-yota-*` run_id → RED via new prefix binding; archived
+legacy Yota bundle (no companion fields) → GREEN with
+Yota-First title; explicit `operator_confirmed=false` under
+legacy shape (no companion fields) → GREEN.
+
+**P2 README carrier-agnostic cleanup.**
+
+The pre-Round-1 README was still worded as "Direct WSS
+Yota-First — Operator Runbook" with:
+
+* prerequisite "phone with **Yota** as the default-data SIM";
+* radio checklist item "Yota is the DEFAULT DATA subscription";
+* pre-parameterization order (`4. preflight (measurement …
+  + Yota)`);
+* evidence path `evidence/yota-wss-<UTC>/`;
+* "MUST type the literal word `YOTA`";
+* "indistinguishable from a real Yota failure" phrase in the
+  prekey-readiness abort message.
+
+All rewritten to be carrier-agnostic; each carrier-specific
+example still shows the concrete Yota + Tele2 pair for the two
+supported labels. The prekey-readiness abort message now says
+"indistinguishable from a real carrier failure on the selected
+operator". Title bumped to `# Direct WSS — Operator Runbook
+(Mac) v3`.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — unchanged.
+* Python — 118 fixtures (7 new for Round-1): fail-open
+  reproduction, title fallback, legacy shape rejection of
+  companion fields, unknown label under legacy, TELE2 metadata
+  + `run-yota-*` prefix binding, archived Yota-First GREEN,
+  legacy shape with explicit `operator_confirmed=false` GREEN.
+* Shell — 79 fixtures (5 new for Round-1): missing value for
+  `--operator`, missing value for `--expected-operator-numeric`,
+  `--operator YOTA` alone (no companion), trailing positional
+  after `--`, valid lone `--`. All wrapped in a pure-bash
+  `run_bounded` watchdog.
+* `bash -n` + `py_compile` clean.
+
+Fixture `_build_wss2_full_bundle` gives each carrier fixture a
+matching `run_id` (`run-yota-fixture` / `run-tele2-fixture`) so
+the prefix check runs against a realistic value.
+
+### §12.10 — WSS-2 operator parameterization (2026-08-13)
+
+WSS-1 delivered a Yota baseline (`run-yota-20260812T171418Z`,
+30/30 WSS + 10/10 REST Delivered once, evidence archive
+`f33a138728…6266`). WSS-2 runs the identical 8×5 matrix on
+another carrier (Tele2 first) with the same APK, identities,
+pairing, emulator, Mac VPN and relay — the only variable is the
+phone's default-data SIM. This block is scripts / verifier /
+docs / tests only. No Android runtime changes. No Gradle. No
+new APK. No bootstrap. Reuse the installed APK sha
+`8802b063…b84c`. Round-9 smoke gate + typed `RUN-FULL-MATRIX`
+preserved unchanged.
+
+**CLI — `preflight` is now operator-parameterized.**
+
+```
+run-yota-wss-diagnostic.sh preflight \
+    --operator <YOTA|TELE2> \
+    --expected-operator-numeric <NNNNN>
+```
+
+`lib/operator-args.sh` provides three pure helpers
+(`validate_operator_label`, `validate_operator_numeric`,
+`parse_operator_args`) that the shell fixture suite drives
+directly. Missing / unknown label / non-digit numeric / unknown
+flag fail closed BEFORE any adb / mktemp / interactive prompt.
+
+Evidence directory + `run_id` are derived from the operator
+label — `evidence/tele2-wss-<STAMP>` and
+`run-tele2-<STAMP>` for Tele2, `evidence/yota-wss-<STAMP>` and
+`run-yota-<STAMP>` for Yota — so a Yota run and a Tele2 run
+land in distinct directories and neither can accidentally
+overwrite the other.
+
+**Observed vs expected numeric check.**
+
+After `dual_sim_report` reads the phone's default-data
+`operator_numeric`, preflight compares it against the
+`--expected-operator-numeric` CLI value BEFORE the typed
+confirmation prompt. A mismatch fails closed — a mistyped
+`--expected-operator-numeric` (e.g. Yota's 25011 passed to a
+Tele2 preflight) cannot pass. The prompt then requires the
+operator to type `<LABEL>` literally (`TELE2` for Tele2, `YOTA`
+for Yota); anything else, including EOF (Round-9 packaging nit
+protection), aborts.
+
+**Evidence schema additions.**
+
+`preflight.json`:
+- `operator_label`             — `YOTA` | `TELE2`
+- `expected_operator_numeric`  — 5-6 digit MCC+MNC
+- `operator_confirmed`         — real JSON boolean, `true` on success
+- `yota_confirmed`             — `true` when label=YOTA, `false` otherwise (legacy field kept for wire compat with the archived Round-9 baseline)
+
+`device-manifest.json`:
+- `operator_label`
+- `expected_operator_numeric`
+- (existing `dual_sim_report_operator_numeric` stays — must equal `expected_operator_numeric`)
+
+Verifier `_validate_operator_gate` accepts EITHER:
+- legacy Round-9 shape: `yota_confirmed == True` (no
+  `operator_label` — the archived `run-yota-20260812T171418Z`
+  bundle stays verifiable and its report still renders as
+  `Direct WSS Yota-First — verification report v4`), OR
+- WSS-2 shape: `operator_confirmed == True` + whitelisted
+  `operator_label` + valid `expected_operator_numeric`.
+
+Cross-file consistency (in `_validate_cross_file_run_consistency`):
+- `preflight.operator_label` == `manifest.operator_label`
+- `preflight.expected_operator_numeric` ==
+  `manifest.expected_operator_numeric`
+- `preflight.expected_operator_numeric` ==
+  `manifest.dual_sim_report_operator_numeric`
+- `operator_label==YOTA` requires `yota_confirmed==True`
+  (belt & braces for legacy readers)
+- `operator_label!=YOTA` with `yota_confirmed==True` → RED
+  (labels contradict)
+
+All new fields go through the same strict `type(v) is bool` /
+`isinstance(v, str)` gates as `blocked` (§12.4 P0-2). Stringly-
+typed values (`"true"`, `1`, list, dict) are RED.
+
+**Report title.**
+
+`verify-evidence.py:render_markdown` now takes the operator
+label from `preflight.json` and renders `Direct WSS <LABEL> —
+verification report v4`. The legacy Yota baseline (no
+`operator_label`) falls back to `Direct WSS Yota-First —
+verification report v4` for exact wire-compat with the
+archived report.
+
+**No changes to matrix logic, Android runtime, WSS_DIAG event
+schema, smoke gate, or `RUN-FULL-MATRIX` confirmation.**
+
+**Fixtures.**
+
+* Kotlin — unchanged (no runtime changes).
+* Python — 111 fixtures (14 new for WSS-2):
+  - archived Yota baseline still verifiable (`yota_confirmed`
+    alone, no `operator_label`);
+  - YOTA in WSS-2 shape verifiable;
+  - TELE2 accepted when expected == observed;
+  - wrong `dual_sim_report_operator_numeric` → RED;
+  - missing `operator_label` → RED;
+  - unknown label (`MEGAFON`) → RED;
+  - no confirmation at all → RED;
+  - stringly-typed `operator_confirmed` (`"true"`) → RED;
+  - stringly-typed `expected_operator_numeric` (int) → RED;
+  - `operator_label` mismatch preflight vs manifest → RED;
+  - `expected_operator_numeric` mismatch preflight vs manifest → RED;
+  - TELE2 with `yota_confirmed=True` → RED (labels contradict);
+  - YOTA label with `yota_confirmed=False` → RED (legacy field
+    must stay in sync);
+  - report title includes operator label.
+* Shell — 74 fixtures (28 new for WSS-2):
+  - `validate_operator_label` — 2 accept + 7 reject (lower case,
+    mixed case, empty, other carriers, space/dash variants);
+  - `validate_operator_numeric` — 4 accept + 7 reject (empty,
+    too short, too long, letters, spaces, `%N` leftover);
+  - `parse_operator_args` — YOTA / TELE2 happy paths + 5
+    fail-closed paths (missing `--operator`, missing
+    `--expected-operator-numeric`, unknown label, malformed
+    numeric, unknown flag).
+* `bash -n` + `py_compile` clean.
+
+**Order of operations for the actual WSS-2 pass (documented in
+`README-OPERATOR.md`).**
+
+1. Reuse the same installed APK. Do NOT re-run
+   `bootstrap --fresh` — that would destroy the pairing.
+2. Do NOT re-do onboarding or QR pairing.
+3. On the phone, switch default-data SIM to the target carrier
+   via Android's SIM/data settings.
+4. Repeat the radio checklist for the new carrier (Wi-Fi OFF,
+   VPN OFF, private DNS OFF, auto-data-switching OFF, other-SIM
+   mobile data OFF).
+5. `run-yota-wss-diagnostic.sh preflight --operator TELE2
+   --expected-operator-numeric <NNNNN>`.
+6. `run-yota-wss-diagnostic.sh matrix` (smoke gate + typed
+   `RUN-FULL-MATRIX` confirmation unchanged).
+
+### §12.9 — Round-9 audit repair (2026-08-12, last mini before APK)
+
+Round-8 (`337ac19e`) accepted the CID-before-send + enqueue-after-
+insert + readiness-in-evidence work but the line-level review found
+five items to close before an APK build. Round-9 closes all five.
+Scope: minimal Android for two ordering changes + Python/shell/docs.
+No APK. No ADB. No tar/repack. No full Gradle suite.
+
+**P0-1 `diag-cmd.sh send` uses `am broadcast --async`.**
+
+Android's `am broadcast` waits for the receiver to `finish()`
+unless `--async` is passed. Under Round-8 the Mac wrapper waited
+for the full ADB reply before entering `wait_send_cid_from_sender`
+— so a hung `sendMessage` (the exact class of product signal we
+came to Yota to investigate) would leave the Mac stuck at the ADB
+call and the CID would appear in logcat but not be looked up.
+
+`lib/diag-cmd.sh` now passes `--async` for the `send` subcommand
+only. Every other subcommand (`pin`, `canary`, `set_emitter_id`,
+`dual_sim_report`, `health`, `clear`, `checkpoint`,
+`paired_count_report`, `signed_prekey_readiness`) stays
+synchronous — their receiver-side work is short and the runner
+relies on the sync ADB return.
+
+**P0-2 receiver no longer holds `goAsync()` around long
+`sendMessage`.**
+
+Android documents that `goAsync()` extends the broadcast timeout
+only in bounded ways — using it for arbitrary network work risks
+ANR or process kill during a diagnosed hang.
+`DiagnosticCommandReceiver.handleSend` now calls
+`coordinator.asyncTrigger(cellId, sequence) { }` and returns
+synchronously — `asyncTrigger` uses `DiagnosticSendCoordinator`'s
+own process-local `CoroutineScope(SupervisorJob() +
+Dispatchers.IO)` bound to the coordinator instance (which itself
+outlives this receiver invocation). The scope is NOT true
+application-lifetime — an Android process kill (LMK, ANR, etc.)
+loses it. That's acceptable for this diagnostic: process death
+during a diagnosed hang leaves an incomplete evidence bundle,
+and the verifier's `matrix_completion.json` requirement + the
+`sender_send_attempt_started → sender_enqueue → sender_prekey_deferred`
+schema render the incompleteness as integrity RED /
+`product_outcome=NOT_EVALUABLE` (never a silent GREEN). The
+coordinator still emits `diagnostic_send_dispatched` immediately
+(BEFORE calling `sendMessage`) and
+`diagnostic_send_command_completed` after return/exception,
+regardless of how long `sendMessage` takes — up to the point of
+a process kill.
+
+Combined with the `--async` flag on the ADB side, the smoke path
+is: `diag-cmd.sh send` → ADB replies immediately →
+`onReceive` returns immediately → the coordinator's coroutine
+emits dispatched → `wait_send_cid_from_sender` picks it up →
+`sendMessage` may hang indefinitely without blocking either the
+broadcast pipeline or the Mac wrapper.
+
+**P1 first-envelope gate is now tri-state.**
+
+Round-8 gate accepted `sender_prekey_deferred` (and other local
+terminal outcomes) as GREEN. A local terminal proves the
+coordinator handed off but NOT that the production transport
+route was reached. Round-9:
+
+* `rc=0` — `sender_transport_decision` seen → smoke GREEN,
+  proceed with typed confirmation.
+* `rc=2` — a local terminal outcome (`sender_prekey_deferred`
+  OR `diagnostic_send_command_completed
+  result ∈ {rejected, exception}`) → setup / command failure.
+  Enough evidence to diagnose but the transport route was NOT
+  reached — do NOT run the rest of the matrix. `ABORT_REASON=
+  setup_or_command_failure`.
+* `rc=1` — nothing within 15 s → tooling / instrumentation
+  failure. `ABORT_REASON=tooling_instrumentation_failure`.
+
+**P1 typed `RUN-FULL-MATRIX` confirmation after smoke GREEN.**
+
+After the gate returns `rc=0` and the first envelope's 120-s
+`poll_envelope` window closes, `run-matrix.sh` prints a summary
+and prompts:
+
+```
+smoke envelope complete on the first canonical cell.
+  * evidence for this envelope is now in <OUT>
+  * type RUN-FULL-MATRIX to continue with the remaining 39 envelopes
+  * anything else aborts cleanly (pins cleared, matrix_completion recorded)
+confirmation>
+```
+
+If the operator types anything other than the literal
+`RUN-FULL-MATRIX`, the runner clears pins on both devices,
+issues `diag-cmd.sh clear` on both, and exits with
+`ABORT_REASON=operator_declined_full_matrix`. The
+`matrix_completion.json` trap still runs so the verifier
+correctly reports NOT_EVALUABLE for the unproduced cells.
+
+An escape hatch for fixture dry-runs is available via
+`WSS_DIAG_SKIP_MATRIX_CONFIRM=1` — used only in tests, never
+in a live Yota pass.
+
+**P2 `deferred` removed from `ALLOWED_COMMAND_RESULTS`.**
+
+Round-7 reserved `deferred` in the closed schema for a
+verifier post-processing step that never materialised.
+Production emits only `handled | rejected | exception` from the
+receiver, and the deferred state is already represented by a
+distinct sender event (`sender_prekey_deferred`). Keeping
+`deferred` in the result schema without a producing code path
+would extend the closed schema beyond code that generates it.
+The verifier now rejects `deferred` as an unknown value.
+
+**Fixtures (all GREEN with `--rerun-tasks`).**
+
+* Kotlin — 8 diag classes + 2 DMS ordering tests: BUILD
+  SUCCESSFUL.
+* Python — 97 fixtures unchanged (the R6 valid-results iteration
+  loop updated: `deferred` dropped).
+* Shell — 43 fixtures (7 new for Round-9):
+  * `diag-cmd.sh send` passes `--async` to `am broadcast`;
+  * `diag-cmd.sh health` / `pin` do NOT pass `--async`
+    (stay synchronous);
+  * wrapper returns quickly (no long shell sleep around adb);
+  * tri-state gate rc=0 when transport_decision seen;
+  * tri-state gate rc=2 for `prekey_deferred` (setup failure);
+  * tri-state gate rc=2 for `command_completed result=rejected`
+    (setup failure).
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per audit exit criteria: after LOGICAL
+GREEN — one `assembleDebug`, clean bootstrap, preflight, smoke
+gate, typed operator confirmation, then full matrix.**
+
+### §12.8 — Round-8 audit repair (2026-08-12, Round-7 REDLINE follow-up)
+
+Round-7 (`de037ead`) accepted the diagnosis but the line-level
+review found four remaining defects. Round-8 closes all four.
+Scope: Python/shell/docs + minimal Android for event ordering
+and one test seam. No APK. No ADB. No tar/repack. No full
+Gradle suite. Compile + focused tests only.
+
+**P0 CID must be visible during a hung send.**
+
+The Round-7 receiver awaited `resolveAndSend` before emitting
+`diagnostic_send_dispatched`. If `messagingService.sendMessage`
+never returned (a hung WSS/REST call — the exact class of
+product signal we come to Yota to investigate) the CID would
+never appear and the runner's gate could not tell the hang
+apart from an instrumentation failure. Fix:
+
+* `DiagnosticSendCoordinator.resolveAndSend` now generates the
+  correlation_id AND emits `diagnostic_send_dispatched` BEFORE
+  calling `messagingService.sendMessage`.
+* `diagnostic_send_command_completed` is emitted AFTER
+  `sendMessage` returns or throws, with the same `correlation_id`
+  + `sequence` and `result ∈ {handled, rejected, exception}`.
+* Rejected paths (no-paired-conversation, multiple-paired) emit
+  both the specific `diagnostic_send_rejected_*` event and the
+  closed-schema `command_completed result=rejected` (no CID —
+  no `sendMessage` was called, no hang possible).
+* `DiagnosticCommandReceiver.handleSend` is now a thin dispatch
+  layer — it delegates to the coordinator and does NOT emit any
+  WSS_DIAG events on the send path.
+* Runner `run-matrix.sh`: missing CID after
+  `wait_send_cid_from_sender`'s 15 s deadline is now an
+  unambiguous `ABORT_REASON=tooling_instrumentation_failure`
+  (was warn+sleep+continue). The Round-8 coordinator MUST emit
+  dispatched within 15 s of the broadcast; if it doesn't, the
+  receiver never dispatched.
+* Focused Kotlin test with a suspending fake `sendMessage`:
+  `diagnostic_send_dispatched` is observed BEFORE the fake
+  releases the hang, `diagnostic_send_command_completed
+  result=handled` fires AFTER release. Proves ORDER, not just
+  presence.
+
+**P1 `sender_enqueue` after successful `insertMessage`.**
+
+The Round-7 emit sat inside `MessageEntity(...).also { emit(...) }`,
+which runs when the entity is constructed — BEFORE `insertMessage`
+sees the row. If `insertMessage` throws, the emit fires anyway
+and the log falsely claims queue acceptance. Fix:
+
+* `DefaultMessagingService.sendMessage` now:
+  `val entity = MessageEntity(...); messageRepository.insertMessage(entity);
+  WssDiagBridgeHolder.instance?.emit("sender_enqueue", …)`.
+* Two focused tests in `DefaultMessagingServiceTest`:
+  * successful insert → `sender_enqueue` emitted for the CID;
+  * `FakeMessageRepository(insertMessageException=IllegalStateException(...))`
+    → `sender_enqueue` NOT emitted, row not persisted.
+
+**P1 prekey readiness persisted in evidence.**
+
+Round-7 preflight ran the readiness check but only greps'd
+logcat and did not write the result to disk. The verifier had
+no way to prove the gate was ever run. Fix:
+
+* `preflight.sh` now captures per-device readiness state and
+  writes two closed-schema boolean fields to `preflight.json`:
+  `phone_signed_prekey_ready` and `emulator_signed_prekey_ready`.
+  No keys, identity, or PII flow into evidence — only booleans.
+* Verifier requires both fields present, `type(v) is bool`, and
+  `v is True`. Missing / `False` / `"true"` / `1` / `None` /
+  wrong-typed → integrity RED (same strict semantics as the
+  matrix `blocked` field, §12.4 P0-2).
+* Five focused Python fixtures (`test_R8_P1_*`) cover
+  each rejection path.
+
+**P1 Kotlin `--rerun-tasks` in handoff.**
+
+Round-7 handoff log showed every task `UP-TO-DATE` — Gradle had
+cached the previous run and the reported focused tests did not
+actually execute. Round-8 handoff invokes
+`./gradlew :apps:android:testDebugUnitTest --rerun-tasks` on
+the 8 diagnostic classes plus
+`:shared:core:messaging:jvmTest --rerun-tasks` on the two new
+DMS ordering tests so the log reflects a live rerun.
+
+**P2 §12.7 root-cause wording softened.**
+
+Prepended a Root-cause note to §12.7 stating that the live
+Yota bundle did NOT contain the downstream telemetry needed to
+prove `PeerBundleMissingException` was the specific cause —
+only that the empty-matrix shape is consistent with it. Source
+review confirms the real success-shaped failure path; the
+Round-7 fix set treats "failure paths that never reached
+transport" as a class rather than binding to one specific cause.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes + 2 messaging tests: BUILD
+  SUCCESSFUL with `--rerun-tasks`.
+  * `DiagnosticSendCoordinatorTest.dispatched_event_emits_BEFORE_sendMessage_completes`
+    — new: proves emit ORDER via a suspending fake sendMessage
+    and a `WssDiag.testSink` seam.
+  * `DefaultMessagingServiceTest.sendMessage_emits_sender_enqueue_AFTER_insertMessage_succeeds`
+    — new: enqueue fires only after row is persisted.
+  * `DefaultMessagingServiceTest.sendMessage_does_NOT_emit_sender_enqueue_when_insertMessage_fails`
+    — new: `FakeMessageRepository(insertMessageException=...)` proves
+    the emit is guarded by insertMessage return.
+* Python — 97 fixtures (5 new for Round-8): missing
+  `phone_signed_prekey_ready`, missing
+  `emulator_signed_prekey_ready`, `False`, stringly-typed
+  `"true"`, int `1`.
+* Shell — 36 fixtures unchanged.
+* `bash -n` + `py_compile` clean.
+
+### §12.7 — Round-7 audit repair (2026-08-12, Round-6 REDLINE follow-up)
+
+Round-6 (`3d7ad16e`) accepted the diagnosis but the delivered
+patch had four residual defects the architect caught before an
+APK build: (a) `PeerBundleMissingException` returns a
+success-shaped `Result<Unit>`, so `command_completed result=accepted`
+would silently certify a WAITING placeholder as transport
+acceptance; (b) the fail-fast gate required a route-return in
+15 s, conflating a hung route call (a legitimate product signal)
+with a tooling failure; (c) the Round-6 move of `sender_enqueue`
+to the send-entry point redefined enqueue's semantic away from
+"row inserted with QUEUED status"; (d) the next clean bootstrap
+would hit the same prekey-publish-latency window with no
+preventative check. Round-7 closes all four.
+
+Scope: Python/shell/docs + minimal Android for the new events
+and the new debug subcommand. No APK build. No ADB. No full
+Gradle suite. Compile + focused tests only.
+
+**P0-1 restore `sender_enqueue`; add `sender_send_attempt_started`
+and `sender_prekey_deferred`.**
+
+_Root-cause note (softened per §12.8 P2)._ The live Yota bundle
+`yota-wss-20260812T082016Z-instrumentation-failure` did not
+contain the downstream sender-side telemetry that would prove
+`PeerBundleMissingException` was the specific cause of the empty
+matrix. It proves only that dispatched CIDs had NO
+`sender_enqueue` / `sender_transport_decision` / route-return /
+recipient events at all. Source review confirms
+`DefaultMessagingService.sendMessage` has a real success-shaped
+failure path (`catch (PeerBundleMissingException) → return@runCatching Unit`)
+that would produce exactly this shape — a strong hypothesis but
+not a proven live root cause. The Round-7 fix set treats
+"failure paths that never reached transport" as a class and
+covers PeerBundleMissing plus any future addition of the same
+shape via `sender_prekey_deferred` (schema-open at the event
+site, closed at the classification site).
+
+* `shared/core/messaging/.../DefaultMessagingService.kt` restores
+  the `sender_enqueue` emit inside `afterEncrypt` (real queue
+  boundary — row inserted with `QUEUED` status). New event
+  `sender_send_attempt_started` fires at the top of `sendMessage`
+  BEFORE `encryptUnderLock` — it is the "send attempt began"
+  signal and always fires. New event `sender_prekey_deferred`
+  fires inside the `catch (e: PeerBundleMissingException)` block,
+  carrying only `correlation_id` + `role` (no exception text,
+  reason tag, recipient hex, message text or PII). Production
+  WAITING behaviour is unchanged.
+* `SendResult.Accepted` renamed to `SendResult.Handled` — the
+  value is deliberately neutral. `command_completed result=handled`
+  means "coordinator saw a definitive result without throw"; it
+  does NOT prove transport acceptance. The closed-schema result
+  set is now `{handled, rejected, exception, deferred}` — the
+  fourth value is reserved for verifier reports and the receiver
+  side does not emit it (the corresponding signal is
+  `sender_prekey_deferred`).
+* Verifier binds `diagnostic_send_dispatched` to
+  `sender_send_attempt_started` (not `sender_enqueue`) — a
+  deferred attempt legitimately has attempt_started + deferred
+  and no enqueue. Missing `sender_send_attempt_started` for a
+  dispatched CID is integrity RED (production send path never
+  reached — the live Yota failure shape). Presence of
+  `sender_prekey_deferred` for any envelope's CID downgrades the
+  envelope to `Unresolved` with a `deferred` reason — it can
+  NEVER be counted as authoritatively delivered.
+
+**P0-2 fail-fast gate rewrite — instrumentation vs product signal.**
+
+The Round-6 gate required a route-return
+(`sender_wss_send_returned` or `sender_rest_post_completed`)
+within 15 s. A hung route call IS the product signal we come to
+Yota to investigate — misreporting it as tooling failure would
+lose evidence. Round-7 narrows the gate to instrumentation-only
+checks. `gate_first_envelope` passes when ALL of the following
+appear within 15 s for the first canonical envelope:
+
+* `diagnostic_send_dispatched` (receiver accepted the command),
+* `sender_send_attempt_started` (DMS entry reached), AND
+* at least one of the "decision-or-terminal" set:
+  * `sender_transport_decision` (send reached HRT — instrumentation
+    proven; missing route return is a product signal from here on),
+  * `sender_prekey_deferred` (local terminal, WAITING placeholder),
+  * `diagnostic_send_command_completed` with
+    `result ∈ {rejected, exception}` (receiver-side terminal).
+
+If `sender_transport_decision` is present the gate is GREEN and
+`poll_envelope`'s ordinary 120-s window classifies missing route
+returns / recipient events as `PENDING` / `Unresolved` (real
+product signal). If none of the "decision-or-terminal" set fires
+within 15 s → `ABORT_REASON=tooling_instrumentation_failure`.
+
+**P1-1 verifier: cell-completion metric switched to
+`sender_send_attempt_started`.**
+
+The 5-per-cell metric is now the send-entry event, not the
+queue-boundary event. `sender_enqueue` keeps its afterEncrypt
+semantic and is a distinct per-envelope signal that may be
+legitimately absent under a deferred attempt. Global CID
+uniqueness now keys on `sender_send_attempt_started` (a deferred
+attempt has attempt_started + no enqueue; keying uniqueness on
+enqueue would miss deferred-attempt collisions). Enqueue keeps
+its own per-cell uniqueness check as defence in depth.
+
+**P1-2 preflight `signed_prekey_readiness` (non-consuming).**
+
+New debug subcommand `signed_prekey_readiness` reads the device's
+own `identity.publicKeyHex` and calls
+`PreKeyApi.fetchStatus(identity, identity)` — a GET
+`/prekeys/status` that returns `(signed_prekey_age_days,
+remaining_opks)` WITHOUT consuming an OPK. The receiver logs
+`signed_prekey_readiness published=<true|false>
+signed_prekey_age_days=<n|null> remaining_opks=<n>` to
+`WSS_DIAG_CMD`. `preflight.sh` refuses to run the matrix if
+either device reports `published=false` — the operator waits
+30 s and re-runs preflight. `fetchBundle` (which DOES consume an
+OPK) is deliberately not called. `AppContainer.preKeyApi` exposed
+for the receiver only; release APK never registers the receiver
+so no production access path exists.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes: BUILD SUCCESSFUL (contract test
+  updated for the new `signed_prekey_readiness` subcommand).
+* Python — 92 fixtures (3 new for Round-7):
+  `sender_prekey_deferred` makes the cell `Unresolved` with a
+  `deferred` reason; `command_completed result=handled` paired
+  with `sender_prekey_deferred` is NOT transport acceptance;
+  `sender_enqueue` and `sender_send_attempt_started` are distinct
+  signals (5 attempts, 4 enqueues → envs=5, product RED, integrity
+  GREEN). The 89 Round-6 fixtures were reworked to emit
+  `sender_send_attempt_started` alongside `sender_enqueue` in the
+  full-delivery helper. All 92 pass.
+* Shell — 36 fixtures (2 new for Round-7): gate GREEN with
+  transport_decision; gate GREEN with prekey_deferred as terminal
+  (no transport_decision required); gate FAIL for the live Yota
+  shape (dispatched without send_attempt_started). The Round-6
+  route-return signal fixture was replaced by these three cases.
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per process constraints: reviewer sees
+`round6-3d7ad16e.patch` + `round7-<hash>.patch` + focused test
+logs. Single `assembleDebug` and destructive `bootstrap --fresh`
+gated on architect LOGICAL GREEN.**
+
+### §12.6 — Round-6 audit repair (2026-08-12, first live Yota run)
+
+First live Yota-pass ran from a signed final tar with APK
+sha `cb8f86114ad3f42873b6c2548c5e2b0fd3a368818d7bc9fa0cf822ded8af6345`
+on TECNO BF7 (default-data Yota, 25011) + Pixel_8_Pro emulator.
+Preflight passed; three matrix cells + a partial fourth ran; each
+of 15 matrix `send` broadcasts wait-timed out on the 120-second
+ceiling, the operator killed the run, and the resulting bundle
+carried:
+
+* 16 `diagnostic_send_dispatched` (1 preflight probe + 15 matrix)
+* 15 `diagnostic_pin_active` / 8 `diagnostic_session_started` /
+  2 `diagnostic_state_cleared`
+* ZERO `sender_enqueue`, `sender_transport_decision`, route-return
+  events, or recipient events.
+
+Verifier still reported `evidence_integrity=GREEN`. That is a
+genuine tooling false-GREEN on top of an aborted matrix that
+produced no product signal at all. This block closes the
+tooling failure at source, at the verifier, at the runner, and
+across three live-Mac operator-side script bugs.
+
+**Root cause (source-level trace).**
+
+* [`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt:handleSend`][] fires
+  `coordinator.resolveAndSend` and unconditionally emits
+  `diagnostic_send_dispatched` on `Outcome.Sent` — even when
+  `MessagingService.sendMessage` returned `Result.failure(...)`
+  or threw.
+* [`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt:resolveAndSend`][]
+  called `messagingService.sendMessage(message)` and DISCARDED
+  the `Result<Unit>`. Any failure — including
+  `PeerBundleMissingException` on a fresh pair whose prekey
+  bundle publish has not yet propagated to the other peer —
+  was invisible to the operator.
+* [`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt:1585-1590`][]
+  emitted `sender_enqueue` only INSIDE the `afterEncrypt` callback
+  of `encryptUnderLock`. Under `PeerBundleMissingException` the
+  callback never runs, the placeholder `WAITING` row is inserted
+  in the `catch` block at :1595, and no `sender_enqueue` is
+  emitted. The verifier then sees a dispatched CID with no matching
+  enqueue and — pre-Round-6 — treats the whole bundle as GREEN.
+
+**Fix (bounded — no ADB, no APK, no full Gradle suite).**
+
+* **P0-1 `sender_enqueue` at send entry.** Moved the emit to the
+  top of `DefaultMessagingService.sendMessage`, right after the
+  `SEND_TRACE send_start` log. Every send attempt now emits enqueue
+  regardless of whether encryption succeeds. Kept the existing
+  `insertMessage` call in `afterEncrypt` intact (no double emit —
+  global CID uniqueness would trip integrity RED).
+* **P0-1 `diagnostic_send_command_completed` event.** New closed-
+  schema event emitted by the receiver on every `handleSend`
+  outcome, carrying the same `correlation_id` + `sequence` plus
+  `result ∈ {accepted, rejected, exception}`. `SendResult.Failed`
+  captures ONLY the exception class simple name — no exception
+  text, no message text, no usernames, no keys, no tokens or PII.
+  `Outcome.Sent` was extended to carry `sendResult: SendResult`
+  so the receiver can pick the right `result` value.
+* **P0-2 `matrix_completion.json` atomic marker.** `run-matrix.sh`
+  installs a bash `trap ... EXIT` that writes an atomic
+  `matrix_completion.json` to the evidence dir on EVERY exit path
+  (normal completion, fail-fast abort, unexpected error, user
+  Ctrl-C). Fields: `run_id`, `completed_at_wall_ms`, `cells_ran`,
+  optional `abort_reason`. Verifier requires the file and matches
+  its `run_id` + `cells_ran` against the matrix; presence of
+  `abort_reason` is integrity RED.
+* **P0-2 integrity RED on incomplete matrix.** `envs != 5` in a
+  non-blocked cell is now an integrity issue (was cell-level
+  Unresolved only). Missing `sender_enqueue` for any
+  `diagnostic_send_dispatched` correlation_id (except the
+  `preflight.rest_capability` probe) is integrity RED. Missing
+  `matrix_completion.json` is integrity RED.
+* **P0-2 `product_outcome = NOT_EVALUABLE` when integrity RED.**
+  A bundle that fails integrity cannot produce an authoritative
+  product verdict. The verifier now emits `NOT_EVALUABLE` (not
+  `GREEN`, not `RED`) so no reader can misread an incomplete run
+  as a real Yota result. Exit code `1` on integrity RED, unchanged.
+* **P0-3 runner fail-fast gate.** After the FIRST canonical cell
+  fires `sequence=1`, `run-matrix.sh:gate_first_envelope` polls
+  for four production signals matching the returned CID for up
+  to 15 seconds: `sender_enqueue`, `sender_transport_decision`,
+  `sender_wss_send_returned` OR `sender_rest_post_completed`,
+  and `diagnostic_send_command_completed`. If any is missing
+  after 15 s → `ABORT_REASON=tooling_instrumentation_failure`,
+  runner exits, trap writes `matrix_completion.json` with the
+  reason. No extra smoke-message is added — the gate reuses the
+  first canonical envelope so measurement is not contaminated.
+
+**Three live-Mac operator-side bugs carried into source.**
+
+* `lib/detect-devices.sh` — nested `adb ... shell getprop
+  ro.kernel.qemu` inside `while read -r serial | adb devices | awk`
+  was consuming the next serial line from the outer pipeline;
+  only the first device got classified. Added `< /dev/null` to
+  detach adb's stdin.
+* `preflight.sh` — API 36 `dumpsys package | grep DiagnosticCommandReceiver`
+  no longer matches a legitimate debug APK. Replaced with an
+  active `diag-cmd.sh health` broadcast and an assertion that a
+  `WSS_DIAG_CMD health emitter_id=` line appears within 2 s.
+  Only the debug variant registers the receiver AND implements
+  health; a release APK silently drops the broadcast.
+* `lib/portable.sh` — `count_matches` under `set -euo pipefail`
+  died when `grep` had zero matches (exit 1 → pipefail → empty
+  stdout). Wrapped with `|| true` so awk always sees a number.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes: BUILD SUCCESSFUL.
+* Python — 89 fixtures (11 new for Round-6): dispatched without
+  matching enqueue → RED, preflight probe dispatch without enqueue
+  is OK (exempt), `diagnostic_send_command_completed` schema
+  (invalid result → RED; accepted/rejected/exception accepted),
+  envs=0 in one cell → RED, missing `matrix_completion.json` →
+  RED, wrong `run_id` in completion → RED, `abort_reason` → RED,
+  wrong `cells_ran` → RED, real-Yota-bundle regression minimized
+  from the live evidence file (envs=0 across all cells + 15
+  orphan dispatched CIDs + missing completion) → RED, `NOT_EVALUABLE`
+  replaces RED/GREEN when integrity fails.
+* Shell — 34 fixtures (4 new for Round-6): `count_matches` returns
+  0 under `set -euo pipefail` on zero matches, `detect-devices`
+  consumes both serials exactly once with the stdin fix,
+  `detect-devices` `roles.env` classifies both, fail-fast gate
+  signal count.
+* `bash -n` + `py_compile` clean.
+
+**No APK built. No ADB. Per process constraints: `assembleDebug` +
+Mac dry-run only AFTER architect LOGICAL GREEN on this block;
+next device run starts with `bootstrap --fresh`; VPS / PR / push
+on HOLD.**
+
+[`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt:handleSend`]: apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticCommandReceiver.kt
+[`apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt:resolveAndSend`]: apps/android/src/debug/kotlin/phantom/android/diagnostic/DiagnosticSendCoordinator.kt
+[`shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt:1585-1590`]: shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/DefaultMessagingService.kt
+
+### §12.5 — Round-5 audit repair (2026-08-12)
+
+Fifth architect audit closed. Scope strictly limited to
+`Python + shell + docs + packaging`. No Android runtime, transport,
+Kotlin/Gradle, APK, ADB or device work.
+
+Baseline `96db5b58` closed the Round-4 blocked/type/skew cases and
+the physical handoff's checksums / mode / executable-file LF were
+verified, but three false-GREEN / non-portable paths remained. All
+are now closed by verifier / packager / preflight changes plus new
+fixtures.
+
+**P0 strict diagnostic boolean parser.** `restored=garbage` and
+`dispatched=garbage` (and every other capitalisation or non-canonical
+string) landed silently as Python `False` in the earlier `fields[x]
+== "true"` idiom, letting a full 8-cell bundle certify as GREEN
+with a malformed `restored` field. The new `_strict_bool` helper
+accepts ONLY the literal strings `true` and `false`; any other
+present value returns `None` AND appends a `malformed ...
+(only 'true'/'false' allowed)` parse error to `parse_errors` which
+lands in `integrity_issues` (integrity RED). Applied to both
+`restored` and `dispatched`. Regression fixtures: a clean full 8-cell
+bundle mutated to `restored=garbage` on one session_started must be
+RED; a mutation to `dispatched=garbage` on one transport decision
+must be RED; a `restored=TRUE` must be RED.
+
+**P1 portable macOS packager.** `build-handoff-tar.sh` rewrote its
+tar invocations to POSIX/BSD-compatible flags only (`-c`, `-z`,
+`-f`, `-x`, `-t`). The prior GNU-only `--force-local` and
+`--show-transformed-names` are gone; the "force-local" need is
+solved by writing the tar at a colon-free `/tmp` path and then
+`mv`ing to the destination. The script has two modes:
+
+* `--review <out.tar.gz>` — ships operator scripts only (no APK).
+* `--final --apk <path> <out.tar.gz>` — ships operator scripts
+  PLUS exactly one debug APK at `<path>` and its `<path>.sha256`
+  sidecar; the pair is verified before staging; the extracted
+  archive is re-verified after sealing.
+
+Both modes still: junk-scan (rejects `.DS_Store`, `__pycache__`,
+`.pyc`; review mode additionally rejects `.apk`); CR-byte scan
+across every packaged `.sh`/`.py`; dry-extract the produced tar
+and re-run shell + python fixtures from the extracted copy. The
+final mode additionally re-verifies the extracted APK sha matches
+its sidecar.
+
+**P1 preflight APK checksum binding on BOTH devices.** `preflight.sh`
+now pulls `base.apk` from BOTH the phone AND the emulator via
+`adb pull`, SHA-256s each locally, and compares to the bundled
+`android-debug-diagnostic.apk.sha256` sidecar; any mismatch fails
+closed with a clear "stale diagnostic APK on device" message. The
+verified SHA is written to `preflight.json.diagnostic_apk_sha256`
+AND `device-manifest.json.diagnostic_apk_sha256`, and
+`verify-evidence.py` enforces:
+
+* both files carry the field;
+* each is a 64-char lowercase hex string;
+* the two match.
+
+**P1 Python 3.9 gate.** Preflight now enforces
+`python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'`
+(the verifier uses 3.9-only PEP 585 generic syntax). A stock macOS
+Python 3.8 no longer passes the environment check.
+
+**P2 contract cleanup.** The pre-Round-1 P0-3 paragraph that
+described `outerArmReader` reading `transportPreferences.privacyMode`
+was factually wrong and contradicted the §12 body; it is rewritten
+to point at the actually-observed `container.transportManager.state.value`
+mapping. §9.5 and §9.6 REDLINE-2 drafts were also stale (talked
+about typing the run ID, a two-device `--verify`, Method A REST
+capability, and a phone↔emulator skew algorithm the scripts do
+not implement); both are collapsed to a SUPERSEDED marker pointing
+at §12 (Round-1..5) and the code as the source of truth. The pre-
+Round-5 wording is available in git history.
+
+**P2 LF-scope narrowing.** The LF guarantee is explicitly narrowed
+to EXECUTABLES under `operator-package/` — `*.sh` and `*.py`. Text
+files that are not run directly (`README-OPERATOR.md`,
+`.gitattributes`, `.gitignore`) may carry CRLF on a Windows clone
+without breaking macOS use. The build-time CR-byte scan and the
+in-repo `tests/test_shell.sh` CR-byte scan both scope to the
+executable set. The `.gitattributes` file remains scoped to
+`*.sh eol=lf` + `*.py eol=lf` under `operator-package/`.
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes unchanged.
+* Python — 78 fixtures (6 new for Round-5): `restored=garbage`
+  full-bundle regression, `dispatched=garbage` regression,
+  `restored=TRUE` non-canonical capitalisation regression,
+  `diagnostic_apk_sha256` missing from manifest, `diagnostic_apk_sha256`
+  mismatch between preflight and manifest, `diagnostic_apk_sha256`
+  malformed hex.
+* Shell — 30 fixtures (3 new for Round-5): shell-side detection
+  of non-canonical `restored` values, Python 3.9 gate positive
+  control, Python gate synthetic 3.4 negative control.
+* `bash -n` + `py_compile` clean.
+
+### §12.4 — Round-4 audit repair (2026-08-12)
+
+Fourth architect audit closed. Scope strictly limited to
+`verifier + runner + fixtures + docs + LF packaging`. No Android
+runtime, transport, Gradle full suite, APK or ADB touched.
+
+Baseline `ebd23f8f` accepted Round-3 but the physical `tar.gz` was
+CRLF (unrunnable on Mac), and the verifier had five reproducible
+false-GREEN paths that survived Round-3. All six are closed by
+verifier / runner behaviour changes plus new fixtures that fail
+without them.
+
+**P0-1 LF-only packaging.** A scoped `.gitattributes` under
+`operator-package/` pins `*.sh` and `*.py` to `text eol=lf` so a
+Windows clone with `core.autocrlf=true` no longer rewrites them on
+checkout. The handoff tarball is built by `build-handoff-tar.sh`,
+which uses `git archive` to read blobs DIRECTLY from the git index
+(LF, always) — bypassing working-tree normalization entirely.
+Before sealing, the builder binary-scans every packaged `.sh` /
+`.py` for `\r` bytes and refuses to write the tar if any offender
+is found. After sealing, the builder extracts the tar to a scratch
+directory, re-checks executable modes, and re-runs the shell +
+python fixture suites from the extracted copy. `tests/test_shell.sh`
+carries a matching CR-scan fixture so an operator's Mac catches a
+broken checkout with a single `bash tests/test_shell.sh`.
+
+**P0-2 strict boolean `blocked`.** `blocked` must be a real JSON
+boolean. `type(value) is bool` at integrity time; any other value
+(`"false"`, `"true"`, `0`, `1`, `null`, list, object) is integrity
+RED. At report-build time, only `raw_blocked is True` treats a cell
+as BLOCKED — the prior `bool(cell.get("blocked"))` coerced non-empty
+strings to `True` and would silently skip a required WSS cell to a
+false BLOCKED verdict.
+
+**P0-3 strict `diagnostic_session_started`.** Every session event
+must carry a real boolean `restored` field and a whitelisted `pin`
+∈ `{none, wss, rest}`; missing / malformed fields are integrity
+RED. In pin-coverage evaluation, a `restored=true` session event
+covers the current envelope ONLY when its `run_id`, `cell_id`,
+`pin`, source device AND `emitter_id` ALL match the current cell /
+sender. Any later mismatched or `restored=false` session event
+resets pin coverage until a fresh matching `diagnostic_pin_active`
+arrives. `pin_active` events likewise require matching emitter,
+not just matching run/cell.
+
+**P1-1 schema-enforce transport evidence fields.** Every
+`sender_transport_decision` MUST have `dispatched=true` (not
+missing, not `false`), `outer_transport=direct`, and
+`inner_route=<cell pin>`. A successful WSS return requires exactly
+`dispatched=true` AND `inner_route=wss` (missing `inner_route` no
+longer counts). A successful REST return requires
+`inner_route=rest` AND `relay_acceptance ∈ {accepted, duplicate}`
+(missing `inner_route` no longer counts). Missing / weakened
+fields land the cell as `Unresolved`.
+
+**P1-2 nested type-safety.** Every matrix cell field is validated
+BEFORE set membership, set insertion, sorting, or classification:
+`cell_id` a non-empty string; `pin` / `direction` / `scenario`
+strings from their whitelist; `blocked` a real boolean. Manifest
+`phone_serial` / `emulator_serial` are non-empty strings. All
+JSON loading paths return `(value, error)` — a wrong-typed field
+never raises `TypeError`; it lands in `integrity_issues`.
+
+**P1-3 runner skew-corrected wall compare.** `run-matrix.sh` now
+reads `host_to_phone_skew_ms` and `host_to_emulator_skew_ms` from
+`preflight.json`, selects the sender's per-device skew, and passes
+it to `find_send_cid_in_log`. The helper converts the host
+`not_before_ms` (captured just before the send subcommand fires)
+to a device `not_before_ms` by subtracting the skew, then compares
+against the event's device-clock `wall_utc_ms`. Under the
+contract's 30-second skew ceiling, a positive skew (host ahead of
+device) at boundary no longer rejects every genuine current-run
+CID; a truly stale event is still rejected regardless of skew
+direction.
+
+**Docs cleanup / hygiene**
+
+* Contract sheet §9.5 / §9.6 prose that predated Round-1
+  incrementally kept behind while the source of truth moved into
+  the §12.x repair blocks. §12.4 (this section) is now the
+  authoritative record for verifier + runner + package invariants
+  through Round-4.
+* README-OPERATOR.md's `sha256sum` requirement was already
+  removed in Round-3 (Tele2 marked DEFERRED).
+
+**Fixtures (all GREEN in isolation from a clean LF clone).**
+
+* Kotlin — 8 diagnostic classes unchanged: BUILD SUCCESSFUL.
+* Python — 72 fixtures (23 new for Round-4): stringly-typed
+  `blocked` (`"false"`, `"true"`, `0`, `1`, `null`, list, object),
+  `session_started` missing `restored`, `session_started`
+  `restored=true` under wrong run / wrong cell / wrong pin, the
+  matching positive control, `session_started` with bogus `pin`,
+  transport decision without `dispatched`, WSS return without
+  `inner_route`, REST return without `inner_route`, nested type
+  cases for cell `pin` / `cell_id` / `direction` / `scenario`,
+  manifest `phone_serial` as list, empty `emulator_serial`,
+  `matrix.run_id` as list.
+* Shell — 27 fixtures (6 new for Round-4): skew-corrected
+  positive skew accepts current, positive skew rejects truly
+  stale, negative skew rejects device line before corrected
+  not-before, negative skew accepts device line past corrected
+  not-before, exact-wall + skew=0 regression guard, CR-byte scan
+  across every packaged `.sh` / `.py`.
+* `bash -n` + `py_compile` clean.
+
+### §12.3 — Round-3 audit repair (2026-08-12)
+
+Third architect audit closed. Scope was strictly limited to
+`verifier + runner + fixtures + documentation/packaging`. No Android
+runtime, transport, APK or ADB touched. Baseline `7f144793` accepted
+the Round-2 fixes but retained six adversarial false-GREEN paths;
+all six are now closed by verifier and runner behaviour changes plus
+new fixtures that fail without them.
+
+**P0-1 five unique CIDs and matching dispatched-event set.**
+Every non-blocked cell must now emit exactly five `sender_enqueue`
+events, each carrying a non-empty `correlation_id`; the five CIDs are
+unique per cell AND globally unique in the run; and the runner's
+`diagnostic_send_dispatched` events must land as an exact 1-to-1
+mapping to those enqueue CIDs, with sequences equal to `{1,2,3,4,5}`,
+on the sender device, with the sender's `emitter_id`. Absent-CID or
+shared-join collapse (five enqueues joining through `cid=None` to one
+recipient triplet) is now integrity RED. Wrong sequence set or
+missing dispatched events land the cell as `Unresolved`.
+
+**P0-2 event provenance and route conflict closure.**
+Every event must carry `emitter_id == source-file device label`; a
+phone-log entry with `emitter_id=emulator` is integrity RED. All
+`sender_transport_decision` events per envelope are inspected — the
+prior `next(...)` picked the first and ignored contradictions.
+Contradictory `outer_transport` or `inner_route` across duplicated
+decisions is an issue. All route-return events per envelope are
+inspected: for WSS cells, any REST completion is an opposite-route
+violation and at least one successful WSS return
+(`dispatched=true`, `inner_route=wss`) is required. Symmetrically for
+REST cells: any WSS return is a violation and at least one REST
+completion with `relay_acceptance ∈ {accepted, duplicate}` is
+required.
+
+**P0-3 cross-file run and gate consistency.**
+The verifier now enforces `matrix.run_id == preflight.run_id ==
+device-manifest.run_id`; `matrix.rest_capability ==
+preflight.rest_capability`; and skew values duplicated across
+`preflight.json` and `device-manifest.json` must match. All preflight
+gates are checked: `apk_variant=debug`; every required `env` tool
+(`adb`, `python3`, `bash`, `jq`) equal to `"ok"`; `canary=="ok"`;
+booleans `yota_confirmed`, `emitter_ids_set`, `radio_confirmed`,
+`paired_conversation_count_ok` all `True`; `rest_capability` in
+`{enabled, disabled, unknown}`. Manifest must carry a valid
+`dual_sim_report_operator_numeric` (5–6 digits) — malformed or
+missing is integrity RED.
+
+**P1-1 bidirectional REST BLOCKED parity.**
+`rest_capability=="disabled"` requires BOTH canonical REST cells
+(`rest.p2e.control`, `rest.e2p.control`) to be BLOCKED AND to carry
+zero matrix enqueues. `rest_capability ∈ {"enabled","unknown"}`
+requires those cells to NOT be BLOCKED. Any deviation is integrity
+RED.
+
+**P1-2 runner staleness closure.**
+Helpers `wait_for_pin_active_in_log`, `find_send_cid_in_log`, and
+`refuse_matrix_rerun` moved to `lib/run-matrix-helpers.sh` so they
+can be driven by `tests/test_shell.sh` against synthetic logs.
+`wait_for_pin_active` now matches `pin + cell_id + run_id + expected
+emitter` on the expected source file per device.
+`wait_for_send_cid` reads ONLY the current sender's log and requires
+`run_id + cell_id + sequence + expected emitter + wall_utc_ms >=
+command_start_ms` (captured just BEFORE the send subcommand fires).
+`refuse_matrix_rerun` blocks a rerun into an evidence directory that
+already contains `matrix.json`.
+
+**P1-3 corrupt JSON fail-closed.**
+Every JSON file load is wrapped in a Round-3 helper that returns
+`(value, error)` instead of raising. Malformed JSON, empty files,
+and wrong top-level types surface in `integrity_issues` — never as
+a Python exception.
+
+**P2 documentation cleanup.**
+Receiver KDoc updated to reflect the DUMP permission boundary (the
+removed `Binder.getCallingUid()` block was still described).
+`README-OPERATOR.md` no longer requires GNU `sha256sum` — the
+`portable.sh` `sha256_file` helper falls back to `shasum -a 256`
+which is stock on macOS. Tele2 follow-up section relabelled as
+DEFERRED: the current preflight hardcodes typed `YOTA`, so a Tele2
+pass would abort at the operator prompt. A later block will add
+operator parametrization.
+
+**P2 packaging hygiene.**
+No APK, `.DS_Store`, or `__pycache__` are shipped with the
+logical-review handoff. The pack is delivered as a `tar.gz` made
+from a clean Git worktree so POSIX modes (`100755` on all `.sh` /
+`.py`) survive extraction.
+
+**Fixtures (all GREEN in isolation, clean-clone rerun).**
+
+* Kotlin — 8 classes unchanged.
+* Python — 49 fixtures (24 new for Round-3): `cid=None` shared-join,
+  missing dispatched, wrong dispatched sequence set, contradictory
+  transport decision, opposite-route return, WSS return without
+  `dispatched=true`, cross-file `run_id` mismatch on both
+  preflight + manifest, `rest_capability` mismatch, skew mismatch,
+  missing `apk_variant` / env tool / canary / `paired_conversation_count_ok`,
+  missing/malformed operator numeric, `disabled`-with-unblocked,
+  `disabled` + BLOCKED-with-enqueues, `enabled`-with-BLOCKED,
+  corrupt matrix/preflight/manifest JSON, matrix wrong top-level
+  type, matrix.cells wrong type.
+* Shell — 21 fixtures (9 new for Round-3): runner helpers exercised
+  against synthetic logs with stale prior-run pin/CID lines, wrong
+  emitter, and predating wall_utc_ms; `refuse_matrix_rerun` block
+  vs allow.
+
+### §12.2 — Round-2 audit repair (2026-08-12)
+
+Third Mac audit REDLINE closed. Compile + focused tests only.
+
+- **P0-1 receiver silently rejects `checkpoint` and `paired_count_report`.** The extras-whitelist map was missing entries for both subcommands added in the Round-1 repair. Preflight physically could not fire them. Fixed by adding empty-extras entries and pinning the invariant with two new contract tests: (a) every ALLOWED_SUBCOMMAND has an ALLOWED_EXTRAS_BY_SUBCOMMAND entry; (b) no stale entries for removed subcommands.
+- **P0-2 verifier false GREEN in three cases**.
+  - `recipient_message_persisted role=matrix` — added strict role check: recipient-event names (`recipient_deliver_received`, `recipient_message_persisted`, `recipient_ack_deliver_sent`) MUST carry `role=recipient`, and sender-event names MUST carry `role=sender`. Any mismatch → integrity RED.
+  - Recipient events for a wrong `cell_id` — added cell_id scoping to the per-envelope `corr_events` filter. Sender+recipient events now filtered by `correlation_id AND run_id AND cell_id` before classification.
+  - Missing `sender_wss_send_returned` / `sender_rest_post_completed` — added mandatory send-completion event matching cell pin. REST pin also requires `relay_acceptance ∈ {accepted, duplicate}`.
+- **P0-3 non-canonical matrix accepted.** Introduced `CANONICAL_MATRIX_TRIPLES` (frozen 8-tuple set); missing or extra triples → integrity RED. Cell IDs must match `pin.direction.scenario` shape.
+- **P1 numeric-field crash.** Introduced `_safe_int` + `parse_events` returns a `(events, parse_errors)` tuple; malformed `wall_utc_ms` / `monotonic_ms` / `sequence` land in `parse_errors` → integrity RED. Never raises.
+- **P1 CID lookup by sequence alone.** `run-matrix.sh:wait_for_send_cid` now matches on `cell_id AND sequence` — a rejected send in a prior cell no longer contaminates the next.
+- **P1 host↔device skew.** Preflight now records `host_to_phone_skew_ms` + `host_to_emulator_skew_ms` (Mac host_ms − device_ms, N=5 samples each). Verifier reads both and translates each envelope's device wall to host time via the sender's per-device offset before comparing to `host_now_ms`. Legacy `clock_skew_ms` key removed from manifest schema; missing new keys → integrity RED.
+- **P1 exec bits.** All `.sh` and `.py` under `operator-package/` set to `100755` in the git index via `git update-index --chmod=+x`. Mac clone gets executable bits from git without needing a manual `chmod`.
+
+### §12.1 — Round-1 audit repair (2026-08-12)
+
+Second Mac audit REDLINE closed in one consolidated block. No APK / ADB / device install during repair.
+
+- **P0-1 runner unable to complete**: `lib/portable.sh` centralises `now_ms` (Python `time.time_ns()`), `sha256_file` (macOS `shasum` OR Linux `sha256sum`), `count_matches` (single-integer sum across N files), `extract_field`. `run-matrix.sh` uses these. Correlation IDs are now read from a new structured `diagnostic_send_dispatched sequence=<N> correlation_id=<uuid>` event emitted by the receiver on the SOLE `WSS_DIAG` tag — `WSS_DIAG_CMD` is no longer required to be in capture. Pin-active wait uses field-agnostic key/value matching AND aborts the cell if both devices don't ack within a 30-s timeout. `capture-logs.sh` no longer clears the log buffer; preflight fires a new `checkpoint` subcommand AFTER capture starts so `diagnostic_session_started` is guaranteed to land in-stream.
+- **P0-2 verifier false GREEN**: v3 rewrite. Every event filtered by `matrix.run_id`. Correlation IDs globally unique per run (not per cell). Pin coverage is a per-sender-device timeline (matching `run_id + cell_id`); prior WSS pin cannot cover a later WSS cell. Contract violations (pin/role/emitter/outer/inner) drop the cell to `Unresolved` — never "Delivered once with warnings". BLOCKED cells require `preflight.rest_capability=disabled` AND cell pin `rest`; illegal BLOCKED → integrity RED. Preflight booleans checked for `True` value (not key presence). 19 Python fixture tests cover every P0-1/P0-5 case listed in the audit.
+- **P0-3 120-s boundary matures with host clock**: verifier's `now_wall` is a real host clock (`time.time_ns() // 1_000_000`) with an optional `--host-now-ms` override for fixtures. PENDING before 120 s from `sender_enqueue`, Unresolved after — no dependency on a synthetic later event.
+- **P0-4 actual outer transport observed**: `DiagnosticBootInit` installs an `outerArmReader` lambda that reads `container.transportManager.state.value` and returns `direct` | `reality` | `tor` | `probing` | `failed` | `idle` per the actually-selected `ManagerState.Connected(TransportKind)`. Policy preference is not evidence. Prior Private↔Ghost reversal corrected — the diagnostic no longer names arms at all; only the connected `TransportKind` is emitted.
+- **P0-5 process/pin evidence internally consistent**: `DiagnosticBootInit` emits ONLY the structured `diagnostic_session_started` event — the earlier raw `Log.i(WSS_DIAG, "diagnostic_boot_init …")` line is gone. New `restored: Boolean` field on the schema replaces the overloaded `dispatched`. `DiagnosticTransportPinStore` now returns Boolean from `writePin` / `writeEmitter` / `clear`; receiver checks the result and refuses to update in-memory state on a failed commit. `handleSend` fail-closed match now requires `persisted.pin != NONE`, `persisted.runId == caller`, `persisted.cellId == caller`, AND `in-memory == persisted` — a process restart that drifted the guard surfaces here.
+- **P0-6 caller boundary via manifest permission**: `android:permission="android.permission.DUMP"` on the debug receiver — AMS-boundary enforcement. Only shell (2000) holds DUMP on stock Android; third-party apps cannot deliver broadcasts even with the explicit component name. Prior `Binder.getCallingUid()` gate is removed (unreliable inside `onReceive`).
+- **P1 batch**:
+  - `paired_count_report` subcommand + preflight enforces exactly 1 paired conversation on each device.
+  - `dual_sim_report` is validated (non-empty `operator_numeric` of ≥ 5 digits) BEFORE the YOTA prompt; malformed output aborts preflight.
+  - `sha256_file` portable helper replaces direct `sha256sum` calls in `preflight.sh` + `bootstrap.sh --verify` + `install-apk.sh`.
+  - Release-manifest opt-out marker approach REPLACED by `DiagnosticSourceSetBoundaryTest` — verifies (a) all debug-only Kotlin files live under `src/debug/`, (b) no `androidMain` file references `DiagnosticCommandReceiver`, (c) debug manifest actually declares `android:permission="android.permission.DUMP"`. Independent of `assembleRelease`.
+
+- **P1 (batched):**
+  - `sender_wss_frame_written` renamed to `sender_wss_send_returned` with an explicit doc line stating `dispatched=true` = "wsTransport.send() returned true, i.e. queued to the OkHttp write path"; not proof of frame egress.
+  - `diag-cmd.sh` replaces `eval` with a Bash argument array (`args=(...); adb "${args[@]}"`).
+  - `DiagnosticBootInitProvider` emits its bootstrap event via `WssDiag.emit(event="diagnostic_session_started", …)` — no raw `Log.i` on other tags.
+  - Debug `DiagnosticCommandReceiver` gates every incoming broadcast on `Binder.getCallingUid() == Process.SHELL_UID || Binder.getCallingUid() == Process.ROOT_UID` — third-party apps cannot deliver a broadcast to this receiver even though `exported="true"`. Manifest comment updated.
+  - REST capability probe log is captured (via `capture-logs.sh` started at preflight, before the probe fires) so the probe's evidence is preserved in the evidence dir.
+  - Verifier exit codes align with runbook: complete evidence + product failure = successful diagnostic (exit 2 + clear message); integrity RED or PENDING = tooling failure (exit 1).
+  - `DiagnosticReceiverManifestPresenceTest` no longer skips when the release manifest is absent — it fails with an explicit message asking for `assembleRelease`; a `.release-manifest-not-required.marker` sentinel opts a CI stage out explicitly if needed.
+  - Handoff repack removes any `.DS_Store`, restores executable bits on `.sh`/`.py`, and the `assembleDebug.log` reflects `--rerun-tasks` output (not `UP-TO-DATE`).
+
+- `recipient_message_persisted` proves the chat-store write completed for the message row; it does NOT literally prove the message is visible on the recipient's screen at that instant (a fully-composed row that's off-screen or hidden behind chrome still qualifies). Verifier documentation states this scope explicitly.
+- The Method-B "controlled fail-closed REST capability envelope" (§8-Q6, §9.6) is a preflight probe. It is **NOT counted in the `8 × 5 = 40` matrix envelopes** and it does NOT consume a `cell_id`. It carries its own `cell_id = "preflight.rest_capability"` and its outcome only stamps `preflight.json.rest_capability = disabled|enabled|unknown`.
+
+The `docs/tracks/direct-wss/` directory is new; the contract sheet, the operator-package spec (§9), and the future observability diff (§7) will live under it.
+
+---
+
+## §1 — Production path map
+
+Every `file:line` reference below is verified against the HEAD listed above. Package paths are project-relative.
+
+### Client (Phantom-android-ui)
+
+| # | Stage | Site | Notes |
+|---|---|---|---|
+| 1 | User send trigger (text) | `apps/android/src/androidMain/kotlin/phantom/android/screens/chat/ChatScreen.kt:1063-1084` (`InputBar` `onSend` → `container.messagingService?.sendMessage(OutgoingMessage(...))`) | Voice: `finalizeAndSendVoice()` `:363` → `sendAudio(...)` `:427-432` — OUT OF SCOPE per §8-Q2 |
+| 2 | Local envelope creation (app model) | UI constructs `phantom.core.messaging.OutgoingMessage` at `ChatScreen.kt:1073-1078`; type at `shared/core/messaging/src/commonMain/kotlin/phantom/core/messaging/OutgoingMessage.kt:6-11` | Wire envelope `RelayMessage.Send` built at `shared/core/messaging/.../DefaultMessagingService.kt:1639-1647` |
+| 3 | Envelope ID generation | `id = uuid4().toString()` at `ChatScreen.kt:1074`; persisted BEFORE send at `DefaultMessagingService.kt:1574` (insertMessage inside `afterEncrypt`); retry keeps same id at `retryWaitingMessages` `:4318-4344` (`OutgoingMessage(id = m.id, …)` `:4338`) | `EnvelopeId.random()` helper exists at `shared/core/transport/.../EnvelopeId.kt:74` but is UNUSED on text send (TODO at `DefaultMessagingService.kt:1793-1799`) |
+| 4a | Local outgoing queue (RAM) | `KtorRelayTransport.pendingOutbox: ArrayDeque<OutboxEntry>` `shared/core/transport/.../KtorRelayTransport.kt:549`; appended `:2079-2081, 2107-2117`; drained by `flushPendingOutbox(mySession)` `:2239-2409` after handshake `:1538` | IN-MEMORY only |
+| 4b | Local outgoing queue (persistent) | `SqlDelightMessageRepository` row with `MessageStatus.QUEUED` inserted at `DefaultMessagingService.kt:1581`; row survives process death; `retryWaitingMessages` `:4318` re-issues after reconnect/ticker | Persistent survival substrate |
+| 5 | Transport selection (outer chain) | `TransportManager` `shared/core/transport/.../TransportManager.kt:35`, chain walk `:200` (`reorderChain`), per-attempt loop `:100-160` | Chosen ONCE per connect; `PrivacyMode` → strategy at `TransportStrategy.kt:44-49` |
+| 5b | Transport selection (WSS ↔ REST) | `HybridRelayTransport.send` re-reads `stateMachine.current` on EVERY send at `apps/android/.../transport/HybridRelayTransport.kt:1055-1081`; enum `RestMode` at `shared/core/transport/.../RestStateMachine.kt:17-46` | Per-send re-select — the "runtime rewalk" (§11) knob for WSS/REST |
+| 6 | Direct WSS send API | `KtorRelayTransport.send(message: RelayMessage.Send): Boolean` `:2067-2166`. `true` = `session.send(Frame.Text(...))` (`sendRaw` `:2149`) did not throw — **queued to Ktor/OkHttp write path, NOT relay-acked** | Relay ack arrives separately on the `acks` Flow with `ACK_DEADLINE_MS = 10 000` (`RelayTransportConfig.kt:91`) + `ACK_TIMEOUT_MS = 60 000` (`:30`). Expiry only REQUEUES + reconnects — see §2 for the correct terminal semantics |
+| 7 | Direct REST send API | `HybridRelayTransport.sendViaRest(message, mode)` `:1083-1135` → `orchestrator.sendEnvelope(...)` `:1093-1099`; impl `shared/core/transport/.../RestFallbackOrchestrator.kt:1048-1264`; `SendOutcome` sealed class `:4139-4153` | `Accepted`(201) + `Duplicate`(200 replay) → `true` at `HybridRelayTransport.kt:1101-1102`. **`DisabledByCapability` today falls back to WS at `:1103-1113` — this must be OVERRIDDEN in "rest" pin mode (see §6)** |
+| 8 | WSS connection state | Ktor `webSocket { }` DSL — NO raw OkHttp `WebSocketListener`. Handler at `runReconnectLoop` `KtorRelayTransport.kt:1479-1556` (onOpen equiv `:1496`, clean close `:1547-1556`, failure `catch` `:1573-1597`, `finally` summary `:1598-1671`) | `WsSessionLifecycleEvent.Ended` carries `closeOrigin` (local/remote/error/unknown/synthetic `:1605-1611`), `closeError` `:1627`, `okhttpPingTimeoutDetected` `:1629-1630`, `pendingAcksAtClose`, `durationMs`, `inboundFrames`, `sessionEpoch`. `state: StateFlow<TransportState>` in `RelayTransport.kt:11` |
+| 9 | WSS timeout / ping | NO `withTimeout` wraps `send()` itself. Per-envelope ack watchdog `startAckWatchdog(...)` `:1523`; expiry `:1862-1878` **requeues + forces reconnect only** (does NOT flip any state to a terminal failure). OkHttp `pingInterval(15 000 ms)` `shared/core/transport/src/androidMain/kotlin/phantom/core/transport/RelayTransportFactory.kt:91`; Ktor `pingIntervalMillis = 0L` at `:203` (intentional — OkHttp emits pings) | |
+| 10 | REST fallback trigger | Driven by `RestStateMachine.onWsSessionEnded(...)` (`RestStateMachine.kt:595-796`) consuming `WsSessionLifecycleEvent.Ended` from `KtorRelayTransport.kt:1636-1648`. Bridge `HybridRelayTransport.startWsCollectors` via `toRestStateMachineEvent()` `:149-156`. Per-send capability-off fallback → WS at `:1103-1113` | Envelope-level fallback happens only via state-machine mode; single failed `send()` does NOT itself fallback |
+| 11 | Runtime transport rewalk | Three layers: (a) WSS↔REST per-send read of `stateMachine.current` at `HybridRelayTransport.kt:1062`; (b) outer-transport chain rewalk on network change by `TransportRewalkCoordinator` at `apps/android/.../transport/TransportRewalkCoordinator.kt:83-467` (entry `performRewalk` `:186`); (c) WSS reconnect loop with backoff `KtorRelayTransport.kt:1479-1597` + public `forceReconnect()` API (`RelayTransport.kt:228`) | |
+| 12 | Recipient dedup (client-side) | 3 layers on `DefaultMessagingService.handleDeliver`: (a) `processedEnvelopeRepository?.exists(deliver.messageId)` `:2580`, ack-and-drop `:2585`; (b) legacy `messageRepository.getMessageById(deliver.messageId) != null` `:2595-2599`; (c) REST inbound `RestInboundDeduplicator.resolve(env.id)` `HybridRelayTransport.kt:1176-1230` (`Emit`/`SkipNoAck`/`ReAck`) plus persistent-ledger pre-check `:1143-1170` | `markProcessed(...)` sites `:1336, 2723, 2869, 3207, 3435, 3497, 3552`. **NOTE: `markProcessed` is not the same as "message persisted into the recipient app's chat store". Persistence to the visible chat conversation happens SEPARATELY inside the same `handleDeliver` branch — see §4 requirement for `recipient_message_persisted`.** |
+| 13 | Sender delivery-state tracking | Enum `MessageStatus { QUEUED, WAITING_FOR_RECIPIENT_BUNDLE, SENT, RELAYED, DELIVERED, READ, FAILED }` `shared/core/storage/.../MessageRepository.kt:49-74`. Init `QUEUED` `:1581`; post-`transport.send` `newStatus = if (sent) SENT else QUEUED` `:1653-1654`; sender-relay-ack promotion in `startReceiving` `:2312-2320` (`"delivered" → DELIVERED`, else `RELAYED`); read receipts `:4055, 4277` | **`MessageStatus.DELIVERED` in the current code reflects the SENDER-RELAY ACK (relay pushed to recipient mpsc — see §R7), NOT recipient-app-side persistence. It MUST NOT be used alone as proof of end-to-end delivery. See §2 for the corrected `Delivered once` definition.** |
+| 14 | Debug toggles (existing) | See §6 — **no single "force WSS-only" / "force REST-only" pin exists in the current tree**; closest are `DEBUG_FORCE_MODE_2_DETECTION` (synthetic RestActive nudge, apps/android/build.gradle.kts:491 + `DebugForceMode2Activity.kt`), `DEBUG_K8_CONNECTION_CLOSE` `:714`, direct-arm probes `DEBUG_RC_DIRECT_ARM*` `:195-325` | |
+| 15 | Existing client logs | See §3 (existing observability table) | |
+
+### Relay (Phantom `services/relay`)
+
+| # | Stage | Site | Notes |
+|---|---|---|---|
+| R1 | WSS ingress | Route `.route("/ws", get(ws_handler))` `services/relay/src/routes.rs:250`; auth `authorise_ws` `:291-300`; per-conn loop `handle_socket` `:401`; frame dispatch `handle_message` `:986`; `"send"` arm `:992` | |
+| R2 | Envelope schema (wire) | Parsed fields at `routes.rs:993-1001` (`to`, `sealedSender`, `payload`, `messageId`); internal `SendCandidate { id, sealed_sender, payload, sequence_ts, expires_at }` `services/relay/src/rest_workers.rs:143-156`; stored `Envelope { id, to, from, sealed_sender, payload, expires_at }` `services/relay/src/envelope.rs:12-29` | |
+| R3 | Envelope-ID canonical shape | `is_valid_envelope_id(&msg_id)` at `routes.rs:1036` — accepts 1..=128 bytes of `[a-zA-Z0-9._-]`; recipient hex check `is_valid_recipient_identity_hex(&to)` `:1021` (64 lowercase hex, X25519 pub key) | Client `uuid4().toString()` (36 chars, dashes only) satisfies the canonical shape — verified |
+| R4 | Ingress dedup | 4-way pre-write gate in `do_send`: reads `rest_store` + `store` + `active_index` + `tombstone_dedup` at `rest_workers.rs:949-962`; `check_pre_write_consistency` → `SendDisposition::{QueuedReplay, TombstoneReplay}` `:981-1017`; body-hash mismatch → `EnvelopeIdReusedWithDivergentBody` `:1003-1006` | |
+| R5 | Persistent queue + TTL | RAM `store: Arc<RwLock<HashMap<String, Vec<Envelope>>>>` `services/relay/src/state.rs:81`; `rest_store` `:150`. Disk persist `persistence::write_record_bytes` (atomic) `rest_workers.rs:1091`. Two-store push `:1154-1164` under write lock; capacity reserve `:1083-1086`; commit `:1207`. TTL fields `Envelope.expires_at` `envelope.rs:32-51`; check `:54-60`. Sweep `services/relay/src/sweep_scheduler.rs:156` | |
+| R6 | Recipient delivery | Deliver frame built `routes.rs:1123-1130` (`{"type":"deliver","from":"","sealedSender","payload","messageId"}`); push via recipient mpsc `:1271-1278`; reconnect flush scan `:575-587`, emit `:591-602` | |
+| R7 | Sender-relay ack emit (**NOT app-ack**) | Single ack path per Send, gated by recipient mpsc `send` result `routes.rs:1296-1304` — `Ok` → `WsAckStatus::Delivered`, else `Relayed`. Tombstone replay: `Relayed` immediately, no re-deliver `:1245-1250`. **`WsAckStatus::Delivered` here means "envelope pushed onto recipient's WS mpsc channel". It DOES NOT mean the recipient app decrypted, persisted, or displayed the message.** Recipient-app confirmation flows via a separate `"ack-deliver"` frame `:1325-1437` (see R8). | The current sender-side status name (`MessageStatus.DELIVERED` in client code, `WsAckStatus::Delivered` in relay code) is misleading. See §4 for the observability rename plan. |
+| R8 | Recipient-app ack path | `ack-deliver` frame handled at `routes.rs:1325-1437`; events `ack_deliver_received` `:1334-1339`, `ack_deliver_dispatched` `:1379-1383`, warn `ack_deliver_runtime_error` `:1394-1399`, `ack_deliver_reply_dropped` `:1413-1417`, `ack_deliver_reply_timeout` `:1431-1435`. Recipient client is expected to emit this frame AFTER it has decrypted + persisted + surfaced the message. | Whether the client actually emits `ack-deliver` at the correct moment is an open code question for §4 (see `recipient_message_persisted` event site TBD). |
+| R9 | PR #397 deployment status | HEAD `d63366b6` sits on `fix/relay-queue-durability-pr2`. Local `master` HEAD is `fadc5c9c` (PR #396 state-dir recovery). Per architect §8-Q1 answer: PR #397 IS merged into upstream `master` on 2026-07-31 — this local `master` is stale. **VPS deployment of PR #397 is still unconfirmed** and requires a separate read-only attestation of the running relay (see §8-Q1 for the attestation protocol). No VPS changes or `docker compose up` are in scope for this diagnostic. | |
+| R10 | Runbook / recalibration docs | `docs/tracks/rc-relay-queue-ram-recalibration.md`; `docs/adr/ADR-027-relay-queue-durability-and-ram-budget.md`; `docs/operations/relay-env-reference.md`; `docs/tracks/rc-relay-state-dir-repair.md` | |
+| R11 | Metrics | **NOT FOUND** — no `metrics::counter!`, no prometheus, no metrics crate in `services/relay/Cargo.toml`. Envelope-level observability = `tracing::info!` structured logs only. No accepted / delivered / dedup / expired counters as first-class metrics | |
+
+### End-to-end path summary
+
+```
+[SENDER CLIENT]
+user tap Send  (ChatScreen.kt:1063)
+ → OutgoingMessage.id = uuid4()  (ChatScreen.kt:1074)
+   → SqlDelight row inserted, MessageStatus.QUEUED  (DMS:1581, id persisted BEFORE any send)
+     → DefaultMessagingService.sendMessage builds RelayMessage.Send  (DMS:1639)
+       → HybridRelayTransport.send reads RestStateMachine.current  (HRT:1055)
+         ├─ WsActive/WsCandidate → KtorRelayTransport.send  (KRT:2067)
+         │   → session.send(Frame.Text)  (KRT:2149)
+         │   → armAckDeadlineLocked, deadline 10 s / timeout 60 s  (KRT:2145-2148)
+         │   → return true = "OkHttp write path did not throw"  ← NOT recipient delivery
+         └─ RestActive → RestFallbackOrchestrator.sendEnvelope  (RFO:1048)
+             → HTTP POST /rest/send
+             → Accepted 201 | Duplicate 200 | DisabledByCapability | Failed
+   → SqlDelight status flipped: SENT if send()==true, else QUEUED  (DMS:1653)
+     → transport.acks Flow emits SENDER-RELAY ACK when relay pushes deliver frame  (DMS:2312)
+       → messageRepository.updateStatus(id, DELIVERED|RELAYED)  (DMS:2318)  ← RELAY-ACK, NOT APP-ACK
+
+[relay side — INBOUND]
+WSS /ws → ws_handler → handle_socket → handle_message → "send"  (routes.rs:250, 401, 986, 992)
+ → validate `to` (64 hex) + `messageId` ([a-zA-Z0-9._-] 1..128)  (:1021, :1036)
+   → do_send  (rest_workers.rs:949)
+     → pre-write dedup gate (rest_store + store + active_index + tombstone)  (rw:960)
+       → QueuedReplay | TombstoneReplay | fresh
+     → persist to disk (atomic write)  (rw:1091)
+     → push into two stores under write lock  (rw:1154-1164)
+   → deliver frame built  (routes.rs:1123)
+     → recipient mpsc.send(deliver)  (routes.rs:1271)
+       → live push OK → WsAckStatus::Delivered ack to sender  (routes.rs:1296-1304)
+                        ← this is push-to-mpsc, NOT app-ack
+       → live push closed → WsAckStatus::Relayed, envelope retained
+   → separate "ack-deliver" flow when RECIPIENT CLIENT confirms  (routes.rs:1325-1437)
+                        ← this is closer to app-ack but still not proof of message persistence
+
+[recipient client — INBOUND]
+handleDeliver
+ → processedEnvelopeRepository.exists(messageId) → ack-and-drop if seen  (DMS:2580)
+ → messageRepository.getMessageById(id) != null → skip  (DMS:2595)
+ → RestInboundDeduplicator.resolve(env.id) → Emit / SkipNoAck / ReAck  (HRT:1176)
+ → on Emit: markProcessed  (DMS:1336, 2723, ...)
+              ← markProcessed is a DEDUP write, NOT proof of chat-visible persistence
+ → decrypt + save into chat conversation store  (site TBD in §4 diff draft)
+              ← this is the actual "message persisted into visible chat"
+ → recipient client emits ack-deliver frame back to relay  (see R8)
+```
+
+---
+
+## §2 — Delivery outcomes contract — SUPERSEDED
+
+**The three-state Recovered/Delivered-once/Unresolved model that used to live here is not the current outcome contract.** WSS-1 first-pass explicitly removed the `Recovered` classification (§12 P0-7: Round-1 audit — the fallback breadcrumbs it depended on, `attempt`, `session_epoch`, `sender_ack_watchdog_requeued`, are undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence). The verifier accepts only four outcomes:
+
+```
+Delivered once | Unresolved | PENDING | BLOCKED
+```
+
+Aggregate `product_outcome=GREEN` iff every non-blocked cell is `Delivered once` (and no cell is `Unresolved` or `PENDING`); `RED` if any cell is `Unresolved`; `PENDING` if any cell is still within its 120-s host-clock window. Source of truth is §12 (Round-1..5 amendments) + `verify-evidence.py`; a follow-up block may reintroduce genuine breadcrumb instrumentation via a shared/core-transport bridge extension. The REDLINE-1 three-state draft below is retained for archaeology and MUST NOT be treated as the outcome contract.
+
+## §2 (archived) — Delivery outcomes contract (REDLINE-1 draft)
+
+**Terminology cleanup.** The current codebase reuses "Delivered" ambiguously:
+
+- `KtorRelayTransport.acks` emits `"delivered"` when the relay's push-to-recipient-mpsc succeeded (this is a **sender-relay ack**, NOT recipient-app confirmation).
+- Client `MessageStatus.DELIVERED` is set on that sender-relay ack (DMS:2312-2320).
+- Relay `WsAckStatus::Delivered` = same meaning as above (push-to-mpsc succeeded).
+- The only signal that comes closer to recipient-app confirmation is the separate `ack-deliver` frame flowing back through the relay (R8) — but even that fires from the recipient client based on wherever the client code emits it, which may or may not be strictly after the message is persisted into the chat store. Verified in §4 diff draft.
+
+Under WSS-1, this ambiguity is resolved in TWO ways: (a) rename the sender-relay-ack observability event so it CANNOT be read as end-to-end delivery, (b) introduce a NEW event `recipient_message_persisted` that fires after the recipient client has actually saved the message into the visible chat store.
+
+**Corrected outcomes with strict priority order.** An envelope MUST resolve into exactly ONE of three states within a bounded budget. The verifier evaluates each correlation ID in the following ORDER — the first matching outcome wins:
+
+### Priority 1 — `Recovered through fallback without duplicate`
+
+Matches when ALL FOUR delivery signals hold **AND** at least one client-observable fallback breadcrumb is present in the sender's log stream for the same `correlation_id`:
+
+Delivery signals (all four, same as Priority 2 below):
+- `recipient_deliver_received dedup_gate=fresh` (recipient client)
+- `recipient_message_persisted` (recipient client — new event, site TBD in §4)
+- `recipient_ack_deliver_sent` (recipient client)
+- NO second `recipient_deliver_received dedup_gate=fresh` for the same correlation ID
+
+Fallback breadcrumbs (client-only for the first pass — relay-side proofs are deferred, see below):
+- `sender_transport_decision` emitted more than once for the same `correlation_id` with the `inner_route` field changing between values (e.g. `wss → rest` or `rest → wss` across `attempt` numbers) — the outbound path moved between routes and eventually delivered.
+- `sender_ack_watchdog_requeued` (new event, §4) fired at least once and delivery signals eventually held on a later attempt.
+- `attempt >= 2` on the `sender_wss_frame_written` or `sender_rest_post_completed` event that immediately precedes the final `sender_relay_ack_received` — a second write of the same envelope preceded convergence.
+
+### Priority 2 — `Delivered once`
+
+Matches when ALL FOUR delivery signals above hold AND there is NO fallback breadcrumb (i.e. `attempt=1` on the winning send event and no route change and no watchdog requeue). The message reached the recipient on the first attempt via the pinned transport.
+
+`MessageStatus.DELIVERED` on the sender (DMS:2312-2320) and relay `WsAckStatus::Delivered` (R7) are RECORDED in the evidence but are NEVER sufficient to declare Priority 2 by themselves — they are sender-relay ack signals, not recipient-app confirmation.
+
+### Priority 3 — `Unresolved`
+
+Matches when Priority 1 and Priority 2 do NOT match within 120 s of the sender's `sender_enqueue` event for that `correlation_id`. The verifier stamps `product_outcome=Unresolved` for that cell. This decision is made ENTIRELY VERIFIER-SIDE from wall-clock reconciliation; **no client event named `UNRESOLVED_AFTER_120S` exists in the `WSS_DIAG` schema** (§4). The 120-s ceiling is not encoded in Compose/Kotlin production state, and this diagnostic MUST NOT introduce a new `MessageStatus.FAILED` for text (that belongs to a separate later product block; voice FAILED at DMS:2042, 2087 is unaffected).
+
+The 120-s window comfortably exceeds `ACK_TIMEOUT_MS = 60 000` (KRT watchdog) + one WS reconnect + a REST fallback. If a message is still `Unresolved` at 120 s, the delivery pipeline has demonstrably failed to converge.
+
+### Deferred enrichment (relay-side breadcrumbs)
+
+Relay `event="ws_send_queued_replay"` / `ws_send_tombstone_replay` (routes.rs:1236, 1255) would qualify as additional Priority-1 breadcrumbs — but the first-pass evidence is client-only black-box (§3, §8-Q1). Relay-side breadcrumbs are NOT collected in the first bundle and MUST NOT be used to promote a Priority-2 result to Priority 1 in the first-pass verifier report. A later architect-gated read-only relay attestation may reintroduce them.
+
+### Forbidden states
+
+- `Pending forever` — every correlation ID reaches one of the three priorities within 120 s (Priority 3 is the ceiling).
+- Silent duplicate emit on the recipient's visible chat surface — a second `recipient_deliver_received dedup_gate=fresh` for the same ID = Priority-1/2 failure (both fall to Priority 3).
+- Confusion between sender-relay ack and recipient-app ack in the verifier's report (§9.4).
+
+---
+
+## §3 — Existing vs missing observability
+
+### Existing (client)
+
+| Layer | Tag / event | Site | Envelope-ID field? |
+|---|---|---|---|
+| UI | `PhantomUI` — `ChatScreen subscribed …` | `ChatScreen.kt:462` | No |
+| Messaging (send) | `MessagingLog` — `SEND_TRACE send_start` | `DefaultMessagingService.kt:1544` | Yes (`id`) |
+| Messaging (send) | `SEND_TRACE relay_send_call` / `_return ok=$sent` | `DMS.kt:1636, 1648` | Yes |
+| Hybrid transport | `PhantomHybrid` — `REST_TRACE route_send` / `_fallback_ws` / `send_oversize` / `send_failed` | `HybridRelayTransport.kt:1088, 1107, 1115, 1127` | Partial (message ID in some, not all) |
+| WSS transport | `PhantomRelay` — `Sending envelope` / `Envelope send returned false` | `KtorRelayTransport.kt:2124-2127, 2151` | Yes |
+| WSS transport | `PhantomRelay` — `Queued until reconnect` / `Deferred to outbox` | `KRT.kt:2082-2086, 2118-2121` | Yes |
+| WSS lifecycle | `PhantomRelay` — `WebSocket connected successfully`, `closed by remote (clean)`, `connect FAILED`, `session_summary`, `readLoop exited` | `KRT.kt:1497, 1552, 1576, 1612, 2063` | No (session-level) |
+| Rewalk | `PhantomHybrid` — `NETWORK_TRACE rewalk_start/_done/_aborted/_route_change/…` | `TransportRewalkCoordinator.kt:223, 463, 249, 262, 254, 320, 342, 370, 394, 447, 295, 502` | No |
+| Receive | `MessagingLog` — `RECV_DIAG …` | `DMS.kt:2288-2321` | Yes |
+| Hybrid inbound | `PhantomHybrid` — `inbound_deliver` / `skip_pending` / `reack_after_ack` / `skip_already_processed` | `HRT.kt:1178, 1196, 1205, 1147` | Yes |
+| State flows | `state: StateFlow<TransportState>`; `pendingAckCount: Int` `RelayTransport.kt:11, 216`; `wsSessionLifecycle: Flow<WsSessionLifecycleEvent>` `KRT.kt:274`; `WsDegradationDetector` | | |
+
+### Existing (relay)
+
+Recorded here for completeness — but per §8-Q1, WSS-1 first-pass evidence is **client-only black-box**; relay events below are NOT collected in the first bundle. See §3 "Relay events in first-pass" below.
+
+| Event | Site | Envelope-ID field? |
+|---|---|---|
+| `event="connect"` | `routes.rs:500-506` | No (conn-level) |
+| `"flushing queued envelopes …"` | `:589` | Yes (`id`) |
+| `event="message"` | `:1050-1058` | Yes (`msg_id`) |
+| `event="ws_send_tombstone_replay"` | `:1236-1241` | Yes |
+| `event="ws_send_queued_replay"` | `:1255-1261` | Yes |
+| `"live delivery dispatched …"` | `:1280-1284` | Yes |
+| `"recipient offline — queued …"` | `:1287-1291` | Yes |
+| `ack_deliver_received` / `_dispatched` / `_runtime_error` / `_reply_dropped` / `_reply_timeout` | `:1334, 1379, 1394, 1413, 1431` | Yes |
+| `event="disconnect"` / `event="session_summary"` | `:940, 963-982` | No / partial |
+| `do_send` inside `rest_workers.rs` | — | **NONE — 0 `tracing::` calls in `do_send` (verified)** |
+
+### Missing (both sides)
+
+1. Correlation across sender ↔ (relay) ↔ recipient with a stable emitter ID + role field + explicit run/cell IDs. Today: envelope ID is present in many logs, but there is no `role=sender|relay|recipient` field, no `run_id`/`cell_id`, no `emitter_id`, no `session_epoch`. Grep-based joins are ad-hoc.
+2. **Client-side transport-decision breadcrumb per send** — did this send go WSS or REST? Which mode? Which attempt? `REST_TRACE route_send` fires but does not include the envelope ID in a machine-parseable field.
+3. **Recipient app-side persistence event `recipient_message_persisted`** — required by §2 outcome (1). Site does not exist today.
+4. **Relay `do_send` is silent** — not consumed in first-pass evidence (§9 client-only black-box) but flagged as a permanent observability gap.
+5. **No 120-second unresolved-window marker** — the verifier fills this in by wall-clock reconciliation, but a client-side heartbeat event helps distinguish "no ack yet at t=60s" from "app process died".
+6. **No debug-only runtime transport pin** — see §6.
+7. **No metrics** on the relay (§R11) — Yota diagnostic has to rely on log parsing.
+
+### Relay events in first-pass
+
+Per §8-Q1 architect answer, WSS-1 first-pass evidence is **client-only black-box**. Relay-side events (§3 relay table above) are NOT collected in the first bundle. The verifier (§9.4) MUST refuse to make conclusions about relay ingress, dedup, or persistence in the first-pass report. A separate architect-gated read-only attestation of the running relay (§8-Q1) may bring relay events into a later evidence pass.
+
+---
+
+## §4 — Minimal instrumentation diff plan (for architect review — NOT YET WRITTEN)
+
+Only additive log calls with the schema below. Zero behaviour change; zero PII, secret, or key-material leakage.
+
+### Common envelope-scoped log schema
+
+Every `WSS_DIAG` event emits ONLY the following structured fields (no `extra`, no opaque diagnostic tokens):
+
+| Field | Source | Notes |
+|---|---|---|
+| `event` | one of the events below | Machine-parseable enum |
+| `correlation_id` | envelope ID (UUID string) | Ties sender + recipient records |
+| `run_id` | UUID assigned once per `run-yota-wss-diagnostic.sh` invocation | Set on both devices before matrix start via the debug command component (§9.3) |
+| `cell_id` | matrix cell identifier (e.g. `wss.phone-to-emu.after-idle.envelope-3`) | Set per cell via the debug command component |
+| `emitter_id` | **device-stable identity — `phone` or `emulator`** | Written once by the debug command component post-install; NEVER carries a sender/recipient qualifier. The phone is `phone` in every cell whether it sends or receives; the emulator is `emulator` in every cell |
+| `role` | **derived per event** — `sender` on outbound-side events (`sender_enqueue`, `sender_transport_decision`, `sender_wss_frame_written`, `sender_rest_post_completed`, `sender_relay_ack_received`, `sender_ack_watchdog_requeued`) / `recipient` on inbound-side events (`recipient_deliver_received`, `recipient_message_persisted`, `recipient_ack_deliver_sent`) / `relay` reserved for a later relay-side pass | Derived from `event` name, hard-coded per event site. NEVER read from cell direction — a bug that mislabels an emitter's role must fail-red on the focused test (§5-1) |
+| `session_epoch` | `KtorRelayTransport` session-epoch counter (existing at `KRT.kt:57`) | Distinguishes events from different WS sessions of the same emitter |
+| `wall_utc_ms` | `System.currentTimeMillis()` snapshot | Only wall time is comparable ACROSS devices; verifier records the measured phone↔emulator clock skew separately (§9.6) |
+| `monotonic_ms` | `SystemClock.elapsedRealtime()` on Android | Comparable **only within one `emitter_id`+`session_epoch`** — verifier uses this for per-process ordering, never for cross-device time comparison |
+| `outer_transport` | `direct` \| `reality` \| `tor` \| `unknown` | Reflects the OUTER transport arm actually selected by `TransportManager`. Set on `sender_transport_decision`; must be `direct` for every pinned cell (§6) |
+| `inner_route` | `wss` \| `rest` \| `unknown` | Inner send path within the outer arm. Set on `sender_transport_decision`, `sender_wss_frame_written`, `sender_rest_post_completed`, `sender_relay_ack_received`. NOTE: replaces the earlier single `transport` field which conflated the two axes |
+| `attempt` | integer `1..N` | Incremented per envelope resend within the same `correlation_id` |
+| `dedup_gate` | `fresh` \| `duplicate` \| `reack` \| `unknown` | Only on `recipient_deliver_received` |
+| `outcome_flag` | `sender_relay_ack_delivered` \| `sender_relay_ack_relayed` \| `queued_for_reconnect` \| `dropped_by_capability` \| `send_error` | Only on the terminal event within its scope. **`unresolved_120s_marker` is NOT a client field — the verifier synthesises the `Unresolved` outcome per §2 Priority 3 at report time.** |
+| `relay_acceptance` | `accepted` \| `duplicate` \| `failed` \| `disabled_by_capability` \| `unknown` | Only on `sender_rest_post_completed`. REST response semantics (`Accepted` = HTTP 201, `Duplicate` = HTTP 200 replay) are DISTINCT from sender-relay-ack semantics; they belong on the REST post event, not on `sender_relay_ack_received`. |
+
+No text content, no username, no auth token, no SNI / UUID / REALITY param, no QR payload, no contact data. Explicit banned fields: any hex payload, any raw bytes, any `sealedSender` blob.
+
+### Client events to add (all in a new single tag `WSS_DIAG`)
+
+| Event | Where | Trigger | `role` |
+|---|---|---|---|
+| `diagnostic_pin_active` | On app start AND on every pin change | Fires from the debug command component (§9.3) once the pin store settles; carries `run_id`, `cell_id`, `outer_transport`, `inner_route`, `emitter_id` — proves which transport actually ran the cell | (no envelope role — matrix-scoped) |
+| `diagnostic_canary` | Fires from the debug command component on `preflight --canary` | Proves the `WSS_DIAG` tag emits on the device WITHOUT enqueueing any envelope into `sendMessage` or touching the chat store | (no envelope role — matrix-scoped) |
+| `sender_enqueue` | `DefaultMessagingService.kt:1581` (after `insertMessage`) | Row lands in SqlDelight with QUEUED | sender |
+| `sender_transport_decision` | `HybridRelayTransport.kt:1063-1080` (inside `send`) | Right before branching WSS or REST | sender; `outer_transport` + `inner_route` fields REQUIRED |
+| `sender_wss_frame_written` | `KtorRelayTransport.kt:2151` (after `sendRaw` return) | Boolean return captured | sender; `outcome_flag=send_error` if false |
+| `sender_rest_post_completed` | `HybridRelayTransport.kt:1093-1102` | After `sendEnvelope` returns | sender; `relay_acceptance` field reflects `SendOutcome` variant. **Does NOT emit `outcome_flag=sender_relay_ack_delivered` — REST acceptance ≠ sender-relay ack** |
+| `sender_relay_ack_received` | `DMS.kt:2312-2320` (inside `startReceiving` ack collector) | `transport.acks` Flow emit — this is the RELAY-side ack, not the recipient-app ack | sender; `outcome_flag=sender_relay_ack_delivered` or `sender_relay_ack_relayed` |
+| `sender_ack_watchdog_requeued` | `KtorRelayTransport.kt:1862-1878` (watchdog expiry) | Ack watchdog fires — this is REQUEUE, not terminal failure | sender |
+| `recipient_deliver_received` | `HRT.kt:1178` + `DMS.kt:1336` | Inbound `Deliver` frame after all dedup layers evaluated | recipient; `dedup_gate` REQUIRED |
+| `recipient_message_persisted` | `DefaultMessagingService.handleDeliver` — site TBD in diff draft, must be AFTER decrypt + chat-store insert (candidate: right before or immediately after `markProcessed` at `DMS.kt:2723` / `:3207` / analogous, but confirm the insert site) | Recipient app has actually saved the plaintext into the visible chat conversation | recipient — **NEW EVENT** |
+| `recipient_ack_deliver_sent` | site where recipient client emits the outbound `ack-deliver` frame; TBD in diff draft | Recipient-app-side ack round-trip closer | recipient |
+
+### Relay events (NOT collected in first-pass client-only black-box)
+
+If a later architect-gated pass adds relay evidence (§8-Q1 attestation), the relay diff would add: `event="do_send_ingress"` / `_dedup` / `_persisted` in `rest_workers.rs`; `deliver_push_ok/_failed` at `routes.rs:1271`. All would carry `msg_id`, `role=relay`, `wall_utc_ms`. NOT in scope for WSS-1 first pass.
+
+### Instrumentation guardrails
+
+- No new business logic. Every added line is `Log.i("WSS_DIAG", …)` on Android.
+- No text, no username, no hex key, no auth token, no SNI / UUID / REALITY param, no QR payload, no contact data. Verifier enforces the guardrail against the collected bundle (§9.4).
+- Every event uses structured fields per the schema above; no `%s` string formatting that dumps envelope contents.
+- Single tag `WSS_DIAG` — the capture script narrows to `WSS_DIAG:V *:S`; no broad `PhantomHybrid` / `PhantomRelay` / `MessagingLog` / `PhantomUI` capture (per P0-4).
+
+---
+
+## §5 — Focused tests (to accompany the observability diff — NOT YET WRITTEN)
+
+All tests pin the correlation contract; none touch transport internals; none require ADB or a device. Every test fails-red if the correlation join a Yota matrix cell will perform is not resolvable.
+
+### Client (pure JVM, `apps/android` `androidUnitTest`)
+
+1. `wss_diag_sender_wss_flow_emits_ordered_events_with_role_derived_from_event` — fake `KtorRelayTransport` returns success + fires ack; assert `WSS_DIAG` emits exactly `sender_enqueue` → `sender_transport_decision outer_transport=direct inner_route=wss` → `sender_wss_frame_written` → `sender_relay_ack_received outcome_flag=sender_relay_ack_delivered` with the SAME `correlation_id`, `run_id`, `cell_id`; **assert `emitter_id` is a stable device identity (e.g. `phone`) and `role=sender` on every event — NEVER `sender.phone`**. A regression that couples direction with device identity fails-red here.
+2. `wss_diag_sender_rest_flow_emits_relay_acceptance_not_relay_ack` — `RestStateMachine` starts in RestActive; assert log sequence emits `sender_transport_decision outer_transport=direct inner_route=rest` then `sender_rest_post_completed relay_acceptance=accepted` (mapped from HTTP 201). **Assert the event does NOT carry `outcome_flag=sender_relay_ack_delivered`** — REST acceptance is a distinct signal.
+3. `wss_diag_recipient_dedup_marks_second_delivery_as_duplicate` — inject same envelope ID twice into `handleDeliver`; assert first emits `recipient_deliver_received dedup_gate=fresh role=recipient` + `recipient_message_persisted role=recipient`; second emits `recipient_deliver_received dedup_gate=duplicate role=recipient` and NO second `recipient_message_persisted`.
+4. `wss_diag_no_pii_or_key_material_in_events` — assertion sweep across a captured event bundle for banned tokens (username fixtures, plaintext, sealed-sender base64, auth token, any 64-char lowercase-hex substring — the key-material shape). UUID correlation IDs (36 chars with dashes) are ALLOWED.
+5. `wss_diag_ack_watchdog_requeue_emits_requeue_event_not_terminal_failure` — advance `mainClock` past `ACK_TIMEOUT_MS`; assert `sender_ack_watchdog_requeued` fires; assert `MessageStatus` did NOT transition to `FAILED` (proves §2 Priority-3 stays verifier-side).
+6. `wss_diag_recipient_message_persisted_fires_after_chat_store_insert` — inject a Deliver frame; assert `recipient_message_persisted` fires strictly AFTER the chat-store insert (verified by an in-memory chat-store fake that records the insert timestamp).
+7. `wss_diag_no_unresolved_120s_marker_event_type_exists` — grep-style guard: no source file under `phantom.android.diagnostic` (or `phantom.android` in general) emits a `WSS_DIAG` event with `event=unresolved_120s_marker` or `outcome_flag=unresolved_120s_marker`. `Unresolved` is a verifier-side classification only.
+8. `wss_diag_wss_pin_fails_closed_when_outer_arm_is_not_direct` — under `Pin.WSS` with the outer transport arm forced to a non-Direct value, assert `sender_transport_decision outer_transport=reality` (or `tor`) emits AND the send returns without dispatching to WSS. The debug pin MUST NOT silently succeed under a non-Direct outer arm.
+9. `wss_diag_rest_pin_fails_closed_on_disabled_by_capability` — under `Pin.REST` with `RestFallbackOrchestrator.sendEnvelope` returning `DisabledByCapability`, assert `sender_rest_post_completed relay_acceptance=disabled_by_capability` fires AND the send returns `false` without silently falling back to WS.
+10. `wss_diag_diagnostic_canary_does_not_enqueue_message` — trigger `diagnostic_canary`; assert `WSS_DIAG event=diagnostic_canary` fires AND no `sender_enqueue` is emitted AND `MessageRepository.insertMessage` is NOT called.
+
+### Relay — deferred to a later pass (client-only black-box first — §3 last row).
+
+---
+
+## §6 — Force WSS / Force REST pin (debug-build only)
+
+**No production toggle exists** in the current tree for pinning transport. Under WSS-1, a new **debug-build-only runtime store** is added, mutated by a debug-only in-app command component.
+
+### Store shape
+
+- **In-memory only.** The pin is a `@Volatile` field on a top-level `DiagnosticTransportGuard` object living in `src/main/`. It is not persisted to disk. This deliberately eliminates any file-write attack surface (`run-as`, ADB `echo`, symlink games) — the only path that mutates the field is the debug-only receiver code below.
+- `data class PinState(pin: Pin, runId: String, cellId: String)` where `enum class Pin { NONE, WSS, REST }`, default `PinState(NONE, "", "")`.
+- **Reader lives in `src/main/`** (`DiagnosticTransportGuard.current(): PinState`). Present in every APK variant, always returns `PinState.NONE` unless a writer has explicitly set it.
+- **Writer lives ONLY in `src/debug/`** (`DiagnosticCommandReceiver`, §9.3). Physically absent from the release APK. Reads a broadcast Intent, validates every input against the whitelist, writes `DiagnosticTransportGuard.set(newState)`.
+- Process death (crash, background kill) resets the pin to `PinState.NONE`. This is a FEATURE: the matrix runner writes the pin at the head of every cell and waits for a matching `diagnostic_pin_active` event before firing the first envelope; a pin loss surfaces as a missing / mismatched event in the next cell and `evidence_integrity` fails-red at the verifier. The operator reruns the matrix; no silent corruption.
+- The `emitter_id` (`phone` or `emulator`) is baked at build time as `BuildConfig` string flavour and read from a companion field on `DiagnosticTransportGuard`. It does NOT change per cell or per pin write — pinning affects `pin`/`runId`/`cellId` only. In this diagnostic APK both emitter_ids are shipped in the same APK (see build variants below) and selected at install time via a one-shot `am broadcast … --es subcommand set_emitter_id --es emitter_id phone|emulator` — the receiver validates the value against `{"phone", "emulator"}` and writes to another `@Volatile` field. Preflight verifies via `diag-cmd.sh health`.
+
+### Semantics
+
+The pin has two effects — an OUTER arm constraint AND an INNER route constraint. Both must hold; violations are fail-closed.
+
+**`Pin.WSS` semantics**
+
+- Outer arm — TWO acceptable implementations, WSS-1 diff draft picks ONE:
+  - (a) **Explicit outer override**: debug-only path forces the `TransportManager` chain to `DIRECT_FIRST` and rejects any transition to a non-Direct arm for the lifetime of the pin. The pin acts as a hard filter, not a preference. Requires touching `TransportManager` — the diff has to add ONE branch that checks the pin state before returning from `reorderChain(...)`.
+  - (b) **Fail-closed check on actually selected arm** (WSS-1 IMPLEMENTED): leave `TransportManager` untouched; observe the actually selected outer arm via `container.transportManager.state.value`; if not `direct`, refuse to dispatch the envelope, emit `sender_transport_decision outer_transport=<actual> inner_route=<pinned> dispatched=false`, and mark the envelope's `outcome_flag=send_error`. The verifier classifies affected envelopes as `Unresolved` — NOT `BLOCKED` (which is reserved for whole REST cells skipped when preflight says `rest_capability=disabled`, see §12.5).
+- Inner route: `HybridRelayTransport.send` (`:1055-1081`) reads the pin FIRST and overrides `stateMachine.current` to force the WSS branch. If the WS session is not connected at send time, the envelope defers to `pendingOutbox` (existing `KRT` behaviour). **Never silently falls through to REST.**
+
+**`Pin.REST` semantics**
+
+- Outer arm: MUST be `direct`; non-Direct → same fail-closed as above → `Unresolved` for affected envelopes.
+- Inner route: `HRT.send` overrides `stateMachine.current` to force REST. **Fail-closed on `DisabledByCapability`**: today's `HRT.kt:1103-1113` falls back to WS when REST orchestrator returns `DisabledByCapability`; **under `Pin.REST` this fallback is disabled** — the send returns `false` and `sender_rest_post_completed relay_acceptance=disabled_by_capability` fires. If preflight's REST-capability probe returned `disabled`, the two REST cells (#7, #8) are pre-marked `BLOCKED` in `matrix.json` and skipped entirely (§12.3 P1-1 parity).
+
+**Observability requirement**
+
+`WSS_DIAG event=diagnostic_pin_active` fires on app start AND on every pin change, carrying `pin`, `run_id`, `cell_id`, `outer_transport` (the ACTUAL selected outer arm at the moment the event fires), `inner_route` (the pinned inner value), and `emitter_id`. This is the ground truth the verifier joins against per matrix cell — the pin's INTENDED value vs the ACTUAL outer transport picked by `TransportManager`. Any mismatch is a fail-red for that cell.
+
+### Why not a `BuildConfig` string
+
+- `BuildConfig` values are baked at build time — changing the pin between matrix cells would require rebuilding the APK 8 times or shipping a matrix-baked variant per cell.
+- A runtime store lets one APK cover all cells; the debug command component writes the pin before each cell begins.
+- Source-set separation guarantees the store code is physically absent from the release APK.
+
+---
+
+## §7 — Observability diff overview
+
+Covered by §3 (existing/missing tables) + §4 (additive events + schema). No change to production behaviour; correlation is the only capability added; guardrails per §4 last block.
+
+---
+
+## §8 — Open questions and blockers (RESOLVED)
+
+Architect answers 2026-08-11 collapsed into resolved decisions:
+
+**Q1.** PR #397 merged into upstream `master` 2026-07-31. Local `master@fadc5c9c` is stale. **VPS deployment still unconfirmed** — WSS-1 first pass proceeds as client-only black-box (§3 last row). A read-only attestation of the running relay is a SEPARATE architect-gated task before any relay events enter evidence; no VPS `git pull` or `docker compose up` in scope.
+
+**Q2.** **WSS-1 diagnostic is text ONLY.** Voice send path (`DMS.kt:1800`) is out of scope for the first pass.
+
+**Q3.** After 120 s without recipient-app proof → verifier stamps `product_outcome=Unresolved` (Priority 3, §2). **No new client `MessageStatus.FAILED` state** — fixing failure/retry semantics for text is a separate later product block. `ACK_TIMEOUT_MS = 60 s` and the ack watchdog remain requeue-only in code; the 120-s ceiling is a verifier-side classification, NOT a client-side state transition, and the `WSS_DIAG` schema (§4) does NOT include an `unresolved_120s_marker` outcome_flag.
+
+**Q4.** **Removed** — irrelevant to WSS diagnostic.
+
+**Q5.** **Yes** — one Yota-radio phone + one Mac-network emulator is an intentionally asymmetric matrix. Emulator is the "network-normal reference"; phone is the "Yota-stressed side".
+
+**Q6.** REST endpoint capability on the target relay is enforced by `preflight.sh` (§9.6) via one of two acceptable methods (REDLINE-2 refinement):
+- **Method A (preferred, when available)**: hit the production REST capability contract endpoint (a `/rest/capability` or equivalent). If the production API exposes a machine-readable capability descriptor, preflight consumes it and stamps REST cells as `BLOCKED` when REST is disabled.
+- **Method B (fallback)**: the production capability contract may not exist. In that case preflight marks REST capability as `UNKNOWN` and adds a **controlled fail-closed REST cell at the head of the matrix**: one envelope pinned to REST; if it comes back `relay_acceptance=disabled_by_capability` from `sender_rest_post_completed`, all subsequent REST cells (#7, #8) are stamped `BLOCKED` and skipped. A generic `HTTP GET /rest/send` without an application-level capability contract does NOT prove capability and is banned as a probe.
+
+Either method, combined with the §6 `Pin.REST` fail-closed behaviour, prevents silent WSS fallback on REST-pinned cells.
+
+**Q7.** **`preflight.sh` is mandatory.** Runs before the matrix. Checks: `adb`, `python3`, `bash`, `jq`; exactly one emulator + one physical device online; correct diagnostic APK variant installed on both; write-verify of the debug-only runtime pin store on both devices (via the debug command component — NOT via ADB file write); a `diagnostic_canary` event emit from both devices; clock-skew measurement (see Q10); dual-SIM default-data-subscription check (see Q9); REST capability check (see Q6).
+
+**Q8.** Focused tests only — no full-suite `AppNotIdleException` gate.
+
+**Q9 (REDLINE-2).** **Dual-SIM handling.** `getprop gsm.operator.numeric` MAY return concatenated values on a dual-SIM device (both SIM slots), so it cannot reliably identify which SIM is the default-data subscription. Preflight instead queries the app-side debug command component (§9.3) which calls `SubscriptionManager.getActiveDataSubscriptionId()` + `TelephonyManager.createForSubscriptionId(...).getSimOperator()` and returns the operator numeric of the DEFAULT DATA subscription only. Preflight requires the operator to confirm that value matches Yota MCC/MNC. If the phone is single-SIM, the check reduces to the same subscription without loss of correctness. `getprop` is retained ONLY as a secondary informational reading in `device-manifest.json`.
+
+**Q10 (REDLINE-2).** **Clock skew.** Cross-device time comparisons use `wall_utc_ms` corrected by the measured phone↔emulator skew from `device-manifest.json`. A large skew reduces cross-device timing precision (per-event ordering across devices becomes lossy) but does NOT by itself invalidate the correlation bundle — `correlation_id` joins on stable UUIDs and remain accurate regardless of clock drift. Preflight WARNS at `|skew| > 2 000 ms` (records to manifest), FAILS only at `|skew| > 30 000 ms` (bundle correlation reliability drops below usable). Between warn and fail, `evidence_integrity=GREEN` remains valid.
+
+No new blockers introduced by the REDLINE-1 or REDLINE-2 amend.
+
+---
+
+## §9 — Mac operator package (WSS-1 deliverable) — SPEC ONLY, not implemented
+
+Per architect direction 2026-08-11 + REDLINE-1 + REDLINE-2: operator does not manually collect logcat, does not correlate envelope IDs, does not hard-code ADB serials, does not touch identity, does not act on relay state, does not compose arbitrary send text.
+
+**Bundle layout** (planned) — root at `docs/tracks/direct-wss/operator-package/` in this branch:
+
+```
+operator-package/
+├── android-debug-diagnostic.apk        # one APK, produced by ONE `assembleDebug` after WSS-1 lands
+├── android-debug-diagnostic.apk.sha256 # checksum, verified by install-apk.sh
+├── README-OPERATOR.md                  # step-by-step, Mac-only, no assumptions
+├── run-yota-wss-diagnostic.sh          # entry point; drives the full matrix
+├── preflight.sh                        # MANDATORY: env + capability + pin + skew + dual-SIM + canary
+├── lib/
+│   ├── detect-devices.sh               # emulator + phone auto-detect (§9.1)
+│   ├── install-apk.sh                  # uninstall → verify absent → install checksum-verified APK
+│   ├── capture-logs.sh                 # per-device logcat filtered to WSS_DIAG only
+│   ├── run-matrix.sh                   # drives 8 directed cells × 5 envelopes = 40 envelopes
+│   ├── diag-cmd.sh                     # thin wrapper around ADB → debug command component (§9.3)
+│   └── bootstrap.sh                    # --fresh: uninstall protocol, no `pm clear`; then manual onboarding
+├── verify-evidence.py                  # verifier; reports evidence_integrity + product_outcome separately
+└── evidence/                           # auto-created, one dir per run
+    └── yota-wss-YYYYMMDDTHHMMSSZ/
+        ├── phone.logcat.wss_diag
+        ├── emulator.logcat.wss_diag
+        ├── device-manifest.json        # default-data operator, radio type, signal, wall-clock skew, APK sha256
+        ├── matrix.json                 # cells + expected outcomes
+        ├── preflight.json              # preflight results (incl. REST capability method + result)
+        └── verification-report.md      # generated by verify-evidence.py
+```
+
+### 9.1 Device auto-detection (`lib/detect-devices.sh`)
+
+Discovers ALL online devices via `adb devices`, classifies each as emulator or physical:
+
+```bash
+adb devices | awk 'NR>1 && $2 == "device" { print $1 }' | while read -r serial; do
+  is_emu=$(adb -s "$serial" shell getprop ro.kernel.qemu 2>/dev/null | tr -d '\r\n')
+  if [ "$is_emu" = "1" ]; then
+    echo "EMULATOR=$serial" >> "$OUT/roles.env"
+  else
+    echo "PHONE=$serial" >> "$OUT/roles.env"
+  fi
+done
+```
+
+Assertions:
+
+- Exactly ONE emulator + ONE physical device online. Otherwise the script exits red.
+- Yota confirmation is deferred to preflight (§9.6) via the default-data-subscription check — `getprop gsm.operator.numeric` alone is NOT authoritative on dual-SIM devices.
+
+### 9.2 Evidence capture (`lib/capture-logs.sh`) — narrow
+
+**Per P0-4:** only `WSS_DIAG` events are collected. No broad `PhantomHybrid` / `PhantomRelay` / `MessagingLog` / `PhantomUI` tags.
+
+```bash
+START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%S.000")
+for role in PHONE EMULATOR; do
+  serial=$(cat "$OUT/roles.env" | grep "^$role=" | cut -d= -f2)
+  adb -s "$serial" logcat -v threadtime -T "$START_ISO" \
+      WSS_DIAG:V *:S \
+      > "$OUT/$(echo "$role" | tr A-Z a-z).logcat.wss_diag" &
+  echo $! >> "$OUT/log-pids"
+done
+```
+
+Canary emission is performed by `preflight.sh` via `diag-cmd.sh canary` (§9.3) — the `diagnostic_canary` event fires INSIDE the app without invoking `sendMessage`, so the tag-emit spot-check does not enqueue any envelope, does not touch the chat store, and does not consume a matrix envelope slot.
+
+### 9.3 Debug command component + matrix runner — SUPERSEDED
+
+**The REDLINE-2 draft that used to live here is not the current spec.**
+Source of truth is §12 (Round-1 audit repair block, Round-2..5 amendments) plus the code in `apps/android/src/debug/kotlin/phantom/android/diagnostic/`. Corrections vs the pre-Round-1 draft:
+
+- The component is a **`BroadcastReceiver` only** (no Activity alternative). Declared solely in the debug `AndroidManifest.xml` overlay, gated by `android:permission="android.permission.DUMP"` so only ADB shell / root can reach it.
+- The `contact_alias` extra is **removed from the whitelist entirely**. Conversation selection is automatic: the receiver queries the local conversation store, requires exactly ONE paired conversation, and fails-red on zero or many. The operator cannot influence which peer receives the send.
+- Allowed subcommand set (see `DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS`): `pin | send | canary | set_emitter_id | dual_sim_report | health | clear | checkpoint | paired_count_report`. There is NO `rest_capability_probe`; the REST capability probe lives in `preflight.sh` and reuses the ordinary `pin` + `send` machinery under a synthetic `preflight.rest_capability` cell.
+- Extras are still strict-whitelisted per subcommand (see `ALLOWED_EXTRAS_BY_SUBCOMMAND`). Any unknown extra is a silent reject.
+- Send text is still derived INTERNALLY as `"WSS-DIAG-${cell_id}-${sequence}"` (carrier-neutral prefix; the earlier `YOTA-WSS-` name was renamed for the WSS-2 Yota+Tele2 matrix).
+- `lib/diag-cmd.sh` wraps `am broadcast -n <component> --es subcommand=<sub> ...` per subcommand; no `--contact-alias` flag exists.
+
+The pre-Round-5 wording is available in git history; the operational contract is §12 + `apps/android/src/debug/kotlin/phantom/android/diagnostic/`.
+
+**Matrix arithmetic** (unchanged from REDLINE-1): 8 directed cells × 5 envelopes = **40 envelopes per pass**.
+
+| # | Pin | Direction | Scenario | Envelopes |
+|---:|---|---|---|---:|
+| 1 | WSS | Phone → Emulator | immediately after connect | 5 |
+| 2 | WSS | Emulator → Phone | immediately after connect | 5 |
+| 3 | WSS | Phone → Emulator | after natural idle (see below) | 5 |
+| 4 | WSS | Emulator → Phone | after natural idle | 5 |
+| 5 | WSS | Phone → Emulator | background → foreground (see below) | 5 |
+| 6 | WSS | Emulator → Phone | background → foreground | 5 |
+| 7 | REST | Phone → Emulator | same-path control | 5 |
+| 8 | REST | Emulator → Phone | same-path control | 5 |
+
+- **"Idle"** — script waits `>= 300 s` with the app in foreground; no user interaction, **no airplane-mode toggle**.
+- **"Background → foreground"** — ADB home-key + foreground restore only. **`am force-stop` is banned by this spec.** Process kill is NOT part of this diagnostic.
+- Envelope IDs come from the app (`uuid4()` at `ChatScreen.kt:1074`) — the script does NOT generate correlation IDs.
+- Between cells the runner invokes `diag-cmd.sh pin <wss|rest>` and waits `>= 5 s` for a `diagnostic_pin_active` event with matching `pin` + `run_id` + `cell_id` on BOTH devices before firing the first envelope.
+
+### 9.4 Evidence verifier (`verify-evidence.py`) — dual output — SUPERSEDED
+
+**The pre-Round-1 draft's outcome model (Recovered / Delivered once / Unresolved / BLOCKED with a Priority 1 → 2 → 3 fallthrough) is not what the verifier does today.** Source of truth is §12 (Round-1..5 amendments) + `verify-evidence.py`. Current behaviour:
+
+- **`evidence_integrity`** — bundle completeness, exactly as before: GREEN when every closed-schema invariant holds, RED on any violation. Details in §12 (Round-1..5) — canonical 8-cell matrix, strict role/emitter provenance, run-id/rest-capability/APK-sha cross-file consistency, strict boolean parsing, nested-type safety, etc.
+- **`product_outcome`** — per non-blocked matrix cell, exactly one of:
+
+  ```
+  Delivered once | Unresolved | PENDING | BLOCKED
+  ```
+
+  `Recovered` is REMOVED (§12 P0-7: the fallback breadcrumbs it required — `attempt`, `session_epoch`, `sender_ack_watchdog_requeued` — are undocumented emit sites in the WSS-1 code and are NOT expected in the WSS-1 evidence). `BLOCKED` is reserved for the two REST cells when `preflight.rest_capability=disabled`; nothing else is stamped `BLOCKED`. Aggregate: `GREEN` iff every non-blocked cell is `Delivered once`; `RED` if any cell is `Unresolved`; `PENDING` if any cell is still within its 120-s host-clock window and no cell is `Unresolved`.
+
+- Cross-device time comparison is via host↔device skew (`host_to_phone_skew_ms` + `host_to_emulator_skew_ms`) recorded in `device-manifest.json`, NOT phone↔emulator directly (§12.4 P1-3).
+
+The pre-Round-1 wording is retained below (archived) for archaeology and MUST NOT be treated as the operational contract.
+
+#### 9.4 (archived) — pre-Round-1 draft
+
+The verifier reports TWO INDEPENDENT results:
+
+- **`evidence_integrity`** — bundle completeness. GREEN if every matrix cell's expected `WSS_DIAG` event set is present with matching `run_id`/`cell_id`/`emitter_id`/`correlation_id` and clock skew is within the FAIL threshold (§8-Q10). A large-but-tolerable skew emits a warning without lowering `evidence_integrity`. This says NOTHING about whether the product delivered messages — a fully-collected bundle of failure evidence is `evidence_integrity=GREEN`.
+- **`product_outcome`** — per matrix cell, one of `Delivered once` (§2 Priority 2) / `Recovered` (§2 Priority 1) / `Unresolved` (§2 Priority 3) / `BLOCKED` (REST cell where preflight's capability check reported disabled OR the controlled fail-closed head cell returned `disabled_by_capability`). Aggregate `product_outcome=RED` if any cell is not `Delivered once` or `Recovered`.
+
+`evidence_integrity=GREEN, product_outcome=RED` is a **successful diagnostic run** — we captured what's broken. `evidence_integrity=RED` is a diagnostic failure — the bundle is unusable for architect review.
+
+Verifier behaviour:
+
+- Reads only `phone.logcat.wss_diag`, `emulator.logcat.wss_diag`, `matrix.json`, `preflight.json`, `device-manifest.json`. Refuses to open any other file.
+- Cross-device correlation joins on `correlation_id` + `run_id` + `cell_id`. Time comparisons across devices use `wall_utc_ms` corrected by the measured clock skew from `device-manifest.json`. `monotonic_ms` is used ONLY for ordering within a single `emitter_id`+`session_epoch`.
+- **Priority-ordered outcome classification** per §2: check Priority 1 (Recovered) first; if unmet, check Priority 2 (Delivered once); if unmet after 120 s, stamp Priority 3 (Unresolved).
+- Refuses to make ANY claim about relay ingress, dedup, or persistence in the first-pass report (§3 last row). Absence of relay data does NOT lower `evidence_integrity`.
+- Rejects any log line where `event=unresolved_120s_marker` OR `outcome_flag=unresolved_120s_marker` appears (client-side emit of the verifier-only classification = schema violation, fails `evidence_integrity`).
+- Report `verification-report.md` is a table: `cell_id`, `direction`, `pin`, expected outcome, observed `product_outcome`, `evidence_integrity` per cell, `outer_transport` actually selected per cell (proves the §6 pin held), and — for RED cells — the exact missing events with their `correlation_id`.
+
+### 9.5 Identity bootstrap (`lib/bootstrap.sh`) — SUPERSEDED
+
+**The REDLINE-2 draft that used to live here is not the current protocol.**
+Source of truth for identity bootstrap is now §12 (Round-1 audit repair block P0-4 + Round-2..5 amendments) plus the code in `lib/bootstrap.sh` itself. In particular, the confirmation token the operator types is `BOOTSTRAP-CONFIRM` (not the run ID); `bootstrap.sh --verify` does a phone-side spot-check only (the exhaustive both-device APK-SHA binding lives in `preflight.sh`, see §9.6 below); and there is no `pm clear` step anywhere. The pre-Round-5 wording is available in git history; the operational contract is §12 + `lib/bootstrap.sh`.
+
+### 9.6 Preflight (`preflight.sh`) — SUPERSEDED
+
+**The rest of this section describes the REDLINE-2 draft. It is not the current preflight.**
+Source of truth for preflight is now §12 (Round-1 audit repair block P0-1 + Round-2..5 amendments) plus the code in `preflight.sh` itself. In particular:
+
+- The Python-version gate really is `>= 3.9`, enforced with `python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'`.
+- APK verification pulls `base.apk` from BOTH the phone AND the emulator, SHA-256s each locally, and compares to the bundled `android-debug-diagnostic.apk.sha256` sidecar; any mismatch fails-red. The verified SHA is written to `preflight.json.diagnostic_apk_sha256` AND `device-manifest.json.diagnostic_apk_sha256`, and `verify-evidence.py` cross-checks that the two match.
+- The REST capability probe is Method (b) fail-closed only. There is no `rest_capability_probe` subcommand and no Method (a) path in this operator package. Preflight pins REST, fires one envelope on a synthetic `preflight.rest_capability` cell, and stamps `rest_capability = enabled|disabled|unknown` based on `sender_rest_post_completed.relay_acceptance`.
+- Clock skew is measured host↔device (both `host_to_phone_skew_ms` and `host_to_emulator_skew_ms`, not phone↔emulator directly). The runner subtracts the per-device skew from `command_start_ms` before comparing against device-clock event walls (§12.4 P1-3).
+- Session-startedness proof uses `diag-cmd.sh checkpoint` after `capture-logs.sh` starts streaming, not a `pin none` readback.
+- Every `diagnostic_pin_active` / `diagnostic_send_dispatched` binding is verified in the verifier, not by re-reading `health`.
+
+The REDLINE-2 draft below is retained for archaeology and MUST NOT be treated as an operational spec.
+
+**REDLINE-2 draft (archaeology, do not follow):** _the archived text has been deleted from this section — see the git history for the pre-Round-5 wording; the operational contract for preflight is §12 + `preflight.sh`._
+
+### 9.7 `README-OPERATOR.md` (planned outline)
+
+1. Prerequisites (Mac, `adb`, `python3 >= 3.9`, `jq`; one physical Yota phone; one running emulator).
+2. Radio setup on the phone (Yota is the default-data subscription; no Wi-Fi/VPN/Tele2/auto-switching — the operator confirms preflight's dual-SIM default-data reading).
+3. Fresh bootstrap (`./run-yota-wss-diagnostic.sh bootstrap --fresh`): uninstall → verify absent → install checksum-verified APK on both → manual onboarding + manual QR pairing per §9.5.
+4. `./preflight.sh` (must exit 0 before the matrix; includes canary, dual-SIM check, REST capability method).
+5. Run matrix (`./run-yota-wss-diagnostic.sh matrix`).
+6. Read report (`open evidence/yota-wss-*/verification-report.md`).
+7. Where to send the bundle for architect review.
+
+No manual logcat commands. No manual envelope ID grep. No manual "tap Send five times in a row and screenshot the status pill". No `adb shell am force-stop` or airplane-mode toggle. No arbitrary text composition — the operator triggers cells; the app derives text internally.
+
+---
+
+## §10 — Deliverables checklist
+
+| # | Item | Status |
+|---|---|---|
+| 1 | `direct-wss-yota-contract.md` (REDLINE-2) | ✅ this document |
+| 2 | Production path map with `file:line` | §1 |
+| 3 | Delivery outcomes with strict priority order + Priority 3 verifier-side only | §2 |
+| 4 | Existing vs missing observability table | §3 |
+| 5 | Minimal instrumentation diff plan (schema with `emitter_id`/`role` split; `outer_transport` + `inner_route`; `relay_acceptance` on REST; no `unresolved_120s_marker` event; `recipient_message_persisted`; `diagnostic_canary`) | §4 |
+| 6 | Focused tests list (10 client tests — includes role-derived, REST semantics, WSS/REST fail-closed, canary no-enqueue, no verifier-only field on client) | §5 |
+| 7 | Debug-only runtime pin — plain `SharedPreferences` via debug `BroadcastReceiver`, outer Direct enforcement via Method (b) fail-closed on `TransportManager.state`, no ADB file write, no silent fallback | §6 |
+| 8 | Open questions collapsed (Q1–Q10, incl. dual-SIM Q9 + clock-skew Q10 + REST capability Q6 method A/B) | §8 |
+| 9 | Confirmation no runtime fix has been made | §0 + this row — verified |
+| 10 | Mac operator package spec (auto-detect, narrow capture, debug command component with strict whitelist for send, uninstall bootstrap protocol with SHA-256, dual-output verifier with Priority-order classification, mandatory preflight incl. canary + dual-SIM + REST capability method A/B + skew warn-vs-fail) | §9 |
+
+**Nothing here is implemented.** After architect GREEN on this REDLINE-2 amend, one WSS-1 code round produces: minimal `WSS_DIAG` instrumentation on the client + debug-only runtime pin store + debug-only command component + `recipient_message_persisted` event + operator-package bundle (per §9) + focused tests (§5) + ONE diagnostic APK. Then one Yota-pass on device.
