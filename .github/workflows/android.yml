@@ -1,7 +1,59 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Android CI — assembleDebug + jvmTest across all shared/core modules.
-# androidInstrumentedTest is intentionally NOT run here (requires emulator;
-# slow + flaky on free runners). Add a separate gated workflow if needed.
+# Android CI — sharded matrix. See docs/tracks/android-onboarding/c6-onboarding-baseline-landing-contract.md
+# §5.0 L2 test-execution note for the rationale behind per-class isolation.
+#
+# History (2026-08-14 sharding):
+#   The previous single-job workflow ran `:apps:android:testDebugUnitTest`
+#   monolithically. Two independent CI-infrastructure failures surfaced on
+#   the onboarding-baseline-landing branch:
+#     1. Compose UI tests (createComposeRule.setContent) hit a documented
+#        cumulative AppNotIdleException after enough classes accumulate in
+#        one JVM (memory record
+#        project_android_test_infra_appnotidleexception_cumulative_2026_08_11).
+#        Each class then wastes its 60 s idle timeout; together they
+#        exhausted the 30-min job limit.
+#     2. Paparazzi 2.0.0-alpha05 on GitHub `ubuntu-24.04` fails to load
+#        `layoutlib-runtime-16.2.1-linux/layoutlib_jni.so` with an
+#        "undefined symbol" native error. windows-latest loads it cleanly
+#        (the same environment where the accepted 98-golden endpoint was
+#        recorded).
+#
+# Shape (2026-08-14):
+#   - `shared-core`      — Ubuntu: jvmTest for every shared/core/* module.
+#   - `android-jvm-state`— Ubuntu: one Gradle invocation with an explicit
+#                          `--tests` filter listing every non-Compose /
+#                          non-Paparazzi androidUnitTest class. Includes
+#                          Robolectric-runner classes from L1 §5.1
+#                          (TransportRewalkCoordinatorTransactionTest,
+#                          CallManagerGuardTest,
+#                          HybridRelayTransportIntegrationTest20) — those
+#                          use `@RunWith(RobolectricTestRunner)` for Log
+#                          stubbing, not createComposeRule, so batching is
+#                          safe.
+#   - `android-compose-ui`— Ubuntu matrix: ONE Gradle invocation per
+#                          Compose UI test class (per §5.0). No global
+#                          `forkEvery = 1L`; instead every class gets its
+#                          own JVM by virtue of being its own workflow
+#                          job.
+#   - `android-paparazzi`— windows-latest: one scoped `verifyPaparazziDebug`
+#                          with `--tests` filter covering all Paparazzi
+#                          classes. Verify-only. `recordPaparazziDebug` is
+#                          NEVER invoked here.
+#   - `android-test-classification-guard`— Ubuntu: fails when a new
+#                          *Test.kt appears under androidUnitTest that is
+#                          not present in the explicit manifest below.
+#                          Forces both the shard list AND the manifest to
+#                          be updated together.
+#   - `assemble-debug`   — Ubuntu: assembleDebug + APK artifact upload;
+#                          runs only after every shard above succeeds.
+#   - `build-and-test`   — Ubuntu: aggregate required-check gate with the
+#                          same name as before; runs with `if: always()`
+#                          and explicitly fails when any shard failed, so
+#                          branch protection remains fully wired.
+#
+# Change policy: do NOT enable global `forkEvery = 1L` (masks leaks,
+# doubles wall-clock). Do NOT invoke `recordPaparazziDebug` in this
+# workflow. Do NOT upgrade Paparazzi/AGP/Gradle in the CI-repair round.
 
 name: Android CI
 
@@ -20,100 +72,395 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
 
+  # =================================================================
+  # 1. shared/core/* jvmTests + the two enforce-gates. Ubuntu, ~10 min.
+  # =================================================================
+  shared-core:
+    name: Shared core (jvmTest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-
-      # ubuntu-latest GitHub-hosted runners ALREADY ship a complete Android
-      # SDK at /usr/local/lib/android/sdk with platform-tools, multiple
-      # build-tools versions, and android-35 platform. ANDROID_HOME and
-      # ANDROID_SDK_ROOT are exported by the runner image itself.
-      #
-      # The previous attempt to use android-actions/setup-android@v3 hit
-      # an interactive license prompt that auto-accept could not handle
-      # ("6 of 7 SDK package licenses not accepted. Review licenses ...
-      # (y/N)?" — sdkmanager waited for input despite the action's
-      # accept-android-sdk-licenses flag).
-      #
-      # `yes | sdkmanager --licenses` reliably accepts every outstanding
-      # licence by piping "y" into the prompt. `|| true` keeps the step
-      # green even on partial-accept paths.
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-
-      - name: Set up Gradle (caches dependencies, daemons, configuration cache)
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-
-      # NOTE: `gradle/actions/wrapper-validation` is intentionally NOT used yet.
-      # The action validates gradle-wrapper.jar against a hard-coded trusted
-      # checksum set, and Gradle 9.3.1 (released 2025) is too new for the
-      # action's published trust list as of this commit — the validation
-      # fails before the build even starts. Re-enable once the action's
-      # checksum DB catches up to Gradle 9.x.
-
-      # The repository is developed primarily on Windows, where file system
-      # permissions are not preserved in git. Linux runners check out
-      # `gradlew` without the execute bit set (`./gradlew: Permission
-      # denied`, exit code 126). Restore it here so the wrapper invocations
-      # below succeed. The persistent fix is one git operation
-      # (`git update-index --chmod=+x gradlew && git commit`) but until
-      # someone on a Unix host runs that, this CI step keeps the workflow
-      # green.
       - name: Make gradlew executable
         run: chmod +x ./gradlew
-
-      # Common tests run on JVM target — fast, no Android SDK required.
-      # Modules split across separate steps so a failure pinpoints exactly
-      # which module's tests broke without grep-archeology in the combined
-      # log. Each step uses --info for verbose output the first time
-      # through; tighten back down once CI is green and we trust the
-      # baseline.
       - name: Test :shared:core:identity (jvm)
-        run: ./gradlew :shared:core:identity:jvmTest --stacktrace --info
-
+        run: ./gradlew :shared:core:identity:jvmTest --stacktrace
       - name: Test :shared:core:crypto (jvm)
-        run: ./gradlew :shared:core:crypto:jvmTest --stacktrace --info
-
+        run: ./gradlew :shared:core:crypto:jvmTest --stacktrace
       - name: Test :shared:core:storage (jvm)
-        run: ./gradlew :shared:core:storage:jvmTest --stacktrace --info
-
+        run: ./gradlew :shared:core:storage:jvmTest --stacktrace
       - name: Test :shared:core:transport (jvm)
-        run: ./gradlew :shared:core:transport:jvmTest --stacktrace --info
-
+        run: ./gradlew :shared:core:transport:jvmTest --stacktrace
       - name: Test :shared:core:messaging (jvm)
-        run: ./gradlew :shared:core:messaging:jvmTest --stacktrace --info
-
-      # CLIENT-PREKEY-SELFHEAL PR #386 round-1: run the Android-app JVM unit
-      # test suite (previously not covered by any CI job). Exercises the
-      # PreKeySelfHealHookTest wiring tests + everything else under
-      # apps/android/src/androidUnitTest/.
-      - name: Test :apps:android (debug unit tests)
-        run: ./gradlew :apps:android:testDebugUnitTest --stacktrace --info
-
-      # CLIENT-PREKEY-SELFHEAL PR #386 round-1: enforce the two mechanical
-      # gates. Neither was previously invoked by CI (both are wired to the
-      # `check` task, which Android CI does not currently run). Running
-      # them explicitly here makes drift a build failure.
+        run: ./gradlew :shared:core:messaging:jvmTest --stacktrace
       - name: Enforce assertClassifyOnJvmBodiesMatch (transport)
         run: ./gradlew :shared:core:transport:assertClassifyOnJvmBodiesMatch --stacktrace
-
       - name: Enforce assertSinglePublishBundleImplementation (messaging)
         run: ./gradlew :shared:core:messaging:assertSinglePublishBundleImplementation --stacktrace
 
-      # Android debug build — exercises full assembly pipeline including
-      # SQLDelight code-gen, Compose compiler, AGP 9.1.1.
-      - name: Build Android debug APK
-        run: ./gradlew :apps:android:assembleDebug --stacktrace
+  # =================================================================
+  # 2. Android JVM/state batch — every androidUnitTest class that does
+  #    NOT use `composeTestRule.setContent` and is NOT a Paparazzi test.
+  #    One Gradle invocation, one JVM. Safe because the batch does not
+  #    accumulate setContent calls.
+  # =================================================================
+  android-jvm-state:
+    name: Android JVM/state batch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+      - name: Android JVM/state focused batch
+        # Explicit --tests filter for every androidUnitTest class that does
+        # NOT use `composeTestRule.setContent` and is NOT a Paparazzi test.
+        # Includes pre-existing WSS PR #399 diagnostic tests + transport
+        # wiring + release-config pins + manifest-contract tests + all L1..L4
+        # additions in the JVM/state category. Verified by
+        # android-test-classification-guard.
+        run: |
+          ./gradlew :apps:android:testDebugUnitTest \
+            --tests "phantom.android.calls.CallManagerGuardTest" \
+            --tests "phantom.android.di.PreKeySelfHealHookTest" \
+            --tests "phantom.android.diagnostic.DiagnosticCommandReceiverContractTest" \
+            --tests "phantom.android.diagnostic.DiagnosticOuterArmObservationTest" \
+            --tests "phantom.android.diagnostic.DiagnosticSendCoordinatorTest" \
+            --tests "phantom.android.diagnostic.DiagnosticSourceSetBoundaryTest" \
+            --tests "phantom.android.diagnostic.DiagnosticTransportGuardOuterArmMappingTest" \
+            --tests "phantom.android.diagnostic.DiagnosticTransportGuardTest" \
+            --tests "phantom.android.diagnostic.DiagnosticTransportPinStoreTest" \
+            --tests "phantom.android.diagnostic.RcDirectArmGTest" \
+            --tests "phantom.android.diagnostic.WssDiagBridgeAdapterTest" \
+            --tests "phantom.android.diagnostic.WssDiagInertByDefaultTest" \
+            --tests "phantom.android.diagnostics.K8HoldOverrideResolverTest" \
+            --tests "phantom.android.navigation.ScreenSaverTest" \
+            --tests "phantom.android.navigation.StartupRouteResolverTest" \
+            --tests "phantom.android.notifications.NotificationsOptInMigrationTest" \
+            --tests "phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingPrivacyModePersistenceTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2FinalizeContractTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2FinalizeOutcomeContractTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2PrivacyFinalizeOrderingTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest" \
+            --tests "phantom.android.screens.onboarding.v2.OnboardingV2StateTest" \
+            --tests "phantom.android.service.TransportNameForOverlayTest" \
+            --tests "phantom.android.transport.AppContainerDebugForceMode2WiringTest" \
+            --tests "phantom.android.transport.AppContainerK8WiringTest" \
+            --tests "phantom.android.transport.AppContainerLastSeenSeqReaderWiringTest" \
+            --tests "phantom.android.transport.AppContainerPollSkipLpAndPpGateTest" \
+            --tests "phantom.android.transport.AppContainerS6DebugTriggerWiringTest" \
+            --tests "phantom.android.transport.ConnectionUiStateTest" \
+            --tests "phantom.android.transport.DebugForceMode2ActivityManifestContractTest" \
+            --tests "phantom.android.transport.DebugK11_5cTokenLogEnabledReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.HybridRelayTransportIntegrationTest20" \
+            --tests "phantom.android.transport.HybridRelayTransportMapperTest" \
+            --tests "phantom.android.transport.KtorRelayTransportProguardNarrowingPinTest" \
+            --tests "phantom.android.transport.LongPollOptInOrchestratorSeamTest" \
+            --tests "phantom.android.transport.LongPollOptInWireRequestTest" \
+            --tests "phantom.android.transport.LongPollV2ReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.Mode2DebugForceReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.Mode2FastPathReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.Mode2StickyReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.PollSkipLpAndPpReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.ReconnectQuiescenceReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.S6ActivityManifestContractTest" \
+            --tests "phantom.android.transport.S6BreakerTriggerActivityContractTest" \
+            --tests "phantom.android.transport.S6DocsHygieneNegativeGrepTest" \
+            --tests "phantom.android.transport.Tele2RunbookPermissionLiteralContractTest" \
+            --tests "phantom.android.transport.TransportRewalkCoordinatorTransactionTest" \
+            --tests "phantom.android.transport.WsDegradationCollectorBindingsTest" \
+            --tests "phantom.android.transport.WsLifecycleCollectorSideEffectsTest" \
+            --tests "phantom.android.transport.WsLifecycleDispatchBehaviourTest" \
+            --tests "phantom.android.transport.WsSessionLifecycleContractTest" \
+            --tests "phantom.android.transport.WsSessionLifecycleDispatcherSequentialOrderTest" \
+            --tests "phantom.android.ui.ConnectionBannerErrorLabelTest" \
+            --stacktrace
 
+  # =================================================================
+  # 3. Android Compose UI matrix — ONE Gradle invocation per test class.
+  #    Every class runs in its own worker JVM by virtue of being its own
+  #    matrix job; this is the per-class isolation §5.0 requires without
+  #    touching build.gradle.kts `forkEvery`.
+  # =================================================================
+  android-compose-ui:
+    name: Android Compose UI (${{ matrix.test-class }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        test-class:
+          # L1
+          - phantom.android.ui.designv2.PhantomComponentsSemanticsTest
+          # L2
+          - phantom.android.ui.designv2.components.PhantomSegmentedControlTouchTargetBoundsTest
+          - phantom.android.screens.onboarding.v2.OnboardingScreenV2GateTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2EdgeGestureTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2PermissionsSemanticsTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2PricingSheetSemanticsTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2PrivacyDialSemanticsTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2ScrollableCtaReachabilityTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2SemanticsTest
+          # L3
+          - phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2IdentityRepairMarkerTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2ProductionWrapperQuarantineTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredScreenTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2StartupErrorScreenTest
+          # L4
+          - phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
+          - phantom.android.screens.onboarding.v2.OnboardingFlowV2TransitionTest
+          - phantom.android.screens.profile.ProfileQrKeyCardSimplifiedTest
+          - phantom.android.navigation.StartupRouteLateWriteIntegrationTest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+      - name: Test ${{ matrix.test-class }}
+        run: ./gradlew :apps:android:testDebugUnitTest --tests "${{ matrix.test-class }}" --stacktrace
+
+  # =================================================================
+  # 4. Paparazzi — windows-latest, verify-only. The GitHub `ubuntu-24.04`
+  #    runner cannot load layoutlib-runtime-16.2.1-linux/layoutlib_jni.so
+  #    (undefined native symbol); windows-latest loads it cleanly.
+  #    `recordPaparazziDebug` is NEVER invoked. If this job fails, STOP
+  #    and report — do NOT upgrade Paparazzi/AGP/Gradle in the CI-repair
+  #    round.
+  # =================================================================
+  android-paparazzi:
+    name: Android Paparazzi (windows)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: verifyPaparazziDebug (scoped, verify-only)
+        run: |
+          ./gradlew :apps:android:verifyPaparazziDebug \
+            --tests "phantom.android.ui.designv2.PhantomAvatarSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomBadgeSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomButtonSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomFilterChipSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomIconAuditSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomIconContactSheetSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomInputSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomSegmentedControlSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomStressSnapshotTest" \
+            --tests "phantom.android.ui.designv2.PhantomToggleSnapshotTest" \
+            --tests "phantom.android.ui.designv2.OnboardingV2ResponsiveMatrixTest" \
+            --tests "phantom.android.ui.designv2.OnboardingV2SnapshotTest" \
+            --tests "phantom.android.ui.designv2.OnboardingV2RecoverySnapshotTest" \
+            --tests "phantom.android.ui.designv2.OnboardingV2Step2AnimationSnapshotTest" \
+            --tests "phantom.android.ui.designv2.ProfileQrKeyCardSnapshotTest" \
+            --stacktrace
+
+  # =================================================================
+  # 5. Test classification guard. Enumerates every androidUnitTest *Test.kt
+  #    file and asserts each is present in the union of the three bucket
+  #    lists below. New test class → must also be added to the matching
+  #    shard AND this manifest. Missing classification = fail-red.
+  # =================================================================
+  android-test-classification-guard:
+    name: Test classification guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify every androidUnitTest test class is classified
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Explicit classification manifest. Must stay in sync with the
+          # jobs above:
+          #   • JVM/STATE  -> android-jvm-state.steps
+          #   • COMPOSE_UI -> android-compose-ui.strategy.matrix.test-class
+          #   • PAPARAZZI  -> android-paparazzi.steps
+          CLASSIFIED=$(cat <<'EOF'
+          phantom.android.calls.CallManagerGuardTest
+          phantom.android.di.PreKeySelfHealHookTest
+          phantom.android.diagnostic.DiagnosticCommandReceiverContractTest
+          phantom.android.diagnostic.DiagnosticOuterArmObservationTest
+          phantom.android.diagnostic.DiagnosticSendCoordinatorTest
+          phantom.android.diagnostic.DiagnosticSourceSetBoundaryTest
+          phantom.android.diagnostic.DiagnosticTransportGuardOuterArmMappingTest
+          phantom.android.diagnostic.DiagnosticTransportGuardTest
+          phantom.android.diagnostic.DiagnosticTransportPinStoreTest
+          phantom.android.diagnostic.RcDirectArmGTest
+          phantom.android.diagnostic.WssDiagBridgeAdapterTest
+          phantom.android.diagnostic.WssDiagInertByDefaultTest
+          phantom.android.diagnostics.K8HoldOverrideResolverTest
+          phantom.android.transport.TransportRewalkCoordinatorTransactionTest
+          phantom.android.transport.HybridRelayTransportIntegrationTest20
+          phantom.android.transport.AppContainerDebugForceMode2WiringTest
+          phantom.android.transport.AppContainerK8WiringTest
+          phantom.android.transport.AppContainerLastSeenSeqReaderWiringTest
+          phantom.android.transport.AppContainerPollSkipLpAndPpGateTest
+          phantom.android.transport.AppContainerS6DebugTriggerWiringTest
+          phantom.android.transport.ConnectionUiStateTest
+          phantom.android.transport.DebugForceMode2ActivityManifestContractTest
+          phantom.android.transport.DebugK11_5cTokenLogEnabledReleaseBuildConfigPinTest
+          phantom.android.transport.HybridRelayTransportMapperTest
+          phantom.android.transport.KtorRelayTransportProguardNarrowingPinTest
+          phantom.android.transport.LongPollOptInOrchestratorSeamTest
+          phantom.android.transport.LongPollOptInWireRequestTest
+          phantom.android.transport.LongPollV2ReleaseBuildConfigPinTest
+          phantom.android.transport.Mode2DebugForceReleaseBuildConfigPinTest
+          phantom.android.transport.Mode2FastPathReleaseBuildConfigPinTest
+          phantom.android.transport.Mode2StickyReleaseBuildConfigPinTest
+          phantom.android.transport.PollSkipLpAndPpReleaseBuildConfigPinTest
+          phantom.android.transport.ReconnectQuiescenceReleaseBuildConfigPinTest
+          phantom.android.transport.S6ActivityManifestContractTest
+          phantom.android.transport.S6BreakerTriggerActivityContractTest
+          phantom.android.transport.S6DocsHygieneNegativeGrepTest
+          phantom.android.transport.Tele2RunbookPermissionLiteralContractTest
+          phantom.android.transport.WsDegradationCollectorBindingsTest
+          phantom.android.transport.WsLifecycleCollectorSideEffectsTest
+          phantom.android.transport.WsLifecycleDispatchBehaviourTest
+          phantom.android.transport.WsSessionLifecycleContractTest
+          phantom.android.transport.WsSessionLifecycleDispatcherSequentialOrderTest
+          phantom.android.notifications.NotificationsOptInMigrationTest
+          phantom.android.navigation.ScreenSaverTest
+          phantom.android.navigation.StartupRouteResolverTest
+          phantom.android.navigation.StartupRouteLateWriteIntegrationTest
+          phantom.android.service.TransportNameForOverlayTest
+          phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest
+          phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest
+          phantom.android.screens.onboarding.v2.OnboardingPrivacyModePersistenceTest
+          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeContractTest
+          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeOutcomeContractTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyFinalizeOrderingTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StateTest
+          phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest
+          phantom.android.ui.designv2.PhantomComponentsSemanticsTest
+          phantom.android.ui.designv2.components.PhantomSegmentedControlTouchTargetBoundsTest
+          phantom.android.screens.onboarding.v2.OnboardingScreenV2GateTest
+          phantom.android.screens.onboarding.v2.OnboardingV2EdgeGestureTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PermissionsSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PricingSheetSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyDialSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2ScrollableCtaReachabilityTest
+          phantom.android.screens.onboarding.v2.OnboardingV2SemanticsTest
+          phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
+          phantom.android.screens.onboarding.v2.OnboardingV2IdentityRepairMarkerTest
+          phantom.android.screens.onboarding.v2.OnboardingV2ProductionWrapperQuarantineTest
+          phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredScreenTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupErrorScreenTest
+          phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
+          phantom.android.screens.onboarding.v2.OnboardingFlowV2TransitionTest
+          phantom.android.screens.profile.ProfileQrKeyCardSimplifiedTest
+          phantom.android.ui.ConnectionBannerErrorLabelTest
+          phantom.android.ui.designv2.PhantomAvatarSnapshotTest
+          phantom.android.ui.designv2.PhantomBadgeSnapshotTest
+          phantom.android.ui.designv2.PhantomButtonSnapshotTest
+          phantom.android.ui.designv2.PhantomFilterChipSnapshotTest
+          phantom.android.ui.designv2.PhantomIconAuditSnapshotTest
+          phantom.android.ui.designv2.PhantomIconContactSheetSnapshotTest
+          phantom.android.ui.designv2.PhantomInputSnapshotTest
+          phantom.android.ui.designv2.PhantomSegmentedControlSnapshotTest
+          phantom.android.ui.designv2.PhantomStressSnapshotTest
+          phantom.android.ui.designv2.PhantomToggleSnapshotTest
+          phantom.android.ui.designv2.OnboardingV2ResponsiveMatrixTest
+          phantom.android.ui.designv2.OnboardingV2SnapshotTest
+          phantom.android.ui.designv2.OnboardingV2RecoverySnapshotTest
+          phantom.android.ui.designv2.OnboardingV2Step2AnimationSnapshotTest
+          phantom.android.ui.designv2.ProfileQrKeyCardSnapshotTest
+          EOF
+          )
+
+          UNCLASSIFIED=()
+          while IFS= read -r path; do
+            fqn="${path#*/androidUnitTest/kotlin/}"
+            fqn="${fqn%.kt}"
+            fqn="${fqn//\//.}"
+            if ! echo "$CLASSIFIED" | grep -qx "$fqn"; then
+              UNCLASSIFIED+=("$fqn")
+            fi
+          done < <(find apps/android/src/androidUnitTest -type f -name "*Test.kt" | sort)
+
+          # OnboardingV2SemanticsMatchers is a helper, not a *Test class.
+          # It intentionally ends with "Matchers" not "Test", so `find`
+          # above already skips it.
+
+          if [ ${#UNCLASSIFIED[@]} -eq 0 ]; then
+            echo "OK — every androidUnitTest *Test.kt is classified in the CI matrix."
+          else
+            echo "FAIL — the following test classes are unclassified. They must be"
+            echo "added to one of the shards (android-jvm-state / android-compose-ui /"
+            echo "android-paparazzi) AND to the CLASSIFIED manifest in this guard:"
+            printf '  %s\n' "${UNCLASSIFIED[@]}"
+            exit 1
+          fi
+
+  # =================================================================
+  # 6. assembleDebug + APK artifact. Runs after all test shards succeed.
+  # =================================================================
+  assemble-debug:
+    name: Assemble Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - shared-core
+      - android-jvm-state
+      - android-compose-ui
+      - android-paparazzi
+      - android-test-classification-guard
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+      - name: assembleDebug
+        run: ./gradlew :apps:android:assembleDebug --stacktrace
       - name: Upload debug APK as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -122,32 +469,51 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      - name: Upload test reports on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-reports
-          path: |
-            shared/core/*/build/reports/tests/
-            shared/core/*/build/test-results/
-          retention-days: 7
-          if-no-files-found: ignore
-
-      # Capture every Kotlin compile / KSP / SQLDelight code-gen log on
-      # failure so we don't need to grep through the GitHub Actions log
-      # viewer manually. This bundle is the fastest way to diagnose
-      # compile errors on Linux runners that don't reproduce locally on
-      # Windows (case-sensitivity, file-path issues, native lib loaders,
-      # etc).
-      - name: Upload Gradle build logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gradle-build-logs
-          path: |
-            shared/core/*/build/kotlin/
-            shared/core/*/build/reports/
-            shared/core/*/build/tmp/
-            ~/.gradle/daemon/*/daemon-*.out.log
-          retention-days: 7
-          if-no-files-found: ignore
+  # =================================================================
+  # 7. Aggregate required-check gate. Preserves the branch-protection
+  #    name `build-and-test`. `if: always()` + explicit shard-result
+  #    check ensures the gate fails (not skips) when any shard fails.
+  #    This makes branch-protection semantics unambiguous.
+  # =================================================================
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - shared-core
+      - android-jvm-state
+      - android-compose-ui
+      - android-paparazzi
+      - android-test-classification-guard
+      - assemble-debug
+    if: always()
+    steps:
+      - name: Verify all shards succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -A results=(
+            [shared-core]="${{ needs.shared-core.result }}"
+            [android-jvm-state]="${{ needs.android-jvm-state.result }}"
+            [android-compose-ui]="${{ needs.android-compose-ui.result }}"
+            [android-paparazzi]="${{ needs.android-paparazzi.result }}"
+            [android-test-classification-guard]="${{ needs.android-test-classification-guard.result }}"
+            [assemble-debug]="${{ needs.assemble-debug.result }}"
+          )
+          fail=0
+          for shard in "${!results[@]}"; do
+            r="${results[$shard]}"
+            if [ "$r" = "success" ]; then
+              echo "  OK   $shard"
+            else
+              echo "  FAIL $shard = $r"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Aggregate build-and-test failed because one or more shards failed."
+            exit 1
+          fi
+          echo ""
+          echo "All required Android CI shards passed."

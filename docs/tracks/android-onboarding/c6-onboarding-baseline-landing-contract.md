@@ -308,6 +308,34 @@ Full path listing:
 
 ## 4. Rollout order + verification gates
 
+### 4.0 Round-9 addendum — control-plane CI-repair commit (2026-08-14)
+
+The four product landing commits (L1..L4) remain the authoritative product scope. An additional commit `ci(android): shard testDebugUnitTest + move Paparazzi to windows-latest` follows L4 on the same branch as **control-plane** (CI-only), not L5 product scope. Rationale:
+
+- L1 CI failed fast (1 m 30 s) with `java.lang.UnsatisfiedLinkError: layoutlib_jni.so: undefined symbol` — Paparazzi 2.0.0-alpha05 native binary vs GitHub `ubuntu-24.04` glibc ABI mismatch.
+- L3 CI hung to the 30-min workflow timeout on `Test :apps:android (debug unit tests)` — the accumulated Compose UI `AppNotIdleException` (each hits its 60 s idle timeout, together they exhaust the job limit) documented in memory `project_android_test_infra_appnotidleexception_cumulative_2026_08_11`.
+
+Both symptoms are CI-environment issues, orthogonal to L1..L4 correctness. Local per-class-isolation + JVM/state batch + scoped Paparazzi verify all GREEN across L1..L4. The CI-repair commit mirrors the local per-class discipline into the workflow file without touching production code, tests, goldens or dependency versions.
+
+Shape of the CI-repair commit (`.github/workflows/android.yml`):
+
+- `shared-core` (Ubuntu, ~10 min) — every `shared/core/*` `jvmTest` + the two enforce-gates. Unchanged from prior workflow.
+- `android-jvm-state` (Ubuntu, ~10 min) — one Gradle invocation with an explicit `--tests` filter listing every `androidUnitTest` class that does NOT use `composeTestRule.setContent` and is NOT a Paparazzi test. Includes the 3 Robolectric-runner classes from §5.1 (they use `@RunWith(RobolectricTestRunner)` for `Log` stubbing, not `createComposeRule`, so batching is safe).
+- `android-compose-ui` (Ubuntu **matrix**, ~15 min per shard) — ONE Gradle invocation per Compose UI test class. Matches §5.0 per-class isolation exactly, without touching `build.gradle.kts` `forkEvery`.
+- `android-paparazzi` (**windows-latest**, ~25 min) — one scoped `verifyPaparazziDebug` covering every Paparazzi class via `--tests` filter. Verify-only. `recordPaparazziDebug` is NEVER invoked. If this job fails, STOP — do NOT upgrade Paparazzi/AGP/Gradle in the CI-repair round.
+- `android-test-classification-guard` (Ubuntu, ~5 min) — enumerates every `androidUnitTest/**/*Test.kt`, asserts each is present in the explicit CLASSIFIED manifest inside the workflow. New unlisted test class = fail-red. Forces both the shard list AND the manifest to update together.
+- `assemble-debug` (Ubuntu, ~15 min) — `assembleDebug` + APK artifact upload, gated on all shards succeeding.
+- `build-and-test` (Ubuntu, aggregate) — required-check gate with the same name as before, preserving branch-protection wiring. Uses `if: always()` + explicit per-shard `needs.<shard>.result != success` check so it FAILS (not skips) when any shard failed.
+
+Change policy for this CI-repair commit:
+
+- No global `forkEvery = 1L` — masks leaks + doubles wall-clock.
+- No `recordPaparazziDebug` invocation anywhere in the workflow.
+- No Paparazzi / AGP / Gradle upgrade in this round.
+- No `continue-on-error` on any shard.
+- No `timeout-minutes` above 25 (Paparazzi Windows) — increased timeout would just hide the flake, not fix it.
+- L4 + CI-repair pushed together in one push so no intermediate workflow run tries the pre-repair (doomed) job graph.
+
 ### 4.1 Landing sequence
 
 1. Branch off `origin/master@bf75d626` as `android/onboarding-baseline-landing` (per architect Q-target-1).
