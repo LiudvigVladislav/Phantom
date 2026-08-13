@@ -64,6 +64,18 @@ kotlin {
                 // which is excluded from any APK.
                 implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
+                // Direct WSS diagnostic — `DiagnosticTransportPinStoreTest`
+                // hosts Android runtime to drive a real `SharedPreferences`
+                // round-trip against the debug-only pin store. Robolectric
+                // is testImplementation-scoped and never ships in release.
+                // `kotlinx-coroutines-test` is used by
+                // `DiagnosticSendCoordinatorTest` for `runTest {}` +
+                // `backgroundScope` — the suspending-fake ordering test.
+                implementation(libs.robolectric)
+                implementation(libs.kotlinx.coroutines.test)
+                // `androidx.test:core` provides `ApplicationProvider`
+                // for the Robolectric-hosted pin-store test.
+                implementation(libs.androidx.test.core)
             }
         }
 

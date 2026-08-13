@@ -46,7 +46,17 @@ import kotlin.test.assertTrue
 
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
-private class FakeMessageRepository : MessageRepository {
+private class FakeMessageRepository(
+    /**
+     * §12 Round-8 audit P1 test seam: when non-null, insertMessage
+     * throws THIS instead of persisting the row. The
+     * `sender_enqueue` diagnostic event must NOT fire in that
+     * case — the Round-7 code emitted from an `.also{}` on the
+     * entity constructor, which ran BEFORE insertMessage saw the
+     * row, so a failing insert produced a lying enqueue event.
+     */
+    val insertMessageException: Throwable? = null,
+) : MessageRepository {
     val messages = mutableListOf<MessageEntity>()
     val statusUpdates = mutableMapOf<String, MessageStatus>()
 
@@ -60,6 +70,7 @@ private class FakeMessageRepository : MessageRepository {
         messages.firstOrNull { it.id == id }
 
     override suspend fun insertMessage(entity: MessageEntity) {
+        insertMessageException?.let { throw it }
         if (messages.any { it.id == entity.id }) return
         messages += entity
     }
@@ -646,6 +657,84 @@ class DefaultMessagingServiceTest {
             OutgoingMessage(id = "msg-4", conversationId = "conv-1", recipientPublicKeyHex = "ccdd", text = "x")
         )
         assertEquals(MessageStatus.SENT, msgRepo.statusUpdates["msg-4"])
+    }
+
+    /**
+     * §12 Round-8 audit P1: `sender_enqueue` must fire AFTER
+     * `insertMessage` returns. The Round-7 code emitted from an
+     * `.also{}` on the entity constructor, which runs BEFORE
+     * insertMessage sees the row. This test installs a recording
+     * WssDiagBridge and asserts the emit happens after
+     * insertMessage's row is persisted.
+     */
+    @Test
+    fun sendMessage_emits_sender_enqueue_AFTER_insertMessage_succeeds() = runTest {
+        val emitted = mutableListOf<String>()
+        val bridge = object : WssDiagBridge {
+            override fun emit(
+                event: String, correlationId: String, role: WssDiagBridge.Role,
+                outcomeFlag: WssDiagBridge.OutcomeFlag, dedupGate: WssDiagBridge.DedupGate?,
+            ) {
+                emitted += "$event:$correlationId"
+            }
+        }
+        WssDiagBridgeHolder.instance = bridge
+        try {
+            val msgRepo = FakeMessageRepository()
+            val service = buildService(this, msgRepo = msgRepo)
+            service.sendMessage(
+                OutgoingMessage(id = "msg-enq", conversationId = "conv-1",
+                                recipientPublicKeyHex = "ccdd", text = "x"),
+            )
+            // Row IS persisted…
+            assertEquals(1, msgRepo.messages.count { it.id == "msg-enq" })
+            // …and sender_enqueue was emitted for this CID.
+            assertTrue(
+                emitted.contains("sender_enqueue:msg-enq"),
+                "sender_enqueue must fire after successful insertMessage; emitted=$emitted",
+            )
+        } finally {
+            WssDiagBridgeHolder.instance = null
+        }
+    }
+
+    /**
+     * §12 Round-8 audit P1: `sender_enqueue` must NOT fire when
+     * `insertMessage` throws. Under Round-7 the emit sat inside
+     * an `.also{}` on the entity constructor which ran BEFORE
+     * insertMessage saw the row — a failing insert produced a
+     * lying enqueue event.
+     */
+    @Test
+    fun sendMessage_does_NOT_emit_sender_enqueue_when_insertMessage_fails() = runTest {
+        val emitted = mutableListOf<String>()
+        val bridge = object : WssDiagBridge {
+            override fun emit(
+                event: String, correlationId: String, role: WssDiagBridge.Role,
+                outcomeFlag: WssDiagBridge.OutcomeFlag, dedupGate: WssDiagBridge.DedupGate?,
+            ) {
+                emitted += "$event:$correlationId"
+            }
+        }
+        WssDiagBridgeHolder.instance = bridge
+        try {
+            val boom = IllegalStateException("db-write-failed-for-test")
+            val msgRepo = FakeMessageRepository(insertMessageException = boom)
+            val service = buildService(this, msgRepo = msgRepo)
+            service.sendMessage(
+                OutgoingMessage(id = "msg-fail", conversationId = "conv-1",
+                                recipientPublicKeyHex = "ccdd", text = "x"),
+            )
+            // Row did NOT land.
+            assertEquals(0, msgRepo.messages.count { it.id == "msg-fail" })
+            // And sender_enqueue must NOT have been emitted for this CID.
+            assertTrue(
+                !emitted.contains("sender_enqueue:msg-fail"),
+                "sender_enqueue must NOT fire when insertMessage throws; emitted=$emitted",
+            )
+        } finally {
+            WssDiagBridgeHolder.instance = null
+        }
     }
 
     @Test
