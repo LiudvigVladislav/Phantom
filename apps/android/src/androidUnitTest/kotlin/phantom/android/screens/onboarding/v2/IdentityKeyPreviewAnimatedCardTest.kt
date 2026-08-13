@@ -32,6 +32,7 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -64,7 +65,7 @@ import phantom.android.screens.onboarding.v2.steps.KEY_PREVIEW_TARGET_CHARS
  *     normal-scale animation completes).
  *   - `card_a11y_...` now inspects the merged semantics config
  *     directly and asserts BOTH the stable `contentDescription` and
- *     the absence of any target-hex substring in the merged text.
+ *     the absence of any decorative-glyph substring in the merged text.
  *   - `reachability_full_step_at_320dp_fs2` now renders the WHOLE
  *     `IdentityKeyStepV2` (title + input + CTA + card) so the
  *     narrow-width claim covers all step-level nodes.
@@ -78,6 +79,24 @@ class IdentityKeyPreviewAnimatedCardTest {
 
     @get:Rule
     val composeTestRule = createAndroidComposeRule<ComponentActivity>()
+
+    /**
+     * Robolectric shares one Choreographer per SDK environment across
+     * every test in the same JVM. Three tests in this class freeze
+     * the composeTestRule.mainClock via `autoAdvance = false` to pin
+     * frame-boundary invariants; if any of them throws before
+     * restoring the clock, the next test class runs against a halted
+     * Choreographer and Espresso trips `AppNotIdleException` on its
+     * very first `setContent`. Restoring here guarantees the leak
+     * blast radius is zero — regardless of which test failed or
+     * threw. Pinned by
+     * `logo-flash-fix-contract.md` §9 (JVM-shared-clock hygiene).
+     */
+    @After
+    fun restoreMainClockAutoAdvance() {
+        composeTestRule.mainClock.autoAdvance = true
+        composeTestRule.waitForIdle()
+    }
 
     // ── §6.8 — Continue disabled invariant ───────────────────────
 
@@ -181,9 +200,9 @@ class IdentityKeyPreviewAnimatedCardTest {
         // substring absence, which is a narrow proxy. New shape
         // fetches the actual merged semantics config and asserts:
         //   (a) ContentDescription is exactly the stable summary tag.
-        //   (b) Merged text does NOT contain ANY hex-glyph substring
-        //       derived from the deterministic target (any leak of
-        //       the body's decorative content would surface here).
+        //   (b) Merged text does NOT contain ANY decorative-glyph
+        //       substring derived from the target `••••` (any leak
+        //       of the body's decorative content would surface here).
         composeTestRule.setContent {
             IdentityKeyPreviewAnimatedCard(usernameValid = true)
         }
@@ -220,8 +239,8 @@ class IdentityKeyPreviewAnimatedCardTest {
             message = "Merged card text MUST include the footer copy. " +
                 "Got: '$mergedText'",
         )
-        // Load-bearing: glyph body ('4FA5', '7D31' etc from the
-        // deterministic target) MUST NOT leak into merged text.
+        // Load-bearing: glyph body (`••••` × 8 groups, from the
+        // masked-bullet target) MUST NOT leak into merged text.
         // We assert on the FIRST group of 4 target chars — a
         // regression that removed `clearAndSetSemantics` on the
         // glyph Text would surface these characters here.

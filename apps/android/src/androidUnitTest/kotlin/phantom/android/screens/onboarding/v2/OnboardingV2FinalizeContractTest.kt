@@ -4,9 +4,6 @@
 package phantom.android.screens.onboarding.v2
 
 import android.app.Application
-import android.content.ClipboardManager
-import android.content.Context
-import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -21,9 +18,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import phantom.android.screens.onboarding.v2.steps.copyFullHexToClipboard
 import phantom.core.identity.IdentityKeyPair
 import phantom.core.identity.IdentityRecord
+import phantom.android.ui.designv2.formatFullKeyForDisplay
+import phantom.android.ui.designv2.formatShortKeyIdForDisplay
 import phantom.core.identity.PrivateKey
 import phantom.core.identity.PublicKey
 import phantom.core.transport.PrivacyMode
@@ -80,35 +78,18 @@ class OnboardingV2FinalizeContractTest {
             privateKey = PrivateKey(ByteArray(32) { (it + 1).toByte() }),
         )
 
-    // ── Clipboard contract (redline §C1) ──────────────────────────────
-
-    @Test
-    fun copy_writes_full_64_char_hex_to_clipboard() {
-        val context: Context = ApplicationProvider.getApplicationContext()
-        copyFullHexToClipboard(context, fakeHex)
-
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = clipboard.primaryClip
-        assertNotNull(clip)
-        assertEquals(1, clip.itemCount)
-        val copied = clip.getItemAt(0).text.toString()
-        assertEquals(fakeHex, copied)
-        assertEquals(64, copied.length)
-    }
-
-    @Test
-    fun copy_does_not_transform_or_wrap_the_hex() {
-        val context: Context = ApplicationProvider.getApplicationContext()
-        val mixedCase = "AbCdEf0123456789" + "abcdef0123456789".repeat(2) + "AbCdEf0123456789"
-        copyFullHexToClipboard(context, mixedCase)
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        assertEquals(mixedCase, clipboard.primaryClip!!.getItemAt(0).text.toString())
-    }
+    // ── Shared formatter contract ─────────────────────────────────────
+    //
+    // Onboarding-stabilization block 2026-08-11: the prior
+    // Finale-specific `copyFullHexToClipboard` helper is retired
+    // (Finale no longer exposes a Copy button). Profile still uses the
+    // shared formatters below in its Advanced-cryptographic-details
+    // rows — this test keeps them pinned as pure functions.
 
     @Test
     fun display_and_short_form_derive_from_the_same_hex() {
-        val display = formatFingerprintForDisplay(fakeHex)
-        val short = formatFingerprintShort(fakeHex)
+        val display = formatFullKeyForDisplay(fakeHex)
+        val short = formatShortKeyIdForDisplay(fakeHex)
         assertEquals(fakeHex, display.replace(" ", ""))
         assertEquals(9, short.length)
         assertEquals(fakeHex.substring(0, 4), short.substring(0, 4))

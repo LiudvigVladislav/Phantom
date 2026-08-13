@@ -28,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,6 +53,8 @@ import phantom.android.di.AppContainer
 import phantom.android.qr.QrCodeImage
 import phantom.android.qr.generateQrBitmap
 import phantom.android.ui.*
+import phantom.android.ui.designv2.formatFullKeyForDisplay
+import phantom.android.ui.designv2.formatShortKeyIdForDisplay
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.identity.IdentityRecord
@@ -107,7 +110,6 @@ fun ProfileScreen(
     var showDeleteDialog by remember { mutableStateOf(false) }
     var editingField by remember { mutableStateOf<String?>(null) }
     var editingValue by remember { mutableStateOf("") }
-    var copied by remember { mutableStateOf(false) }
 
     val avatarFile = remember { File(context.filesDir, "profile_avatar.jpg") }
 
@@ -191,19 +193,26 @@ fun ProfileScreen(
                 },
             )
 
-            // ── QR key card ──────────────────────────────────────────────────
+            // ── My Phantom QR + Advanced keys ────────────────────────────────
+            // Onboarding-stabilization block 2026-08-11: main surface is a
+            // single QR + Share; both public keys live under the
+            // collapsible "Advanced cryptographic details" toggle inside
+            // the card itself. Copy handlers just push to clipboard —
+            // per-key "Copied" pills were dropped along with the
+            // per-key labels; the raw system-clipboard-notification is
+            // the ack. Alpha-1 records (no Ed25519) are still skipped.
             identity?.let { id ->
-                val identityString = "${id.username}:${id.publicKeyHex}"
-                QrKeyCard(
-                    identityString = identityString,
-                    copied = copied,
-                    onShare = { showShareDialog = true },
-                    onCopy = {
-                        copyToClipboard(context, identityString)
-                        copied = true
-                        scope.launch { kotlinx.coroutines.delay(2000); copied = false }
-                    },
-                )
+                val signingHex = id.signingPublicKeyHex
+                if (signingHex != null) {
+                    QrKeyCard(
+                        username = id.username,
+                        signingPublicKeyHex = signingHex,
+                        publicKeyHex        = id.publicKeyHex,
+                        onShare = { _qrPayload -> showShareDialog = true },
+                        onCopySigningKey = { hex -> copyToClipboard(context, hex) },
+                        onCopyEncryptionKey = { hex -> copyToClipboard(context, hex) },
+                    )
+                }
             }
 
             // ── Account card ─────────────────────────────────────────────────
@@ -731,15 +740,28 @@ private fun ProfileFieldDivider() {
 // ── QR key card ───────────────────────────────────────────────────────────────
 
 @Composable
-private fun QrKeyCard(
-    identityString: String,
-    copied: Boolean,
-    onShare: () -> Unit,
-    onCopy: () -> Unit,
+internal fun QrKeyCard(
+    username: String,
+    signingPublicKeyHex: String,
+    publicKeyHex: String,
+    onShare: (qrPayload: String) -> Unit,
+    onCopySigningKey: (hex: String) -> Unit,
+    onCopyEncryptionKey: (hex: String) -> Unit,
+    initialAdvancedExpanded: Boolean = false,
 ) {
-    // Phase 2 mockup IdentityKeyBlock — SurfaceDeep card with BorderSubtle
-    // outline, 12dp radius. Header row: Shield icon (cyan 70%) + "IDENTITY KEY"
-    // mono overline + right "ED25519" mono 10sp tertiary. Below: QR + key text.
+    // Onboarding-stabilization block 2026-08-11 (architect verdict on
+    // the dual-key-labels shape): the main surface is now a single
+    // "My Phantom QR" block with one primary "Share my Phantom
+    // contact" action. Ed25519 + X25519 public keys are moved into a
+    // collapsible "Advanced cryptographic details" section labelled
+    // "Public key" so no user can mistake them for secrets. The QR
+    // payload stays byte-exactly `${username}:${publicKeyHex}` (X25519
+    // only) — same wire format as before, so existing scanners keep
+    // working.
+    val qrPayload = "$username:$publicKeyHex"
+    var advancedExpanded by rememberSaveable {
+        mutableStateOf(initialAdvancedExpanded)
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -748,14 +770,13 @@ private fun QrKeyCard(
             .background(PhantomTokens.Colors.SurfaceDeep)
             .border(1.dp, PhantomTokens.Colors.BorderSubtle, RoundedCornerShape(PhantomTokens.Radius.md)),
     ) {
-        // Header
+        // Header — My Phantom QR
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // Shield glyph — Canvas-drawn cyan @ 70% alpha.
             Canvas(modifier = Modifier.size(13.dp)) {
                 val w = size.width
                 val h = size.height
@@ -780,106 +801,210 @@ private fun QrKeyCard(
             }
             Spacer(Modifier.width(7.dp))
             Text(
-                text = "IDENTITY KEY",
+                text = "My Phantom QR",
                 color = PhantomTokens.Colors.TextSecondary,
                 fontSize = 10.sp,
                 fontFamily = PhantomFontMono,
                 letterSpacing = 0.6.sp,
             )
-            Spacer(Modifier.weight(1f))
-            Text(
-                text = "ED25519",
-                color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
-                fontSize = 10.sp,
-                fontFamily = PhantomFontMono,
-            )
         }
         HorizontalDivider(color = PhantomTokens.Colors.BorderSubtle, thickness = 1.dp)
 
-        // QR + body
+        // QR + share body
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            QrCodeImage(content = identityString, size = 172.dp)
-
-            Spacer(Modifier.height(14.dp))
-
-            // First 32 hex chars of the public key, formatted as 8 groups
-            // of 4. FULL_COMPOSE Profile/Mobile 1 uses this hex as the
-            // verify-by-eye channel; we keep the QR above for QR-scan and
-            // add the hex below so both modes are reachable from one card.
-            val hexFingerprint = remember(identityString) {
-                val pubHex = identityString.substringAfter(":", "")
-                if (pubHex.length >= 32)
-                    pubHex.substring(0, 32).uppercase().chunked(4).joinToString("  ")
-                else "—"
-            }
-            Text(
-                text = hexFingerprint,
-                color = TextPrimary,
-                fontSize = 13.sp,
-                fontFamily = PhantomFontMono,
-                letterSpacing = 0.65.sp,
-                lineHeight = 22.sp,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = "Your public identity fingerprint",
-                color = TextDim.copy(alpha = 0.65f),
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-            )
+            QrCodeImage(content = qrPayload, size = 172.dp)
 
             Spacer(Modifier.height(16.dp))
 
-            // Share button — pill-shape primary cyan with restrained glow.
+            // Single primary Share action.
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(44.dp)
                     .clip(RoundedCornerShape(9999.dp))
                     .background(CyanAccent)
-                    .clickable { onShare() },
+                    .clickable { onShare(qrPayload) },
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "Share my key",
+                    text = "Share my Phantom contact",
                     color = BgDeep,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(16.dp))
 
-            // Copy — ghost pill with cyan outline.
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(40.dp)
-                    .clip(RoundedCornerShape(9999.dp))
-                    .border(
-                        1.dp,
-                        CyanAccent.copy(alpha = if (copied) 1f else 0.4f),
-                        RoundedCornerShape(9999.dp),
-                    )
-                    .clickable { onCopy() },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = if (copied) "Copied" else "Copy key",
-                    color = CyanAccent,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
+            // ── Advanced cryptographic details (collapsed by default) ──
+            AdvancedCryptoDetailsSection(
+                expanded = advancedExpanded,
+                onToggle = { advancedExpanded = !advancedExpanded },
+                signingPublicKeyHex = signingPublicKeyHex,
+                publicKeyHex = publicKeyHex,
+                onCopySigningKey = onCopySigningKey,
+                onCopyEncryptionKey = onCopyEncryptionKey,
+            )
         }
     }
 }
+
+/**
+ * Collapsible "Advanced cryptographic details" section under the
+ * primary QR + Share block. Hidden behind an explicit toggle so the
+ * two 32-byte public keys never sit in a casual user's main view.
+ *
+ * Copy is labelled per architect: `Public key · Ed25519 (signing)`
+ * and `Public key · X25519 (encryption)`, so nobody mistakes them
+ * for secret material.
+ */
+@Composable
+private fun AdvancedCryptoDetailsSection(
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    signingPublicKeyHex: String,
+    publicKeyHex: String,
+    onCopySigningKey: (hex: String) -> Unit,
+    onCopyEncryptionKey: (hex: String) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { onToggle() }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (expanded) "▾  Advanced cryptographic details"
+                       else "▸  Advanced cryptographic details",
+                color = TextDim,
+                fontSize = 11.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.4.sp,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (expanded) {
+            Spacer(Modifier.height(8.dp))
+            AdvancedPublicKeyRow(
+                keyLabel = "Public key · Ed25519 (signing)",
+                fullHexDisplay = formatFullKeyForDisplay(signingPublicKeyHex),
+                shortIdLabel = "Short ID",
+                shortIdValue = formatShortKeyIdForDisplay(signingPublicKeyHex),
+                copyButtonText = "Copy public key",
+                onCopy = { onCopySigningKey(signingPublicKeyHex) },
+            )
+            Spacer(Modifier.height(12.dp))
+            AdvancedPublicKeyRow(
+                keyLabel = "Public key · X25519 (encryption)",
+                fullHexDisplay = formatFullKeyForDisplay(publicKeyHex),
+                shortIdLabel = "Short ID",
+                shortIdValue = formatShortKeyIdForDisplay(publicKeyHex),
+                copyButtonText = "Copy public key",
+                onCopy = { onCopyEncryptionKey(publicKeyHex) },
+            )
+            Spacer(Modifier.height(6.dp))
+            // Final Stabilization Mini-Block 2026-08-11 §P2:
+            // "safe to share" was too absolute — the public keys are
+            // stable identifiers that can be used for correlation, so
+            // the copy below states the actual guarantee (identity,
+            // verification) and the actual boundary (they cannot
+            // unlock the account, private key or backup must never
+            // be shared). Pinned verbatim by
+            // ProfileQrKeyCardSimplifiedTest.
+            Text(
+                text = "These public keys identify your Phantom account and " +
+                    "may be shared for verification. They cannot unlock it. " +
+                    "Never share a private key or recovery backup.",
+                color = TextDim.copy(alpha = 0.6f),
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun AdvancedPublicKeyRow(
+    keyLabel: String,
+    fullHexDisplay: String,
+    shortIdLabel: String,
+    shortIdValue: String,
+    copyButtonText: String,
+    onCopy: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = keyLabel,
+            color = PhantomTokens.Colors.TextSecondary,
+            fontSize = 11.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 0.4.sp,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = fullHexDisplay,
+            color = TextPrimary,
+            fontSize = 12.sp,
+            fontFamily = PhantomFontMono,
+            letterSpacing = 0.6.sp,
+            lineHeight = 20.sp,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = shortIdLabel,
+                color = TextDim.copy(alpha = 0.65f),
+                fontSize = 10.sp,
+                fontFamily = PhantomFontMono,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = shortIdValue,
+                color = TextPrimary,
+                fontSize = 11.sp,
+                fontFamily = PhantomFontMono,
+                letterSpacing = 0.4.sp,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(40.dp)
+                .clip(RoundedCornerShape(9999.dp))
+                .border(1.dp, CyanAccent.copy(alpha = 0.4f), RoundedCornerShape(9999.dp))
+                .clickable { onCopy() },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = copyButtonText,
+                color = CyanAccent,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+// Onboarding-stabilization block 2026-08-11: the previous
+// two-copy-button `ProfileKeyRow` helper is retired — public keys now
+// live in the Advanced section rendered by [AdvancedPublicKeyRow]
+// above. Casual users no longer see raw key material at the top of
+// Profile.
 
 // ── Account card (Username / Plan / Member since) ────────────────────────────
 // FULL_COMPOSE Profile/Mobile 1: three rows on a SurfaceElevated card with
@@ -1032,11 +1157,11 @@ private fun ConnectionCard(identity: IdentityRecord) {
                 modifier = Modifier.padding(horizontal = 14.dp),
                 color = Color.White.copy(alpha = 0.05f),
             )
-            ConnectionRow(label = "Key ID", value = identity.publicKeyHex.take(12) + "…")
-            HorizontalDivider(
-                modifier = Modifier.padding(horizontal = 14.dp),
-                color = Color.White.copy(alpha = 0.05f),
-            )
+            // Onboarding-stabilization block 2026-08-11: the "X25519
+            // short ID" hex slice moved into the collapsible
+            // Advanced cryptographic details block above (rendered
+            // by QrKeyCard). Casual users no longer see key
+            // fragments in the main Connection card.
             ConnectionRow(label = "Created", value = formatTimestamp(identity.createdAt))
         }
     }

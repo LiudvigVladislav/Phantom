@@ -31,7 +31,10 @@ import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
+import androidx.compose.runtime.saveable.rememberSaveable
 import phantom.android.navigation.Screen
+import phantom.android.navigation.ScreenSaver
+import phantom.android.navigation.resolveScreenAfterStartup
 import phantom.android.qr.QrScanScreen
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
@@ -278,7 +281,6 @@ private fun PhantomApp(
     pendingInviteQr: androidx.compose.runtime.MutableState<String?> = androidx.compose.runtime.mutableStateOf(null),
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var startScreen by remember { mutableStateOf<Screen?>(null) }
     // C6-a round-8 REDLINE §P0/§P1 pin: separate presentation
     // slots. Repair (proven corruption) still uses in-memory
     // override to force MissingKeyRepairRequired even when the
@@ -302,6 +304,41 @@ private fun PhantomApp(
     var startupInFlight by remember { mutableStateOf(false) }
     val startupContext = androidx.compose.ui.platform.LocalContext.current
 
+    // currentScreen starts as null so the first frame after readiness
+    // shows the splash, NOT a brief flash of Onboarding (the prior
+    // default that surfaced as "ToS shown on every restart" in 2026-04-30
+    // testing — bug F). The when-block below treats null → splash.
+    //
+    // Onboarding-stabilization block 2026-08-11: `rememberSaveable` with
+    // a custom Screen saver keeps the current route across Activity
+    // recreation (rotation, split-screen, dark-mode toggle). Plain
+    // `remember` reset it to `null` on recreation → the startup
+    // LaunchedEffect below re-derived `Screen.ChatList` from disk and
+    // dropped the user out of Profile / Settings / any detail screen
+    // back to Chats on every rotation.
+    //
+    // Declared BEFORE the startup LaunchedEffect so the coroutine can
+    // read it at completion time — that read is the load-bearing
+    // defect fix for the Final Stabilization Mini-Block 2026-08-11
+    // (P1). See [resolveScreenAfterStartup] KDoc for the precedence
+    // rules; the resolver's contract tests live at
+    // `phantom.android.navigation.StartupRouteResolverTest`.
+    var currentScreen by rememberSaveable(stateSaver = ScreenSaver) {
+        mutableStateOf<Screen?>(null)
+    }
+    // scannedQrValue carries both QR-scanner results and decoded invite deep links —
+    // both resolve to the same "username:pubkeyHex" format consumed by AddContactDialog.
+    var scannedQrValue by remember { mutableStateOf<String?>(null) }
+
+    // Drain any invite deep link that arrived before Compose was ready (cold-start)
+    // or while the app was running (onNewIntent forwards to pendingInviteQr).
+    LaunchedEffect(pendingInviteQr.value) {
+        pendingInviteQr.value?.let { payload ->
+            scannedQrValue = payload
+            pendingInviteQr.value = null
+        }
+    }
+
     LaunchedEffect(retryTick) {
         // Round-8 REDLINE §P0/§P1 pin: startup effect follows
         // architect's scope lock:
@@ -313,11 +350,15 @@ private fun PhantomApp(
         //      is injected + runs off-Main (Dispatchers.IO); a
         //      failed .commit() falls back to in-memory repair
         //      for THIS session.
-        //   3. Presentation → Screen mapping. Transient failure
-        //      goes to the DEDICATED Screen.StartupError with a
-        //      Retry that increments retryTick; a subsequent
-        //      run may succeed cleanly with no lingering
-        //      side-effects.
+        //   3. resolveScreenAfterStartup — the Final Stabilization
+        //      Mini-Block 2026-08-11 (P1) resolver reads the LIVE
+        //      currentScreen at completion time; a healthy ChatList
+        //      decision preserves whatever route the user was
+        //      already on (restored by ScreenSaver OR navigated to
+        //      before the coroutine finished). The four
+        //      security-critical decisions (RepairQuarantine,
+        //      TransientStartupFailure, FreshOnboarding, Migration)
+        //      still force their routes — see the resolver KDoc.
         //   4. Single-flight: `startupInFlight = true` at start,
         //      = false in `finally` so Retry callbacks see the
         //      right state.
@@ -351,13 +392,9 @@ private fun PhantomApp(
                     // Round-8 mini-round §P1 pin: absence of
                     // migrationManager is an OPERATIONAL failure
                     // (initMessaging didn't bootstrap it), NOT
-                    // proven identity corruption. Prior shape's
-                    // `mgr != null && mgr.needsMigration()` returned
-                    // `false` on null manager → for a null-hex
-                    // identity that flipped to
-                    // NullHexNoMigrationExpected → permanent quarantine.
-                    // `checkNotNull` throws → decideStartupRoute's
-                    // catch on this suspend call maps it to
+                    // proven identity corruption. `checkNotNull`
+                    // throws → decideStartupRoute's catch on this
+                    // suspend call maps it to
                     // TransientStartupFailure(NeedsMigrationThrew),
                     // which never writes the marker.
                     val mgr = checkNotNull(container.migrationManager) {
@@ -373,71 +410,46 @@ private fun PhantomApp(
                         .productionMarkerWriter(startupContext)
                 },
             )
-            // Reset presentation state before applying new one
-            // so a Retry after Repair→Transient doesn't leak
-            // the prior quarantine flag.
-            quarantineForcedInMemory = false
-            startScreen = when (presentation) {
-                phantom.android.screens.onboarding.v2.StartupPresentation.FreshOnboarding ->
-                    Screen.Onboarding
-                is phantom.android.screens.onboarding.v2.StartupPresentation.OnboardingRepair -> {
-                    quarantineForcedInMemory = true
-                    Screen.Onboarding
-                }
-                phantom.android.screens.onboarding.v2.StartupPresentation.Migration ->
-                    Screen.Migration
-                phantom.android.screens.onboarding.v2.StartupPresentation.ChatList ->
-                    Screen.ChatList
-                is phantom.android.screens.onboarding.v2.StartupPresentation.StartupError ->
-                    Screen.StartupError(presentation.reason.name)
-            }
-        } finally {
-            startupInFlight = false
-        }
-    }
+            // Reset then re-apply presentation-specific flag so a
+            // Retry after Repair→Transient doesn't leak the prior
+            // quarantine bit.
+            quarantineForcedInMemory =
+                presentation is phantom.android.screens.onboarding.v2
+                    .StartupPresentation.OnboardingRepair
 
-    // currentScreen starts as null so the first frame after readiness
-    // shows the splash, NOT a brief flash of Onboarding (the prior
-    // default that surfaced as "ToS shown on every restart" in 2026-04-30
-    // testing — bug F). The when-block below treats null → splash.
-    var currentScreen by remember { mutableStateOf<Screen?>(null) }
-    // scannedQrValue carries both QR-scanner results and decoded invite deep links —
-    // both resolve to the same "username:pubkeyHex" format consumed by AddContactDialog.
-    var scannedQrValue by remember { mutableStateOf<String?>(null) }
+            // Snapshot the LIVE currentScreen at completion — this is
+            // the load-bearing defect fix. rememberSaveable restored
+            // the pre-recreation route (e.g. Screen.Profile) before
+            // this coroutine got scheduled; the resolver keeps that
+            // route on a healthy ChatList decision.
+            val restoredOrCurrent = currentScreen
+            val resolved = resolveScreenAfterStartup(decision, restoredOrCurrent)
 
-    // Drain any invite deep link that arrived before Compose was ready (cold-start)
-    // or while the app was running (onNewIntent forwards to pendingInviteQr).
-    LaunchedEffect(pendingInviteQr.value) {
-        pendingInviteQr.value?.let { payload ->
-            scannedQrValue = payload
-            pendingInviteQr.value = null
-        }
-    }
-
-    LaunchedEffect(startScreen) {
-        startScreen?.let { screen ->
-            // initMessagingFromStorage was called inside the prior
-            // LaunchedEffect for the Migration / ChatList branches;
-            // calling it again here would be redundant. Onboarding
-            // path doesn't initialise messaging until onComplete fires.
-            if (screen is Screen.ChatList && container.migrationManager == null) {
-                // Defence-in-depth: cover any cold-path where the
-                // outer LaunchedEffect bailed before initMessaging.
+            // Defence-in-depth: if we're landing on ChatList and
+            // migrationManager wasn't bootstrapped by the primary
+            // initMessaging path, try once more. Never blocks the
+            // navigation write.
+            if (resolved is Screen.ChatList && container.migrationManager == null) {
                 runCatching { container.initMessagingFromStorage() }
             }
-            // If launched from a notification tap, navigate directly to the relevant chat.
-            // Only valid when user already has an identity (ChatList start screen).
+
+            // Notification tap: only apply when we're actually landing
+            // on a fresh ChatList (no restored route, decision healthy)
+            // — never hijack a restored Profile/Settings/etc.
             val destination = if (
-                screen is Screen.ChatList &&
+                resolved is Screen.ChatList &&
+                restoredOrCurrent == null &&
                 notifConversationId != null &&
                 notifSenderName != null
             ) {
                 Log.d("PHANTOM", "Notification tap → Chat($notifConversationId)")
                 Screen.Chat(notifConversationId, notifSenderName)
             } else {
-                screen
+                resolved
             }
             currentScreen = destination
+        } finally {
+            startupInFlight = false
         }
     }
 

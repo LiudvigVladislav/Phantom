@@ -185,28 +185,63 @@ class KeyPreviewAnimationPhaseTest {
         // NOT contain any hex character — architect on-device UX
         // rule that the terminal state cannot be mistaken for a
         // real key.
-        val rendered = renderShuffleGlyphs(progress = 1f)
+        //
+        // Cleanup 2026-08-10 (architect post-device): strengthened
+        // to sweep all 33 discrete settled states (0/32 … 32/32),
+        // not just progress = 1f. The prior single-tick check
+        // named "at any progress" but only asserted the terminal
+        // tick. This loop makes the "at any progress" claim
+        // literally true.
+        for (settledSlots in 0..KEY_PREVIEW_GLYPH_COUNT) {
+            val progress = settledSlots.toFloat() / KEY_PREVIEW_GLYPH_COUNT
+            val rendered = renderShuffleGlyphs(progress = progress)
+            val anyHex = rendered.any { it in '0'..'9' || it in 'A'..'F' }
+            check(!anyHex) {
+                "Rendered body MUST NOT contain any hex character at any " +
+                    "progress — UX rule: masked visual only. Got at " +
+                    "settledSlots=$settledSlots (progress=$progress): '$rendered'"
+            }
+            // Layout is progress-independent — same 43 chars, 1 newline.
+            assertEquals(
+                43,
+                rendered.length,
+                "Rendered body MUST be 43 chars at settledSlots=$settledSlots (no layout shift).",
+            )
+            assertEquals(
+                1,
+                rendered.count { it == '\n' },
+                "Rendered body MUST contain exactly one newline at settledSlots=$settledSlots.",
+            )
+        }
+        // Additional pin: at progress 1f every slot equals the
+        // terminal bullet in order (independent of the shuffle
+        // table).
+        val terminal = renderShuffleGlyphs(progress = 1f)
         // 32 bullet-slot chars (excluding separators).
-        val slotChars = rendered.filter { it != ' ' && it != '\n' && it != '·' }
+        val slotChars = terminal.filter { it != ' ' && it != '\n' && it != '·' }
         assertEquals(
             KEY_PREVIEW_TARGET_CHARS.joinToString(""),
             slotChars,
             "At progress 1f, all 32 slot positions MUST render terminal `•` bullets in order.",
         )
-        val anyHex = rendered.any { it in '0'..'9' || it in 'A'..'F' }
+        // Legacy assertions kept for the terminal tick (redundant
+        // with the loop above but preserved to give a clean
+        // failure at exactly progress = 1f if the loop passes but
+        // the terminal shape drifts).
+        val anyHex = terminal.any { it in '0'..'9' || it in 'A'..'F' }
         check(!anyHex) {
             "Rendered body MUST NOT contain any hex character at any progress " +
-                "— UX rule: masked visual only. Got: '$rendered'"
+                "— UX rule: masked visual only. Got: '$terminal'"
         }
         // Layout: 21 chars per line × 2 lines + 1 newline.
         assertEquals(
             43,
-            rendered.length,
+            terminal.length,
             "Rendered body MUST be 43 chars (21 per line + 1 newline) at all progress values — no layout shift.",
         )
         assertEquals(
             1,
-            rendered.count { it == '\n' },
+            terminal.count { it == '\n' },
             "Rendered body MUST contain exactly one newline.",
         )
     }
