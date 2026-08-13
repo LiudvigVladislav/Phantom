@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Диагностика зависания потока на мобильном пути — Инженерные заметки PHANTOM</title>
+<meta name="description" content="Диагностическая заметка: пять опровергнутых гипотез, два измерения на российской мобильной сети и архитектура транспорта, которая из них выросла.">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://phntm.pro/ru/writeups/how-phantom-survives-dpi.html">
+<link rel="alternate" hreflang="en" href="https://phntm.pro/writeups/how-phantom-survives-dpi.html">
+<link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/writeups/how-phantom-survives-dpi.html">
+<link rel="alternate" hreflang="x-default" href="https://phntm.pro/writeups/how-phantom-survives-dpi.html">
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<link rel="apple-touch-icon" href="/static/favicon.png">
+<meta name="theme-color" content="#08090C">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://phntm.pro/ru/writeups/how-phantom-survives-dpi.html">
+<meta property="og:title" content="Диагностика зависания потока на мобильном пути — Инженерные заметки PHANTOM">
+<meta property="og:description" content="Диагностическая заметка: пять опровергнутых гипотез, два измерения на российской мобильной сети и архитектура транспорта, которая из них выросла.">
+<meta property="og:image" content="https://phntm.pro/static/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:site_name" content="PHANTOM">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:locale:alternate" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Диагностика зависания потока на мобильном пути — Инженерные заметки PHANTOM">
+<meta name="twitter:description" content="Диагностическая заметка: пять опровергнутых гипотез, два измерения на российской мобильной сети и архитектура транспорта, которая из них выросла.">
+<meta name="twitter:image" content="https://phntm.pro/static/og-image.png">
+<style>
+/* self-hosted fonts (Phase 4 — no external font requests).
+   Inter + JetBrains Mono: variable, Latin + Cyrillic subsets.
+   Geist Sans: variable, Latin only — Cyrillic falls through the CSS chain to Inter
+   (var(--geist)='Geist','Inter',sans-serif), which we self-host with Cyrillic. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/static/fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/static/fonts/inter-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/static/fonts/jetbrains-mono-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/static/fonts/jetbrains-mono-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/static/fonts/geist-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root{
+  --surface-deep:#08090C; --surface:#0E1014; --elev:#161A20; --hover:#1C2128;
+  --border:#2A2F38; --border-sub:rgba(107,115,133,0.12);
+  --cyan:#00D4FF; --cyan-hover:#00BDDF; --cyan-dark:#0099BB;
+  --tp:#F5F7FA; --ts:#A4ACBA; --tt:#6B7385; --td:#3F4654;
+  --success:#22C55E; --warn:#F59E0B; --danger:#EF4444;
+  --geist:'Geist','Inter',sans-serif; --inter:'Inter',sans-serif; --mono:'JetBrains Mono',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--surface);color:var(--tp);font-family:var(--inter);line-height:1.6;overflow-x:hidden;-webkit-font-smoothing:antialiased;min-height:100vh}
+
+.atmos{position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse 75% 50% at 50% -5%,rgba(0,212,255,0.22),transparent 55%),
+    radial-gradient(ellipse 60% 45% at 88% 15%,rgba(123,107,240,0.18),transparent 55%),
+    radial-gradient(ellipse 65% 55% at 10% 92%,rgba(0,150,200,0.14),transparent 55%),
+    radial-gradient(ellipse 50% 40% at 95% 95%,rgba(123,107,240,0.10),transparent 55%),
+    var(--surface-deep)}
+.grid-bg{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0.9;
+  background-image:linear-gradient(rgba(0,212,255,0.09) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,0.09) 1px,transparent 1px);
+  background-size:54px 54px;mask-image:radial-gradient(ellipse 95% 80% at 50% 15%,#000,transparent 85%);-webkit-mask-image:radial-gradient(ellipse 95% 80% at 50% 15%,#000,transparent 85%)}
+
+/* NAV */
+nav{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;
+  padding:15px 40px;background:rgba(8,9,12,0.8);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border-sub)}
+.nav-logo{display:flex;align-items:center;gap:11px;text-decoration:none}
+.nav-logo img{width:30px;height:30px;border-radius:7px}
+.nav-logo span{font-family:var(--geist);font-weight:500;letter-spacing:0.32em;font-size:0.88rem;text-indent:0.32em;color:var(--tp)}
+.nav-links{display:flex;gap:30px;align-items:center}
+.nav-links a{color:var(--ts);text-decoration:none;font-size:0.78rem;letter-spacing:0.05em;font-family:var(--mono);transition:color .2s}
+.nav-links a:hover,.nav-links a.active{color:var(--cyan)}
+.lang{display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.lang a{background:transparent;border:none;color:var(--tt);font-family:var(--mono);font-size:0.68rem;padding:5px 10px;cursor:pointer;transition:all .2s;text-decoration:none}
+.lang a.active{background:var(--cyan);color:#04141a;font-weight:500}
+.menu-btn{display:none;background:none;border:none;color:var(--tp);cursor:pointer;padding:4px}
+
+.wrap{position:relative;z-index:2;max-width:1180px;margin:0 auto;padding:0 40px}
+
+/* page hero (inner pages) */
+.page-hero{position:relative;z-index:2;padding:160px 0 50px;text-align:center}
+.page-hero h1{font-family:var(--geist);font-weight:500;font-size:clamp(2rem,5vw,3.2rem);letter-spacing:-0.02em;margin-bottom:18px}
+.page-hero p{color:var(--ts);max-width:560px;margin:0 auto;font-size:1rem}
+
+/* FOOTER */
+footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin-top:40px}
+.foot-inner{max-width:1180px;margin:0 auto;padding:46px 40px;display:flex;flex-wrap:wrap;gap:30px;justify-content:space-between;align-items:flex-start}
+.foot-brand{font-family:var(--geist);font-weight:500;letter-spacing:0.3em;text-indent:0.3em;font-size:0.85rem}
+.foot-meta{color:var(--td);font-family:var(--mono);font-size:0.7rem;line-height:1.7;margin-top:10px}
+.foot-links{display:flex;gap:22px;flex-wrap:wrap}
+.foot-links a{color:var(--ts);text-decoration:none;font-family:var(--mono);font-size:0.74rem;transition:color .2s}
+.foot-links a:hover{color:var(--cyan)}
+
+@media(max-width:820px){
+  nav{padding:13px 20px}
+  .nav-links{position:fixed;top:57px;left:0;right:0;flex-direction:column;gap:0;background:rgba(8,9,12,0.97);backdrop-filter:blur(20px);border-bottom:1px solid var(--border-sub);padding:0;max-height:0;overflow:hidden;transition:max-height .3s}
+  .nav-links.open{max-height:400px}
+  .nav-links a{padding:15px 24px;width:100%;border-bottom:1px solid var(--border-sub)}
+  .nav-links .lang{margin:14px 24px}
+  .menu-btn{display:block}
+  .wrap{padding:0 22px}
+  .foot-inner{padding:40px 22px}
+}
+
+/* subtle atmospherics animation — respects reduced-motion */
+.atmos{animation:atmos-breathe 14s ease-in-out infinite}
+@keyframes atmos-breathe{0%,100%{opacity:1}50%{opacity:0.82}}
+.grid-bg{animation:grid-drift 60s linear infinite}
+@keyframes grid-drift{0%{background-position:0 0,0 0}100%{background-position:64px 64px,64px 64px}}
+@media(prefers-reduced-motion:reduce){
+  .atmos,.grid-bg{animation:none}
+}
+</style>
+<script>(function(){
+  document.addEventListener('DOMContentLoaded', function(){
+    var mb = document.querySelector('.menu-btn');
+    var links = document.querySelector('.nav-links');
+    if(mb && links){
+      mb.addEventListener('click', function(){ links.classList.toggle('open'); });
+      links.querySelectorAll('a').forEach(function(a){
+        a.addEventListener('click', function(){ links.classList.remove('open'); });
+      });
+    }
+  });
+})();</script>
+</head>
+<style>
+/* Writeup page — first long-form article on the site.
+   Reading column matches .about-body (760 px). Per-element chrome
+   (H3, prose <code>, <hr>, <table>, <ul>, byline, outro) lives in this
+   block because none of about/roadmap/donate ships equivalent styling. */
+
+.writeup-hero{padding:150px 0 40px;text-align:center}
+.writeup-hero h1{font-family:var(--geist);font-weight:500;font-size:clamp(1.7rem,4vw,2.6rem);letter-spacing:-0.02em;line-height:1.2;max-width:880px;margin:0 auto 16px}
+.writeup-hero .writeup-byline{color:var(--tt);font-family:var(--mono);font-size:0.82rem;letter-spacing:0.04em;margin:0;font-style:normal}
+.writeup-hero .writeup-byline em{font-style:italic}
+
+.writeup-body{position:relative;z-index:2;max-width:760px;margin:0 auto;padding:40px 40px 30px}
+
+/* Paragraph — unified rule so the lead-in paragraph before any H3
+   (e.g. "When a connection dies at 30 seconds..." in Five plausible
+   causes) picks up normal body styling and isn't swallowed into H3 spacing. */
+.writeup-body p{color:var(--ts);font-size:1rem;line-height:1.75;margin:0 0 16px}
+.writeup-body p strong{color:var(--tp);font-weight:500}
+.writeup-body p em{font-style:italic}
+
+/* Lede — first non-byline paragraph. Slightly larger, primary-text colour. */
+.writeup-body .lede{color:var(--tp);font-size:1.12rem;line-height:1.7;margin-bottom:22px}
+.writeup-body .lede strong{color:var(--tp)}
+
+/* H2 — section heading (5 in article). Matches .about-block h2 scale. */
+.writeup-body h2{font-family:var(--geist);font-weight:500;font-size:clamp(1.4rem,2.8vw,1.9rem);letter-spacing:-0.01em;line-height:1.2;color:var(--tp);margin:0 0 22px}
+
+/* H3 — sub-section (5 in Five-plausible-causes, 2 in Two-measurements). */
+.writeup-body h3{font-family:var(--geist);font-weight:500;font-size:clamp(1.1rem,2.1vw,1.35rem);letter-spacing:-0.005em;line-height:1.3;color:var(--tp);margin:36px 0 14px}
+
+/* Inline <code> — 403, send(), RelayTransport, etc. */
+.writeup-body code{font-family:var(--mono);font-size:0.86em;background:var(--elev);color:var(--tp);padding:1px 6px;border-radius:4px;border:1px solid var(--border-sub)}
+
+/* Prose links — cyan with soft underline that darkens on hover. */
+.writeup-body a{color:var(--cyan);text-decoration:underline;text-decoration-color:rgba(0,212,255,0.35);text-underline-offset:2px;transition:text-decoration-color .2s}
+.writeup-body a:hover{text-decoration-color:var(--cyan)}
+
+/* Chapter divider — Vladislav's amendment round 2 (2026-08-11):
+   full-width thin rule, 72 px vertical margin, so major-chapter
+   transitions read like structural breaks rather than a decorative pause.
+   Opacity bumped from --border-sub's 0.12 to 0.30 (same #6B7385 family,
+   no new token) because the site-wide atmos radial glow at (50%, -5%)
+   washes the fainter rule out entirely in the article's top-third — a
+   perception bug specific to a long article, not visible on the shorter
+   landing pages the token was originally tuned for. 0.30 reads
+   consistently on both the bright top and the darker bottom of the page. */
+.writeup-body hr{border:0;border-top:1px solid rgba(107,115,133,0.30);margin:72px 0}
+
+/* Unordered list — bullets in "The symptom" (3 items, data) and
+   "What we'd tell the next person" (6 items, lessons). Cyan markers
+   initially; if the shared cyan with prose links reads as noise on
+   the rendered page, dial back to var(--tt) per Vladislav's note. */
+.writeup-body ul{margin:0 0 16px;padding-left:22px;list-style:disc}
+.writeup-body li{color:var(--ts);font-size:1rem;line-height:1.75;margin-bottom:10px}
+.writeup-body li::marker{color:var(--cyan)}
+.writeup-body li strong{color:var(--tp);font-weight:500}
+.writeup-body li:last-child{margin-bottom:0}
+
+/* Table — one data table in "Observation 1". Overflow wrapper on the
+   parent handles narrow viewports. */
+.writeup-body .table-wrap{overflow-x:auto;margin:20px 0 24px;border-radius:6px;border:1px solid var(--border-sub)}
+.writeup-body table{width:100%;border-collapse:collapse;font-size:0.92rem;min-width:520px}
+.writeup-body thead th{color:var(--tp);font-weight:500;font-family:var(--geist);font-size:0.85rem;text-transform:uppercase;letter-spacing:0.06em;text-align:left;padding:14px;background:rgba(0,0,0,0.18);border-bottom:1px solid var(--border)}
+.writeup-body tbody td{color:var(--ts);padding:14px;border-bottom:1px solid var(--border-sub);vertical-align:top;line-height:1.55}
+.writeup-body tbody tr:last-child td{border-bottom:0}
+.writeup-body tbody strong{color:var(--tp)}
+
+/* Outro — closing italic attribution paragraph, tighter typography,
+   sits under the final hr as a distinct wrap-up beat. */
+.writeup-body .writeup-outro{color:var(--tt);font-style:italic;font-size:0.94rem;line-height:1.7;text-align:center;margin-top:0;padding-top:0}
+.writeup-body .writeup-outro a{font-style:italic}
+
+@media(max-width:680px){
+  .writeup-body{padding:32px 22px 20px}
+  .writeup-body hr{margin:56px 0}
+}
+</style>
+<body>
+<div class="atmos"></div>
+<div class="grid-bg"></div>
+<nav>
+  <a href="/ru/index.html" class="nav-logo"><img src="/static/favicon.png" alt="PHANTOM logo"><span>PHANTOM</span></a>
+  <button class="menu-btn" aria-label="Menu"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+  <div class="nav-links">
+    <a href="/ru/index.html">Главная</a>
+    <a href="/ru/about.html">О проекте</a>
+    <a href="/ru/roadmap.html">Дорожная карта</a>
+    <a href="/ru/donate.html">Поддержать</a>
+    <div class="lang"><a href="/writeups/how-phantom-survives-dpi.html" hreflang="en">EN</a><a href="/ru/writeups/how-phantom-survives-dpi.html" class="active" hreflang="ru">RU</a></div>
+  </div>
+</nav>
+<header class="page-hero writeup-hero">
+  <div class="wrap">
+    <h1>Когда TLS остаётся открытым, а принятые к отправке данные не доходят: диагностика зависания потока в мобильной сети</h1>
+    <p class="writeup-byline"><em>Инженерная заметка проекта PHANTOM (Willen LLC).</em></p>
+  </div>
+</header>
+<article class="writeup-body">
+<p class="lede">PHANTOM — мессенджер с открытым кодом и сквозным шифрованием, спроектированный исходя из того, что сеть враждебна. Сказать, что сеть враждебна, легко; спроектировать систему с учётом этого — трудно, потому что неисправность во враждебной сети редко бывает «чистой». Она не присылает вам <code>403</code>. Она не закрывает соединение с указанием причины. Она даёт TLS- и WebSocket-соединению установиться; клиентский API принимает записи приложения; и всё же relay ни разу не сообщает, что видел их, а сокет остаётся открытым, и клиент продолжает считать, что всё в порядке — вплоть до момента, когда сам объявляет соединение неисправным.</p>
+
+<p>Это заметка об одном конкретном столкновении с таким видом отказа: воспроизводимом, «отрицаемом» зависании на российском мобильном пути, которое выводило из строя наш прямой WebSocket-транспорт, и о процессе фальсификации гипотез, который мы применили до того, как поменяли хоть одну строку транспортного кода.</p>
+
+<p>Интересно здесь не то, что «в России есть DPI» — это хорошо задокументированный факт. Интересна форма самого расследования: как проверить пять правдоподобных причин, когда сеть отказывается что-либо сообщать, как сузить то, что реально подтверждается доказательствами, и — не менее важно — где нужно остановиться и признать, что часть гипотез так и осталась неопровергнутой.</p>
+
+<p><strong>Область измерений — сразу и заранее, потому что от неё зависит, как читать каждое число ниже.</strong> Всё, что описано здесь, измерено на одном тестовом стенде: один бюджетный Android-телефон в одном российском регионе, в течение нескольких окон измерений в конце II квартала 2026 года — один мобильный оператор (Tele2 LTE), один Wi-Fi-провайдер для сравнения, одно устройство.</p>
+
+<p>Эта статья анализирует контролируемые диагностические плечи на raw-OkHttp. Production-путь на Ktor показал отдельный, более тяжёлый базовый профиль — 29 сессий примерно по 31 секунде; клиент не зафиксировал ни одного успешного цикла ping/pong до таймаута — и мы не смешиваем эти измерения здесь. Там, где архитектурный раздел делает выводы, они опираются на production-код, соответствующие architecture decision records и production-наблюдения; <em>числа</em> в диагностических разделах на них не опираются. Один оператор, один регион, одно устройство, одна измерительная кампания, охватившая несколько окон. Каждое число здесь — наблюдение с этого стенда, а не утверждение о «российских мобильных сетях» вообще и не утверждение о какой-либо конкретной системе цензуры. Экстраполяция от одного оператора в одном регионе к общенациональной политике — отдельная исследовательская программа, и это не она.</p>
+
+<hr>
+
+<h2>Симптом</h2>
+
+<p>Диагностический путь на raw-OkHttp воспроизводил класс отказа Direct WebSocket с ритмом, по которому можно было сверять часы. (Напоминание из области измерений: это диагностический клиент, не production. Смешение этих двух дало бы более складную историю — и неверную.)</p>
+
+<ul>
+  <li><strong>Первая сессия после холодного старта:</strong> около 30 секунд жизни, затем тишина — клиент не наблюдал ни одного control Pong в течение этой сессии.</li>
+  <li><strong>Каждая следующая сессия:</strong> около 45 секунд, ровно один control Pong, наблюдаемый клиентом, затем тишина.</li>
+  <li><strong>Путь по Wi-Fi, та же сборка, тот же код:</strong> работал значительно дольше, но тоже отказал — около 150 секунд, после восьми успешных циклов ping/pong.</li>
+</ul>
+
+<p>Последняя строка важна: путь по Wi-Fi нельзя считать заведомо исправным контрольным вариантом. Direct WS отказывал и там, просто позже. Это расширяет поверхность отказа за пределы LTE; это не устанавливает, что оба пути имели общий триггер или механизм.</p>
+
+<p>«Тишина» — ключевое слово. Не пришло ни разрыва соединения удалённой стороной, ни TLS alert — соединение так и не было закрыто с другого конца. Клиент в итоге локально признал сокет неисправным: при отправке очередного запланированного Ping библиотека обнаруживала, что всё ещё ожидает Pong на предыдущий Ping. До этого момента его собственные логи показывали, что <code>send()</code> принимал записи в соединение, application-нагрузку которого relay ни разу не зафиксировал как полученную. Сбой лежал где-то между приёмом в исходящий путь клиента и доставкой в приложение relay; эти логи не локализуют его точнее.</p>
+
+<p>Настолько чистый ритм — подарок. «Отрицаемые» отказы мучительно отлаживать, но <em>воспроизводимый</em> отрицаемый отказ — это рычаг: он даёт базовую линию, и каждая гипотеза делает какое-то наблюдаемое предсказание при изменении одного релевантного условия. Этого достаточно, чтобы начать выбивать их одну за другой.</p>
+
+<hr>
+
+<h2>Пять правдоподобных причин и что установил каждый эксперимент</h2>
+
+<p>Когда соединение умирает на 30-й секунде, у каждого в команде в течение часа появляется любимая теория. Дисциплина в том, чтобы записать их все, а затем спроектировать самый дешёвый эксперимент, способный <em>убить</em> каждую — не подтвердить, а убить. Две из пяти пережили этот процесс в ослабленном виде, и сказать об этом — часть отчёта.</p>
+
+<h3>1. «Дело в нашей каденции heartbeat»</h3>
+
+<p>Первый подозреваемый — всегда ты сам. Может быть, наш интервал ping задевал какой-то таймер простоя.</p>
+
+<p>Мы задавали несколько значений интервала WebSocket ping и измеряли время жизни сессии для каждого. Результат оказался почти оскорбительно линейным: <strong>длительность первой сессии составляла примерно два интервала ping, а последующих — примерно три</strong>, на каждом интервале, который мы пробовали.</p>
+
+<p>Эта картина прямо вытекает из того, как HTTP-библиотека клиента обнаруживает мёртвый сокет: она допускает один неотвеченный Ping. В первой сессии первый Ping не получил Pong, и следующий запланированный Ping обнаружил, что ответ на предыдущий Ping всё ещё не пришёл, и завершил сокет с ошибкой — два такта, отсюда примерно 2×. В последующих сессиях сначала завершался один цикл ping/pong, поэтому отказ приходился на третий такт, примерно 3×. Это детектор «один неотвеченный Ping», а не политика «три пропущенных heartbeat».</p>
+
+<p>Один только наклон кривой этого не решает: middlebox, действующий по счётчику keepalive, дал бы похожую кривую. Метки времени на стороне relay установили одну вещь — relay уже не наблюдал application-доставку <em>до</em> того, как клиент объявил соединение неисправным, — что отделяет зависание от его обнаружения. Но само по себе это не исключает участие каденции в триггере. Чтобы это решить, нужен был бы outbound-захват или счётчики очереди, либо тест, в котором сначала подтверждается работающая application-доставка, а затем она исчезает при разных интервалах — а мы ни разу не наблюдали сессию, где application-доставка вообще работала, так что момента перехода для измерения не было.</p>
+
+<p>Поэтому честный вывод более узок, чем «теория мертва»: <strong>каденция определяет задержку обнаружения, а участвует ли она также в триггере — не доказано.</strong> Полезное переосмысление сохраняется в любом случае — <em>ненаблюдение application-данных и обнаружение отказа сокета — два разных события, и мы их путали.</em></p>
+
+<h3>2. «Дело в нашем edge-сервере, который неправильно обрабатывает WebSocket-фреймы»</h3>
+
+<p>Следующий подозреваемый — наш собственный edge. Мы терминируем TLS на реверс-прокси, полностью осведомлённом о WebSocket — там достаточно места для тонкого бага обработки фреймов.</p>
+
+<p>Поэтому мы убрали его из уравнения. Мы подняли второй edge, который не делал ничего, кроме терминации TLS и форвардинга сырого TCP: никакой осведомлённости об HTTP, никакой осведомлённости о WebSocket, никакого мнения о фреймах вообще. Два совершенно разных TLS-стека, два совершенно разных поведения прокси.</p>
+
+<p>Оба дали <strong>одинаковый тайминг и одинаковую сигнатуру отказа</strong> в 21 сессии на каждом edge. Тот же ритм 30/45 секунд, та же тишина, то же расхождение между эндпоинтами.</p>
+
+<p>Это весомый довод против implementation-specific бага edge или обработки WebSocket-фреймов. Обратите внимание на границу этого вывода: он не снимает подозрение с общей конфигурации, адреса origin-сервера, хостового ядра и сетевого пути, а также самого приложения relay — всё это оставалось постоянным на обоих edge. И мы аккуратно записали вердикт: не «наш edge невиновен, значит виноват оператор», а «implementation-specific баг обработки фреймов маловероятен; общие факторы остаются в рассмотрении». Нельзя осудить подозреваемого только потому, что оправдали другого.</p>
+
+<h3>3. «Дело в артефакте client-side send-буфера»</h3>
+
+<p>На клиенте успешный вызов <code>send()</code> на WebSocket означает лишь, что фрейм был принят в исходящую очередь — не то, что он покинул радиомодуль. Так что, может быть, фреймы, которые мы считали отправленными, скапливались локально и никогда не уходили в эфир.</p>
+
+<p>Эту гипотезу мы не смогли убить, и честно будет так и сказать. Есть соблазн указать на асимметрию control-versus-application, описанную ниже, как на довод против локальной буферизации — но этот довод не работает: control-фреймы и application-фреймы могут проходить через разные внутренние очереди клиента, и наши логи не позволяют отличить это от сетевого эффекта. Разрешить вопрос помог бы outbound-захват или счётчики очереди, которых у нас не было. В журнале расследования эта гипотеза остаётся <strong>открытой</strong>, а не опровергнутой. Отладочный лог, который содержит только победы, вам врёт.</p>
+
+<h3>4. «Прошивка телефона паркует радиомодуль»</h3>
+
+<p>Агрессивное управление питанием на бюджетном Android-железе — реальность, и задремавший радиомодуль дал бы ровно такую тишину.</p>
+
+<p>Целевая тестовая матрица исключила <em>полную парковку</em> радиомодуля: отказ воспроизводился в состояниях, где радиомодуль был доказуемо активен и нёс другой трафик. Обратите внимание на узость этого вывода — он исключает именно спящий радиомодуль. Он не исключает любой эффект прошивки или хостового сетевого стека, и мы не утверждаем обратного.</p>
+
+<h3>5. «TLS- или WebSocket-соединение так и не устанавливается корректно»</h3>
+
+<p>Радикальная гипотеза: что-то фундаментально не так с самим установлением защищённого канала.</p>
+
+<p>Версия гипотезы, относящаяся к установлению соединения, опровергается доказательствами, и понимание <em>почему</em> указывает на ответ. <strong>Сессии завершали полное TLS-рукопожатие, и relay получал control Ping клиента во всех 20 сессиях, дошедших до якоря</strong> — защищённый канал устанавливался успешно и нёс фреймы на транспортном уровне. Рукопожатие, которое завершается, и канал, который несёт фреймы десятки секунд, — это не сломанное рукопожатие. Обратите внимание, чего этот результат не исключает: post-setup баг в WebSocket-слое клиента или в приложении relay остаётся в рассмотрении, как и общие факторы из §2 и §3. И чего он не доказывает: relay не зафиксировал ни одного application heartbeat за все эти сессии, поэтому мы ни разу не наблюдали, чтобы путь application-данных работал. Setup прошёл успешно; application-доставка ни разу не была доказуемо здоровой с самого начала. Отказ не в установлении канала — сам setup прошёл успешно. Следовательно, причина связана с некоторым свойством после установления соединения или общим коррелирующим фактором: возраст соединения, объём байт или пакетов, количество событий, либо иное состояние пути.</p>
+
+<p>Это переосмысление — <em>успех установки TLS/WebSocket и успех application-доставки — разные свойства; наши эксперименты установили первое, но ни разу не наблюдали второе</em> — превратило груду мёртвых теорий в нечто проверяемое.</p>
+
+<hr>
+
+<h2>Два измерения и что они показывают, а что нет</h2>
+
+<h3>Наблюдение 1: часть control-трафика доходит, а записи приложения — нет</h3>
+
+<p>Мы инструментировали оба конца одного и того же соединения и сравнили логи. Это самый важный методологический шаг во всей работе: <strong>зависание видно только потому, что одна и та же сессия логировалась и с телефона, и с relay, и эти два лога разошлись в том, что реально дошло.</strong></p>
+
+<p>Эти цифры получены из той же работы по сравнению edge, описанной выше, а не из отдельной кампании: в рамках серии на edge с Caddy открылась 21 сессия, из которых 20 дошли до контрольной точки Ping до окончания захвата. По этим 20:</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Событие</th><th>Направление</th><th>Наблюдение</th></tr></thead>
+<tbody><tr><td>Control Ping</td><td>клиент → relay</td><td>relay получил во всех 20 сессиях, дошедших до контрольной точки</td></tr><tr><td>Control Pong</td><td>relay → клиент</td><td>первая сессия: клиент не увидел ни одного. Последующие сессии: ровно один, затем тишина</td></tr><tr><td>Application heartbeat</td><td>клиент → relay</td><td>клиентский лог: <code>send()</code> сообщил об успешном результате; <strong>relay: не получено ни одного</strong></td></tr><tr><td>Application echo</td><td>relay → клиент</td><td>не сформирован ни разу — не было heartbeat, на который отвечать</td></tr></tbody>
+</table></div>
+
+<p>Важно внимательно читать причинный порядок, потому что его легко перепутать: relay получал <em>control</em>-фреймы клиента, но ни разу не зафиксировал от него application heartbeat. Echo отсутствует не потому, что потерялся на обратном пути, а потому, что relay было нечего эхировать. Достигли ли application-фреймы провода вообще — это ровно то, что мы не смогли установить.</p>
+
+<p>Так что в рамках одних и тех же установленных сессий, на одном и том же пути: control-фреймы доходили до relay; записи приложения, принятые клиентом, там не наблюдались. Покинули ли эти записи исходящую очередь клиента вообще — это ровно то, что мы не смогли определить.</p>
+
+<p><strong>Чего это не показывает.</strong> Есть соблазн заключить, что нечто на пути различает control-фреймы WebSocket и текстовые фреймы. Прямо это невозможно: opcode лежит внутри WebSocket-фрейма, который лежит внутри TLS. Наблюдатель без терминации TLS не может его прочитать. Что наблюдатель на пути <em>может</em> видеть — это размер, тайминг, направление и структуру TLS-записей — и control-фреймы с application-фреймами различаются именно по этим осям. Различия в размере полезной нагрузки, каденции записи, батчинге, постановке в очередь на клиенте или формировании TLS-записей остаются правдоподобными объяснениями измеренной асимметрии. Мы сообщаем о наблюдении относительно наших эндпоинтов, а не о механизме внутри сети.</p>
+
+<h3>Наблюдение 2: один поток, наблюдался один полный чанк</h3>
+
+<p>Отдельно мы провели один медленный «ручеёк» по обычному HTTPS: chunked POST, отправляющий 40 KiB тела как восемь чанков по 5 KiB с интервалом в десять секунд.</p>
+
+<p>Приложение relay зафиксировало первый чанк в <strong>5 KiB</strong> и никаких последующих данных тела запроса. Иными словами, приложение relay увидело одну восьмую полного тела запроса, которое клиент пытался отправить.</p>
+
+<p><strong>Чего это не показывает, и это важная часть.</strong> Это был <em>единственный прогон при единственной конфигурации</em>, и это не был тест с единственным соединением: параллельно с ним шли вызов session-auth и три запроса публикации prekey, два из которых завершились клиентским таймаутом. То, что повлияло на POST, могло зависеть от этой параллельной нагрузки, либо повлияло и на эти запросы тоже — мы не можем разделить два эффекта. Вдобавок размер чанка, каденция, число байт, число пакетов и прошедшее время менялись одновременно, и граница между тем, что дошло, и тем, что нет, пришлась ровно на границу первого чанка. По одному прогону мы не можем отделить триггер по числу байт от таймаута простоя между первым и вторым чанком, окна буферизации на нашем собственном edge, границы PDP-контекста или любого из нескольких эффектов планирования, которые могли совпасть с этой границей. Мы также не можем установить даже диапазон, в котором мог бы находиться порог по числу байт, если причиной вообще был такой порог: всё, что мы знаем, — <strong>первый чанк в 5 KiB дошёл, а после него не дошло ничего</strong> — реальный предел мог лежать где угодно дальше, а второй чанк просто ни разу не был доставлен. Другой размер чанка или другая пауза могли дать другой результат — или не дать вообще никакого.</p>
+
+<p>Так что честное утверждение таково: <strong>в этой единственной конфигурации приложение relay зафиксировало первый чанк в 5 KiB и никаких последующих данных тела запроса — что согласуется с гипотезой об отсечении на уровне потока, но не доказывает ни само отсечение, ни его триггер.</strong> Что-либо сильнее — «бюджет байт на поток составляет X» — это гипотеза, для которой у нас недостаточно данных. Чтобы её установить, нужны были бы повторы с разными размерами чанков и каденциями, плюс демонстрация того, что свежий TCP-поток снова пропускает начальную порцию.</p>
+
+<p><strong>О предшествующих работах.</strong> Сообщество уже документировало зависания на уровне потока у российских мобильных операторов — тред <a href="https://github.com/net4people/bbs/issues/490">net4people/bbs Issue #490</a> изначально описывает зависание примерно после 15–20 KB в направлении сервер→клиент, а позднейшее обновление характеризует его как примерно 25 пакетов в любом направлении, в среднем около 16 KB. Две вещи делают это плохой калибровкой для нашего прогона. Исходный кейс преимущественно идёт в направлении сервер→клиент, тогда как наш медленный POST — клиент→сервер. А более фундаментально — это разные типы величин: их число — это выведенный порог, наше — это просто последний полностью наблюдённый чанк. Наш прогон нельзя поставить ни ниже, ни выше их результата, потому что мы вообще не измеряли порог. Из этого сравнения можно сделать только один вывод: никому не следует предполагать универсальный порог, и оба наблюдения вполне могут иметь разные триггеры. Конструкция, которая жёстко закладывает предположение о «том самом пороге», строится на песке.</p>
+
+<p><strong>Что мы говорим, а что нет.</strong> Что показал этот стенд: на Tele2 LTE базовые диагностические сессии WebSocket показывали время жизни 30/45 секунд; в 20 сессиях, дошедших до контрольной точки на edge с Caddy, relay ни разу не получил application heartbeat; а в одном медленном HTTPS POST приложение relay зафиксировало только первый чанк в 5 KiB. Чего мы намеренно <strong>не</strong> говорим: что мы определили порог, что он применим к другим операторам, что нам известен механизм, или что PHANTOM что-либо «побеждает». Мы обходим конкретный, наблюдённый эффект на конкретном стенде. Это гораздо меньшее и гораздо более честное утверждение.</p>
+
+<hr>
+
+<h2>Ни один транспорт не является универсальным фундаментом</h2>
+
+<p>Здесь диагностика перестаёт быть детективной историей и становится архитектурным ограничением. Пояснение о том, на чём стоит этот раздел: диагностические числа выше стали поводом для этой работы, но архитектурные выводы ниже опираются на production-код, architecture decision records и production-наблюдения — не на диагностические плечи. Если потоки могут зависать рано на некоторых путях, а условия, вызывающие это, <em>не являются</em> устойчивой известной константой, из этого следует несколько вещей.</p>
+
+<p><strong>Ни один транспорт не является фундаментом.</strong> Direct WebSocket, обычный HTTPS long-poll, TLS-мимикрирующий туннель и Tor демонстрируют разные режимы отказа и разные компромиссы. Если ваша realtime-подложка — один сетевой протокол, вы наследуете его конкретный отказ. Значит подложка не может быть протоколом. Она должна быть <em>набором</em> протоколов за одним интерфейсом — хотя не каждый режим получает fallback, и это осознанный выбор, а не недосмотр (см. режимы приватности ниже).</p>
+
+<p>PHANTOM обращается к своим транспортам через единый интерфейс <code>RelayTransport</code>, за которым стоит несколько классов:</p>
+
+<ul>
+  <li><strong>Direct WebSocket</strong> — самый дешёвый и низколатентный вариант, когда application-доставка доказуемо здорова. На диагностических WebSocket-путях, которые мы тестировали через Tele2, она таковой не была (application heartbeat по Wi-Fi мы не тестировали), так что, каковы бы ни были его достоинства в других условиях, его нельзя принимать за фундамент доставки системы.</li>
+  <li><strong>REST send и poll.</strong> Передача envelope через ограниченный HTTPS request/response. Каждый обмен ограничен <em>по конструкции</em> — маленький запрос, маленький ответ, один envelope за раз — что <strong>снижает подверженность</strong> тому, что обрывает долгоживущие потоки. Это не иммунитет: наш собственный медленный POST показывает, что и HTTPS-запрос может зависнуть рано. Там, где жизнеспособен более долгий poll, он используется; короткий poll — самый консервативный fallback, который у нас остаётся, а не гарантия доставки.</li>
+  <li><strong>TLS-мимикрирующий туннель (REALITY).</strong> Меняет наблюдаемую внешнюю форму TLS так, чтобы она напоминала настроенный сервис прикрытия. Важно точно сформулировать это утверждение: это предназначено для противодействия фильтрации, опирающейся на внешний вид потока, и не является гарантией против любой фильтрации. Это также не спроектировано для решения описанного выше зависания, и мы не проводили эксперимент, изолирующий, решает ли оно эту проблему. Мимикрия и стабильность сессии — две разные проблемы, и держать их раздельно в голове — большая часть дела.</li>
+  <li><strong>Tor</strong> — другой компромисс, дающий более сильное сокрытие источника ценой задержки. Более сильное, не абсолютное.</li>
+</ul>
+
+<p>Пользователь не выбирает конкретный транспорт. Он выбирает политику приватности, а менеджер транспорта выбирает среди маршрутов и возможностей, которые эта политика допускает. Standard и Private сохраняют более широкие цепочки кандидатов и примерно сопоставимую функциональность. Ghost — осознанное исключение: работает только через Tor и закрывается при отказе (fail-closed), а в текущей альфа-версии поддерживает только текстовые сообщения, жертвуя доступностью медиа и связи в реальном времени ради более сильного сокрытия источника, вместо того чтобы молча откатываться на менее приватный путь.</p>
+
+<p>Режимы действительно различаются в том, что происходит, когда транспорт недоступен — и честное описание уже, чем «просто переключается на другой». На этапе <em>первичного выбора соединения</em> режимы Standard и Private проходят по упорядоченным цепочкам кандидатов. После того как соединение установлено, деградация WebSocket в runtime обрабатывается в первую очередь слоем REST-fallback; он <strong>не</strong> проходит автоматически заново по цепочке внешних транспортов. Это было осознанным решением на протестированных путях: на момент, когда эта политика выбиралась, REST поверх Direct оставался более быстрым путём восстановления в рамках соответствующей проверки, тогда как мимикрирующий транспорт ещё не был подтверждён, а Tor мог запускаться минутами. Отказ от рабочего пути REST-поверх-Direct просто из-за деградации WebSocket сделал бы восстановление медленнее, а не лучше. (Позднейшее тестирование на Tele2 обнаружило отдельный режим отказа REST long-poll на этом же пути — напоминание, что и это тоже наблюдение, ограниченное временем и сетью, а не постоянное свойство.) Самый строгий режим допускает только Tor и <strong>fail-closed</strong> вместо отката — потому что молчаливый откат на менее приватный путь есть ровно то поведение, которого пытается избежать тот, кто выбрал этот режим.</p>
+
+<p><strong>Несущая идея</strong>, которую стоит унести с собой, даже если вы никогда не столкнётесь с цензурируемой сетью: контракт доставки живёт <em>над</em> транспортным интерфейсом, а не внутри какого-либо транспорта.</p>
+
+<p>Сообщения ставятся в очередь на relay, могут повторно выдаваться после переподключения и имеют последовательную нумерацию для каждого получателя, при этом идемпотентность на стороне relay и ограниченное по времени хранение tombstone снижают дублирование доставки — а дедупликация по envelope-ID на стороне клиента служит последней защитой. Всё это — свойство слоя доставки, находящегося поверх абстракции транспорта.</p>
+
+<p>Так что когда поток прямого WebSocket молча зависает, отправитель может повторить отправку <em>того же запечатанного envelope</em> через путь REST send, а получатель забирает его поллингом — без повторного шифрования, без повторной подписи. В пределах окна идемпотентности и хранения tombstone на relay тот же envelope-ID позволяет пути REST send подавлять дублирующие повторы. За пределами этого окна дедупликация по envelope-ID на клиенте остаётся последней защитой. Отказ транспорта не обязан становиться потерей сообщения, если доставка успешно завершается по другому пути, — но абстракция не может гарантировать, что альтернативный путь сработает в любой сети; как минимум на одном пути Tele2 LTE сам REST long-poll не смог завершить доставку. Устойчивость никогда не была обязанностью какого-либо одного транспорта, но она и не гарантия.</p>
+
+<p>(Оговорка о текущем состоянии: персистентные очереди relay (с сохранением на диске) с тех пор попали в <code>master</code>, но не были развёрнуты во время этих экспериментов, и production-раскатка пока не состоялась.)</p>
+
+<p>Сжато: <strong>там, где политика допускает fallback, восстанавливаемость — это свойство подложки, а не какого-либо одного сетевого протокола.</strong> Нельзя сделать враждебную сеть надёжной, найдя тот единственный волшебный транспорт, который всегда работает, — такого не существует, и на этой посылке построены Standard/Private. Ghost — осознанное исключение: он принимает доступность только через Tor, чтобы сохранить свой fail-closed контракт приватности, обменивая восстанавливаемость на гарантию того, что никогда молча не откатится на что-то менее приватное.</p>
+
+<hr>
+
+<h2>Что мы сказали бы следующему человеку</h2>
+
+<ul>
+  <li><strong>Отделяйте ненаблюдение application-данных от обнаружения отказа сокета.</strong> Метки времени на эндпоинтах показали, что relay уже не наблюдал application-доставку до того, как клиент объявил соединение неисправным; вариация каденции отдельно показала, что <em>объявленное</em> время жизни отслеживало интервал ping. Два эксперимента, два разных результата — и ни один не закрывает вопрос о том, что именно вызывает зависание.</li>
+  <li><strong>Инструментируйте оба конца.</strong> Вся диагностика строилась на том, что лог телефона и лог relay расходились. Одностороннее логирование показало бы только, что <code>send()</code> вернул успешный результат; оно не смогло бы отличить постановку в очередь на клиенте от недоставки на другой стороне.</li>
+  <li><strong>Убивайте гипотезы, а не подтверждайте их, и меняйте одну переменную за эксперимент.</strong> Две реализации edge, одна сигнатура отказа — это довод против implementation-specific бага edge или обработки фреймов. Варьирование только интервала ping показало, что время жизни сессии отслеживает каденцию — корреляция, которая сужает возможные модели детектора, но не отделяет его от триггера.</li>
+  <li><strong>Знайте разницу между наблюдением и механизмом.</strong> Мы измерили асимметрию между control- и application-трафиком. Мы <em>не можем</em> видеть внутрь TLS, поэтому не можем утверждать, что сеть читает opcode фреймов. Сообщать первое и удерживаться от второго — вот и вся дисциплина.</li>
+  <li><strong>Один прогон — это один прогон.</strong> В нашем единственном медленном POST один полный чанк дошёл, а после него — ничего. Это согласуется с несколькими разными триггерами, и по одной точке данных мы не вправе выбирать любимую версию — и даже не можем установить границы возможного порога.</li>
+  <li><strong>Считайте своё локальное измерение локальным.</strong> Наше наблюдение последнего полного чанка и выведенный порог из публичного отчёта напрямую не сравнимы. Ни одно из них не следует считать универсальным порогом, и считать любое из них «тем самым» числом означало бы жёстко закладывать хрупкое допущение.</li>
+</ul>
+
+<p>Ничто из этого не требовало знать, <em>кто</em> это делал или <em>почему</em>. Требовалось относиться к враждебной сети как к отлаживаемой системе: формулировать гипотезы, проектировать эксперименты, способные их опровергнуть, инструментировать оба конца и соразмерять уверенность выводов с тем, что действительно подтверждают доказательства. Сеть может быть враждебной. Но она не магия — и нам нельзя быть чрезмерно уверенными в своих выводах.</p>
+
+<hr>
+
+<p class="writeup-outro"><em>PHANTOM — проект с открытым кодом (AGPL-3.0-or-later). Архитектурные решения, модель угроз и известные проблемы открыты публично. Если вы строите транспорты для враждебных сетей или хотите поискать слабые места в наших решениях — код и проектная документация доступны на <a href="https://github.com/LiudvigVladislav/Phantom">github.com/LiudvigVladislav/Phantom</a>, а сам проект живёт на <a href="https://phntm.pro">phntm.pro</a>.</em></p>
+</article>
+<footer>
+  <div class="foot-inner">
+    <div>
+      <div class="foot-brand">PHANTOM</div>
+      <div class="foot-meta"><span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span></div>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/LiudvigVladislav/Phantom">GitHub</a>
+      <a href="https://codeberg.org/VladislavLiudvig/Phantom">Codeberg</a>
+      <a href="/ru/donate.html">Поддержать</a>
+      <a href="/ru/index.html">Главная</a>
+    </div>
+  </div>
+</footer>
+</body>
+</html>
