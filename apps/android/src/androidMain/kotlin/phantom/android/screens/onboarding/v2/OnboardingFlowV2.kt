@@ -158,7 +158,20 @@ import phantom.core.crypto.DhPublicKey
  *     Working. Same handling as Persisted-error.)
  */
 internal sealed interface FinalizeOutcome {
-    data class Completed(val signingPublicKeyHex: String) : FinalizeOutcome {
+    /**
+     * Both keys landed successfully:
+     *   - [signingPublicKeyHex] — Ed25519 identity signing key (64 hex).
+     *   - [publicKeyHex]        — X25519 messaging encryption key (64 hex).
+     *
+     * Dual-key labels track (2026-08-10): the atomic Completed
+     * outcome now carries BOTH keys per architect §3.1. Either
+     * hex being missing / malformed collapses to
+     * [MissingKeyMaterial] upstream in [runFinalize].
+     */
+    data class Completed(
+        val signingPublicKeyHex: String,
+        val publicKeyHex: String,
+    ) : FinalizeOutcome {
         init {
             require(isValidEd25519PublicKeyHex(signingPublicKeyHex)) {
                 "FinalizeOutcome.Completed requires a valid Ed25519 signingPublicKeyHex " +
@@ -166,6 +179,13 @@ internal sealed interface FinalizeOutcome {
                     "${signingPublicKeyHex.length}. Malformed hex must be filtered upstream " +
                     "in runFinalize and routed to MissingKeyMaterial " +
                     "(round-2 REDLINE §P1 pin)."
+            }
+            require(isValidX25519PublicKeyHex(publicKeyHex)) {
+                "FinalizeOutcome.Completed requires a valid X25519 publicKeyHex " +
+                    "(exactly 64 hex chars, [0-9a-fA-F]); got length " +
+                    "${publicKeyHex.length}. Malformed hex must be filtered upstream " +
+                    "in runFinalize and routed to MissingKeyMaterial " +
+                    "(dual-key-labels track 2026-08-10 §3.1)."
             }
         }
     }
@@ -256,9 +276,20 @@ internal suspend fun runFinalize(
             //     an unhandled IllegalArgumentException inside the
             //     coroutine. Fixed here by the isValidEd25519PublicKeyHex
             //     check upfront (length != 64 fails empty too).
-            val hex = end.record.signingPublicKeyHex
-            if (hex != null && isValidEd25519PublicKeyHex(hex)) {
-                FinalizeOutcome.Completed(hex)
+            // Dual-key labels track (2026-08-10) — architect §3.3:
+            // Extract BOTH the Ed25519 signing key AND the X25519
+            // messaging encryption key from the record. Both must
+            // pass validation atomically; either malformed / missing
+            // collapses to MissingKeyMaterial (same repair path).
+            val signHex = end.record.signingPublicKeyHex
+            val encHex  = end.record.publicKeyHex
+            val signValid = signHex != null && isValidEd25519PublicKeyHex(signHex)
+            val encValid  = isValidX25519PublicKeyHex(encHex)
+            if (signValid && encValid) {
+                FinalizeOutcome.Completed(
+                    signingPublicKeyHex = signHex!!,
+                    publicKeyHex        = encHex,
+                )
             } else {
                 FinalizeOutcome.MissingKeyMaterial
             }
@@ -724,7 +755,39 @@ internal fun OnboardingFlowV2Internal(
         // Direction (goingForward/back) no longer needs a bespoke curve
         // — a fade reads correctly in both directions. The step-dots +
         // top-bar chrome carry the "which way is forward" cue.
-        AnimatedContent(
+        //
+        // Onboarding-stabilization block 2026-08-11 — structural
+        // logo-flash fix. Prior shape kept Welcome as one branch of
+        // `AnimatedContent { when(step) { ... } }`; even with
+        // `EnterTransition.None togetherWith ExitTransition.None`,
+        // Compose's `KeepUntilTransitionsFinished` machinery held
+        // the outgoing Welcome tree in composition for one extra
+        // frame after the tap, and on-device users still perceived
+        // the PHANTOM logo flash. The fix here is STRUCTURAL: when
+        // `currentStep == Welcome`, render `WelcomeStepV2` OUTSIDE
+        // `AnimatedContent` entirely — the moment state flips to
+        // How, the `if` branch disposes Welcome in the SAME frame
+        // and the `else` branch mounts `AnimatedContent` for the
+        // first time with initial state = How (no fade-in on
+        // first-mount). Zero overlap, zero logo flash. Every other
+        // forward/back transition (How ↔ Identity, Identity ↔
+        // Privacy, etc.) still runs the symmetric crossfade inside
+        // `AnimatedContent`.
+        //
+        // See `docs/tracks/android-onboarding/onboarding-stabilization-block-2026-08-11.md`.
+        if (currentStep == OnboardingStepV2.Welcome) {
+            WelcomeStepV2(
+                // Guard against a double-fire on Get started —
+                // `canAdvanceFromV2` returns true for BOTH Welcome
+                // and How, so without the guard a rapid second fire
+                // would advance nav past How to Identity in the
+                // same gesture window. Pinned by
+                // `OnboardingFlowV2TransitionTest.get_started_double_tap_ends_at_how_not_identity`.
+                onContinueClick = {
+                    if (navigationStep == OnboardingStepV2.Welcome) goNext()
+                },
+            )
+        } else AnimatedContent(
             targetState = currentStep,
             transitionSpec = {
                 fadeIn(tween(180)) togetherWith fadeOut(tween(160))
@@ -733,7 +796,12 @@ internal fun OnboardingFlowV2Internal(
             modifier = Modifier.fillMaxSize(),
         ) { step ->
             when (step) {
-                OnboardingStepV2.Welcome -> WelcomeStepV2(onContinueClick = goNext)
+                // Welcome is handled OUTSIDE this AnimatedContent by
+                // the enclosing `if` guard — it is unreachable here.
+                // A defensive no-op keeps the `when` exhaustive so
+                // future step additions still fail-red at compile
+                // time.
+                OnboardingStepV2.Welcome -> Unit
                 OnboardingStepV2.How -> HowStepV2(
                     dotsIndex = step.dotsIndex,
                     onContinueClick = goNext,
@@ -943,24 +1011,14 @@ internal fun OnboardingFlowV2Internal(
                     )  // PermissionsStepV2 close
                 }  // OnboardingStepV2.Permissions block close
                 OnboardingStepV2.FinaleConfirmation -> FinaleConfirmationStepV2(
-                    // C6-a: hex arrives directly from the sealed
-                    // finalize holder — non-null iff state is
-                    // Completed, and the derived currentStep only
-                    // resolves to FinaleConfirmation in that case
-                    // (see the `val currentStep` expression at the
-                    // top of the composable). Absent the coupling
-                    // through `formState.signingPublicKeyHex`, there
-                    // is no way for a caller to render this step
-                    // with a stale hex.
-                    signingPublicKeyHex = finalizeHolder.signingPublicKeyHex,
+                    // Onboarding-stabilization block 2026-08-11:
+                    // Finale is now a plain "Identity created +
+                    // Continue" surface — no raw hexes, no Copy
+                    // affordance, no toast. The keys still travel
+                    // through `finalizeHolder` into the persisted
+                    // `IdentityRecord`; they surface in Profile
+                    // under "Advanced cryptographic details".
                     onContinueClick = onComplete,
-                    onKeyCopied = {
-                        // Round-1 REDLINE Commit-3 §P2-1: Copy needs
-                        // acknowledgement per handoff. Route through
-                        // the existing onboarding toast slot so the
-                        // feedback re-uses the flow's Toast composable.
-                        toastMessage = "Key copied to clipboard."
-                    },
                 )
             }
         }
@@ -1190,3 +1248,13 @@ private suspend fun persistMissingKeyMarkerIfNeeded(
     }
     return ok
 }
+
+// Onboarding-stabilization block 2026-08-11: the prior
+// `onboardingStepContentTransform` extension (with the Welcome→How
+// scoped no-transition branch) is deleted. Welcome is now rendered
+// OUTSIDE `AnimatedContent` (see the `if (currentStep == Welcome)`
+// guard in `OnboardingFlowV2Internal`), so no cross-step transition
+// ever involves the Welcome branch — the special case is gone. All
+// remaining forward/back transitions run the symmetric
+// `fadeIn(180) togetherWith fadeOut(160)` inline inside
+// `AnimatedContent.transitionSpec` at the call site.

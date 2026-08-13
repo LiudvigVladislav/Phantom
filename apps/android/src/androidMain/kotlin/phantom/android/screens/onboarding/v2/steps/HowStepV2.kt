@@ -27,6 +27,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -38,6 +39,14 @@ import phantom.android.ui.designv2.DesignV2FontBody
 import phantom.android.ui.designv2.DesignV2FontDisplay
 import phantom.android.ui.designv2.DesignV2Tokens
 import phantom.android.ui.designv2.components.PhantomButton
+
+/**
+ * Test-only stable tag on the How-step root Column. Used by
+ * `OnboardingFlowV2TransitionTest` to assert How IS present in
+ * the composition tree immediately after `Get started` is
+ * tapped (logo-flash-fix track, 2026-08-10).
+ */
+internal const val HOW_STEP_ROOT_TEST_TAG: String = "how_step_root"
 
 /**
  * HowStepV2 — Step 1 / "How Phantom protects you". Chrome: top bar
@@ -88,7 +97,8 @@ fun HowStepV2(
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(horizontal = 24.dp)
             // Round-8 REDLINE §P1: top bar reserved above in HostFrame Column.
-            .padding(top = 4.dp, bottom = 24.dp),
+            .padding(top = 4.dp, bottom = 24.dp)
+            .testTag(HOW_STEP_ROOT_TEST_TAG),
     ) {
         // Hard newline per REDLINE P1-3 — matches handoff line-break.
         // letterSpacing = 0.sp per round-2 REDLINE P2-5: the UI contract

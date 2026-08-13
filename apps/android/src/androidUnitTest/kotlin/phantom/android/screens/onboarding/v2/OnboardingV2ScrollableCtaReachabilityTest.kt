@@ -220,21 +220,22 @@ class OnboardingV2ScrollableCtaReachabilityTest {
     }
 
     @Test
-    fun finale_scrolls_to_copy_button_then_taps_cta_at_320dp_fs2() {
+    fun finale_identity_created_and_continue_cta_reachable_at_320dp_fs2() {
+        // Onboarding-stabilization block 2026-08-11: Finale is now a
+        // plain "Identity created" surface — no scrollable body, no
+        // raw hexes, no Copy buttons. This test proves the title
+        // AND the CTA are BOTH displayed + tappable at the narrow-
+        // width + large-text extreme (320 × 640 dp @ fs=2.0). The
+        // step is intentionally a fixed-layout Column with weight
+        // spacers; if it ever regains scrollable content, this test
+        // still passes because both nodes are present, but a
+        // separate reachability test should be added for the new
+        // below-fold content.
         var clicked = false
-        val syntheticHex = "9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e4c7a9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e"
         renderNarrowFs2 {
-            FinaleConfirmationStepV2(
-                signingPublicKeyHex = syntheticHex,
-                onContinueClick = { clicked = true },
-                onKeyCopied = {},
-            )
+            FinaleConfirmationStepV2(onContinueClick = { clicked = true })
         }
-        // Below-fold anchor: the Copy public key button lives at
-        // the bottom of the scrollable body. If the body isn't
-        // scrollable, this fails.
-        composeTestRule.onNodeWithText("Copy public key")
-            .performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithText("Identity created").assertIsDisplayed()
         composeTestRule.onNodeWithText("Continue")
             .assertIsDisplayed().performClick()
         check(clicked) { "Finale 'Continue' CTA did not fire" }

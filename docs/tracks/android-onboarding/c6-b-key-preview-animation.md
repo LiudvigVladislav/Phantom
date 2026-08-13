@@ -281,11 +281,13 @@ frames.
     by the `LocalInspectionMode` short-circuit in the animated
     card.
   - `KEY_PREVIEW_CARD_A11Y_TAG`, `KEY_PREVIEW_IDLE_PLACEHOLDER`,
-    `KEY_PREVIEW_HEX_GLYPH_COUNT` public consts.
+    `KEY_PREVIEW_GLYPH_COUNT` public consts (const renamed
+    from `KEY_PREVIEW_HEX_GLYPH_COUNT` in the naming-hygiene
+    sweep after the UX correction).
   - `CssEaseEasing` (private) for the three color transitions.
-  - Deterministic seeded target hex generator +
-    shuffle-tick-table + `renderShuffleGlyphs` +
-    `settledCountFor`.
+  - Terminal target `List(32) { '•' }` (all-bullets masked
+    pattern) + deterministic seeded shuffle-tick-table drawn
+    from `·•○.` + `renderShuffleGlyphs` + `settledCountFor`.
 
 - **MODIFIED** `apps/android/src/androidMain/kotlin/phantom/android/screens/onboarding/v2/steps/IdentityKeyStepV2.kt`
   — swap the current static `IdentityKeyPreviewCard(usernameValid)`
@@ -344,7 +346,7 @@ byte-identical, кроме заранее перечисленных intentional
 | `onboarding_v2_identity_key_empty.png` | Idle card (dashes, neutral dot, WILL BE GENERATED) | **byte-identical** — `usernameValid = false` → Idle phase → same render. |
 | `onboarding_v2_identity_key_short.png` | Idle card (username = "al" invalid) | **byte-identical** — same reasoning. |
 | `onboarding_v2_identity_key_invalid_chars.png` | Idle card (username = "al!ce" invalid) | **byte-identical** — same reasoning. |
-| `onboarding_v2_identity_key_valid.png` | Static card: dashes + neutral dot + `READY TO CREATE` label swapped instantly on validity (visually inconsistent — label said "ready" while body still showed dashes) | **INTENTIONAL CHANGE (Round-1 fix)** — animation renders steady **Terminal** state (32-hex target chars + cyan-tinted border + green dot + white text + `READY TO CREATE`). Golden re-recorded. |
+| `onboarding_v2_identity_key_valid.png` | Static card: dashes + neutral dot + `READY TO CREATE` label swapped instantly on validity (visually inconsistent — label said "ready" while body still showed dashes) | **INTENTIONAL CHANGE (Round-1 + UX correction)** — animation renders steady **Terminal** state (32 masked bullets `•` + cyan-tinted border + green dot + white text + `READY TO CREATE`). Golden re-recorded first as target hex (Round-1) then again as bullets (UX correction 2026-08-10). |
 
 Round-1 P1-4 fix (2026-08-10): the previous shape of this
 handoff had the `valid` golden capture the transient
@@ -365,10 +367,10 @@ short-circuit branch. Under this wrap:
   `WILL BE GENERATED`. **Byte-identical to pre-C6-b goldens**
   (verified in the Round-1 verifyPaparazziDebug run).
 - `usernameValid = true` (valid golden) → phase = Terminal →
-  32 target hex + cyan-tinted border + green dot + white text
-  + `READY TO CREATE`. **Terminal steady state** — a stable
-  design baseline that does NOT depend on Paparazzi clock or
-  first-frame Animatable value.
+  32 masked bullets `•` + cyan-tinted border + green dot +
+  white text + `READY TO CREATE`. **Terminal steady state**
+  — a stable design baseline that does NOT depend on Paparazzi
+  clock or first-frame Animatable value.
 
 Independent motion sampling continues via the three
 `OnboardingV2Step2AnimationSnapshotTest` frames (`frame_00pct`

@@ -34,6 +34,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -46,6 +47,16 @@ import phantom.android.ui.designv2.DesignV2FontDisplay
 import phantom.android.ui.designv2.DesignV2FontMono
 import phantom.android.ui.designv2.DesignV2Tokens
 import phantom.android.ui.designv2.components.PhantomButton
+
+/**
+ * Test-only stable tag on the Welcome-step PHANTOM logo image.
+ * Used by `OnboardingFlowV2TransitionTest` (logo-flash-fix track,
+ * 2026-08-10) to assert the logo is NOT in the composition tree
+ * after `Get started` is tapped — the fix removes the outgoing
+ * Welcome content on the very next frame via
+ * `ExitTransition.None`, so the logo must not be findable.
+ */
+internal const val WELCOME_PHANTOM_LOGO_TEST_TAG: String = "welcome_phantom_logo"
 
 /**
  * WelcomeStepV2 — Step 0 / prelude. Chromeless: no top bar, no dots.
@@ -143,7 +154,13 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
                     .size(126.dp)
-                    .scale(breathScale),
+                    .scale(breathScale)
+                    // Stable testTag — used by
+                    // `OnboardingFlowV2TransitionTest` to assert
+                    // the Welcome logo is NOT present after
+                    // `Get started` (logo-flash defect fix
+                    // 2026-08-10).
+                    .testTag(WELCOME_PHANTOM_LOGO_TEST_TAG),
             )
         }
 

@@ -112,7 +112,17 @@ import androidx.compose.runtime.saveable.rememberSaveable
 internal sealed interface OnboardingFinalizeState {
     object NotStarted : OnboardingFinalizeState
     object InFlight : OnboardingFinalizeState
-    data class Completed(val signingPublicKeyHex: String) : OnboardingFinalizeState {
+
+    /**
+     * Both keys landed. Dual-key labels track (2026-08-10) —
+     * architect §3.2: the atomic Completed variant now carries
+     * BOTH keys so downstream UI (Finale, Profile) can render
+     * them side-by-side with clear labels.
+     */
+    data class Completed(
+        val signingPublicKeyHex: String,
+        val publicKeyHex: String,
+    ) : OnboardingFinalizeState {
         init {
             require(isValidEd25519PublicKeyHex(signingPublicKeyHex)) {
                 "OnboardingFinalizeState.Completed requires a valid Ed25519 signingPublicKeyHex " +
@@ -120,6 +130,13 @@ internal sealed interface OnboardingFinalizeState {
                     "${signingPublicKeyHex.length}. Malformed hex must be filtered upstream in " +
                     "runFinalize and routed to FinalizeOutcome.MissingKeyMaterial " +
                     "(round-2 REDLINE §P1 pin)."
+            }
+            require(isValidX25519PublicKeyHex(publicKeyHex)) {
+                "OnboardingFinalizeState.Completed requires a valid X25519 publicKeyHex " +
+                    "(exactly 64 hex chars, [0-9a-fA-F]); got length " +
+                    "${publicKeyHex.length}. Malformed hex must be filtered upstream in " +
+                    "runFinalize and routed to FinalizeOutcome.MissingKeyMaterial " +
+                    "(dual-key labels track 2026-08-10 §3.2)."
             }
         }
     }
@@ -142,16 +159,44 @@ internal fun isValidEd25519PublicKeyHex(hex: String): Boolean {
 }
 
 /**
- * Saver for [OnboardingFinalizeState]. Serialises the sealed
- * variant as a `[tag, hex?]` list — tag is the variant simple
- * name; hex is the `Completed` payload (empty string for the
- * three variants that carry no hex).
+ * X25519 public-key hex contract: exactly 64 hex characters
+ * (case-insensitive). Same implementation shape as
+ * [isValidEd25519PublicKeyHex] because both keys are 32-byte
+ * curve-25519 points → 64 hex chars. Kept as a separate helper
+ * for grep clarity, so a future divergence in canonical-form
+ * constraints can be pinned in one place.
  *
- * On restore, a "Completed" tag with an invalid hex payload
- * (empty, wrong length, non-hex chars) is REJECTED with a
- * localised failure — the same invariant [Completed.init]
- * enforces at construction, but surfaced as a "restore"
- * failure for diagnosability of saved-state corruption.
+ * Dual-key labels track (2026-08-10) — architect §3.4.
+ */
+internal fun isValidX25519PublicKeyHex(hex: String): Boolean {
+    if (hex.length != 64) return false
+    return hex.all { c -> c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F' }
+}
+
+/**
+ * Saver for [OnboardingFinalizeState]. Serialises the sealed
+ * variant as a `[tag, ...payload]` list.
+ *
+ * Dual-key labels track (2026-08-10) — architect §3.5 + §3.6:
+ * the `Completed` variant now writes THREE elements
+ * `[tag, signingHex, publicHex]` and the restore branch treats
+ * legacy TWO-element payloads (`[Completed, signingHex]` from
+ * pre-dual-key builds) via a graceful recovery path — the
+ * legacy state is rehydrated as [OnboardingFinalizeState.InFlight]
+ * so the composable's resume `LaunchedEffect` fires an
+ * IDEMPOTENT [runFinalize] which loads the already-persisted
+ * `IdentityRecord` and produces a fresh `Completed(both hexes)`.
+ * Health identities are NOT quarantined.
+ *
+ * Legacy payloads with a MALFORMED signing hex do NOT use the
+ * compatibility path — they are rejected as corrupt saved state
+ * (same as any new-format Completed with malformed hex).
+ *
+ * On restore, a "Completed" tag with an invalid signing or
+ * encryption hex payload (empty, wrong length, non-hex chars) is
+ * REJECTED with a localised failure — the same invariants
+ * [Completed.init] enforces at construction, but surfaced as a
+ * "restore" failure for diagnosability of saved-state corruption.
  */
 internal val OnboardingFinalizeStateSaver: Saver<OnboardingFinalizeState, Any> = listSaver(
     save = { state ->
@@ -161,6 +206,7 @@ internal val OnboardingFinalizeStateSaver: Saver<OnboardingFinalizeState, Any> =
             is OnboardingFinalizeState.Completed -> listOf(
                 "Completed",
                 state.signingPublicKeyHex,
+                state.publicKeyHex,
             )
             OnboardingFinalizeState.MissingKeyRepairRequired -> listOf("MissingKeyRepair", "")
         }
@@ -170,15 +216,43 @@ internal val OnboardingFinalizeStateSaver: Saver<OnboardingFinalizeState, Any> =
             "NotStarted" -> OnboardingFinalizeState.NotStarted
             "InFlight" -> OnboardingFinalizeState.InFlight
             "Completed" -> {
-                val hex = it[1] as String
-                if (!isValidEd25519PublicKeyHex(hex)) {
+                val signHex = it[1] as String
+                if (!isValidEd25519PublicKeyHex(signHex)) {
                     error(
                         "OnboardingFinalizeStateSaver restore: Completed payload had " +
-                            "invalid Ed25519 hex (length=${hex.length}) — saved state " +
-                            "is corrupt (round-2 REDLINE §P1 pin).",
+                            "invalid Ed25519 signingPublicKeyHex (length=${signHex.length}) " +
+                            "— saved state is corrupt (round-2 REDLINE §P1 pin).",
                     )
                 }
-                OnboardingFinalizeState.Completed(hex)
+                if (it.size < 3) {
+                    // Legacy 2-element `[Completed, signingHex]`
+                    // from pre-dual-key builds. Signing hex was
+                    // just validated above → the underlying
+                    // identity was healthy at save time; a fresh
+                    // idempotent `runFinalize` on the persisted
+                    // record will re-hydrate the missing
+                    // `publicKeyHex`. Land as `InFlight` so the
+                    // composable's resume `LaunchedEffect` picks
+                    // it up (dual-key labels track 2026-08-10
+                    // §3.6 — architect Option A + graceful
+                    // recovery via loading existing identity;
+                    // no new identity generation).
+                    OnboardingFinalizeState.InFlight
+                } else {
+                    val encHex = it[2] as String
+                    if (!isValidX25519PublicKeyHex(encHex)) {
+                        error(
+                            "OnboardingFinalizeStateSaver restore: Completed payload had " +
+                                "invalid X25519 publicKeyHex (length=${encHex.length}) " +
+                                "— saved state is corrupt (dual-key-labels track " +
+                                "2026-08-10 §3.5).",
+                        )
+                    }
+                    OnboardingFinalizeState.Completed(
+                        signingPublicKeyHex = signHex,
+                        publicKeyHex        = encHex,
+                    )
+                }
             }
             "MissingKeyRepair" -> OnboardingFinalizeState.MissingKeyRepairRequired
             else -> error("Unknown OnboardingFinalizeState tag: ${it[0]}")
@@ -231,6 +305,16 @@ internal class OnboardingFinalizeStateHolder internal constructor(
         get() = (state as? OnboardingFinalizeState.Completed)?.signingPublicKeyHex
 
     /**
+     * The persisted identity's X25519 messaging encryption key —
+     * only non-null once state is [OnboardingFinalizeState.Completed],
+     * and enforced-valid X25519 hex by [Completed.init]. Sibling
+     * projection to [signingPublicKeyHex] (dual-key labels track
+     * 2026-08-10 §3.7).
+     */
+    val publicKeyHex: String?
+        get() = (state as? OnboardingFinalizeState.Completed)?.publicKeyHex
+
+    /**
      * Set state = InFlight. Called from the Done-tap handler
      * BEFORE launching the finalize coroutine.
      *
@@ -261,7 +345,10 @@ internal class OnboardingFinalizeStateHolder internal constructor(
         if (state !is OnboardingFinalizeState.InFlight) return
         stateSlot.value = when (outcome) {
             is FinalizeOutcome.Completed ->
-                OnboardingFinalizeState.Completed(outcome.signingPublicKeyHex)
+                OnboardingFinalizeState.Completed(
+                    signingPublicKeyHex = outcome.signingPublicKeyHex,
+                    publicKeyHex        = outcome.publicKeyHex,
+                )
             FinalizeOutcome.FailedBeforePersistence ->
                 OnboardingFinalizeState.NotStarted
             FinalizeOutcome.FailedAfterPersistence ->

@@ -143,6 +143,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
         signingPrivateKeyHex = "dd".repeat(32),
     )
     private val syntheticHex: String = syntheticRecord.signingPublicKeyHex!!
+    private val syntheticEncHex: String = syntheticRecord.publicKeyHex
     private val syntheticKeyPair = IdentityKeyPair(
         publicKey = phantom.core.identity.PublicKey(ByteArray(32) { it.toByte() }),
         privateKey = phantom.core.identity.PrivateKey(ByteArray(32) { (it + 100).toByte() }),
@@ -286,6 +287,66 @@ class OnboardingV2FinalizeOutcomeContractTest {
         assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
     }
 
+    // ── Dual-key labels track 2026-08-10 §3.3 — X25519 side of runFinalize ─
+
+    @Test
+    fun empty_X25519_publicKeyHex_Complete_from_controller_routes_to_MissingKeyMaterial() = runTest {
+        // Symmetric to the Ed25519 empty-hex test above: an X25519
+        // `publicKeyHex = ""` from the controller-returned record
+        // MUST route atomically to MissingKeyMaterial. Both hexes
+        // must pass validation together (dual-key contract §3.3).
+        val brokenRecord = syntheticRecord.copy(publicKeyHex = "")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    @Test
+    fun wrong_length_X25519_publicKeyHex_Complete_routes_to_MissingKeyMaterial() = runTest {
+        // 63 chars, off-by-one truncation kind of bug.
+        val brokenRecord = syntheticRecord.copy(publicKeyHex = "ab".repeat(31) + "c")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    @Test
+    fun non_hex_chars_X25519_publicKeyHex_Complete_routes_to_MissingKeyMaterial() = runTest {
+        // 64 chars total but contains a non-hex character.
+        val brokenRecord = syntheticRecord.copy(publicKeyHex = "z" + "b".repeat(63))
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    @Test
+    fun valid_record_produces_Completed_with_both_hexes() = runTest {
+        // Positive complement: BOTH signing + encryption hexes on
+        // the record are 64-char valid → outcome carries both.
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> syntheticRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertTrue(outcome is FinalizeOutcome.Completed)
+        val completed = outcome as FinalizeOutcome.Completed
+        assertEquals(syntheticHex, completed.signingPublicKeyHex)
+        assertEquals(syntheticEncHex, completed.publicKeyHex)
+    }
+
     // ── Ed25519 hex contract ─────────────────────────────────────────
 
     @Test
@@ -309,7 +370,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun Completed_construction_rejects_empty_hex() {
         val ex = assertFailsWith<IllegalArgumentException> {
-            OnboardingFinalizeState.Completed("")
+            OnboardingFinalizeState.Completed("", syntheticEncHex)
         }
         assertTrue(
             ex.message?.contains("Ed25519") == true,
@@ -320,17 +381,17 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun Completed_construction_rejects_wrong_length_hex() {
         assertFailsWith<IllegalArgumentException> {
-            OnboardingFinalizeState.Completed("a".repeat(63))
+            OnboardingFinalizeState.Completed("a".repeat(63), syntheticEncHex)
         }
         assertFailsWith<IllegalArgumentException> {
-            OnboardingFinalizeState.Completed("a".repeat(65))
+            OnboardingFinalizeState.Completed("a".repeat(65), syntheticEncHex)
         }
     }
 
     @Test
     fun Completed_construction_rejects_non_hex_characters() {
         assertFailsWith<IllegalArgumentException> {
-            OnboardingFinalizeState.Completed("g" + "a".repeat(63))
+            OnboardingFinalizeState.Completed("g" + "a".repeat(63), syntheticEncHex)
         }
     }
 
@@ -341,13 +402,56 @@ class OnboardingV2FinalizeOutcomeContractTest {
         // bypassed the runFinalize filter would still fail-loud
         // here rather than reaching the holder.
         assertFailsWith<IllegalArgumentException> {
-            FinalizeOutcome.Completed("")
+            FinalizeOutcome.Completed("", syntheticEncHex)
         }
         assertFailsWith<IllegalArgumentException> {
-            FinalizeOutcome.Completed("a".repeat(63))
+            FinalizeOutcome.Completed("a".repeat(63), syntheticEncHex)
         }
         assertFailsWith<IllegalArgumentException> {
-            FinalizeOutcome.Completed("z" + "a".repeat(63))
+            FinalizeOutcome.Completed("z" + "a".repeat(63), syntheticEncHex)
+        }
+    }
+
+    // ── Dual-key labels track 2026-08-10 §3 additions ────────────────
+
+    @Test
+    fun Completed_construction_rejects_empty_publicKeyHex_X25519_side() {
+        val ex = assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed(syntheticHex, "")
+        }
+        assertTrue(
+            ex.message?.contains("X25519") == true,
+            "IllegalArgumentException must name the X25519 contract, got: ${ex.message}",
+        )
+    }
+
+    @Test
+    fun Completed_construction_rejects_wrong_length_publicKeyHex() {
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed(syntheticHex, "a".repeat(63))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed(syntheticHex, "a".repeat(65))
+        }
+    }
+
+    @Test
+    fun Completed_construction_rejects_non_hex_publicKeyHex_characters() {
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed(syntheticHex, "g" + "a".repeat(63))
+        }
+    }
+
+    @Test
+    fun FinalizeOutcome_Completed_construction_rejects_invalid_publicKeyHex() {
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed(syntheticHex, "")
+        }
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed(syntheticHex, "a".repeat(63))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed(syntheticHex, "z" + "a".repeat(63))
         }
     }
 
@@ -375,7 +479,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
 
     @Test
     fun holder_markInFlight_is_NO_OP_when_Completed_terminal_guard() {
-        val completedState = OnboardingFinalizeState.Completed(syntheticHex)
+        val completedState = OnboardingFinalizeState.Completed(syntheticHex, syntheticEncHex)
         val h = makeHolder(completedState)
         h.markInFlight()
         assertEquals(completedState, h.state)
@@ -400,7 +504,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun holder_applyFinalizeOutcome_Completed_from_InFlight_lands_Completed() {
         val h = makeHolder(OnboardingFinalizeState.InFlight)
-        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex, syntheticEncHex))
         val state = h.state
         assertTrue(state is OnboardingFinalizeState.Completed)
         assertEquals(syntheticHex, (state as OnboardingFinalizeState.Completed).signingPublicKeyHex)
@@ -437,7 +541,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun holder_applyFinalizeOutcome_is_NO_OP_from_NotStarted() {
         val h = makeHolder(OnboardingFinalizeState.NotStarted)
-        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex, syntheticEncHex))
         assertEquals(OnboardingFinalizeState.NotStarted, h.state)
         h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
         assertEquals(OnboardingFinalizeState.NotStarted, h.state)
@@ -447,10 +551,10 @@ class OnboardingV2FinalizeOutcomeContractTest {
 
     @Test
     fun holder_applyFinalizeOutcome_is_NO_OP_from_Completed_terminal_guard() {
-        val completedState = OnboardingFinalizeState.Completed(syntheticHex)
+        val completedState = OnboardingFinalizeState.Completed(syntheticHex, syntheticEncHex)
         val h = makeHolder(completedState)
         // Different-hex Completed — terminal must survive.
-        h.applyFinalizeOutcome(FinalizeOutcome.Completed("ee".repeat(32)))
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed("ee".repeat(32), "ff".repeat(32)))
         assertEquals(completedState, h.state)
         // Failure outcomes — terminal must survive.
         h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
@@ -471,7 +575,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun holder_applyFinalizeOutcome_is_NO_OP_from_MissingKeyRepairRequired() {
         val h = makeHolder(OnboardingFinalizeState.MissingKeyRepairRequired)
-        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex, syntheticEncHex))
         assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
         h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
         assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
@@ -498,7 +602,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
         listOf(
             OnboardingFinalizeState.NotStarted,
             OnboardingFinalizeState.InFlight,
-            OnboardingFinalizeState.Completed(syntheticHex),
+            OnboardingFinalizeState.Completed(syntheticHex, syntheticEncHex),
         ).forEach { start ->
             val h = makeHolder(start)
             h.resetFromRepairRequired()
@@ -535,14 +639,77 @@ class OnboardingV2FinalizeOutcomeContractTest {
     }
 
     @Test
-    fun saver_round_trips_Completed_with_hex_intact() {
-        val hex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
-        require(hex.length == 64)
-        val original = OnboardingFinalizeState.Completed(hex)
+    fun saver_round_trips_Completed_with_both_hexes_intact() {
+        val signHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+        val encHex  = "1234" + "fedcba9876543210".repeat(3) + "1234abcdef56"
+        require(signHex.length == 64)
+        require(encHex.length == 64)
+        val original = OnboardingFinalizeState.Completed(signHex, encHex)
         val restored = roundTrip(OnboardingFinalizeStateSaver, original)
         assertTrue(restored is OnboardingFinalizeState.Completed)
-        assertEquals(hex, (restored as OnboardingFinalizeState.Completed).signingPublicKeyHex)
+        val r = restored as OnboardingFinalizeState.Completed
+        assertEquals(signHex, r.signingPublicKeyHex)
+        assertEquals(encHex, r.publicKeyHex)
         assertEquals(original, restored)
+    }
+
+    // ── Dual-key labels track §3.6 — legacy 2-elem restore path ─
+
+    @Test
+    fun saver_restore_legacy_two_element_Completed_with_valid_signing_hex_hydrates_as_InFlight() {
+        // Pre-dual-key builds wrote `[Completed, signingHex]`. On
+        // dual-key restore, if the signing hex is VALID (healthy
+        // identity), the state is rehydrated as `InFlight` so the
+        // composable's resume LaunchedEffect fires an idempotent
+        // `runFinalize` that loads the already-persisted record
+        // and produces `Completed(both hexes)`. Healthy identity
+        // is NOT quarantined (dual-key track §3.6 architect
+        // Option A + graceful recovery).
+        val validSignHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+        require(validSignHex.length == 64)
+        val legacyList = listOf("Completed", validSignHex)
+        val restored = OnboardingFinalizeStateSaver.restore(legacyList)
+        assertEquals(
+            OnboardingFinalizeState.InFlight,
+            restored,
+            "Legacy 2-element Completed(signingHex) with a VALID signing hex MUST " +
+                "rehydrate as InFlight so an idempotent runFinalize re-produces " +
+                "Completed(both hexes) via IdentityManager.createOrLoad. Healthy " +
+                "identity must NOT be quarantined.",
+        )
+    }
+
+    @Test
+    fun saver_restore_legacy_two_element_Completed_with_malformed_signing_hex_rejects() {
+        // Corrupt legacy payload (signing hex too short) MUST NOT
+        // use the compatibility path — reject as corrupt saved
+        // state, same as any new-format Completed with malformed
+        // hex (dual-key track §3.6 architect explicit).
+        val malformedList = listOf("Completed", "a".repeat(63))
+        val ex = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(malformedList)
+        }.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(
+            ex.message?.contains("Ed25519") == true,
+            "Restore error must name the Ed25519 contract; got: ${ex.message}",
+        )
+    }
+
+    @Test
+    fun saver_restore_new_three_element_Completed_with_malformed_publicKeyHex_rejects() {
+        val validSignHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+        require(validSignHex.length == 64)
+        val corruptEncHex = "a".repeat(63)
+        val corruptList = listOf("Completed", validSignHex, corruptEncHex)
+        val ex = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(corruptList)
+        }.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(
+            ex.message?.contains("X25519") == true,
+            "Restore error must name the X25519 contract; got: ${ex.message}",
+        )
     }
 
     @Test
@@ -572,7 +739,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
         }.exceptionOrNull()
         assertNotNull(ex)
         assertTrue(
-            ex.message?.contains("invalid Ed25519 hex") == true,
+            ex.message?.contains("invalid Ed25519 signingPublicKeyHex") == true,
             "restore error must name the contract, got: ${ex.message}",
         )
     }
@@ -585,13 +752,13 @@ class OnboardingV2FinalizeOutcomeContractTest {
             OnboardingFinalizeStateSaver.restore(listOf("Completed", "a".repeat(63)))
         }.exceptionOrNull()
         assertNotNull(exWrongLength)
-        assertTrue(exWrongLength.message?.contains("invalid Ed25519 hex") == true)
+        assertTrue(exWrongLength.message?.contains("invalid Ed25519 signingPublicKeyHex") == true)
 
         val exNonHex = kotlin.runCatching {
             OnboardingFinalizeStateSaver.restore(listOf("Completed", "z" + "a".repeat(63)))
         }.exceptionOrNull()
         assertNotNull(exNonHex)
-        assertTrue(exNonHex.message?.contains("invalid Ed25519 hex") == true)
+        assertTrue(exNonHex.message?.contains("invalid Ed25519 signingPublicKeyHex") == true)
     }
 
     // ── Full end-to-end via runFinalize + holder ────────────────────
