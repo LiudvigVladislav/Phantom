@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/phantom-premium.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_phantom_premium),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Converter v3 (2026-08-01): invariant-culture number formatting,
+    per-primitive fill/stroke resolution, near-zero <line> → filled dot,
+    dashed <circle> → arc-segment chain (AVD has no strokeDashArray).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M6.5 19V11a5.5 5.5 0 0 1 11 0v8l-2.75-1.7-2.75 1.7-2.75-1.7L6.5 19Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M9.15,11 a0.85,0.85 0 1 0 1.7,0 a0.85,0.85 0 1 0 -1.7,0 Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M13.15,11 a0.85,0.85 0 1 0 1.7,0 a0.85,0.85 0 1 0 -1.7,0 Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M8.5 7.8 8 4.4l2.6 2.1L12 3.8l1.4 2.7L16 4.4l-0.5 3.4Z"
+        android:fillColor="#FFFFFF" />
+</vector>

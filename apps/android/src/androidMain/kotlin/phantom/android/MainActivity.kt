@@ -393,7 +393,30 @@ private fun PhantomApp(
             // even when identity already existed (bug F, 2026-04-30).
             PhantomSplashScreen()
         }
-        is Screen.Onboarding -> OnboardingScreen(
+        is Screen.Onboarding -> phantom.android.screens.onboarding.v2.OnboardingScreenV2(
+            // Commit 5 round-1 REDLINE §P0 fix: switch to the
+            // `OnboardingScreenV2` WRAPPER (not `OnboardingFlowV2`
+            // directly). The wrapper gates Terms-of-Service
+            // acceptance BEFORE the flow — bypassing it would let
+            // a first-run user see Welcome without accepting the
+            // legal terms, which the legacy `OnboardingScreen`
+            // did NOT allow. Signature is identical to the legacy
+            // entry point (both take `container` + `onComplete`).
+            //
+            // The `onComplete` shape is identical (the V2 finalize
+            // state machine calls it once via
+            // `FinaleConfirmationStepV2.onContinueClick` after
+            // `initMessaging` succeeded), so the post-onboarding
+            // flow — foreground-service restart + jump to
+            // Screen.ChatList — is unchanged.
+            //
+            // Legacy `OnboardingScreen.kt` is INTENTIONALLY kept in
+            // the source tree for now; the follow-up cleanup PR
+            // (out of Commit 5 scope) will delete it after this
+            // switch soaks. Rollback plan if a P0 emerges post-
+            // merge: revert Commit 5's MainActivity edit only —
+            // the OnboardingFlowV2 code stays but the entry point
+            // reverts to legacy in one line.
             container = container,
             onComplete = {
                 // Identity is now persisted. Restart the foreground service so it

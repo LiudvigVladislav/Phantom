@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/tier-pro.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_tier_pro),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Hexagon container + 5-point star — Onboarding Pricing sheet Pro tier.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M12.00,2.80 L19.97,7.40 L19.97,16.60 L12.00,21.20 L4.03,16.60 L4.03,7.40 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M12.00,8.90 L12.85,11.13 L15.23,11.25 L13.38,12.75 L14.00,15.05 L12.00,13.75 L10.00,15.05 L10.62,12.75 L8.77,11.25 L11.15,11.13 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
