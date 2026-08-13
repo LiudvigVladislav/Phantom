@@ -1545,6 +1545,26 @@ class DefaultMessagingService(
             MessagingLogLevel.INFO,
             "SEND_TRACE send_start id=${message.id.take(12)}… conv=$convTag textLen=${message.text.length}",
         )
+        // §12 Round-7 audit P1-1: `sender_send_attempt_started` is a
+        // NEW event on the SEND ENTRY. It replaces the Round-6 move
+        // of `sender_enqueue` (which would have redefined enqueue's
+        // semantic from "row inserted into DB with QUEUED status" to
+        // "send attempt began"). `sender_enqueue` is restored to its
+        // afterEncrypt site below so the two signals stay distinct:
+        //   * `sender_send_attempt_started` — sendMessage entered
+        //     for this correlation_id (proves diagnostic reached the
+        //     shared messaging service).
+        //   * `sender_enqueue` — the DB row was inserted with QUEUED
+        //     status after successful encryption (real queue boundary).
+        // Under `PeerBundleMissingException` on a fresh pair, the
+        // attempt-started event fires but no enqueue — the catch
+        // block below then emits `sender_prekey_deferred` so the
+        // verifier can attribute the missing enqueue correctly.
+        WssDiagBridgeHolder.instance?.emit(
+            event = "sender_send_attempt_started",
+            correlationId = message.id,
+            role = WssDiagBridge.Role.SENDER,
+        )
         val payload = json.encodeToString(
             MessagePayload(
                 text = message.text,
@@ -1571,17 +1591,35 @@ class DefaultMessagingService(
                 afterEncrypt = { wireFrame ->
                     val ct = json.encodeToString(wireFrame).encodeToByteArray()
                     ciphertextBytes = ct
-                    messageRepository.insertMessage(
-                        MessageEntity(
-                            id = message.id,
-                            conversationId = message.conversationId,
-                            ciphertext = ct,
-                            plaintextCache = message.text,
-                            sent = true,
-                            status = MessageStatus.QUEUED,
-                            createdAt = insertedAtMs,
-                            expiresAtMs = outgoingExpiresAtMs,
-                        )
+                    // §12 Round-7 audit P1-1 + Round-8 audit P1:
+                    // `sender_enqueue` fires AFTER the row is
+                    // successfully persisted, not from an `.also{}`
+                    // side-effect on the entity constructor (which
+                    // runs BEFORE insertMessage sees the row). If
+                    // insertMessage throws, the enqueue event MUST
+                    // NOT fire — otherwise the log would falsely
+                    // claim queue acceptance for a row that never
+                    // landed. Under PeerBundleMissingException this
+                    // callback is not reached; the catch block emits
+                    // `sender_prekey_deferred` for the same CID.
+                    val entity = MessageEntity(
+                        id = message.id,
+                        conversationId = message.conversationId,
+                        ciphertext = ct,
+                        plaintextCache = message.text,
+                        sent = true,
+                        status = MessageStatus.QUEUED,
+                        createdAt = insertedAtMs,
+                        expiresAtMs = outgoingExpiresAtMs,
+                    )
+                    messageRepository.insertMessage(entity)
+                    // insertMessage returned without throwing — the
+                    // row is durably persisted; only now do we log
+                    // the queue-boundary event.
+                    WssDiagBridgeHolder.instance?.emit(
+                        event = "sender_enqueue",
+                        correlationId = message.id,
+                        role = WssDiagBridge.Role.SENDER,
                     )
                 },
             )
@@ -1616,6 +1654,21 @@ class DefaultMessagingService(
                     "reason=${e.reason.toLogTag()} ${e.reason.toLogDetails()}. " +
                     "Message saved with WAITING status; retryWaitingMessages() " +
                     "will retry on next reconnect / ticker tick.",
+            )
+            // §12 Round-7 audit P0-1: `sender_prekey_deferred` — closed-
+            // schema signal that this send did NOT reach the transport
+            // because the peer's prekey bundle was missing. Emits ONLY
+            // the correlation_id + role — no exception text, no reason
+            // tag, no recipient hex, no message text or PII of any
+            // kind. `runCatching` returns Result.success below (the
+            // WAITING placeholder is real product behaviour and must
+            // stay), but the presence of this event lets the verifier
+            // classify the envelope as deferred — never as
+            // authoritatively delivered.
+            WssDiagBridgeHolder.instance?.emit(
+                event = "sender_prekey_deferred",
+                correlationId = message.id,
+                role = WssDiagBridge.Role.SENDER,
             )
             return@runCatching Unit
         }
@@ -2316,6 +2369,21 @@ class DefaultMessagingService(
                     else        -> MessageStatus.RELAYED
                 }
                 messageRepository.updateStatus(ack.messageId, newStatus)
+                // Direct WSS Yota-First diagnostic §4 —
+                // sender_relay_ack_received. RENAMED from the
+                // legacy MessageStatus.DELIVERED name so it cannot
+                // be misread as end-to-end delivery — this ack is
+                // "relay pushed to recipient mpsc" (see routes.rs
+                // R7 in contract §1).
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "sender_relay_ack_received",
+                    correlationId = ack.messageId,
+                    role = WssDiagBridge.Role.SENDER,
+                    outcomeFlag = when (ack.status) {
+                        "delivered" -> WssDiagBridge.OutcomeFlag.SENDER_RELAY_ACK_DELIVERED
+                        else -> WssDiagBridge.OutcomeFlag.SENDER_RELAY_ACK_RELAYED
+                    },
+                )
             }
             .launchIn(scope)
     }
@@ -2582,7 +2650,21 @@ class DefaultMessagingService(
                     MessagingLogLevel.INFO,
                     "Duplicate envelope (already in ledger): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping decrypt",
                 )
+                // Direct WSS Yota-First diagnostic §4 — recipient_deliver_received.
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_deliver_received",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                    dedupGate = WssDiagBridge.DedupGate.DUPLICATE,
+                )
                 transport.sendDeliveryAck(deliver.messageId)
+                // Direct WSS Yota-First diagnostic §4 — recipient_ack_deliver_sent
+                // (re-ack for duplicate path).
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_ack_deliver_sent",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                )
                 return@runCatching
             }
 
@@ -2598,9 +2680,29 @@ class DefaultMessagingService(
                     MessagingLogLevel.INFO,
                     "Duplicate envelope (already in messages DB): id=${deliver.messageId.take(12)}… — sending ack-deliver and skipping",
                 )
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_deliver_received",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                    dedupGate = WssDiagBridge.DedupGate.DUPLICATE,
+                )
                 transport.sendDeliveryAck(deliver.messageId)
+                WssDiagBridgeHolder.instance?.emit(
+                    event = "recipient_ack_deliver_sent",
+                    correlationId = deliver.messageId,
+                    role = WssDiagBridge.Role.RECIPIENT,
+                )
                 return@runCatching
             }
+
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_deliver_received (fresh path).
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_deliver_received",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+                dedupGate = WssDiagBridge.DedupGate.FRESH,
+            )
 
             val rawPayloadBytes = deliver.payload.decodeBase64Bytes()
 
@@ -4078,6 +4180,16 @@ class DefaultMessagingService(
                 )
             )
             messagingLog(MessagingLogLevel.INFO, "DB insertMessage OK")
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_message_persisted. Fires STRICTLY AFTER
+            // insertMessage returns; proves the chat-store row is
+            // committed. Does NOT prove screen-visibility (see
+            // §11.1 clarification).
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_message_persisted",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+            )
 
             // Create conversation as REQUEST if unknown sender, keep TRUSTED if already known.
             val existing = conversationRepository.getConversation(conversationId)
@@ -4183,6 +4295,15 @@ class DefaultMessagingService(
             // messages table makes any duplication harmless, but explicit
             // ack-deliver is what actually frees server-side memory.
             transport.sendDeliveryAck(deliver.messageId)
+            // Direct WSS Yota-First diagnostic §4 —
+            // recipient_ack_deliver_sent. Emits AFTER the ack frame
+            // hand-off, closing the round-trip loop the verifier needs
+            // for outcome (1) `Delivered once`.
+            WssDiagBridgeHolder.instance?.emit(
+                event = "recipient_ack_deliver_sent",
+                correlationId = deliver.messageId,
+                role = WssDiagBridge.Role.RECIPIENT,
+            )
 
             messagingLog(
                 MessagingLogLevel.INFO,

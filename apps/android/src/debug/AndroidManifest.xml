@@ -1,21 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Trek 2 Stage 2B-B (C6 review-fix round 10): debug-only
-    manifest overlay declaring the S6 controllable breaker trigger
-    Activity. Round-9 declared it in `androidMain/AndroidManifest.xml`
-    which left the component enumerable via `pm list packages -f` and
-    `dumpsys package` on release APKs even though the runtime gates
-    would refuse to dispatch.
+    Debug-only manifest overlay. This overlay is merged into the debug
+    variant's manifest ONLY; release APKs' merged manifest does NOT
+    include any of the components declared here.
 
-    Round 10 manifest-surface review flagged this as a regression
-    vs the round 3-8 dynamic-receiver approach (which never existed
-    in release manifests). This overlay restores the round 3-8
-    invariant: the activity exists ONLY in debug-variant APKs.
+    The overlay hosts THREE independent debug-only entry points that
+    share this file only for source-set separation from release:
 
-    Release builds still pin BuildConfig.S6_DEBUG_TRIGGER_ENABLED to
-    "0" as a defence-in-depth backstop; the orchestrator constructor
-    gate (s6DebugTriggerEnabled = false in release) is the load-
-    bearing third layer.
+      1. `phantom.android.dev.S6BreakerTriggerActivity`
+         Trek 2 Stage 2B-B (C6 review-fix round 10) — S6 controllable
+         breaker trigger. Historical; see legacy Trek 2 comment below.
+
+      2. `phantom.android.dev.DebugForceMode2Activity`
+         QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §5.2 — L1
+         synthetic-trigger for Mode 2 detection. Historical; see
+         legacy comment below.
+
+      3. `phantom.android.diagnostic.DiagnosticCommandReceiver` +
+         `phantom.android.diagnostic.DiagnosticBootInitProvider`
+         Direct WSS Yota-First diagnostic (WSS-0..WSS-2). §11 lock 1
+         + §12 P1: added additively; the release variant's merged
+         manifest does NOT declare either. Verified by
+         `DiagnosticSourceSetBoundaryTest.debug_manifest_grants_DUMP_permission_to_the_receiver`
+         + `debug_only_diagnostic_files_do_NOT_exist_in_main_source_set`.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -79,6 +86,49 @@
             android:noHistory="true"
             android:excludeFromRecents="true"
             android:theme="@android:style/Theme.NoDisplay" />
+
+        <!--
+            Direct WSS Yota-First diagnostic (WSS-0..WSS-2) —
+            debug-only BroadcastReceiver. §11 lock 1 + §12 P1:
+            declared ONLY in this debug source set. At release
+            build time the merged manifest does NOT include this
+            receiver — verified by
+            `DiagnosticSourceSetBoundaryTest.debug_manifest_grants_DUMP_permission_to_the_receiver`.
+
+            `android:exported="true"` is required so `am broadcast
+            -n` from an ADB shell can invoke the receiver by
+            explicit component. §12 Round-1 audit P0-6: the
+            AMS-boundary enforcement replaces the earlier
+            `Binder.getCallingUid()` gate — the receiver requires
+            the caller to hold `android.permission.DUMP`, which
+            is a signature permission granted only to the shell
+            UID (2000) on stock Android. A third-party app cannot
+            deliver a broadcast even if it discovers the component
+            name.
+        -->
+        <receiver
+            android:name="phantom.android.diagnostic.DiagnosticCommandReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
+        <!--
+            Zero-touch boot-init provider: instantiated by the
+            Android framework BEFORE Application.onCreate() so the
+            shared WssDiagBridge is installed AND the persisted
+            diagnostic state (pin + run/cell/emitter) is restored
+            + emitted as a `diagnostic_session_started` WSS_DIAG
+            event, before any messaging code runs. This provider
+            ALSO activates `WssDiag` (release-inert-by-default
+            invariant, §PR-review-round-1 P0). `exported="false"`
+            — external apps cannot query.
+        -->
+        <provider
+            android:name="phantom.android.diagnostic.DiagnosticBootInitProvider"
+            android:authorities="${applicationId}.diagnostic.bootinit"
+            android:enabled="true"
+            android:exported="false" />
+
     </application>
 
 </manifest>

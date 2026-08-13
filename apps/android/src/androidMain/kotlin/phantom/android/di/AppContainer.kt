@@ -310,6 +310,16 @@ class AppContainer(private val context: Context) {
     @Volatile var preKeyLifecycle: phantom.core.messaging.PreKeyLifecycleService? = null
         private set
 
+    /**
+     * §12 Round-7 audit P1-2: expose the (non-consuming) `preKeyApi`
+     * so the debug-only `signed_prekey_readiness` diagnostic subcommand
+     * can query relay-side publication status via `fetchStatus(...)`.
+     * `fetchBundle` (which consumes an OPK) is NOT exposed for this
+     * reason. Populated inside `initMessaging`; null before then.
+     */
+    @Volatile var preKeyApi: phantom.core.transport.PreKeyApi? = null
+        internal set
+
     // ── Storage ───────────────────────────────────────────────────────────────
     private val driverFactory = DatabaseDriverFactory(context)
     private val dbHolder = PhantomDatabaseHolder(driverFactory)
@@ -1229,6 +1239,13 @@ class AppContainer(private val context: Context) {
                 phantom.android.BuildConfig.DEBUG &&
                     phantom.android.BuildConfig.RELAY_T2_DIAG_CLIENT == "1",
         )
+        // §12 Round-7 audit P1-2: expose the non-consuming PreKeyApi
+        // so the debug-only `signed_prekey_readiness` subcommand can
+        // read relay publication state via `fetchStatus(...)`. The
+        // debug receiver never touches `fetchBundle` (which would
+        // consume an OPK). Release APK never registers the receiver
+        // so no debug-only access path exists in production.
+        this.preKeyApi = preKeyApi
 
         // PR-D1b (2026-05-16): construct the REST fallback orchestrator using
         // the same long-lived Ktor REST client. Wire it into the HybridRelayTransport
