@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/tier-business.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_tier_business),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Hexagon container + crown + baseline — Onboarding Pricing sheet
+    Business tier. Original SVG path uses shorthand `M7.5 15.2 7 10 l...`
+    which the Android vector parser tolerates less consistently across
+    devices; expanded here to explicit absolute + relative commands.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M12.00,2.80 L19.97,7.40 L19.97,16.60 L12.00,21.20 L4.03,16.60 L4.03,7.40 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M7.5,15.2 L7,10 L10,12.6 L12,9 L14,12.6 L17,10 L16.5,15.2 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M7.5,15.2 L16.5,15.2"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

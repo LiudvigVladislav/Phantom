@@ -73,6 +73,16 @@ fun PhantomFilterChip(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Round-3 REDLINE on Commit 5 §P1-1: chip labels MUST NOT
+        // wrap character-by-character at narrow widths under
+        // `fontScale=2.0`. `maxLines = 1` + `softWrap = false`
+        // keeps the label on one line inside the chip pill; the
+        // pill itself widens with its content (chips are content-
+        // sized) and any parent layout (typically FlowRow in a
+        // stress harness) wraps the whole chip to a new line if
+        // width is short. Ellipsize as a last-resort fallback if
+        // the parent constrains the chip's own width — better
+        // than character shred.
         Text(
             text = text,
             color = fg,
@@ -82,6 +92,9 @@ fun PhantomFilterChip(
                 fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
                 lineHeight = 16.sp,
             ),
+            maxLines = 1,
+            softWrap = false,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         )
     }
 }

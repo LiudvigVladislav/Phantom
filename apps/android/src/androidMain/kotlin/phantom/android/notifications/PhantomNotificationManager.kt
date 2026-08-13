@@ -122,7 +122,34 @@ object PhantomNotificationManager {
 
         Log.i(LOG_TAG, "NOTIF api_level sdk=${Build.VERSION.SDK_INT}")
 
+        // Round-4 REDLINE on Commit 5 §P1-3: 4-signal gate (opt-in
+        // + runtime permission + OS notifications + per-channel
+        // importance). Gate + `isEffectiveNotificationsEnabled`
+        // live in this package now — the publisher no longer
+        // depends on any UI package.
+        //   effective = userOptedIn
+        //             ∧ runtimePermissionGranted
+        //             ∧ osNotificationsEnabled
+        //             ∧ messageChannelEnabled
+        // Any signal false → skip `notify()` with a structured
+        // log line naming which signal blocked.
+        val gate = readCurrentNotificationsGate(context)
+        if (!isEffectiveNotificationsEnabled(gate)) {
+            Log.i(
+                LOG_TAG,
+                "NOTIF skip reason=gate_disabled " +
+                    "conv=${conversationId.take(8)} id=$notificationId " +
+                    "gate=(optIn=${gate.userOptedIn}," +
+                    "perm=${gate.runtimePermissionGranted}," +
+                    "osEnabled=${gate.osNotificationsEnabled}," +
+                    "channelEnabled=${gate.messageChannelEnabled})",
+            )
+            return
+        }
+
         // Permission guard — POST_NOTIFICATIONS is runtime on API 33+
+        // (kept as a belt-and-braces check in addition to the two-gate
+        // guard above; two-gate reads permission via the same path).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val granted = ContextCompat.checkSelfPermission(
                 context,

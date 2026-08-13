@@ -58,6 +58,21 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * a caller decision — the composable draws the ring but does not compute
  * whether the value is valid.
  *
+ * [leadingContent] and [trailingContent] are generic composable slots that
+ * render inside the input's outer box, flanking the text/placeholder area.
+ * Existing callers pass neither and get the original single-column layout.
+ * Onboarding's username field uses [leadingContent] for the `@` glyph +
+ * hairline divider and [trailingContent] for a validity status icon; other
+ * consumers can use the same slots for anything shaped like an icon-sized
+ * adornment (e.g. a currency symbol, unit label, or clear-value button).
+ *
+ * Slot vs [isError] icon precedence: when [isError] is true AND
+ * [trailingContent] is null, the built-in `(!)` alert icon renders on the
+ * right — original behaviour preserved. When [trailingContent] is provided,
+ * the built-in alert icon is suppressed and the caller's slot content owns
+ * the trailing area (semantics still carry the error description via the
+ * [helperText] channel — the visual is delegated).
+ *
  * Touch-target height: 48dp minimum, even though the visual box is 44dp per
  * handoff — internal padding brings it up. Wraps BasicTextField (foundation)
  * so we don't inherit Material's TextField chrome.
@@ -73,6 +88,8 @@ fun PhantomInput(
     enabled: Boolean = true,
     useMonoFont: Boolean = false,
     keyboardType: KeyboardType = KeyboardType.Text,
+    leadingContent: (@Composable () -> Unit)? = null,
+    trailingContent: (@Composable () -> Unit)? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
@@ -100,14 +117,17 @@ fun PhantomInput(
 
     val errorDescription = if (isError) helperText ?: "invalid input" else null
 
+    // Round-3 REDLINE on Commit 3 §P2: the Error semantic must live on
+    // the SAME accessibility node that carries `SetText` — the
+    // BasicTextField itself — so a screen reader announces the error
+    // when focus lands on the field. Attaching it here (an ancestor
+    // of BasicTextField, without `mergeDescendants = true`) leaves the
+    // field's own a11y node error-less and requires TalkBack to walk
+    // to an ancestor to discover the error — which it does not do by
+    // default. Error semantic moved onto the BasicTextField's own
+    // modifier below.
     Column(
-        modifier = modifier
-            .alpha(if (enabled) 1f else 0.38f)
-            .then(
-                if (errorDescription != null) {
-                    Modifier.semantics { error(errorDescription) }
-                } else Modifier
-            ),
+        modifier = modifier.alpha(if (enabled) 1f else 0.38f),
     ) {
         Box(
             modifier = Modifier
@@ -127,6 +147,10 @@ fun PhantomInput(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                if (leadingContent != null) {
+                    leadingContent()
+                    Spacer(Modifier.width(8.dp))
+                }
                 Box(modifier = Modifier.weight(1f)) {
                     if (value.isEmpty() && placeholder != null) {
                         Text(text = placeholder, style = placeholderStyle)
@@ -140,10 +164,28 @@ fun PhantomInput(
                         cursorBrush = androidx.compose.ui.graphics.SolidColor(DesignV2Tokens.Colors.Cyan),
                         interactionSource = interaction,
                         keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-                        modifier = Modifier.fillMaxWidth(),
+                        // Round-3 REDLINE on Commit 3 §P2: attach the
+                        // Error semantic to the SAME modifier chain as
+                        // the SetText action so a screen reader
+                        // announces the error the instant the field
+                        // receives focus. `Modifier.semantics { }`
+                        // here merges into BasicTextField's own
+                        // semantics node; the SetText action and the
+                        // Error property therefore land on ONE
+                        // accessibility node.
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (errorDescription != null) {
+                                    Modifier.semantics { error(errorDescription) }
+                                } else Modifier
+                            ),
                     )
                 }
-                if (isError) {
+                if (trailingContent != null) {
+                    Spacer(Modifier.width(8.dp))
+                    trailingContent()
+                } else if (isError) {
                     Spacer(Modifier.width(8.dp))
                     Icon(
                         painter = painterResource(R.drawable.ic_dv2_alert),

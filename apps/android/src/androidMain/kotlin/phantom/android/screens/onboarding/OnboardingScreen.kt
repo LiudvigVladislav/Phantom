@@ -202,6 +202,12 @@ private fun WelcomeStep(onContinue: () -> Unit) {
         // width auto-scales — the mark is wider than tall (motion lines
         // extend to the left of the P), so at height=60dp width ≈ 67dp.
         Image(
+            // Round-9 §P0: switched from R.drawable.phantom_logo
+            // (deleted with icon-refresh) to R.drawable.phantom_splash.
+            // Legacy v1 onboarding is not shipped — Commit 5 switched
+            // MainActivity's Screen.Onboarding arm to OnboardingScreenV2
+            // — but this file still compiles so the reference must be
+            // valid.
             painter = painterResource(R.drawable.phantom_splash),
             contentDescription = "PHANTOM",
             modifier = Modifier.height(60.dp),

@@ -387,6 +387,26 @@ Stays out (explicit non-goals — §6):
 - Rotate device on Profile → still on `Screen.Profile` after settle.
 - **Background-process-kill with saved task** (architect REDLINE-2 F7 — replaces prior "force-kill" wording which cleared task and did not exercise `rememberSaveable`): put app in background, kill the background process via `adb shell am kill phantom.android` (or wait for system LMK to reclaim it) WITHOUT swiping the task out; return to app via recents → system restores the task with saved `Bundle`; verify onboarding progress restored through sealed holder + `rememberSaveable` fields. `adb shell am force-stop` is NOT used for this test because it clears the task and bypasses the saved-state path being validated.
 
+### 5.0 L2 test-execution note (Round-7, 2026-08-13)
+
+When validating L2 (or any landing that adds Compose-UI test classes to the shared `androidUnitTest` JVM), the authoritative gate is **per-class isolation via one `--tests` filter per Gradle invocation** for every Compose-UI class in the change set — plus one small focused batch for pure JVM/state classes — plus a scoped `verifyPaparazziDebug` filter for Paparazzi snapshot classes.
+
+Rationale: a single full `:apps:android:testDebugUnitTest` sweep on L2 accumulates enough `composeTestRule.setContent { … }` calls in one JVM to trip the documented cumulative flake `androidx.test.espresso.AppNotIdleException: Compose did not get idle after N attempts in 60 SECONDS` (memory record: `project_android_test_infra_appnotidleexception_cumulative_2026_08_11`; base-regression confirmed 2026-08-11 on the accepted tip `86c2de99` with all onboarding-v2 changes stashed). The flake is infrastructure-level and orthogonal to L2 correctness. It is NOT a regression, but it IS a real failure of the full-run gate, so the full-run result is recorded as `KNOWN INFRA RED / NON-GATE` and per-class isolation replaces it as the authoritative gate.
+
+Rules (Round-7):
+
+1. Do NOT enable global `forkEvery = 1L` for `testDebugUnitTest` — masks leaks and doubles wall-clock.
+2. Do NOT run all Compose-UI classes under a single combined `--tests` filter — same cumulative accumulation.
+3. Do NOT run the full `:apps:android:testDebugUnitTest` sweep as a landing gate for any commit that adds Compose-UI classes.
+4. DO run each L2+ Compose-UI test class as its own `./gradlew :apps:android:testDebugUnitTest --tests "<FQN>" --rerun-tasks` invocation.
+5. DO batch pure JVM/state classes (no `composeTestRule.setContent`) as one focused invocation with multiple `--tests` filters.
+6. DO run `./gradlew :apps:android:verifyPaparazziDebug --tests "phantom.android.ui.designv2.*Snapshot*" --tests "phantom.android.ui.designv2.*ResponsiveMatrix*" --rerun-tasks` as one invocation to cover Paparazzi snapshot classes.
+7. STOP rules: any isolated class that still fails with `AppNotIdleException` → report as tooling issue without further experiments; any other unexpected failure → report as potential landing regression, do not proceed.
+
+Root-cause investigation of the cumulative flake is a **parked separate track** — see memory `project_android_test_infra_appnotidleexception_cumulative_2026_08_11` for known bisect data. Landing L2..L4 does not gate on that investigation.
+
+**Round-7 verified L2 landing:** 9 Compose-UI classes isolated + 1 JVM/state batch + 1 scoped Paparazzi verify = all BUILD SUCCESSFUL / 0 failures. Full-run `485/22` recorded as KNOWN INFRA RED / NON-GATE (all 22 failures = same `AppNotIdleException` signature at `RobolectricIdlingStrategy.runUntilIdle`).
+
 ### 5.1 L1 compatibility invariant (Round-6, 2026-08-13)
 
 > **Local JVM tests that transitively invoke Android framework APIs use an explicit Robolectric runner with bare Application.**

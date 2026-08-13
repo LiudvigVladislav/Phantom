@@ -55,6 +55,84 @@ class PhantomApplication : Application() {
                 LibsodiumInitializer.initialize()
                 Log.d("PHANTOM_INIT", "libsodium OK — creating AppContainer…")
                 container = AppContainer(this@PhantomApplication)
+                // Round-5 REDLINE §P0 (round-6 fail-loud upgrade) —
+                // one-time upgrade migration for the persisted
+                // `notifications_user_opted_in` bit runs BEFORE
+                // signalling `ready`. Decision matrix:
+                //   - existing identity + no key   → key = true
+                //     (preserve prior "notifications work" post-upgrade)
+                //   - no identity + no key         → key = false
+                //     (fresh install product default; onboarding
+                //     governs the eventual value)
+                //   - key already set (any value)  → respect verbatim
+                //   - marker already set           → no-op
+                //
+                // Round-7 REDLINE §P1 pin: identity-load failure MUST
+                // NOT run the migration at all — running it with a
+                // synthetic `hasExistingIdentity = false` would
+                // atomically write `userOptedIn = false` + marker,
+                // and a subsequent successful launch would skip
+                // migration (marker set). A transient DB/Keystore
+                // failure would then become an irreversible OFF for
+                // an actual existing user.
+                //
+                // Correct behaviour: on identity-load failure, SKIP
+                // migration entirely — do not write the key, do not
+                // write the marker. `ready.complete(Unit)` still
+                // fires so the app is usable; the very next launch
+                // that successfully loads identity re-attempts the
+                // migration cleanly. The pre-migration read fallback
+                // returns `false` (fail-closed) so no wrong-user
+                // notification fires during this window.
+                //
+                // Round-6 §P1 fail-loud on `commitOk = false` kept.
+                val identityLoad = runCatching {
+                    container.identityRepo.loadIdentity() != null
+                }
+                if (identityLoad.isFailure) {
+                    Log.w(
+                        "PhantomNotif",
+                        "NOTIF migration skipped reason=identity_load_failed — " +
+                            "will retry on next process launch",
+                        identityLoad.exceptionOrNull(),
+                    )
+                } else {
+                    val hasExistingIdentity = identityLoad.getOrThrow()
+                    val outcome = phantom.android.notifications
+                        .migrateNotificationsOptInIfNeeded(
+                            context = this@PhantomApplication,
+                            hasExistingIdentity = hasExistingIdentity,
+                        )
+                    Log.i(
+                        "PhantomNotif",
+                        "NOTIF migration outcome=${outcome::class.simpleName} " +
+                            "hasExistingIdentity=$hasExistingIdentity",
+                    )
+                    // Round-6 §P1 fail-loud: any migration outcome that
+                    // reports a failed commit must FAIL boot rather
+                    // than silently paper over the disk failure.
+                    val commitOk: Boolean = when (outcome) {
+                        is phantom.android.notifications
+                            .NotificationsOptInMigrationOutcome.AlreadyRun -> true
+                        is phantom.android.notifications
+                            .NotificationsOptInMigrationOutcome.RespectedExistingValue ->
+                                outcome.commitOk
+                        is phantom.android.notifications
+                            .NotificationsOptInMigrationOutcome.SetTrueForExistingUser ->
+                                outcome.commitOk
+                        is phantom.android.notifications
+                            .NotificationsOptInMigrationOutcome.SetFalseForNewInstall ->
+                                outcome.commitOk
+                    }
+                    if (!commitOk) {
+                        error(
+                            "NOTIF migration commit failed — refusing to signal ready " +
+                                "so a subsequent process launch retries the migration " +
+                                "rather than silently proceeding with an inconsistent " +
+                                "SharedPreferences state (outcome=${outcome::class.simpleName})",
+                        )
+                    }
+                }
                 Log.d("PHANTOM_INIT", "AppContainer OK — signalling ready")
                 ready.complete(Unit)
             } catch (t: Throwable) {
