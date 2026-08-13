@@ -1,0 +1,8 @@
+# §12 Round-4 audit P0-1: pin operator scripts to LF so a Windows
+# clone with core.autocrlf=true does NOT rewrite them to CRLF on
+# checkout. This makes any `cp -a` / `git worktree`-based handoff
+# safe. The handoff tarball is separately built via `git archive`
+# which reads blobs directly from the index (always LF), bypassing
+# working-tree normalization entirely.
+*.sh text eol=lf
+*.py text eol=lf
