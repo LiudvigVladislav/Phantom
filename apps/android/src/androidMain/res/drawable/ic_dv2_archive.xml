@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/archive.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_archive),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Converter v2 (2026-07-31): invariant-culture number formatting,
+    per-primitive fill/stroke resolution, near-zero <line> → filled dot.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M3,3 H21 A1,1 0 0 1 22,4 V7 A1,1 0 0 1 21,8 H3 A1,1 0 0 1 2,7 V4 A1,1 0 0 1 3,3 Z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M10 12h4"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

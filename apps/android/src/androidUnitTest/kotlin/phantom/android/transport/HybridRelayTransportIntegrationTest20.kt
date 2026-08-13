@@ -3,6 +3,10 @@
 
 package phantom.android.transport
 
+import android.app.Application
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -149,7 +153,19 @@ import kotlin.test.assertTrue
  * `closeForIntegrationTest()` on each so the per-instance
  * `cleanupScope` is cancelled and its worker thread freed. Without
  * this, sweep runs could hang on accumulated cleanup-scope tasks.
+ *
+ * L1 baseline-landing Round-6 (2026-08-13, architect direction): this
+ * test transitively invokes `android.util.Log.i` via production
+ * `RelayLog_androidKt.relayLog` (called from `KtorRelayTransport.flushPendingOutbox`).
+ * On L1's `androidUnitTest` classpath the AGP null-mock stub for `Log`
+ * no longer supersedes the real `android.util.Log`, so `Log.i` reaches
+ * `println_native` at runtime. Explicit Robolectric runner + bare
+ * `Application` install `ShadowLog` (proper stub) without booting the
+ * production `PhantomApplication` this test does not need. See §L1
+ * compatibility invariant in `docs/tracks/android-onboarding/c6-onboarding-baseline-landing-contract.md`.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], application = Application::class)
 class HybridRelayTransportIntegrationTest20 {
 
     private val livingScopes = mutableListOf<CoroutineScope>()

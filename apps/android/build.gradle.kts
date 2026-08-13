@@ -6,6 +6,14 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
+    // Paparazzi — verified baseline (pinned in libs.versions.toml). Backs
+    // Compose golden/snapshot tests for DesignV2 components. AGP 9.1.1 +
+    // Kotlin 2.2.10 + KMP androidTarget compatibility was proven by the
+    // 2026-07-30 F0-A spike on branch android/ui-designv2-foundation-2026-07-30
+    // and has stayed green across F1 → F2b → onboarding-baseline-landing.
+    // Do NOT self-switch to a different snapshot tool without approval; on
+    // regression, stop and report.
+    alias(libs.plugins.paparazzi)
 }
 
 // Load release signing credentials from keystores/signing.properties (gitignored)
@@ -64,18 +72,29 @@ kotlin {
                 // which is excluded from any APK.
                 implementation(kotlin("reflect"))
                 implementation(project(":shared:core:transport"))
-                // Direct WSS diagnostic — `DiagnosticTransportPinStoreTest`
-                // hosts Android runtime to drive a real `SharedPreferences`
-                // round-trip against the debug-only pin store. Robolectric
-                // is testImplementation-scoped and never ships in release.
-                // `kotlinx-coroutines-test` is used by
-                // `DiagnosticSendCoordinatorTest` for `runTest {}` +
-                // `backgroundScope` — the suspending-fake ordering test.
+                // Robolectric hosts the JVM test environment for both:
+                //   - Direct WSS diagnostic `DiagnosticTransportPinStoreTest`
+                //     (real `SharedPreferences` round-trip against the
+                //     debug-only pin store, from PR #399); and
+                //   - F2b (android/ui-designv2-foundation-2026-07-30)
+                //     Compose semantics tests — `ui-test-junit4-android`
+                //     enables `createComposeRule()`, `ui-test-manifest`
+                //     provides the merged test manifest.
+                // All entries below are testImplementation-scoped and
+                // never ship in release.
                 implementation(libs.robolectric)
+                // WSS PR #399 test additions:
+                //   `kotlinx-coroutines-test` for `DiagnosticSendCoordinatorTest`
+                //   (`runTest {}` + `backgroundScope` — suspending-fake
+                //   ordering test).
+                //   `androidx.test:core` for `ApplicationProvider`
+                //   in the Robolectric-hosted pin-store test.
                 implementation(libs.kotlinx.coroutines.test)
-                // `androidx.test:core` provides `ApplicationProvider`
-                // for the Robolectric-hosted pin-store test.
                 implementation(libs.androidx.test.core)
+                // L1 baseline-landing additions (DesignV2 F2b semantics
+                // matrix):
+                implementation(libs.androidx.compose.ui.test.junit4)
+                implementation(libs.androidx.compose.ui.test.manifest)
             }
         }
 
@@ -1000,6 +1019,13 @@ android {
         // checkCallCapability (CallManagerGuardTest). Without this, any Log.*
         // invocation throws RuntimeException("Method not mocked").
         unitTests.isReturnDefaultValues = true
+        // F2b (android/ui-designv2-foundation-2026-07-30) — Robolectric-backed
+        // Compose semantics tests need access to Android resources
+        // (AndroidManifest merging, string/plurals resolution, activity theme
+        // lookup). Paparazzi 2.0-alpha05 renders correctly either way but
+        // benefits from the same setting; enabling it here is a net-safe
+        // change for the semantics test infrastructure.
+        unitTests.isIncludeAndroidResources = true
     }
 
     // Required by kmp-tor:resource-noexec-tor 409.x (ADR-016 Stage 2).
@@ -1011,6 +1037,19 @@ android {
     packaging {
         jniLibs.useLegacyPackaging = true
     }
+}
+
+// F2b (android/ui-designv2-foundation-2026-07-30) — the compose-ui-test-manifest
+// artifact must be added at the AGP variant configuration level (`debugImplementation`),
+// NOT inside `kotlin { sourceSets { androidUnitTest { } } }`, so its embedded
+// AndroidManifest.xml — which registers `androidx.activity.ComponentActivity` for
+// Compose-test `createComposeRule()` — participates in the debug variant's manifest
+// merge. Without this, Robolectric-hosted semantics tests fail with
+// "Unable to resolve activity for Intent { cmp=phantom.android/androidx.activity.ComponentActivity }".
+// The artifact is <3 KB, contains only the manifest, and DOES NOT ship in release
+// because release doesn't consume `debugImplementation` configurations.
+dependencies {
+    "debugImplementation"(libs.androidx.compose.ui.test.manifest)
 }
 
 // --------------------------------------------------------------------------
