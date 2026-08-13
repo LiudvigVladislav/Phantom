@@ -14,6 +14,18 @@ sealed class Screen {
      */
     object Migration : Screen()
     object ChatList : Screen()
+    /**
+     * C6-a round-8 REDLINE §P0 pin — retryable startup error
+     * shown when `decideStartupRoute` returns
+     * `StartupRouteDecision.TransientStartupFailure`. Dedicated
+     * screen (NOT reused Screen.Onboarding) so a transient
+     * failure NEVER touches the finalize holder / Terms /
+     * durable identity_repair_required marker. Carries the
+     * underlying transient reason (name only) so the UI can
+     * surface a stable copy without leaking a Throwable message.
+     * A downstream commit may add per-reason recovery hints.
+     */
+    data class StartupError(val reasonName: String) : Screen()
     object Calls : Screen()
     object Nearby : Screen()
     object Premium : Screen()

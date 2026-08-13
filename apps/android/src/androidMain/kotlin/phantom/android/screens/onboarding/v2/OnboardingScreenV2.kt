@@ -33,25 +33,66 @@ import phantom.android.di.AppContainer
  * invocation without needing to compose the whole Terms scroll +
  * button-enable flow).
  */
+/**
+ * Container-based entry point used by `MainActivity`. Delegates
+ * the Terms-bypass-on-quarantine logic to
+ * [OnboardingScreenV2Host] and passes the real production flow
+ * as `flowContent`.
+ *
+ * Round-8 §P1 pin — architect's slot-based Host contract: the
+ * host doesn't take a controller at all; it takes a
+ * `@Composable () -> Unit flowContent` slot. Production passes
+ * `OnboardingFlowV2(container, ...)`; tests pass any marker
+ * composable. This lets the wrapper's Terms-bypass logic be
+ * tested against the SAME real host without pulling in
+ * `AppContainer` or a controller stub — the test just observes
+ * whether the slot rendered.
+ */
 @Composable
-fun OnboardingScreenV2(
+internal fun OnboardingScreenV2(
     container: AppContainer,
     onComplete: () -> Unit,
+    explicitInitialFinalizeState: OnboardingFinalizeState? = null,
+) {
+    OnboardingScreenV2Host(
+        explicitInitialFinalizeState = explicitInitialFinalizeState,
+        flowContent = {
+            OnboardingFlowV2(
+                container = container,
+                onComplete = onComplete,
+                explicitInitialFinalizeState = explicitInitialFinalizeState,
+            )
+        },
+    )
+}
+
+/**
+ * Round-8 §P1 pin — production wrapper extracted with a
+ * `flowContent` SLOT so `OnboardingV2ProductionWrapperQuarantineTest`
+ * can render the SAME composable path a real launch uses
+ * (Terms bypass on quarantine + flow otherwise) with a plain
+ * marker slot instead of a controller / AppContainer.
+ *
+ * Owns the Terms `rememberSaveable` state; delegates the render
+ * branching to [PreFlowTermsGate] (stateless, unit-tested). The
+ * OR-clause `tosAccepted = tosAccepted || quarantined` bypasses
+ * Terms when MainActivity forces `MissingKeyRepairRequired` via
+ * [explicitInitialFinalizeState]. Round-6 pin retained.
+ */
+@Composable
+internal fun OnboardingScreenV2Host(
+    explicitInitialFinalizeState: OnboardingFinalizeState?,
+    flowContent: @Composable () -> Unit,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    // Round-10 REDLINE §P1 pin: `rememberSaveable` so a config
-    // change (rotation, dark-mode toggle, font-scale change,
-    // Activity recreation on low memory) preserves the accepted-
-    // Terms flag. Prior plain `remember` reset to `false` on
-    // rotation and forced the user to re-read the Terms.
     var tosAccepted by rememberSaveable { mutableStateOf(false) }
+    val quarantined = explicitInitialFinalizeState ==
+        OnboardingFinalizeState.MissingKeyRepairRequired
     PreFlowTermsGate(
         topInset = topInset,
-        tosAccepted = tosAccepted,
+        tosAccepted = tosAccepted || quarantined,
         onAcceptTos = { tosAccepted = true },
-        flowContent = {
-            OnboardingFlowV2(container = container, onComplete = onComplete)
-        },
+        flowContent = flowContent,
     )
 }
 

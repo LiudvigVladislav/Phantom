@@ -43,7 +43,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.R
-import phantom.android.screens.onboarding.v2.OnboardingFormStateV2
 import phantom.android.screens.onboarding.v2.formatFingerprintForDisplay
 import phantom.android.screens.onboarding.v2.formatFingerprintShort
 import phantom.android.ui.designv2.DesignV2FontBody
@@ -72,20 +71,29 @@ import phantom.android.ui.designv2.components.PhantomButton
  *   - `Continue` CTA calls `onContinueClick` which routes to
  *     `MainActivity.onComplete()` → transition to ChatList.
  *
- * If `formState.signingPublicKeyHex` is null (defensive — should not
- * happen since finalize populates it before advancing to this step),
- * the step renders a fallback "Something went wrong" state and
- * disables Continue. UI-level safety net; the flow's finalize path
- * guarantees the field is populated on success.
+ * C6-a: the composable now takes [signingPublicKeyHex] as a
+ * direct parameter instead of pulling it out of a form-state
+ * field. The caller wires it from the sealed
+ * [phantom.android.screens.onboarding.v2.OnboardingFinalizeStateHolder]:
+ * non-null iff the holder is in the `Completed(hex)` variant, and
+ * that variant is the sole gate that promotes the flow to Finale
+ * (via the derived `currentStep` at the top of the composable).
+ * So the null branch below is defense-in-depth for genuinely
+ * unexpected states, not the normal happy path.
+ *
+ * If [signingPublicKeyHex] is null (defensive — should not happen
+ * since only the Completed variant renders this step), the step
+ * renders a fallback "Something went wrong" state and disables
+ * Continue.
  */
 @Composable
 fun FinaleConfirmationStepV2(
-    formState: OnboardingFormStateV2,
+    signingPublicKeyHex: String?,
     onContinueClick: () -> Unit,
     onKeyCopied: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val hex = formState.signingPublicKeyHex
+    val hex = signingPublicKeyHex
 
     // Round-6 REDLINE on Commit 5 §P0: scrollable body + fixed CTA.
     Column(modifier = Modifier.fillMaxSize()) {
