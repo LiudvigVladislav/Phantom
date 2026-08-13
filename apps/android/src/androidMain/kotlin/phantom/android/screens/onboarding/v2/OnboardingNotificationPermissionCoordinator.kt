@@ -217,7 +217,13 @@ private fun readGateWithDenialHint(
  * unit-test harness) — the caller then treats permanent-denial
  * as false.
  */
-private fun Context.findActivityOrNull(): Activity? {
+// C6-a round-4 REDLINE §P1 pin: promoted from `private` to
+// `internal` so the repair-screen exit action in
+// `OnboardingFlowV2Internal` can reuse the same
+// ContextWrapper-chain walker. Prior round-3 shape used
+// `(context as? Activity)?.finishAffinity()` which silently
+// no-op'd on wrapped contexts.
+internal fun Context.findActivityOrNull(): Activity? {
     var ctx = this
     while (ctx is android.content.ContextWrapper) {
         if (ctx is Activity) return ctx

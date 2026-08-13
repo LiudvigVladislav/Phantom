@@ -279,27 +279,120 @@ private fun PhantomApp(
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     var startScreen by remember { mutableStateOf<Screen?>(null) }
+    // C6-a round-8 REDLINE §P0/§P1 pin: separate presentation
+    // slots. Repair (proven corruption) still uses in-memory
+    // override to force MissingKeyRepairRequired even when the
+    // marker write failed. Transient (retryable operational
+    // failure) uses its OWN screen — Screen.StartupError — so it
+    // NEVER touches the Terms gate / finalize holder / durable
+    // marker.
+    var quarantineForcedInMemory by remember { mutableStateOf(false) }
+    // Round-8 §P0 pin: single-flight retry counter. LaunchedEffect
+    // keys on this value; each Retry tap increments it and
+    // triggers a fresh startup run. A prior in-flight run is
+    // cancelled by LaunchedEffect's structured concurrency —
+    // CancellationException propagates up (guaranteed by all four
+    // decideStartupRoute suspend catches) and the old coroutine
+    // does not mutate presentation.
+    var retryTick by remember { mutableStateOf(0) }
+    // Round-8 §P0 pin: single-flight guard read by the Retry
+    // callback. Prevents double-tap from launching a second
+    // concurrent startup run. Toggled true when a run begins,
+    // false when it completes.
+    var startupInFlight by remember { mutableStateOf(false) }
+    val startupContext = androidx.compose.ui.platform.LocalContext.current
 
-    LaunchedEffect(Unit) {
-        val identity = container.identityRepo.loadIdentity()
-        startScreen = when {
-            identity == null -> Screen.Onboarding
-            // PR C-followup-2: Alpha 1 → Alpha 2 migration trigger.
-            // Records that predate the PR C commit-6 schema migration
-            // have null signingPublicKeyHex; needsMigration() returns
-            // true and the user lands on MigrationScreen instead of
-            // ChatList. After they tap Continue the screen invokes
-            // [onMigrationComplete] which advances to ChatList.
-            // We must initMessaging FIRST so container.migrationManager
-            // is set; without it the field is null and we'd fall
-            // through to ChatList, where the broken-Alpha-1 send path
-            // would throw on every outgoing message.
-            else -> {
-                runCatching { container.initMessagingFromStorage() }
-                val mgr = container.migrationManager
-                if (mgr != null && mgr.needsMigration()) Screen.Migration
-                else Screen.ChatList
+    LaunchedEffect(retryTick) {
+        // Round-8 REDLINE §P0/§P1 pin: startup effect follows
+        // architect's scope lock:
+        //   1. decideStartupRoute — pure, cancellation-safe on
+        //      ALL FOUR suspend calls (markerRead + loadIdentity
+        //      + initMessaging + needsMigration).
+        //   2. applyStartupDecision — testable orchestrator
+        //      returns StartupPresentation; marker side-effect
+        //      is injected + runs off-Main (Dispatchers.IO); a
+        //      failed .commit() falls back to in-memory repair
+        //      for THIS session.
+        //   3. Presentation → Screen mapping. Transient failure
+        //      goes to the DEDICATED Screen.StartupError with a
+        //      Retry that increments retryTick; a subsequent
+        //      run may succeed cleanly with no lingering
+        //      side-effects.
+        //   4. Single-flight: `startupInFlight = true` at start,
+        //      = false in `finally` so Retry callbacks see the
+        //      right state.
+        startupInFlight = true
+        try {
+            val decision = phantom.android.screens.onboarding.v2.decideStartupRoute(
+                markerRead = {
+                    phantom.android.screens.onboarding.v2.IdentityRepairMarker
+                        .isRepairRequired(startupContext)
+                },
+                loadIdentity = { container.identityRepo.loadIdentity() },
+                initMessaging = {
+                    // Round-8 pin: return true on success, false
+                    // on non-cancellation failure. Cancellation
+                    // rethrown so decideStartupRoute propagates
+                    // it up (structured concurrency).
+                    try {
+                        container.initMessagingFromStorage()
+                        true
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        android.util.Log.w(
+                            "MainActivity",
+                            "container.initMessagingFromStorage threw", t,
+                        )
+                        false
+                    }
+                },
+                needsMigration = {
+                    // Round-8 mini-round §P1 pin: absence of
+                    // migrationManager is an OPERATIONAL failure
+                    // (initMessaging didn't bootstrap it), NOT
+                    // proven identity corruption. Prior shape's
+                    // `mgr != null && mgr.needsMigration()` returned
+                    // `false` on null manager → for a null-hex
+                    // identity that flipped to
+                    // NullHexNoMigrationExpected → permanent quarantine.
+                    // `checkNotNull` throws → decideStartupRoute's
+                    // catch on this suspend call maps it to
+                    // TransientStartupFailure(NeedsMigrationThrew),
+                    // which never writes the marker.
+                    val mgr = checkNotNull(container.migrationManager) {
+                        "migrationManager unavailable after initMessaging"
+                    }
+                    mgr.needsMigration()
+                },
+            )
+            val presentation = phantom.android.screens.onboarding.v2.applyStartupDecision(
+                decision = decision,
+                markerWriter = {
+                    phantom.android.screens.onboarding.v2
+                        .productionMarkerWriter(startupContext)
+                },
+            )
+            // Reset presentation state before applying new one
+            // so a Retry after Repair→Transient doesn't leak
+            // the prior quarantine flag.
+            quarantineForcedInMemory = false
+            startScreen = when (presentation) {
+                phantom.android.screens.onboarding.v2.StartupPresentation.FreshOnboarding ->
+                    Screen.Onboarding
+                is phantom.android.screens.onboarding.v2.StartupPresentation.OnboardingRepair -> {
+                    quarantineForcedInMemory = true
+                    Screen.Onboarding
+                }
+                phantom.android.screens.onboarding.v2.StartupPresentation.Migration ->
+                    Screen.Migration
+                phantom.android.screens.onboarding.v2.StartupPresentation.ChatList ->
+                    Screen.ChatList
+                is phantom.android.screens.onboarding.v2.StartupPresentation.StartupError ->
+                    Screen.StartupError(presentation.reason.name)
             }
+        } finally {
+            startupInFlight = false
         }
     }
 
@@ -393,6 +486,48 @@ private fun PhantomApp(
             // even when identity already existed (bug F, 2026-04-30).
             PhantomSplashScreen()
         }
+        is Screen.StartupError -> {
+            // C6-a round-8 §P0 pin — retryable transient startup
+            // failure. Renders a stable-copy screen with a Retry
+            // action; single-flight guarded — if a run is already
+            // in flight the tap is a no-op.
+            phantom.android.screens.onboarding.v2.OnboardingStartupErrorScreen(
+                reason = runCatching {
+                    enumValueOf<phantom.android.screens.onboarding.v2.TransientReason>(
+                        screen.reasonName,
+                    )
+                }.getOrElse {
+                    // Defensive: if the reason string was corrupted
+                    // (shouldn't happen — Screen.StartupError is set
+                    // only by MainActivity from the enum's own name),
+                    // fall back to a generic reason so the screen
+                    // still renders.
+                    phantom.android.screens.onboarding.v2
+                        .TransientReason.LoadIdentityThrew
+                },
+                // Mini-round §P2 pin — single-flight guard also
+                // reflected in the button's `enabled` state, so
+                // the user cannot tap Retry while a startup run
+                // is already in flight. The `enabled` value
+                // recomposes with `startupInFlight`.
+                enabled = !startupInFlight,
+                onRetry = {
+                    // Mini-round §P2 pin — synchronous
+                    // `startupInFlight = true` BEFORE
+                    // `retryTick += 1`. Compose recomposition
+                    // observes the flip immediately, so a
+                    // second tap on the same frame sees the
+                    // button disabled AND the guard is already
+                    // true. Prior shape only guarded on the
+                    // flag; LaunchedEffect(retryTick) flipped
+                    // it later, leaving a 1-frame race.
+                    if (!startupInFlight) {
+                        startupInFlight = true
+                        retryTick += 1
+                    }
+                },
+            )
+        }
         is Screen.Onboarding -> phantom.android.screens.onboarding.v2.OnboardingScreenV2(
             // Commit 5 round-1 REDLINE §P0 fix: switch to the
             // `OnboardingScreenV2` WRAPPER (not `OnboardingFlowV2`
@@ -427,6 +562,16 @@ private fun PhantomApp(
                 context.startForegroundService(Intent(context, PhantomMessagingService::class.java))
                 currentScreen = Screen.ChatList
             },
+            // C6-a round-6 §P1 pin: forward in-memory quarantine
+            // flag. When the durable marker write failed in the
+            // startup routing branch, `quarantineForcedInMemory`
+            // is true and this override forces the flow's holder
+            // to seed at MissingKeyRepairRequired regardless of
+            // what the disk marker reads back.
+            explicitInitialFinalizeState = if (quarantineForcedInMemory)
+                phantom.android.screens.onboarding.v2.OnboardingFinalizeState.MissingKeyRepairRequired
+            else
+                null,
         )
         is Screen.Migration -> {
             // PR C-followup-2: Alpha 1 → Alpha 2 migration UI. The
@@ -663,6 +808,10 @@ private fun parentScreenOf(screen: Screen?): Screen? = when (screen) {
     Screen.Calls,
     Screen.Nearby,
     Screen.Settings -> null
+
+    // C6-a round-8: transient startup error is a top-level
+    // screen with its own Retry action; no parent for Back.
+    is Screen.StartupError -> null
 
     Screen.Premium -> Screen.Settings
     Screen.PrivacyModeDetail -> Screen.Settings

@@ -15,10 +15,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -147,13 +149,83 @@ class OnboardingV2ScrollableCtaReachabilityTest {
         check(clicked) { "Privacy 'Continue' CTA did not fire" }
     }
 
+    // ── C6-a — Recovery-surface reachability @ 320 × 640 dp fs=2.0 ────
+    //
+    // The two chromeless recovery screens ship as part of the sealed
+    // finalize-state work. Their CTAs must remain tappable at the
+    // narrow-width + large-text extreme. Both screens are Box(Center)
+    // + Column layouts (see OnboardingRepairRequiredScreen +
+    // OnboardingStartupErrorScreen). No scrolling ancestor by design
+    // — the whole surface must fit inside 320 × 640 dp even at
+    // fontScale=2.0 without the CTA being clipped or covered.
+
+    @Test
+    fun identity_repair_required_cta_is_displayed_and_clickable_at_320dp_fs2() {
+        // Guarantees at this device tier:
+        //   1. "Identity repair required" title is displayed.
+        //   2. "Exit onboarding" CTA is displayed AND clickable.
+        //   3. Fixed body copy does not push the CTA off-screen — an
+        //      assertIsDisplayed on the CTA (a real hit-test against
+        //      the composition tree) would fail if the button were
+        //      clipped by the 640 dp height limit.
+        var exitFired = false
+        renderNarrowFs2 {
+            OnboardingRepairRequiredScreen(onExit = { exitFired = true })
+        }
+        composeTestRule.onNodeWithText("Identity repair required")
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithText("Exit onboarding")
+            .assertIsDisplayed()
+            .assertIsEnabled()
+            .performClick()
+        check(exitFired) {
+            "OnboardingRepairRequiredScreen 'Exit onboarding' CTA did not fire at " +
+                "320×640 dp fs=2.0 — the button is either clipped by the viewport " +
+                "height or covered by the surface's body copy."
+        }
+    }
+
+    @Test
+    fun transient_startup_error_cta_is_displayed_and_clickable_at_320dp_fs2() {
+        // Guarantees at this device tier:
+        //   1. "Something went wrong" title is displayed.
+        //   2. Retry CTA is displayed, enabled AND clickable.
+        //   3. Body one-liner does not push the CTA below the 640 dp
+        //      viewport at fontScale=2.0.
+        //   4. Mini-round §P2 pin: no "Reason:" text leaks to the
+        //      screen even at this device tier.
+        var retryFired = false
+        renderNarrowFs2 {
+            OnboardingStartupErrorScreen(
+                reason = TransientReason.LoadIdentityThrew,
+                enabled = true,
+                onRetry = { retryFired = true },
+            )
+        }
+        composeTestRule.onNodeWithText("Something went wrong")
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithText("Retry")
+            .assertIsDisplayed()
+            .assertIsEnabled()
+            .performClick()
+        check(retryFired) {
+            "OnboardingStartupErrorScreen 'Retry' CTA did not fire at 320×640 dp " +
+                "fs=2.0 — the button is either clipped by the viewport height or " +
+                "covered by the surface's body copy."
+        }
+        // Mini-round §P2 sanity check under the same layout stress.
+        composeTestRule.onAllNodesWithText(
+            "Reason", substring = true, ignoreCase = true,
+        ).assertCountEquals(0)
+    }
+
     @Test
     fun finale_scrolls_to_copy_button_then_taps_cta_at_320dp_fs2() {
         var clicked = false
         val syntheticHex = "9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e4c7a9f3a8b7d5c1e4f8a2b6d9e7c0a3f5b8d1e"
         renderNarrowFs2 {
             FinaleConfirmationStepV2(
-                formState = OnboardingFormStateV2(signingPublicKeyHex = syntheticHex),
+                signingPublicKeyHex = syntheticHex,
                 onContinueClick = { clicked = true },
                 onKeyCopied = {},
             )

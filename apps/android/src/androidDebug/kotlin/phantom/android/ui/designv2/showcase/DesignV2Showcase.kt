@@ -808,15 +808,28 @@ private const val IdentityStepDotsIndex = 1  // OnboardingStepV2.Identity.dotsIn
 
 @Composable
 private fun identityFrame(content: @Composable () -> Unit) {
-    phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
-        currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Identity,
-        topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
-        onBackClick = {},
-        edgeSwipeBackEnabled = true,
-        onEdgeSwipeBack = {},
-        toastMessage = null,
-        onToastDismiss = {},
-    ) { content() }
+    // C6-b Round-1 P1-4 fix: Paparazzi 2.0.0-alpha05 does NOT set
+    // `LocalInspectionMode` automatically, so under `paparazzi.snapshot`
+    // the animated card would render its live-render branch at t=0
+    // (Running-at-t=0 for the valid golden — a transient state, not
+    // a stable baseline). Wrapping the whole identity showcase frame
+    // in `LocalInspectionMode = true` opts the animated card into
+    // its `if (inspection)` short-circuit → steady Terminal state
+    // for `usernameValid = true` (valid golden) and steady Idle
+    // for all other Identity goldens.
+    androidx.compose.runtime.CompositionLocalProvider(
+        androidx.compose.ui.platform.LocalInspectionMode provides true,
+    ) {
+        phantom.android.screens.onboarding.v2.OnboardingV2HostFrame(
+            currentStep = phantom.android.screens.onboarding.v2.OnboardingStepV2.Identity,
+            topInset = SHOWCASE_STATUS_BAR_INSET_DP.dp,
+            onBackClick = {},
+            edgeSwipeBackEnabled = true,
+            onEdgeSwipeBack = {},
+            toastMessage = null,
+            onToastDismiss = {},
+        ) { content() }
+    }
 }
 
 @Composable
@@ -867,6 +880,68 @@ fun ShowcaseOnboardingIdentityKeyValid() {
     }
 }
 
+// ── C6-b — Step 2 animation frames (3 discrete progress values) ──────
+//
+// See docs/tracks/android-onboarding/c6-b-key-preview-animation.md
+// §6.14-6.16 + contract sheet §3.2.
+//
+// The animated card owns its own `Animatable` progress internally;
+// Paparazzi's one-shot render cannot drive Compose animation
+// clocks. To capture the three canonical animation frames as
+// byte-deterministic goldens, these Showcase entries invoke the
+// test-only `IdentityKeyPreviewCardFrame(progress, phase)`
+// composable directly at fixed progress values, wrapped in a
+// minimal dark surface (no host chrome — the frames focus on the
+// card itself, mirroring the recovery-snapshot pattern from C6-a).
+
+@Composable
+private fun cardOnlyFrame(content: @Composable () -> Unit) {
+    androidx.compose.foundation.layout.Box(
+        modifier = androidx.compose.ui.Modifier
+            .background(DesignV2Tokens.Colors.Background)
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 32.dp),
+    ) {
+        content()
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyPreviewFrame00() {
+    // 0 % — Running phase at the moment shuffle begins.
+    // Border still neutral, dot animating from neutral to cyan,
+    // glyphs all mid-shuffle (settledCount == 0).
+    cardOnlyFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyPreviewCardFrame(
+            progress = 0f,
+            phase = phantom.android.screens.onboarding.v2.steps.KeyPreviewAnimationPhase.Running,
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyPreviewFrame50() {
+    // 50 % — exactly 16 of 32 glyphs settled, other 16 shuffling.
+    cardOnlyFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyPreviewCardFrame(
+            progress = 0.5f,
+            phase = phantom.android.screens.onboarding.v2.steps.KeyPreviewAnimationPhase.Running,
+        )
+    }
+}
+
+@Composable
+fun ShowcaseOnboardingIdentityKeyPreviewFrame100() {
+    // 100 % — all 32 glyphs settled, phase Terminal, cyan border,
+    // green dot, white text, "READY TO CREATE" label.
+    cardOnlyFrame {
+        phantom.android.screens.onboarding.v2.steps.IdentityKeyPreviewCardFrame(
+            progress = 1f,
+            phase = phantom.android.screens.onboarding.v2.steps.KeyPreviewAnimationPhase.Terminal,
+        )
+    }
+}
+
 /**
  * FinaleConfirmationStepV2 rendered with a fixed test-fixture hex so
  * the golden is deterministic. Real users see the actual
@@ -888,10 +963,7 @@ fun ShowcaseOnboardingFinaleConfirmation() {
         onToastDismiss = {},
     ) {
         phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2(
-            formState = phantom.android.screens.onboarding.v2.OnboardingFormStateV2(
-                username = "alice",
-                signingPublicKeyHex = fixtureHex,
-            ),
+            signingPublicKeyHex = fixtureHex,
             onContinueClick = {},
         )
     }
@@ -1112,6 +1184,51 @@ fun ShowcaseOnboardingPermissionsNotifEnabled() {
                 .NotificationsPermissionState.Enabled,
         )
     }
+}
+
+// ── C6-a — Recovery-surface goldens (post-mini-round) ─────────────────
+//
+// Two screens rendered when startup routing diverges from the happy
+// path. Both are chromeless full-screen surfaces (no host frame, no
+// dots row, no back button) — see OnboardingStartupErrorScreen.kt
+// and OnboardingFlowV2.kt::OnboardingRepairRequiredScreen for the
+// production composables.
+//
+//  identity_repair_required :
+//      Proven identity corruption (durable marker written). Shows
+//      "Identity repair required" copy + "Exit onboarding" CTA.
+//      Rendered by OnboardingScreenV2's early-return branch when
+//      finalize holder is MissingKeyRepairRequired.
+//
+//  transient_startup_error :
+//      Transient / operational failure on decideStartupRoute (e.g.
+//      one-off loadIdentity throw). Shows stable "Something went
+//      wrong" copy + "Retry" CTA. NO marker write, NO mention of
+//      the internal TransientReason (mini-round §P2 pin).
+//
+// Rendered without OnboardingV2HostFrame because production wires
+// them straight into a full-screen Box (no shared chrome).
+
+@Composable
+fun ShowcaseOnboardingIdentityRepairRequired() {
+    // onExit is a no-op — the golden captures the visual only.
+    phantom.android.screens.onboarding.v2.OnboardingRepairRequiredScreen(
+        onExit = {},
+    )
+}
+
+@Composable
+fun ShowcaseOnboardingTransientStartupError() {
+    // Reason is retained on the composable signature for
+    // diagnostic side-channel use, but the golden's visual is
+    // identical for every TransientReason value (mini-round §P2
+    // pin: no internal reason label reaches the user). Pinning
+    // LoadIdentityThrew here as the canonical example.
+    phantom.android.screens.onboarding.v2.OnboardingStartupErrorScreen(
+        reason = phantom.android.screens.onboarding.v2.TransientReason.LoadIdentityThrew,
+        enabled = true,
+        onRetry = {},
+    )
 }
 
 // ── Stress goldens — narrow width + long strings, split A + B ──────────────

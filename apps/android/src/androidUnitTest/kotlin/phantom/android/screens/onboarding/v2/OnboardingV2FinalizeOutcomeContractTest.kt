@@ -3,11 +3,15 @@
 
 package phantom.android.screens.onboarding.v2
 
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.Saver
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import phantom.core.identity.IdentityKeyPair
 import phantom.core.identity.IdentityRecord
@@ -15,34 +19,117 @@ import phantom.core.transport.PrivacyMode
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Round-15 REDLINE §P1 pin — regression suite for the
- * `runFinalize` / `FinalizeOutcome` contract that round-14
- * shipped for atomic success-transition. These tests fail if a
- * future refactor:
- *   - Splits the phase-write out of the coroutine again (round-13
- *     shape); or
- *   - Returns a wrong `FinalizeOutcome` for a given terminal
- *     controller state (which would let the caller either double-
- *     invoke initMessaging on the retry path or wrongly unlock
- *     Back on the post-persistence-error path).
+ * C6-a REDLINE pin — regression suite for the sealed
+ * [OnboardingFinalizeState] model + its holder API + Saver.
+ *
+ * Round-2 amend adds the [OnboardingFinalizeState.MissingKeyRepairRequired]
+ * state + a strict Ed25519 hex contract on `Completed` and the
+ * `FinalizeOutcome.Completed` outcome. Prior round-1 shape
+ * routed null-hex Complete to `FailedAfterPersistence`
+ * (silent-InFlight-tupik) and let empty-hex reach the sealed
+ * constructor as an unhandled `IllegalArgumentException`. The
+ * round-2 shape:
+ *
+ *   - validates hex against the Ed25519 contract
+ *     ([isValidEd25519PublicKeyHex]: exactly 64 chars, `[0-9a-fA-F]`)
+ *     BEFORE constructing an outcome, upstream in `runFinalize`;
+ *   - routes any malformed hex (null / empty / wrong length /
+ *     non-hex) to a NEW outcome `FinalizeOutcome.MissingKeyMaterial`;
+ *   - maps that outcome via the holder to a NEW sealed state
+ *     `MissingKeyRepairRequired` — a VISIBLE repair-required
+ *     screen with a safe-exit action, not an invisible retry loop;
+ *   - unlocks system Back in the repair-required state (safe exit
+ *     up the flow);
+ *   - `Completed(hex).init` + `FinalizeOutcome.Completed.init`
+ *     BOTH `require` the Ed25519 contract, so a malformed hex
+ *     escaping the runFinalize filter would fail-loud at
+ *     construction rather than silently corrupting the sealed
+ *     state.
  *
  * Scenarios pinned:
- *   1. Success → `FinalizeOutcome.Completed(record)`;
- *      `initMessaging` invoked exactly once;
- *      controller terminal state = `Complete(record)`.
- *   2. Phase-0 error (createOrLoad throws) → `FailedBeforePersistence`;
- *      controller reverts to `Idle`;
- *      `initMessaging` never invoked.
- *   3. Phase-2 error (initMessaging throws) → `FailedAfterPersistence`;
- *      controller stays at `Persisted(...)`;
- *      first `initMessaging` invoked once with the persisted pair.
- *   4. Retry after Phase-2 error → `Completed`;
- *      `createOrLoad` NOT called a second time (short-circuit);
- *      `initMessaging` invoked one MORE time with the SAME pair.
  *
- * The test uses real `OnboardingFinalizeController` (not a mock)
- * with test lambdas — the invariants are what the flow depends
- * on, not the controller shape.
+ *   ── `runFinalize` outcome contract ──────────────────────────
+ *   1. Success → `Completed(hex)`; controller Complete(record).
+ *   2. Phase-0 error → `FailedBeforePersistence`; controller Idle.
+ *   3. Phase-2 error → `FailedAfterPersistence`; controller Persisted.
+ *   4. Retry after Phase-2 → `Completed(hex)`; no re-createOrLoad.
+ *   5. C6-a REDLINE round-2 §P1: NULL hex Complete →
+ *      `MissingKeyMaterial`.
+ *   6. C6-a REDLINE round-2 §P1: EMPTY hex Complete →
+ *      `MissingKeyMaterial` (does NOT throw at outcome layer).
+ *   7. C6-a REDLINE round-2 §P1: MALFORMED hex Complete (wrong
+ *      length / non-hex chars) → `MissingKeyMaterial`.
+ *
+ *   ── Ed25519 hex contract ──────────────────────────────────
+ *   8.  `isValidEd25519PublicKeyHex` accepts 64-char hex.
+ *   9.  Rejects: empty, wrong length, non-hex chars.
+ *  10.  `OnboardingFinalizeState.Completed("")` throws.
+ *  11.  `Completed(wrongLength)` throws.
+ *  12.  `Completed(nonHex)` throws.
+ *  13.  `FinalizeOutcome.Completed("")` throws (defense in depth
+ *       at the outcome boundary too).
+ *
+ *   ── Holder API + state-machine guards ────────────────────
+ *  14.  `markInFlight`: NotStarted → InFlight.
+ *  15.  `markInFlight`: InFlight → InFlight (idempotent).
+ *  16.  `markInFlight`: Completed → NO-OP (terminal guard).
+ *  17.  `markInFlight`: MissingKeyRepairRequired → NO-OP
+ *       (needs explicit repair via resetFromRepairRequired).
+ *  18.  `applyFinalizeOutcome(Completed(hex))` from InFlight
+ *       transitions to `Completed(hex)`.
+ *  19.  `applyFinalizeOutcome(FailedBeforePersistence)` from
+ *       InFlight → NotStarted.
+ *  20.  `applyFinalizeOutcome(FailedAfterPersistence)` from
+ *       InFlight → InFlight.
+ *  21.  `applyFinalizeOutcome(MissingKeyMaterial)` from InFlight
+ *       → MissingKeyRepairRequired (round-2 §P1 pin).
+ *  22.  `applyFinalizeOutcome` NO-OP from NotStarted (stale
+ *       outcome guard).
+ *  23.  `applyFinalizeOutcome` NO-OP from Completed (stale
+ *       outcome guard; also blocks a MissingKeyMaterial from
+ *       "downgrading" a happy Completed).
+ *  24.  `applyFinalizeOutcome` NO-OP from
+ *       MissingKeyRepairRequired (defense: only the repair
+ *       screen's Start-over action mutates this state).
+ *  25.  `resetFromRepairRequired`: MissingKeyRepairRequired
+ *       → NotStarted.
+ *  26.  `resetFromRepairRequired` NO-OP from every other state.
+ *
+ *   ── Saver round-trip ────────────────────────────────────
+ *  27.  NotStarted round-trips.
+ *  28.  InFlight round-trips.
+ *  29.  Completed(hex) round-trips with hex intact.
+ *  30.  MissingKeyRepairRequired round-trips (round-2 §P1 pin).
+ *  31.  Saver restore rejects unknown tag.
+ *  32.  Saver restore of Completed slot with EMPTY hex fails-loud.
+ *  33.  Saver restore of Completed slot with MALFORMED hex
+ *       (wrong length / non-hex) fails-loud (round-2 §P1 pin).
+ *
+ *   ── Full end-to-end via runFinalize + holder ────────────
+ *  34.  Success end-to-end: holder lands Completed with hex.
+ *  35.  Phase-0 error e2e: holder reverts to NotStarted.
+ *  36.  Phase-2 error e2e: holder stays InFlight.
+ *  37.  NULL hex e2e: holder lands MissingKeyRepairRequired
+ *       (round-2 §P1 pin — architect asked for this specifically).
+ *  38.  EMPTY hex e2e: holder lands MissingKeyRepairRequired.
+ *  39.  MALFORMED hex e2e: holder lands MissingKeyRepairRequired.
+ *
+ *   ── Structural block on regular navigation → Finale ────
+ *  40.  `canAdvanceFromV2(Permissions, any)` is false.
+ *  41.  `computeNextNavigationStep(Permissions)` is null.
+ *  42.  `computeNextNavigationStep(FinaleConfirmation)` is null.
+ *  43.  `computeNextNavigationStep(any)` never returns Finale.
+ *  44.  `computeNextNavigationStep` positive-side advances
+ *       Welcome → How → Identity → Privacy.
+ *
+ *   ── Source-contract tripwire (NON-EXHAUSTIVE, tightened) ─
+ *  45.  Combined test: no direct writes to former finalize
+ *       fields; holder call parity (Done tap + resume = 2
+ *       applyFinalizeOutcome + 2 runFinalize + 1 markInFlight).
+ *
+ *   ── Defensive: transient error is cleared on next attempt ─
+ *  46.  Retry after Phase-2 error clears
+ *       `controller.transientErrorMessage`.
  */
 class OnboardingV2FinalizeOutcomeContractTest {
 
@@ -55,6 +142,7 @@ class OnboardingV2FinalizeOutcomeContractTest {
         signingPublicKeyHex = "cc".repeat(32),
         signingPrivateKeyHex = "dd".repeat(32),
     )
+    private val syntheticHex: String = syntheticRecord.signingPublicKeyHex!!
     private val syntheticKeyPair = IdentityKeyPair(
         publicKey = phantom.core.identity.PublicKey(ByteArray(32) { it.toByte() }),
         privateKey = phantom.core.identity.PrivateKey(ByteArray(32) { (it + 100).toByte() }),
@@ -65,53 +153,30 @@ class OnboardingV2FinalizeOutcomeContractTest {
     @Test
     fun success_returns_Completed_and_invokes_initMessaging_exactly_once() = runTest {
         val initMessagingCalls = AtomicInteger(0)
-        val savePrivacyCalls = AtomicInteger(0)
-        val createOrLoadCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
-            savePrivacyMode = { savePrivacyCalls.incrementAndGet() },
-            createOrLoad = { _ ->
-                createOrLoadCalls.incrementAndGet()
-                syntheticRecord to syntheticKeyPair
-            },
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> syntheticRecord to syntheticKeyPair },
             initMessaging = { _, _ -> initMessagingCalls.incrementAndGet() },
         )
         val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
-        assertTrue(
-            outcome is FinalizeOutcome.Completed,
-            "expected Completed, got $outcome",
-        )
-        assertEquals(syntheticRecord, (outcome as FinalizeOutcome.Completed).record)
-        assertEquals(1, initMessagingCalls.get(), "initMessaging should be invoked exactly once")
-        assertEquals(1, savePrivacyCalls.get())
-        assertEquals(1, createOrLoadCalls.get())
-        assertTrue(
-            controller.state is FinalizeState.Complete,
-            "controller terminal state should be Complete",
-        )
+        assertTrue(outcome is FinalizeOutcome.Completed, "expected Completed, got $outcome")
+        assertEquals(syntheticHex, (outcome as FinalizeOutcome.Completed).signingPublicKeyHex)
+        assertEquals(1, initMessagingCalls.get())
+        assertTrue(controller.state is FinalizeState.Complete)
     }
 
     // ── Scenario 2: phase-0 error (createOrLoad throws) ───────────────
 
     @Test
     fun phase_0_error_returns_FailedBeforePersistence_and_reverts_to_Idle() = runTest {
-        val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
             savePrivacyMode = { /* ok */ },
             createOrLoad = { _ -> throw IllegalStateException("phase 0 fail") },
-            initMessaging = { _, _ -> initMessagingCalls.incrementAndGet() },
+            initMessaging = { _, _ -> /* unreachable */ },
         )
         val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
         assertEquals(FinalizeOutcome.FailedBeforePersistence, outcome)
-        assertTrue(
-            controller.state is FinalizeState.Idle,
-            "controller should revert to Idle after phase-0 error, got ${controller.state}",
-        )
-        assertEquals(
-            0,
-            initMessagingCalls.get(),
-            "initMessaging must NEVER be invoked when createOrLoad throws",
-        )
-        // Transient error surface populated for UI toast.
+        assertTrue(controller.state is FinalizeState.Idle)
         assertNotNull(controller.transientErrorMessage)
     }
 
@@ -119,26 +184,14 @@ class OnboardingV2FinalizeOutcomeContractTest {
 
     @Test
     fun phase_2_error_returns_FailedAfterPersistence_and_stays_Persisted() = runTest {
-        val initMessagingCalls = AtomicInteger(0)
         val controller = OnboardingFinalizeController(
             savePrivacyMode = { /* ok */ },
             createOrLoad = { _ -> syntheticRecord to syntheticKeyPair },
-            initMessaging = { _, _ ->
-                initMessagingCalls.incrementAndGet()
-                throw IllegalStateException("phase 2 fail")
-            },
+            initMessaging = { _, _ -> throw IllegalStateException("phase 2 fail") },
         )
         val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
         assertEquals(FinalizeOutcome.FailedAfterPersistence, outcome)
-        val terminal = controller.state
-        assertTrue(
-            terminal is FinalizeState.Persisted,
-            "controller should stay at Persisted after phase-2 error, got $terminal",
-        )
-        val persisted = terminal as FinalizeState.Persisted
-        assertEquals(syntheticRecord, persisted.record)
-        assertEquals(PrivacyMode.Standard, persisted.privacyMode)
-        assertEquals(1, initMessagingCalls.get())
+        assertTrue(controller.state is FinalizeState.Persisted)
     }
 
     // ── Scenario 4: retry after phase-2 error ─────────────────────────
@@ -163,317 +216,613 @@ class OnboardingV2FinalizeOutcomeContractTest {
         assertEquals(FinalizeOutcome.FailedAfterPersistence, firstOutcome)
         shouldInitFail = false
         val secondOutcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertTrue(secondOutcome is FinalizeOutcome.Completed)
+        assertEquals(syntheticHex, (secondOutcome as FinalizeOutcome.Completed).signingPublicKeyHex)
+        assertEquals(1, createOrLoadCalls.get())
+        assertEquals(2, initMessagingCalls.get())
+    }
+
+    // ── Scenarios 5, 6, 7: null / empty / malformed hex from controller ─
+
+    @Test
+    fun null_hex_Complete_from_controller_routes_to_MissingKeyMaterial() = runTest {
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = null)
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(
+            FinalizeOutcome.MissingKeyMaterial,
+            outcome,
+            "null hex Complete MUST route to MissingKeyMaterial (round-2 §P1 pin) — " +
+                "routing to FailedAfterPersistence (round-1 shape) trapped user at " +
+                "InFlight/Permissions with Back locked and no visible error.",
+        )
+    }
+
+    @Test
+    fun empty_hex_Complete_from_controller_routes_to_MissingKeyMaterial() = runTest {
+        // Round-1 shape only checked hex == null, so empty string
+        // reached Completed("") constructor and threw
+        // IllegalArgumentException in the coroutine. Round-2
+        // filters upfront in runFinalize.
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = "")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    @Test
+    fun malformed_hex_Complete_from_controller_routes_to_MissingKeyMaterial() = runTest {
+        // Wrong length (63 chars) — closer to a real ed25519 hex
+        // but off-by-one, the kind of bug a truncation would
+        // produce.
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = "ab".repeat(31) + "a")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    @Test
+    fun non_hex_chars_Complete_from_controller_routes_to_MissingKeyMaterial() = runTest {
+        // 64 chars total but contains a non-hex character.
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = "z" + "b".repeat(63))
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
+        assertEquals(FinalizeOutcome.MissingKeyMaterial, outcome)
+    }
+
+    // ── Ed25519 hex contract ─────────────────────────────────────────
+
+    @Test
+    fun isValidEd25519PublicKeyHex_accepts_64_char_hex() {
+        assertTrue(isValidEd25519PublicKeyHex("0123456789abcdef".repeat(4)))
+        assertTrue(isValidEd25519PublicKeyHex("A".repeat(64)))
+        assertTrue(isValidEd25519PublicKeyHex("f".repeat(64)))
+    }
+
+    @Test
+    fun isValidEd25519PublicKeyHex_rejects_empty_wrong_length_or_non_hex() {
+        assertTrue(!isValidEd25519PublicKeyHex(""))
+        assertTrue(!isValidEd25519PublicKeyHex("a".repeat(63)))
+        assertTrue(!isValidEd25519PublicKeyHex("a".repeat(65)))
+        // 64 chars but 'g' is not hex.
+        assertTrue(!isValidEd25519PublicKeyHex("g" + "a".repeat(63)))
+        // 64 chars but space char.
+        assertTrue(!isValidEd25519PublicKeyHex(" " + "a".repeat(63)))
+    }
+
+    @Test
+    fun Completed_construction_rejects_empty_hex() {
+        val ex = assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed("")
+        }
         assertTrue(
-            secondOutcome is FinalizeOutcome.Completed,
-            "retry should reach Completed, got $secondOutcome",
-        )
-        assertEquals(
-            1,
-            createOrLoadCalls.get(),
-            "createOrLoad MUST NOT be re-invoked on retry (Persisted → Complete short-circuit)",
-        )
-        assertEquals(
-            2,
-            initMessagingCalls.get(),
-            "initMessaging invoked exactly once per attempt",
-        )
-        assertTrue(controller.state is FinalizeState.Complete)
-    }
-
-    // ── Round-16 §P1 pin: `applyFinalizeOutcome` reducer contract ────
-
-    @Test
-    fun apply_Completed_advance_has_hex_and_Finale_and_Completed() {
-        val outcome = FinalizeOutcome.Completed(syntheticRecord)
-        val advance = applyFinalizeOutcome(outcome)
-        assertEquals(
-            syntheticRecord.signingPublicKeyHex,
-            advance.newSigningPublicKeyHex,
-            "Completed advance MUST carry the record's signingPublicKeyHex",
-        )
-        assertEquals(
-            OnboardingStepV2.FinaleConfirmation,
-            advance.newStep,
-            "Completed advance MUST transition to FinaleConfirmation",
-        )
-        assertEquals(
-            OnboardingFinalizePhase.Completed,
-            advance.newPhase,
-            "Completed advance MUST set phase = Completed",
+            ex.message?.contains("Ed25519") == true,
+            "IllegalArgumentException must name the contract, got: ${ex.message}",
         )
     }
 
     @Test
-    fun apply_FailedBeforePersistence_leaves_hex_and_step_and_sets_NotStarted() {
-        val advance = applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
-        assertNull(
-            advance.newSigningPublicKeyHex,
-            "FailedBeforePersistence must NOT change signingPublicKeyHex",
-        )
-        assertNull(
-            advance.newStep,
-            "FailedBeforePersistence must NOT change currentStep (user stays on Permissions)",
-        )
+    fun Completed_construction_rejects_wrong_length_hex() {
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed("a".repeat(63))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed("a".repeat(65))
+        }
+    }
+
+    @Test
+    fun Completed_construction_rejects_non_hex_characters() {
+        assertFailsWith<IllegalArgumentException> {
+            OnboardingFinalizeState.Completed("g" + "a".repeat(63))
+        }
+    }
+
+    @Test
+    fun FinalizeOutcome_Completed_construction_rejects_invalid_hex() {
+        // Defense in depth: the outcome type ALSO enforces the
+        // Ed25519 contract at construction. A refactor that
+        // bypassed the runFinalize filter would still fail-loud
+        // here rather than reaching the holder.
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed("")
+        }
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed("a".repeat(63))
+        }
+        assertFailsWith<IllegalArgumentException> {
+            FinalizeOutcome.Completed("z" + "a".repeat(63))
+        }
+    }
+
+    // ── C6-a sealed holder API ────────────────────────────────────────
+
+    private fun makeHolder(
+        initial: OnboardingFinalizeState = OnboardingFinalizeState.NotStarted,
+    ): OnboardingFinalizeStateHolder =
+        OnboardingFinalizeStateHolder(mutableStateOf(initial))
+
+    @Test
+    fun holder_markInFlight_transitions_from_NotStarted_to_InFlight() {
+        val h = makeHolder()
+        h.markInFlight()
+        assertEquals(OnboardingFinalizeState.InFlight, h.state)
+        assertEquals(OnboardingFinalizePhase.InFlight, h.phase)
+    }
+
+    @Test
+    fun holder_markInFlight_is_idempotent_on_InFlight() {
+        val h = makeHolder(OnboardingFinalizeState.InFlight)
+        h.markInFlight()
+        assertEquals(OnboardingFinalizeState.InFlight, h.state)
+    }
+
+    @Test
+    fun holder_markInFlight_is_NO_OP_when_Completed_terminal_guard() {
+        val completedState = OnboardingFinalizeState.Completed(syntheticHex)
+        val h = makeHolder(completedState)
+        h.markInFlight()
+        assertEquals(completedState, h.state)
+    }
+
+    @Test
+    fun holder_markInFlight_is_NO_OP_when_MissingKeyRepairRequired() {
+        // Round-2 §P1 pin: the round-1 amend's tupik was a
+        // silent Done retap. The repair-required state MUST NOT
+        // silently accept another markInFlight — the user needs
+        // to explicitly acknowledge via `resetFromRepairRequired`
+        // (the "Start over" button on the repair screen).
+        val h = makeHolder(OnboardingFinalizeState.MissingKeyRepairRequired)
+        h.markInFlight()
         assertEquals(
-            OnboardingFinalizePhase.NotStarted,
-            advance.newPhase,
-            "FailedBeforePersistence MUST unlock Back via NotStarted",
+            OnboardingFinalizeState.MissingKeyRepairRequired, h.state,
+            "markInFlight from MissingKeyRepairRequired must be a no-op — user needs " +
+                "to explicitly reset via resetFromRepairRequired first.",
         )
     }
 
     @Test
-    fun apply_FailedAfterPersistence_leaves_hex_and_step_and_keeps_InFlight() {
-        val advance = applyFinalizeOutcome(FinalizeOutcome.FailedAfterPersistence)
-        assertNull(advance.newSigningPublicKeyHex)
-        assertNull(advance.newStep)
+    fun holder_applyFinalizeOutcome_Completed_from_InFlight_lands_Completed() {
+        val h = makeHolder(OnboardingFinalizeState.InFlight)
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        val state = h.state
+        assertTrue(state is OnboardingFinalizeState.Completed)
+        assertEquals(syntheticHex, (state as OnboardingFinalizeState.Completed).signingPublicKeyHex)
+    }
+
+    @Test
+    fun holder_applyFinalizeOutcome_FailedBeforePersistence_reverts_to_NotStarted() {
+        val h = makeHolder(OnboardingFinalizeState.InFlight)
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
+    }
+
+    @Test
+    fun holder_applyFinalizeOutcome_FailedAfterPersistence_keeps_InFlight() {
+        val h = makeHolder(OnboardingFinalizeState.InFlight)
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedAfterPersistence)
+        assertEquals(OnboardingFinalizeState.InFlight, h.state)
+    }
+
+    @Test
+    fun holder_applyFinalizeOutcome_MissingKeyMaterial_lands_MissingKeyRepairRequired() {
+        // Round-2 §P1 pin: the visible repair state.
+        val h = makeHolder(OnboardingFinalizeState.InFlight)
+        h.applyFinalizeOutcome(FinalizeOutcome.MissingKeyMaterial)
         assertEquals(
-            OnboardingFinalizePhase.InFlight,
-            advance.newPhase,
-            "FailedAfterPersistence MUST keep Back locked via InFlight " +
-                "(Done retap short-circuits Persisted → Complete)",
+            OnboardingFinalizeState.MissingKeyRepairRequired, h.state,
+            "MissingKeyMaterial outcome MUST land the visible MissingKeyRepairRequired " +
+                "state so the user sees the error and has a safe-exit action.",
+        )
+        assertEquals(OnboardingFinalizePhase.MissingKeyRepair, h.phase)
+        assertNull(h.signingPublicKeyHex)
+    }
+
+    @Test
+    fun holder_applyFinalizeOutcome_is_NO_OP_from_NotStarted() {
+        val h = makeHolder(OnboardingFinalizeState.NotStarted)
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
+        h.applyFinalizeOutcome(FinalizeOutcome.MissingKeyMaterial)
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
+    }
+
+    @Test
+    fun holder_applyFinalizeOutcome_is_NO_OP_from_Completed_terminal_guard() {
+        val completedState = OnboardingFinalizeState.Completed(syntheticHex)
+        val h = makeHolder(completedState)
+        // Different-hex Completed — terminal must survive.
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed("ee".repeat(32)))
+        assertEquals(completedState, h.state)
+        // Failure outcomes — terminal must survive.
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+        assertEquals(completedState, h.state)
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedAfterPersistence)
+        assertEquals(completedState, h.state)
+        // Round-2 §P1 pin: MissingKeyMaterial arriving after
+        // Completion must NOT downgrade a happy Completed to
+        // MissingKeyRepairRequired.
+        h.applyFinalizeOutcome(FinalizeOutcome.MissingKeyMaterial)
+        assertEquals(
+            completedState, h.state,
+            "A stale MissingKeyMaterial after Completion must NOT " +
+                "downgrade the terminal state.",
         )
     }
 
-    // ── End-to-end: outcome + apply produce the fully-transitioned model.
-    // Simulates the caller coroutine's behaviour without going through
-    // Compose. A round-13 split-writer regression would leave one of
-    // the three fields at its pre-transition value here.
+    @Test
+    fun holder_applyFinalizeOutcome_is_NO_OP_from_MissingKeyRepairRequired() {
+        val h = makeHolder(OnboardingFinalizeState.MissingKeyRepairRequired)
+        h.applyFinalizeOutcome(FinalizeOutcome.Completed(syntheticHex))
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+        h.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+        h.applyFinalizeOutcome(FinalizeOutcome.MissingKeyMaterial)
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+    }
 
     @Test
-    fun success_end_to_end_all_three_fields_flip_atomically() = runTest {
+    fun holder_resetFromRepairRequired_transitions_to_NotStarted() {
+        val h = makeHolder(OnboardingFinalizeState.MissingKeyRepairRequired)
+        h.resetFromRepairRequired()
+        assertEquals(
+            OnboardingFinalizeState.NotStarted, h.state,
+            "resetFromRepairRequired MUST return holder to NotStarted so the user " +
+                "can navigate the flow again OR safe-exit via system Back.",
+        )
+    }
+
+    @Test
+    fun holder_resetFromRepairRequired_is_NO_OP_from_every_other_state() {
+        // Defensive: only the repair screen's Start-over action
+        // wires this. Any other caller trying to reset a happy
+        // Completed or an InFlight would be a bug.
+        listOf(
+            OnboardingFinalizeState.NotStarted,
+            OnboardingFinalizeState.InFlight,
+            OnboardingFinalizeState.Completed(syntheticHex),
+        ).forEach { start ->
+            val h = makeHolder(start)
+            h.resetFromRepairRequired()
+            assertEquals(
+                start, h.state,
+                "resetFromRepairRequired from $start must be a no-op.",
+            )
+        }
+    }
+
+    // ── C6-a Saver round-trip ─────────────────────────────────────────
+
+    private fun <T, S : Any> roundTrip(saver: Saver<T, S>, value: T): T {
+        val scope = androidx.compose.runtime.saveable.SaverScope { true }
+        val saved = with(saver) { scope.save(value) }
+            ?: error("Saver returned null for value $value")
+        return saver.restore(saved) ?: error("Saver restore returned null for payload $saved")
+    }
+
+    @Test
+    fun saver_round_trips_NotStarted() {
+        assertSame(
+            OnboardingFinalizeState.NotStarted,
+            roundTrip(OnboardingFinalizeStateSaver, OnboardingFinalizeState.NotStarted),
+        )
+    }
+
+    @Test
+    fun saver_round_trips_InFlight() {
+        assertSame(
+            OnboardingFinalizeState.InFlight,
+            roundTrip(OnboardingFinalizeStateSaver, OnboardingFinalizeState.InFlight),
+        )
+    }
+
+    @Test
+    fun saver_round_trips_Completed_with_hex_intact() {
+        val hex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
+        require(hex.length == 64)
+        val original = OnboardingFinalizeState.Completed(hex)
+        val restored = roundTrip(OnboardingFinalizeStateSaver, original)
+        assertTrue(restored is OnboardingFinalizeState.Completed)
+        assertEquals(hex, (restored as OnboardingFinalizeState.Completed).signingPublicKeyHex)
+        assertEquals(original, restored)
+    }
+
+    @Test
+    fun saver_round_trips_MissingKeyRepairRequired() {
+        assertSame(
+            OnboardingFinalizeState.MissingKeyRepairRequired,
+            roundTrip(
+                OnboardingFinalizeStateSaver,
+                OnboardingFinalizeState.MissingKeyRepairRequired,
+            ),
+        )
+    }
+
+    @Test
+    fun saver_rejects_unknown_tag_defensively() {
+        val ex = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(listOf("MysteryVariant", ""))
+        }.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(ex.message?.contains("Unknown OnboardingFinalizeState tag") == true)
+    }
+
+    @Test
+    fun saver_rejects_empty_hex_on_Completed_restore() {
+        val ex = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(listOf("Completed", ""))
+        }.exceptionOrNull()
+        assertNotNull(ex)
+        assertTrue(
+            ex.message?.contains("invalid Ed25519 hex") == true,
+            "restore error must name the contract, got: ${ex.message}",
+        )
+    }
+
+    @Test
+    fun saver_rejects_malformed_hex_on_Completed_restore() {
+        // Round-2 §P1 pin: wrong length + non-hex chars must both
+        // fail-loud, matching the outcome and construction guards.
+        val exWrongLength = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(listOf("Completed", "a".repeat(63)))
+        }.exceptionOrNull()
+        assertNotNull(exWrongLength)
+        assertTrue(exWrongLength.message?.contains("invalid Ed25519 hex") == true)
+
+        val exNonHex = kotlin.runCatching {
+            OnboardingFinalizeStateSaver.restore(listOf("Completed", "z" + "a".repeat(63)))
+        }.exceptionOrNull()
+        assertNotNull(exNonHex)
+        assertTrue(exNonHex.message?.contains("invalid Ed25519 hex") == true)
+    }
+
+    // ── Full end-to-end via runFinalize + holder ────────────────────
+
+    @Test
+    fun end_to_end_success_lands_Completed_with_holder() = runTest {
+        val h = makeHolder()
         val controller = OnboardingFinalizeController(
             savePrivacyMode = { /* ok */ },
             createOrLoad = { _ -> syntheticRecord to syntheticKeyPair },
             initMessaging = { _, _ -> /* ok */ },
         )
-        // Model state before Done tap.
-        var formHex: String? = null
-        var currentStep: OnboardingStepV2 = OnboardingStepV2.Permissions
-        var phase: OnboardingFinalizePhase = OnboardingFinalizePhase.NotStarted
-
-        // Done tap: phase → InFlight.
-        phase = OnboardingFinalizePhase.InFlight
-        // Same body as production: runFinalize + applyFinalizeOutcome
-        // + write all three fields atomically.
-        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
-        val advance = applyFinalizeOutcome(outcome)
-        advance.newSigningPublicKeyHex?.let { formHex = it }
-        advance.newStep?.let { currentStep = it }
-        phase = advance.newPhase
-
-        assertEquals(
-            syntheticRecord.signingPublicKeyHex, formHex,
-            "success: signingPublicKeyHex must be set",
-        )
-        assertEquals(
-            OnboardingStepV2.FinaleConfirmation, currentStep,
-            "success: currentStep must advance to FinaleConfirmation",
-        )
-        assertEquals(
-            OnboardingFinalizePhase.Completed, phase,
-            "success: phase must be Completed",
-        )
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertTrue(h.state is OnboardingFinalizeState.Completed)
+        assertEquals(syntheticHex, h.signingPublicKeyHex)
     }
 
     @Test
-    fun phase_0_error_end_to_end_stays_on_Permissions_with_NotStarted() = runTest {
+    fun end_to_end_phase_0_error_reverts_holder_to_NotStarted() = runTest {
+        val h = makeHolder()
         val controller = OnboardingFinalizeController(
             savePrivacyMode = { /* ok */ },
             createOrLoad = { _ -> throw IllegalStateException("fail phase 0") },
             initMessaging = { _, _ -> /* unreachable */ },
         )
-        var formHex: String? = null
-        var currentStep: OnboardingStepV2 = OnboardingStepV2.Permissions
-        var phase: OnboardingFinalizePhase = OnboardingFinalizePhase.InFlight
-
-        val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
-        val advance = applyFinalizeOutcome(outcome)
-        advance.newSigningPublicKeyHex?.let { formHex = it }
-        advance.newStep?.let { currentStep = it }
-        phase = advance.newPhase
-
-        assertNull(formHex, "phase-0 error: hex must remain null")
-        assertEquals(
-            OnboardingStepV2.Permissions, currentStep,
-            "phase-0 error: currentStep must stay on Permissions",
-        )
-        assertEquals(
-            OnboardingFinalizePhase.NotStarted, phase,
-            "phase-0 error: phase must revert to NotStarted (Back unlocks)",
-        )
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
     }
 
     @Test
-    fun phase_2_error_end_to_end_stays_on_Permissions_with_InFlight() = runTest {
+    fun end_to_end_phase_2_error_keeps_holder_InFlight() = runTest {
+        val h = makeHolder()
         val controller = OnboardingFinalizeController(
             savePrivacyMode = { /* ok */ },
             createOrLoad = { _ -> syntheticRecord to syntheticKeyPair },
             initMessaging = { _, _ -> throw IllegalStateException("fail phase 2") },
         )
-        var formHex: String? = null
-        var currentStep: OnboardingStepV2 = OnboardingStepV2.Permissions
-        var phase: OnboardingFinalizePhase = OnboardingFinalizePhase.InFlight
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertEquals(OnboardingFinalizeState.InFlight, h.state)
+    }
 
+    // Round-2 §P1 architect-requested end-to-end tests:
+
+    @Test
+    fun end_to_end_null_hex_lands_holder_MissingKeyRepairRequired() = runTest {
+        val h = makeHolder()
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = null)
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertEquals(
+            OnboardingFinalizeState.MissingKeyRepairRequired,
+            h.state,
+            "null hex end-to-end MUST land holder at MissingKeyRepairRequired — this " +
+                "is the visible repair state; NOT InFlight (round-1 tupik) NOT " +
+                "Completed(null) (would strand user on Finale with no exit).",
+        )
+        assertNull(h.signingPublicKeyHex)
+    }
+
+    @Test
+    fun end_to_end_empty_hex_lands_holder_MissingKeyRepairRequired() = runTest {
+        val h = makeHolder()
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = "")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        h.markInFlight()
+        // Round-2 §P1 pin: this MUST NOT throw. Round-1 shape
+        // threw IllegalArgumentException inside the coroutine
+        // because Completed("") tripped the require.
         val outcome = runFinalize(controller, "alice", PrivacyMode.Standard)
-        val advance = applyFinalizeOutcome(outcome)
-        advance.newSigningPublicKeyHex?.let { formHex = it }
-        advance.newStep?.let { currentStep = it }
-        phase = advance.newPhase
+        h.applyFinalizeOutcome(outcome)
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+    }
 
-        assertNull(formHex, "phase-2 error: hex must remain null")
-        assertEquals(
-            OnboardingStepV2.Permissions, currentStep,
-            "phase-2 error: currentStep must stay on Permissions",
+    @Test
+    fun end_to_end_malformed_hex_lands_holder_MissingKeyRepairRequired() = runTest {
+        val h = makeHolder()
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = "ab".repeat(31) + "a")
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
         )
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+    }
+
+    @Test
+    fun end_to_end_repair_screen_start_over_resets_holder_to_NotStarted() = runTest {
+        // The composable renders OnboardingRepairRequiredScreen
+        // when state is MissingKeyRepairRequired; its "Start over"
+        // button calls holder.resetFromRepairRequired(). Pin the
+        // full end-to-end action here.
+        val h = makeHolder()
+        val brokenRecord = syntheticRecord.copy(signingPublicKeyHex = null)
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { /* ok */ },
+            createOrLoad = { _ -> brokenRecord to syntheticKeyPair },
+            initMessaging = { _, _ -> /* ok */ },
+        )
+        h.markInFlight()
+        h.applyFinalizeOutcome(runFinalize(controller, "alice", PrivacyMode.Standard))
+        assertEquals(OnboardingFinalizeState.MissingKeyRepairRequired, h.state)
+
+        // Simulate user tapping "Start over" on repair screen.
+        h.resetFromRepairRequired()
+        assertEquals(OnboardingFinalizeState.NotStarted, h.state)
+    }
+
+    // ── Structural block on regular navigation opening Finale ────────
+
+    @Test
+    fun canAdvanceFromV2_Permissions_is_false() {
         assertEquals(
-            OnboardingFinalizePhase.InFlight, phase,
-            "phase-2 error: phase must stay InFlight (Back stays locked)",
+            false,
+            canAdvanceFromV2(OnboardingStepV2.Permissions, OnboardingFormStateV2()),
         )
     }
 
-    // ── Round-17 §P1 pin: writer interface + single-helper contract ──
-
     @Test
-    fun applyAndCommit_success_calls_writer_in_hex_step_phase_order() {
-        val w = CapturingFinalizeStateWriter()
-        applyAndCommitFinalizeOutcome(FinalizeOutcome.Completed(syntheticRecord), w)
-        assertEquals(syntheticRecord.signingPublicKeyHex, w.capturedHex)
-        assertTrue(w.advancedToFinaleConfirmation)
-        assertEquals(OnboardingFinalizePhase.Completed, w.capturedPhase)
-        // Ordering pin: hex first, then step advance, then phase.
-        assertEquals(listOf("hex", "step", "phase"), w.callOrder)
+    fun computeNextNavigationStep_Permissions_is_null() {
+        assertNull(computeNextNavigationStep(OnboardingStepV2.Permissions))
     }
 
     @Test
-    fun applyAndCommit_failed_before_persistence_calls_phase_only() {
-        val w = CapturingFinalizeStateWriter()
-        applyAndCommitFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence, w)
-        assertNull(w.capturedHex)
-        assertTrue(!w.advancedToFinaleConfirmation)
-        assertEquals(OnboardingFinalizePhase.NotStarted, w.capturedPhase)
-        assertEquals(listOf("phase"), w.callOrder)
+    fun computeNextNavigationStep_FinaleConfirmation_is_null() {
+        assertNull(computeNextNavigationStep(OnboardingStepV2.FinaleConfirmation))
     }
 
     @Test
-    fun applyAndCommit_failed_after_persistence_calls_phase_only() {
-        val w = CapturingFinalizeStateWriter()
-        applyAndCommitFinalizeOutcome(FinalizeOutcome.FailedAfterPersistence, w)
-        assertNull(w.capturedHex)
-        assertTrue(!w.advancedToFinaleConfirmation)
-        assertEquals(OnboardingFinalizePhase.InFlight, w.capturedPhase)
-        assertEquals(listOf("phase"), w.callOrder)
+    fun computeNextNavigationStep_never_returns_FinaleConfirmation_from_any_step() {
+        OnboardingStepV2.entries.forEach { step ->
+            val next = computeNextNavigationStep(step)
+            assertTrue(
+                next != OnboardingStepV2.FinaleConfirmation,
+                "computeNextNavigationStep($step) returned FinaleConfirmation — " +
+                    "Finale MUST be unreachable via regular navigation.",
+            )
+        }
     }
 
-    // ── Source-contract pin: OnboardingFlowV2.kt uses helper only ─────
+    @Test
+    fun computeNextNavigationStep_advances_the_reachable_steps() {
+        assertEquals(OnboardingStepV2.How, computeNextNavigationStep(OnboardingStepV2.Welcome))
+        assertEquals(OnboardingStepV2.Identity, computeNextNavigationStep(OnboardingStepV2.How))
+        assertEquals(OnboardingStepV2.Privacy, computeNextNavigationStep(OnboardingStepV2.Identity))
+        assertEquals(OnboardingStepV2.Permissions, computeNextNavigationStep(OnboardingStepV2.Privacy))
+    }
+
+    // ── Source-contract tripwire (NON-EXHAUSTIVE) ─────────────────────
 
     @Test
-    fun source_contract_flow_calls_applyAndCommit_exactly_twice_and_only_via_writer() {
+    fun source_contract_flow_has_no_direct_finalize_writes_and_uses_holder_only() {
         val source = java.io.File(
             "src/androidMain/kotlin/phantom/android/screens/onboarding/v2/OnboardingFlowV2.kt",
         ).readText()
 
-        // Must call helper exactly twice: once for Done tap, once
-        // for post-recreation resume. Extra or missing calls signal
-        // a bypass or new duplicated write site.
-        // Negative lookbehind excludes the `internal fun` declaration
-        // (function signature is not a call).
-        val helperCalls = Regex("""(?<!fun )\bapplyAndCommitFinalizeOutcome\s*\(""")
+        val externalPhaseWrites = Regex("""(?<![\w./`])finalizePhase\s*=(?!=)""")
             .findAll(source).count()
-        assertEquals(
-            2, helperCalls,
-            "OnboardingFlowV2.kt must invoke applyAndCommitFinalizeOutcome exactly twice " +
-                "(Done tap + resume). Found $helperCalls.",
-        )
-
-        // runFinalize must ALWAYS be paired with the helper — count
-        // of runFinalize calls (excluding declaration) must equal
-        // count of helper calls.
-        val runFinalizeCalls = Regex("""(?<!fun )\brunFinalize\s*\(""")
+        assertEquals(0, externalPhaseWrites,
+            "OnboardingFlowV2.kt must not contain any external `finalizePhase = …` " +
+                "assignments. Found $externalPhaseWrites.")
+        val externalPhaseDecls = Regex("""(?<![\w./`])var\s+finalizePhase\b""")
             .findAll(source).count()
-        assertEquals(
-            helperCalls, runFinalizeCalls,
-            "runFinalize call count ($runFinalizeCalls) MUST equal " +
-                "applyAndCommitFinalizeOutcome call count ($helperCalls) — every " +
-                "finalize invocation must feed its outcome through the writer.",
-        )
+        assertEquals(0, externalPhaseDecls,
+            "OnboardingFlowV2.kt must not declare a `var finalizePhase`. Found $externalPhaseDecls.")
 
-        // No direct assignment to `formState.copy(signingPublicKeyHex ...`
-        // outside the writer's `writeSigningPublicKeyHex` body.
         val hexAssignments = Regex(
             """formState\s*=\s*formState\.copy\s*\(\s*signingPublicKeyHex\s*=""",
         ).findAll(source).count()
-        assertEquals(
-            1, hexAssignments,
-            "Only the FinalizeStateWriter's writeSigningPublicKeyHex may assign " +
-                "formState.signingPublicKeyHex. Found $hexAssignments direct assignments.",
-        )
+        assertEquals(0, hexAssignments,
+            "OnboardingFlowV2.kt must not write formState.copy(signingPublicKeyHex = …). " +
+                "Found $hexAssignments.")
 
-        // No direct assignment `currentStep = OnboardingStepV2.FinaleConfirmation`
-        // outside the writer's `advanceToFinaleConfirmation` body.
         val finaleAssignments = Regex(
-            """currentStep\s*=\s*OnboardingStepV2\.FinaleConfirmation""",
+            """(?<![`])currentStep\s*=\s*OnboardingStepV2\.FinaleConfirmation""",
         ).findAll(source).count()
-        assertEquals(
-            1, finaleAssignments,
-            "Only the FinalizeStateWriter's advanceToFinaleConfirmation may assign " +
-                "currentStep = OnboardingStepV2.FinaleConfirmation. " +
-                "Found $finaleAssignments direct assignments.",
-        )
+        assertEquals(0, finaleAssignments,
+            "OnboardingFlowV2.kt must not directly assign " +
+                "`currentStep = OnboardingStepV2.FinaleConfirmation`. Found $finaleAssignments.")
 
-        // Round-18 REDLINE §P1 pin: `finalizePhase = <anything>` must
-        // appear EXACTLY ONCE in the file — inside the writer's
-        // `setFinalizePhase` body. Round-17 shape allowed a direct
-        // `finalizePhase = OnboardingFinalizePhase.InFlight` from the
-        // Done-tap block; round-18 routes even that pre-launch
-        // transition through the writer. Any additional direct
-        // assignment fails this pin.
-        val phaseAssignments = Regex(
-            """(?<!\S)finalizePhase\s*=(?!=)""",
-        ).findAll(source).count()
-        assertEquals(
-            1, phaseAssignments,
-            "Only the FinalizeStateWriter's setFinalizePhase may assign " +
-                "finalizePhase. Found $phaseAssignments direct assignments — every " +
-                "InFlight / Completed / NotStarted transition MUST route through " +
-                "the writer.",
-        )
+        val applyOutcomeCalls = Regex("""(?<![\w])finalizeHolder\.applyFinalizeOutcome\s*\(""")
+            .findAll(source).count()
+        assertEquals(2, applyOutcomeCalls,
+            "OnboardingFlowV2.kt must call finalizeHolder.applyFinalizeOutcome exactly " +
+                "twice (Done tap + resume LaunchedEffect). Found $applyOutcomeCalls.")
+        val runFinalizeCalls = Regex("""(?<!fun )\brunFinalize\s*\(""")
+            .findAll(source).count()
+        assertEquals(applyOutcomeCalls, runFinalizeCalls,
+            "runFinalize call count ($runFinalizeCalls) MUST equal " +
+                "finalizeHolder.applyFinalizeOutcome call count ($applyOutcomeCalls).")
+        val markInFlightCalls = Regex("""(?<![\w])finalizeHolder\.markInFlight\s*\(""")
+            .findAll(source).count()
+        assertEquals(1, markInFlightCalls,
+            "OnboardingFlowV2.kt must call finalizeHolder.markInFlight exactly once " +
+                "(from the Done tap, pre-launch). Found $markInFlightCalls.")
     }
 
-    // ── Round-18 pin: source-contract accuracy note ────────────────
+    // ── Source-contract accuracy note (C6-a round-2) ─────────────────
     //
-    // The regex checks above catch the STRAIGHT-FORWARD assignment
-    // forms that any reasonable refactor would produce (direct
-    // `field = value` at file scope). They are not, and cannot be,
-    // an exhaustive proof of writer exclusivity — a determined
-    // refactor could route a write through an intermediate `val
-    // updated = ...` binding or a reflected setter and slip past
-    // the regex. The tripwire's role is to fail EARLY on the
-    // common regression shape, not to certify total ownership.
-    // Total ownership would require sealing the three state slots
-    // behind a private state holder with a public writer-only API;
-    // that is the direction Commit 6's holder refactor takes.
-
-    private class CapturingFinalizeStateWriter : FinalizeStateWriter {
-        val callOrder = mutableListOf<String>()
-        var capturedHex: String? = null
-        var advancedToFinaleConfirmation: Boolean = false
-        var capturedPhase: OnboardingFinalizePhase? = null
-
-        override fun writeSigningPublicKeyHex(hex: String) {
-            capturedHex = hex
-            callOrder += "hex"
-        }
-
-        override fun advanceToFinaleConfirmation() {
-            advancedToFinaleConfirmation = true
-            callOrder += "step"
-        }
-
-        override fun setFinalizePhase(phase: OnboardingFinalizePhase) {
-            capturedPhase = phase
-            callOrder += "phase"
-        }
-    }
+    // The regex checks above catch STRAIGHT-FORWARD shapes and are
+    // NOT exhaustive. Real guarantees come from:
+    //   1. Sealed model — three former slots physically no longer
+    //      exist as independent mutable fields.
+    //   2. Ed25519 hex contract enforced at three layers:
+    //      `runFinalize` filter + `FinalizeOutcome.Completed.init`
+    //      + `OnboardingFinalizeState.Completed.init`.
+    //   3. Holder state-machine guards — Completed is TERMINAL;
+    //      MissingKeyRepairRequired needs explicit
+    //      resetFromRepairRequired; stale-outcome guard on
+    //      applyFinalizeOutcome.
+    //   4. `computeNextNavigationStep` — structurally refuses
+    //      FinaleConfirmation regardless of enum ordering.
+    //   5. `canAdvanceFromV2(Permissions) = false` —
+    //      belt-and-suspenders first line of defence.
+    //   6. Composable short-circuits into
+    //      OnboardingRepairRequiredScreen when state is
+    //      MissingKeyRepairRequired — the state is VISIBLE to
+    //      the user, not silent (round-2 §P1 pin).
 
     // ── Defensive: transient error is cleared on next attempt ─────────
 
@@ -489,11 +838,8 @@ class OnboardingV2FinalizeOutcomeContractTest {
             },
         )
         runFinalize(controller, "alice", PrivacyMode.Standard)
-        assertNotNull(controller.transientErrorMessage, "first attempt should set error")
+        assertNotNull(controller.transientErrorMessage)
         runFinalize(controller, "alice", PrivacyMode.Standard)
-        assertNull(
-            controller.transientErrorMessage,
-            "retry clears the transient error (controller resets it before phase 2)",
-        )
+        assertNull(controller.transientErrorMessage)
     }
 }

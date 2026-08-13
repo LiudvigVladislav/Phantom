@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
@@ -38,14 +39,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.invisibleToUser
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import android.util.Log
-import phantom.core.identity.IdentityRecord
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2
@@ -109,120 +111,112 @@ import phantom.core.crypto.DhPublicKey
  */
 
 /**
- * Round-14 REDLINE §P1 pin — typed finalize outcome returned to
- * the single caller coroutine. The caller then performs the
- * atomic success-transition (seed hex → advance step → set
- * phase = Completed) in one uninterruptible sequence, so no
- * intermediate `phase = Completed && currentStep = Permissions`
- * state can be observed by a rotation between two independent
- * effect writes (round-13 shape suffered from that gap).
+ * Typed finalize outcome returned to the single caller coroutine.
+ * The caller feeds the outcome to
+ * `finalizeHolder.applyFinalizeOutcome` — a single
+ * sealed-state assignment.
  *
- * Terminal resolution:
- *   - `FinalizeState.Complete(record)` → [FinalizeOutcome.Completed(record)]
- *   - `FinalizeState.Idle`             → [FinalizeOutcome.FailedBeforePersistence]
- *       (finalize returned back to Idle → phase-0 error before
- *        any disk write; user should be able to fix
- *        username/privacy and retry from a clean slate.)
- *   - `FinalizeState.Persisted`        → [FinalizeOutcome.FailedAfterPersistence]
- *       (identity + mode already on disk; initMessaging failed;
- *        caller keeps phase = InFlight so Back stays locked and
- *        a Done re-tap hits the controller's Persisted → Complete
- *        short-circuit.)
- *   - `FinalizeState.Working`          → [FinalizeOutcome.FailedAfterPersistence]
- *       (defensive; the suspend function shouldn't return while
- *        still Working. Same handling as Persisted-error — keep
- *        Back locked, wait for user re-tap.)
+ * C6-a round-1 REDLINE §P1: `Completed` carries the
+ * `signingPublicKeyHex` as a NON-NULL String (not the whole
+ * `IdentityRecord`). Round-2 REDLINE §P1 tightened the filter:
+ * ANY malformed hex (null / empty / wrong length / non-hex) is
+ * routed to a NEW outcome [MissingKeyMaterial]. The sealed state
+ * model never sees a `Completed` with anything other than a
+ * valid Ed25519 hex; the null/malformed-hex case lands the
+ * holder at
+ * [OnboardingFinalizeState.MissingKeyRepairRequired] instead,
+ * which surfaces a visible repair-required screen with an
+ * "Exit onboarding" action.
+ *
+ * Terminal resolution (round-3 REDLINE §P2 pin — this table
+ * matches the actual runFinalize + holder wiring):
+ *   - `FinalizeState.Complete(record)` with a VALID Ed25519
+ *     `signingPublicKeyHex` → [FinalizeOutcome.Completed(hex)]
+ *     → holder → `Completed(hex)` → Finale opens.
+ *   - `FinalizeState.Complete(record)` with a MALFORMED
+ *     `signingPublicKeyHex` (null / empty / wrong length /
+ *     non-hex) → [FinalizeOutcome.MissingKeyMaterial] → holder
+ *     → `MissingKeyRepairRequired`. Controller state stays at
+ *     `Complete(brokenRecord)` — the composable's early return
+ *     into `OnboardingRepairRequiredScreen` (with its own
+ *     BackHandler wired to `Activity.finishAffinity()`) exits
+ *     the flow rather than trying to unwind the controller.
+ *     Round-1 shape routed this to `FailedAfterPersistence`,
+ *     which stranded the user at InFlight/Permissions with
+ *     Back locked — that path is no longer used for null-hex.
+ *   - `FinalizeState.Idle` → [FinalizeOutcome.FailedBeforePersistence]
+ *     (phase-0 error before any disk write; holder reverts to
+ *     NotStarted so the user can fix username/privacy and
+ *     retry from a clean slate.)
+ *   - `FinalizeState.Persisted` → [FinalizeOutcome.FailedAfterPersistence]
+ *     (identity + mode on disk; initMessaging failed; holder
+ *     stays InFlight so Back stays locked and a Done re-tap
+ *     hits the controller's `Persisted → Complete`
+ *     short-circuit.)
+ *   - `FinalizeState.Working` → [FinalizeOutcome.FailedAfterPersistence]
+ *     (defensive; suspend function shouldn't return while still
+ *     Working. Same handling as Persisted-error.)
  */
 internal sealed interface FinalizeOutcome {
-    data class Completed(val record: IdentityRecord) : FinalizeOutcome
+    data class Completed(val signingPublicKeyHex: String) : FinalizeOutcome {
+        init {
+            require(isValidEd25519PublicKeyHex(signingPublicKeyHex)) {
+                "FinalizeOutcome.Completed requires a valid Ed25519 signingPublicKeyHex " +
+                    "(exactly 64 hex chars, [0-9a-fA-F]); got length " +
+                    "${signingPublicKeyHex.length}. Malformed hex must be filtered upstream " +
+                    "in runFinalize and routed to MissingKeyMaterial " +
+                    "(round-2 REDLINE §P1 pin)."
+            }
+        }
+    }
     object FailedBeforePersistence : FinalizeOutcome
     object FailedAfterPersistence : FinalizeOutcome
+
+    /**
+     * Round-2 REDLINE §P1 pin: controller returned Complete but
+     * the persisted record's signingPublicKeyHex failed the
+     * Ed25519 contract ([isValidEd25519PublicKeyHex] — 64 hex
+     * chars, `[0-9a-fA-F]`). The identity is on disk but its
+     * signing key material is malformed; the flow MUST NOT open
+     * Finale (would land the user on a "Something went wrong"
+     * fallback with no exit) and MUST NOT stay at InFlight (was
+     * the round-1 amend shape: silent infinite retry). Holder
+     * transitions to [OnboardingFinalizeState.MissingKeyRepairRequired]
+     * so the flow can render a visible repair-required screen
+     * with a safe-exit action.
+     */
+    object MissingKeyMaterial : FinalizeOutcome
 }
 
-/**
- * Round-16 REDLINE §P1 pin — pure reducer describing the atomic
- * state advance from a [FinalizeOutcome]. Extracted out of the
- * caller coroutine so a Kotlin unit test can assert the exact
- * transition for each outcome without going through Compose UI.
- * A refactor that splits the writes across parallel effects
- * would either stop calling this reducer or feed the wrong
- * fields into it — both cases fail
- * `OnboardingV2FinalizeOutcomeContractTest`.
- *
- * Fields carry `null` when the outcome does NOT change that
- * particular slot (Failed*Persistence outcomes preserve
- * `signingPublicKeyHex` and `currentStep` in-place; only the
- * phase transitions).
- */
-internal data class FinalizeAdvance(
-    val newSigningPublicKeyHex: String?,
-    val newStep: OnboardingStepV2?,
-    val newPhase: OnboardingFinalizePhase,
-)
-
-internal fun applyFinalizeOutcome(outcome: FinalizeOutcome): FinalizeAdvance = when (outcome) {
-    is FinalizeOutcome.Completed -> FinalizeAdvance(
-        newSigningPublicKeyHex = outcome.record.signingPublicKeyHex,
-        newStep = OnboardingStepV2.FinaleConfirmation,
-        newPhase = OnboardingFinalizePhase.Completed,
-    )
-    FinalizeOutcome.FailedBeforePersistence -> FinalizeAdvance(
-        newSigningPublicKeyHex = null,
-        newStep = null,
-        newPhase = OnboardingFinalizePhase.NotStarted,
-    )
-    FinalizeOutcome.FailedAfterPersistence -> FinalizeAdvance(
-        newSigningPublicKeyHex = null,
-        newStep = null,
-        newPhase = OnboardingFinalizePhase.InFlight,
-    )
-}
-
-/**
- * Round-17 REDLINE §P1 pin — production-side writer interface used
- * by [applyAndCommitFinalizeOutcome]. Production `Flow` provides an
- * anonymous impl that pokes the composable's three
- * `rememberSaveable` slots (signingPublicKeyHex, currentStep,
- * finalizePhase). Tests provide a capturing impl that records the
- * write ORDER and VALUES.
- *
- * Ownership scope: for the terminal finalize transition, these
- * methods own the currently present direct assignment forms of
- * `signingPublicKeyHex`, `currentStep = FinaleConfirmation`, and
- * `finalizePhase`. Regular navigation (e.g. Next/Back reassigning
- * `currentStep`) writes those fields elsewhere and is NOT
- * governed by this interface.
- *
- * `OnboardingV2FinalizeOutcomeContractTest`'s source-contract
- * test is a NON-EXHAUSTIVE tripwire: it fails-red on the
- * straight-forward assignment shapes any reasonable refactor
- * would produce, not on determined indirections through
- * intermediate vals or reflected setters. Total ownership
- * requires the planned sealed state holder (Commit 6).
- */
-internal interface FinalizeStateWriter {
-    fun writeSigningPublicKeyHex(hex: String)
-    fun advanceToFinaleConfirmation()
-    fun setFinalizePhase(phase: OnboardingFinalizePhase)
-}
-
-/**
- * Round-17 REDLINE §P1 pin — single production helper that Done
- * tap AND resume LaunchedEffect both invoke. Reads outcome via
- * `applyFinalizeOutcome` reducer, then commits via [writer].
- * Guarantees identical write order across both flows.
- */
-internal fun applyAndCommitFinalizeOutcome(
-    outcome: FinalizeOutcome,
-    writer: FinalizeStateWriter,
-) {
-    val advance = applyFinalizeOutcome(outcome)
-    advance.newSigningPublicKeyHex?.let { writer.writeSigningPublicKeyHex(it) }
-    if (advance.newStep == OnboardingStepV2.FinaleConfirmation) {
-        writer.advanceToFinaleConfirmation()
-    }
-    writer.setFinalizePhase(advance.newPhase)
-}
+// C6-a: the `FinalizeAdvance` data class + `applyFinalizeOutcome`
+// reducer + `FinalizeStateWriter` interface +
+// `applyAndCommitFinalizeOutcome` helper that round-16..18 shipped
+// have been retired. Their combined ownership contract (atomic
+// three-slot terminal transition, writer-only mutation surface)
+// now lives inside a single sealed [OnboardingFinalizeState] whose
+// three variants — NotStarted / InFlight / Completed(hex) —
+// replace the former three separate slots. See
+// [OnboardingFinalizeStateHolder]'s KDoc for the sealed-model
+// rationale (partial recreation between two independent writes is
+// now un-representable, not merely un-observed).
+//
+// The only remaining coordinator in this file is [runFinalize]
+// below: it drives the controller and returns a typed
+// [FinalizeOutcome]. Both call sites (Done tap + resume
+// LaunchedEffect) feed the outcome to
+// `holder.applyFinalizeOutcome(outcome)` — a SINGLE
+// `MutableState` assignment inside the holder. There is no
+// external `finalizePhase` field, no external
+// `signingPublicKeyHex` field on the form state, and the only
+// direct `currentStep = FinaleConfirmation` transition is the
+// derived-value expression at the top of the composable:
+//
+//     val currentStep = if (holder.state is Completed)
+//         OnboardingStepV2.FinaleConfirmation
+//     else navigationStep
+//
+// Regular Next/Back writes `navigationStep`, never Finale
+// directly.
 
 /**
  * `internal` (was `private`) so
@@ -240,7 +234,35 @@ internal suspend fun runFinalize(
 ): FinalizeOutcome {
     controller.finalize(username, privacyMode)
     return when (val end = controller.state) {
-        is FinalizeState.Complete -> FinalizeOutcome.Completed(end.record)
+        is FinalizeState.Complete -> {
+            // C6-a round-2 REDLINE §P1 pin: validate hex against the
+            // Ed25519 public-key contract (exactly 64 hex chars,
+            // `[0-9a-fA-F]`) HERE, before constructing any outcome.
+            //   - Valid hex → `Completed(hex)`; sealed model lands on
+            //     Completed(hex) via holder → Finale opens with the
+            //     real key.
+            //   - Null / empty / wrong length / non-hex char →
+            //     `MissingKeyMaterial`; sealed model lands on
+            //     `MissingKeyRepairRequired` via holder → the flow
+            //     renders a visible repair-required screen with a
+            //     safe-exit action. The round-1 amend routed null
+            //     hex to `FailedAfterPersistence`, which trapped the
+            //     user at InFlight on Permissions with Back locked
+            //     and no error surface — silent infinite retry. The
+            //     round-2 shape makes that state visible + exitable.
+            //   - Empty-string hex specifically: prior round-1 code
+            //     only checked `hex == null`, so an empty string
+            //     reached the `Completed(hex)` constructor and threw
+            //     an unhandled IllegalArgumentException inside the
+            //     coroutine. Fixed here by the isValidEd25519PublicKeyHex
+            //     check upfront (length != 64 fails empty too).
+            val hex = end.record.signingPublicKeyHex
+            if (hex != null && isValidEd25519PublicKeyHex(hex)) {
+                FinalizeOutcome.Completed(hex)
+            } else {
+                FinalizeOutcome.MissingKeyMaterial
+            }
+        }
         is FinalizeState.Idle -> FinalizeOutcome.FailedBeforePersistence
         is FinalizeState.Persisted -> FinalizeOutcome.FailedAfterPersistence
         is FinalizeState.Working -> FinalizeOutcome.FailedAfterPersistence
@@ -248,9 +270,10 @@ internal suspend fun runFinalize(
 }
 
 @Composable
-fun OnboardingFlowV2(
+internal fun OnboardingFlowV2(
     container: AppContainer,
     onComplete: () -> Unit,
+    explicitInitialFinalizeState: OnboardingFinalizeState? = null,
 ) {
     // Real production wiring for the two-phase finalize. See
     // [OnboardingFinalizeController] for the state-machine contract.
@@ -290,6 +313,7 @@ fun OnboardingFlowV2(
     OnboardingFlowV2Internal(
         onComplete = onComplete,
         controller = controller,
+        explicitInitialFinalizeState = explicitInitialFinalizeState,
     )
 }
 
@@ -305,18 +329,98 @@ fun OnboardingFlowV2(
 internal fun OnboardingFlowV2Internal(
     onComplete: () -> Unit,
     controller: OnboardingFinalizeController,
+    /**
+     * C6-a round-6 REDLINE §P1 pin — optional explicit override
+     * for the sealed finalize holder's initial state. When
+     * non-null, WINS over the disk-marker read. `MainActivity`
+     * passes `MissingKeyRepairRequired` here when the durable
+     * marker write from the quarantine startup branch returned
+     * `false` — that lets the current session still show the
+     * repair-required screen even when SharedPreferences
+     * rejected the write. Without this override, the flow
+     * would read the disk marker as `false` (because the write
+     * failed) and seed the holder at `NotStarted`, silently
+     * dropping the user on Welcome despite the identity being
+     * broken.
+     *
+     * Defaults to `null` so existing test call-sites
+     * (`OnboardingV2NextLaunchQuarantineTest`,
+     * `OnboardingV2RepairRequiredIntegrationTest`) keep their
+     * marker-driven seeding behaviour unchanged.
+     */
+    explicitInitialFinalizeState: OnboardingFinalizeState? = null,
 ) {
     // Round-10 REDLINE §P1 pin: rememberSaveable everywhere so a
     // config change (rotation, dark-mode toggle, font-scale change)
     // preserves the flow's state. Prior plain `remember` reset
     // currentStep to Welcome + wiped formState.username on every
     // rotation.
-    var currentStep by rememberSaveable(stateSaver = OnboardingStepV2Saver) {
+    //
+    // C6-a rename: the mutable slot is `navigationStep` (what the
+    // Next / Back gestures write). The composable reads `currentStep`
+    // — a DERIVED value that becomes FinaleConfirmation the instant
+    // the sealed finalize holder reports `Completed`, otherwise
+    // returns navigationStep verbatim. This means:
+    //   - `navigationStep = FinaleConfirmation` is IMPOSSIBLE from
+    //     regular navigation (the derived value ignores writes here
+    //     for the Finale case; only holder.state = Completed can
+    //     promote UI to Finale).
+    //   - Rotation cannot land between "finalize returned" and
+    //     "currentStep advanced" — those are the SAME single
+    //     `holder.applyFinalizeOutcome(outcome)` assignment.
+    var navigationStep by rememberSaveable(stateSaver = OnboardingStepV2Saver) {
         mutableStateOf(OnboardingStepV2.Welcome)
     }
     var formState by rememberSaveable(stateSaver = OnboardingFormStateV2Saver) {
         mutableStateOf(OnboardingFormStateV2())
     }
+    // C6-a: sealed finalize state holder. Sole owner of the three
+    // former slots (`finalizePhase` + `currentStep = Finale` +
+    // `formState.signingPublicKeyHex`). See
+    // [OnboardingFinalizeStateHolder] file KDoc for the sealed
+    // model rationale — impossible combinations are now
+    // un-representable, not just un-observed.
+    //
+    // Round-4 REDLINE §P1 pin: seed the holder from the durable
+    // [IdentityRepairMarker] on FIRST composition of this
+    // rememberSaveable slot. If a prior session wrote the
+    // marker (via the repair-screen exit action), the flow opens
+    // directly on the repair-required screen instead of
+    // Welcome → How → … → Done → repair. MainActivity's startup
+    // gate ALSO reads the marker and routes to Onboarding
+    // regardless of `identity != null`, so a broken identity on
+    // disk cannot bypass this quarantine by taking the ChatList
+    // shortcut. Uninstall (which wipes SharedPreferences) is
+    // the sole way to clear the marker until a downstream commit
+    // adds `IdentityRepairMarker.clearRepairRequiredBlocking`
+    // callers alongside a real repair capability.
+    // Round-7 REDLINE: `decideStartupRoute` (invoked in
+    // MainActivity) is the SINGLE source of truth for quarantine
+    // detection. MainActivity ALWAYS passes
+    // `MissingKeyRepairRequired` as `explicitInitialFinalizeState`
+    // when the decision is RepairQuarantine (or
+    // InitializationFailed). Prior round-4..6 shape had this
+    // flow independently reading the disk marker as fallback —
+    // that duplicated the quarantine decision across two layers
+    // and let the "marker-present + explicit override null" case
+    // slip past MainActivity's Terms bypass (round-6 §P1).
+    // Round-7 removes the fallback: the flow trusts the caller's
+    // explicit override; if null, seeds `NotStarted`.
+    val holderContext = androidx.compose.ui.platform.LocalContext.current
+    val holderInitialState: OnboardingFinalizeState = remember(
+        explicitInitialFinalizeState,
+    ) {
+        explicitInitialFinalizeState ?: OnboardingFinalizeState.NotStarted
+    }
+    val finalizeHolder = rememberOnboardingFinalizeStateHolder(holderInitialState)
+    // Derived displayed step. `Completed` → Finale, regardless of
+    // navigationStep. Every other state → navigationStep verbatim.
+    // A regular Next/Back tap can never promote UI to Finale from
+    // this expression alone; only the holder can.
+    val currentStep: OnboardingStepV2 =
+        if (finalizeHolder.state is OnboardingFinalizeState.Completed)
+            OnboardingStepV2.FinaleConfirmation
+        else navigationStep
     var toastMessage by rememberSaveable(
         stateSaver = androidx.compose.runtime.saveable.autoSaver(),
     ) { mutableStateOf<String?>(null) }
@@ -344,29 +448,10 @@ internal fun OnboardingFlowV2Internal(
     // is a one-line change.
     var pricingSheetVisible by rememberSaveable { mutableStateOf(false) }
     var pricingSheetPresent by rememberSaveable { mutableStateOf(false) }
-    // Round-12 REDLINE §P1 pin: durable three-phase finalize state.
-    // Prior round-11 was a single Boolean set on Done and never
-    // cleared — a rotation on Finale replayed the entire finalize
-    // path against a fresh Idle controller (doubled initMessaging),
-    // and error-before-persistence left Back locked while the
-    // controller had reverted to Idle.
-    //
-    // Round-12 rules (see OnboardingFinalizePhase KDoc):
-    //   - NotStarted → Back unlocked; Done can re-fire.
-    //   - InFlight   → Back locked; resume LaunchedEffect replays
-    //                  finalize IFF controller state is Idle.
-    //   - Completed  → Back locked; resume NEVER re-invokes finalize.
-    //
-    // Transitions:
-    //   Done tap                → InFlight
-    //   controller Complete     → Completed
-    //   controller error before
-    //     persistence (state
-    //     ends up back at Idle) → NotStarted (allow user to fix
-    //                              username/privacy and retry)
-    var finalizePhase by rememberSaveable(stateSaver = OnboardingFinalizePhaseSaver) {
-        mutableStateOf(OnboardingFinalizePhase.NotStarted)
-    }
+    // C6-a: `finalizePhase` durable slot retired. Its role is
+    // subsumed by `finalizeHolder.state` above — the sealed model
+    // covers all three phases (NotStarted / InFlight /
+    // Completed(hex)) with a single write per transition.
     val scope = rememberCoroutineScope()
 
     // Surface controller's transient error via the existing toast slot,
@@ -379,89 +464,87 @@ internal fun OnboardingFlowV2Internal(
         }
     }
 
-    // Round-14 REDLINE §P1 pin: atomic success-transition owned
-    // by the caller coroutine. Round-13 shape split responsibility
-    // between the coroutine (wrote phase=Completed on Complete)
-    // and a separate Complete-observer LaunchedEffect (advanced
-    // currentStep + seeded hex). A rotation between those two
-    // writes left `phase = Completed && currentStep = Permissions`
-    // — post-restart the resume effect skipped (only InFlight
-    // triggers replay) and the Complete-observer no longer had
-    // a Complete controller state to observe. User stranded on
-    // Permissions with Back locked.
+    // C6-a: post-recreation resume. Runs EXACTLY ONCE per
+    // composition on `LaunchedEffect(Unit)` — which for
+    // post-rotation IS the newly-composed instance. If we come
+    // back with `state = InFlight` (Done had fired before the
+    // rotation) AND the controller is fresh (Idle after
+    // recreation), replay finalize and apply the outcome
+    // atomically inside the holder.
     //
-    // Round-14 collapses the transition into ONE atomic block
-    // inside the coroutine (seed hex → advance step → set phase =
-    // Completed). No Compose observer touches the transition; no
-    // gap between the two writes is possible.
-    //
-    // Post-recreation resume — fires EXACTLY ONCE per composition
-    // on `LaunchedEffect(Unit)`, which for post-rotation IS the
-    // newly-composed instance. Runs the SAME atomic block as the
-    // Done tap.
-    // Round-17 REDLINE §P1 pin: single production writer for the
-    // terminal finalize transition. Both call sites (Done tap AND
-    // this resume LaunchedEffect) delegate to the helper defined
-    // above — the writer owns the direct terminal-assignment
-    // shapes for `formState.signingPublicKeyHex`, `currentStep =
-    // FinaleConfirmation`, and `finalizePhase`. Guarded by
-    // `OnboardingV2FinalizeOutcomeContractTest`'s source-contract
-    // test — a non-exhaustive tripwire (fails-red on straight-
-    // forward assignments; determined indirections through
-    // intermediate vals can bypass). Total ownership will come
-    // with the sealed state holder in Commit 6.
-    val finalizeStateWriter = object : FinalizeStateWriter {
-        override fun writeSigningPublicKeyHex(hex: String) {
-            formState = formState.copy(signingPublicKeyHex = hex)
-        }
-        override fun advanceToFinaleConfirmation() {
-            currentStep = OnboardingStepV2.FinaleConfirmation
-        }
-        override fun setFinalizePhase(phase: OnboardingFinalizePhase) {
-            finalizePhase = phase
-        }
-    }
-
+    // Why the holder writes the whole terminal state in ONE
+    // assignment: prior split-writer shapes (round-13..18) could
+    // leave the three durable slots (`phase`, `currentStep`,
+    // `hex`) partially updated between two independent effects or
+    // between two lines of a helper method. A rotation caught in
+    // that gap stranded the user on Permissions with Back locked.
+    // The sealed model closes that gap: the whole snapshot rides
+    // on a single `MutableState` write; there is no "between two
+    // writes" to catch.
     LaunchedEffect(Unit) {
-        if (finalizePhase == OnboardingFinalizePhase.InFlight &&
-            controller.state is FinalizeState.Idle &&
-            currentStep != OnboardingStepV2.FinaleConfirmation
+        if (finalizeHolder.state is OnboardingFinalizeState.InFlight &&
+            controller.state is FinalizeState.Idle
         ) {
             val outcome = runFinalize(
                 controller = controller,
                 username = formState.username,
                 privacyMode = formState.privacyMode,
             )
-            applyAndCommitFinalizeOutcome(outcome, finalizeStateWriter)
+            if (!persistMissingKeyMarkerIfNeeded(outcome, holderContext)) return@LaunchedEffect
+            finalizeHolder.applyFinalizeOutcome(outcome)
         }
     }
 
-    // Round-1 REDLINE Commit-3 §P1-1: back navigation is locked once
-    // the finalize controller reaches Persisted or later — the
-    // persisted record is immutable, so returning to Identity to
-    // "change" the username would be silently ignored.
-    // Round-12 REDLINE §P1 pin: OR-include the durable phase.
-    // InFlight OR Completed → Back locked. NotStarted defers to
-    // the controller state (Idle → unlocked; Persisted/Working →
-    // locked via `isBackNavigationLockedByFinalize`). The
-    // error-before-persistence LaunchedEffect above returns
-    // phase to NotStarted on Idle so Back unlocks for user
-    // recovery.
-    val backLocked =
-        isBackNavigationLockedByFinalize(controller.state) ||
-            finalizePhase != OnboardingFinalizePhase.NotStarted
+    // Back navigation lock:
+    //   - Controller Persisted/Working → locked (identity already on
+    //     disk, going back would silently drop user edits).
+    //   - Holder NotStarted → defers entirely to controller state.
+    //   - Holder InFlight  → locked (Done coroutine still running).
+    //   - Holder Completed → locked (Finale is showing; nothing to
+    //     unwind).
+    //   - Holder MissingKeyRepairRequired → UNLOCKED regardless of
+    //     controller state (round-3 REDLINE §P1 pin: the round-2
+    //     shape leaked `isBackNavigationLockedByFinalize(controller.state)`
+    //     into this predicate — when we reach MissingKeyRepairRequired
+    //     the controller stays at `Complete(brokenRecord)` and that
+    //     predicate returns true, so Back was silently absorbed even
+    //     though we CLAIMED it was a safe exit. The when-branch
+    //     below explicitly overrides the controller-side lock for
+    //     this holder state — the repair-required screen ALSO
+    //     installs its OWN BackHandler wired to the exit action,
+    //     so the flow's outer BackHandler routing intentionally
+    //     skips this branch too).
+    // Error-before-persistence flips the holder back to NotStarted
+    // via `applyFinalizeOutcome`, so Back unlocks for user recovery.
+    val backLocked = when {
+        finalizeHolder.state is OnboardingFinalizeState.MissingKeyRepairRequired -> false
+        else ->
+            isBackNavigationLockedByFinalize(controller.state) ||
+                finalizeHolder.state is OnboardingFinalizeState.InFlight ||
+                finalizeHolder.state is OnboardingFinalizeState.Completed
+    }
+    // goBack / goNext operate on `navigationStep` — the mutable
+    // slot. Reads look up the previous/next OnboardingStepV2 by
+    // ordinalInFlow relative to navigationStep, NOT the derived
+    // currentStep — otherwise, in the Completed state (where
+    // currentStep == Finale but navigationStep == Permissions), a
+    // stale gesture could try to advance past Finale.
     val goBack: () -> Unit = {
         if (!backLocked) {
             val prev = OnboardingStepV2.entries
-                .firstOrNull { it.ordinalInFlow == currentStep.ordinalInFlow - 1 }
-            if (prev != null) currentStep = prev
+                .firstOrNull { it.ordinalInFlow == navigationStep.ordinalInFlow - 1 }
+            if (prev != null) navigationStep = prev
         }
     }
     val goNext: () -> Unit = {
-        if (canAdvanceFromV2(currentStep, formState)) {
-            val next = OnboardingStepV2.entries
-                .firstOrNull { it.ordinalInFlow == currentStep.ordinalInFlow + 1 }
-            if (next != null) currentStep = next
+        if (canAdvanceFromV2(navigationStep, formState)) {
+            // C6-a round-1 REDLINE §P1 pin: pure helper enforces the
+            // "Finale is never a regular-nav target" invariant.
+            // Returns null if the next candidate would be
+            // FinaleConfirmation OR if `from` itself is a step with
+            // no forward-nav target (Permissions / Finale).
+            val next = computeNextNavigationStep(navigationStep)
+            if (next != null) navigationStep = next
         }
     }
 
@@ -482,13 +565,107 @@ internal fun OnboardingFlowV2Internal(
     //     is Persisted (or later), backward navigation from Permissions
     //     would try to unwind an already-committed identity — no-op.
     //   Other steps: goBack decrements currentStep.
+    // C6-a round-3 REDLINE §P1 pin: early return to render the
+    // repair-required screen BEFORE the regular BackHandler routing
+    // + host frame. The repair screen installs its OWN BackHandler
+    // wired to the same `onExit` action its "Exit onboarding"
+    // button uses, so both system-Back and CTA-tap produce the
+    // SAME honest exit (Activity.finishAffinity()). Placed after
+    // all rememberSaveable slots + the resume LaunchedEffect so
+    // state + resume gating remain correct across rotation.
+    //
+    // Prior round-2 shape put this short-circuit INSIDE the outer
+    // Box and let the regular BackHandler routing install
+    // `BackHandler { intentionally absorbed }` (because
+    // `isBackNavigationLockedByFinalize(controller.state) == true`
+    // when the controller reached Complete with a broken record).
+    // System Back was silently swallowed while we claimed it was a
+    // safe exit. Round-3 closes that surface via BOTH the
+    // `backLocked` when-branch above AND this early return.
+    if (finalizeHolder.state is OnboardingFinalizeState.MissingKeyRepairRequired) {
+        val exitContext = androidx.compose.ui.platform.LocalContext.current
+        val onExit: () -> Unit = remember(exitContext, finalizeHolder) {
+            {
+                // C6-a round-5 REDLINE §P1 pin: Exit is now
+                // IDEMPOTENT — the durable
+                // `identity_repair_required` marker was already
+                // written the moment `runFinalize` returned
+                // `MissingKeyMaterial` (see
+                // `persistMissingKeyMarkerIfNeeded` in the
+                // Done-tap coroutine + resume LaunchedEffect
+                // above). Cold-restart via `MainActivity`'s
+                // startup gate already routes back to
+                // Onboarding, and this composable's
+                // `holderInitialState` re-seeds
+                // MissingKeyRepairRequired from that marker.
+                //
+                // The Exit CTA's sole job is to close the current
+                // task via `Activity.finishAffinity()`. Round-4
+                // wrote the marker HERE too — that write was
+                // needed then because there was no detection-time
+                // write. Round-5 removed it: the detection-time
+                // write is guaranteed BEFORE any user interaction
+                // with the repair screen, so backgrounding /
+                // process-kill between MissingKeyMaterial and
+                // Exit is now handled by the durable marker
+                // rather than requiring the user to reach the
+                // Exit CTA at all.
+                //
+                // Reliable Activity lookup still uses
+                // `findActivityOrNull()` (unchanged round-4 fix)
+                // — `(context as? Activity)?.finishAffinity()`
+                // would silently no-op on ContextWrapper.
+                val activity = exitContext.findActivityOrNull()
+                if (activity == null) {
+                    // No Activity in the Context chain. Should
+                    // never happen inside a rendered composable,
+                    // but if the Compose runtime is somehow
+                    // hosting us via a raw ApplicationContext,
+                    // fail-loud instead of pretending the exit
+                    // succeeded. Holder stays; marker is on disk
+                    // so a fresh cold-start will still route to
+                    // the quarantine.
+                    android.util.Log.e(
+                        "OnboardingV2",
+                        "OnboardingRepairRequiredScreen.onExit: no Activity in LocalContext " +
+                            "chain — finishAffinity() cannot be called. " +
+                            "Holder stays at MissingKeyRepairRequired. " +
+                            "Durable IdentityRepairMarker was written, so the next " +
+                            "launch will route back to quarantine even without " +
+                            "the current-task finish.",
+                    )
+                    return@remember
+                }
+                activity.finishAffinity()
+                // NB: intentionally NOT calling
+                // finalizeHolder.resetFromRepairRequired() —
+                // the durable marker is now on disk (the true
+                // quarantine anchor), the Activity is finishing
+                // (the composable tears down), and if for any
+                // reason the Activity survives finishAffinity
+                // the flow must STAY at MissingKeyRepairRequired
+                // rather than silently transitioning to
+                // NotStarted (which would let a subsequent Done
+                // tap loop through the same broken controller).
+            }
+        }
+        OnboardingRepairRequiredScreen(onExit = onExit)
+        return
+    }
+
     if (pricingSheetVisible) {
         BackHandler(enabled = true) { pricingSheetVisible = false }
     } else if (pricingSheetPresent) {
         BackHandler(enabled = true) { /* mid-exit-animation — absorbed */ }
-    } else if (currentStep == OnboardingStepV2.FinaleConfirmation || backLocked) {
+    } else if (backLocked) {
+        // Absorbs OS Back on:
+        //   - Finale (holder = Completed → currentStep derived to
+        //     FinaleConfirmation → backLocked true).
+        //   - Any InFlight finalize (Done fired, coroutine running).
+        //   - Any state where the controller is Persisted/Working
+        //     (identity already committed).
         BackHandler(enabled = true) { /* intentionally absorbed */ }
-    } else if (currentStep != OnboardingStepV2.Welcome) {
+    } else if (navigationStep != OnboardingStepV2.Welcome) {
         BackHandler(enabled = true) { goBack() }
     }
 
@@ -728,39 +905,54 @@ internal fun OnboardingFlowV2Internal(
                         }
                     },
                     onDoneClick = {
-                        // Delegate the THREE-phase state machine
-                        // (double-tap guard, savePrivacyMode / createOrLoad
-                        // / initMessaging with retry semantics + cancellation
-                        // handling) to the controller. Round-14 REDLINE §P1:
-                        // advancement to FinaleConfirmation is owned by this
-                        // coroutine's atomic outcome-match block below — the
-                        // previous LaunchedEffect(controller.state) Compose
-                        // observer was removed to avoid the observable gap
-                        // between finalize's return and the step advance.
-                        // Round-18 REDLINE §P1 pin: pre-launch
-                        // InFlight transition ALSO goes through the
-                        // writer — no direct assignment of
-                        // `finalizePhase` in the currently present
-                        // shapes outside the writer's
-                        // `setFinalizePhase` body. Guarded by the
-                        // source-contract test (non-exhaustive
-                        // tripwire — see FinalizeStateWriter KDoc).
-                        finalizeStateWriter.setFinalizePhase(
-                            OnboardingFinalizePhase.InFlight,
-                        )
+                        // C6-a: kick off the atomic finalize.
+                        //   1. `finalizeHolder.markInFlight` — single
+                        //      write, sealed slot flips to InFlight.
+                        //      Back locks immediately; resume
+                        //      LaunchedEffect can now replay from a
+                        //      post-rotation composition if this
+                        //      coroutine dies with the process.
+                        //   2. `runFinalize` — drive the two-phase
+                        //      controller state machine (double-tap
+                        //      guard, savePrivacyMode / createOrLoad /
+                        //      initMessaging with retry + cancellation
+                        //      handling).
+                        //   3. `finalizeHolder.applyFinalizeOutcome`
+                        //      — single sealed-slot write that atomically
+                        //      lands NotStarted, InFlight, or
+                        //      Completed(hex) as appropriate. There is
+                        //      NO longer a separate `currentStep =
+                        //      FinaleConfirmation` line or a separate
+                        //      `formState.copy(signingPublicKeyHex =
+                        //      hex)` line — both are implicit in the
+                        //      Completed(hex) variant + the derived
+                        //      `currentStep` at the top of the
+                        //      composable.
+                        finalizeHolder.markInFlight()
                         scope.launch {
                             val outcome = runFinalize(
                                 controller = controller,
                                 username = formState.username,
                                 privacyMode = formState.privacyMode,
                             )
-                            applyAndCommitFinalizeOutcome(outcome, finalizeStateWriter)
+                            if (!persistMissingKeyMarkerIfNeeded(outcome, holderContext))
+                                return@launch
+                            finalizeHolder.applyFinalizeOutcome(outcome)
                         }
                     },
                     )  // PermissionsStepV2 close
                 }  // OnboardingStepV2.Permissions block close
                 OnboardingStepV2.FinaleConfirmation -> FinaleConfirmationStepV2(
-                    formState = formState,
+                    // C6-a: hex arrives directly from the sealed
+                    // finalize holder — non-null iff state is
+                    // Completed, and the derived currentStep only
+                    // resolves to FinaleConfirmation in that case
+                    // (see the `val currentStep` expression at the
+                    // top of the composable). Absent the coupling
+                    // through `formState.signingPublicKeyHex`, there
+                    // is no way for a caller to render this step
+                    // with a stale hex.
+                    signingPublicKeyHex = finalizeHolder.signingPublicKeyHex,
                     onContinueClick = onComplete,
                     onKeyCopied = {
                         // Round-1 REDLINE Commit-3 §P2-1: Copy needs
@@ -821,3 +1013,180 @@ internal fun OnboardingFlowV2Internal(
  * 3 dp spec. `BlurredEdgeTreatment.Unbounded` prevents a hard blur
  * cutoff at the flow-content edge.
  */
+
+/**
+ * Safe-exit repair-required screen (round-3 REDLINE §P1 pin).
+ *
+ * Rendered when the sealed finalize holder reports
+ * [OnboardingFinalizeState.MissingKeyRepairRequired] — the
+ * persisted identity's signingPublicKeyHex failed the Ed25519
+ * contract (null / empty / wrong length / non-hex).
+ *
+ * The screen contains:
+ *   - A clear error message so the user KNOWS what happened.
+ *   - An "Exit onboarding" button whose click calls [onExit].
+ *     Round-3 wires this to `Activity.finishAffinity()` +
+ *     `holder.resetFromRepairRequired()` in the composable, so
+ *     the tap ACTUALLY exits the flow (round-2 shape wired
+ *     "Start over" to holder-reset ONLY, which left the user in
+ *     a visible retap loop — architect flagged it as "надпись
+ *     Start over при текущем поведении недопустима").
+ *   - Its OWN [BackHandler] wired to the same [onExit] action,
+ *     so system Back produces the SAME honest exit as the CTA
+ *     tap. Prior round-2 shape had the outer BackHandler
+ *     routing silently absorb system Back via
+ *     `isBackNavigationLockedByFinalize(controller.state)`
+ *     (which was true because the controller stays at Complete).
+ *     Round-3 short-circuits ABOVE that routing so this
+ *     BackHandler wins.
+ *
+ * The `onExit` action:
+ *   - Resets the sealed holder to NotStarted (housekeeping — if
+ *     the Activity somehow survives finishAffinity, the flow is
+ *     left in a coherent state).
+ *   - Calls `Activity.finishAffinity()` on the enclosing
+ *     Activity so the whole onboarding task closes.
+ * A downstream commit will replace this with an ATOMIC repair
+ * (`IdentityManager.delete()` + controller reset + fresh identity
+ * generation) so the button can genuinely "start over" instead
+ * of just exiting.
+ *
+ * Marked `internal` (was `private`) so the Compose semantics
+ * test at
+ * `OnboardingV2RepairRequiredScreenTest` can render it directly
+ * and pin the CTA-click + Back-press behaviour without needing
+ * to drive the full flow.
+ *
+ * Deliberately spartan visual — the state-model boundary, not a
+ * user-facing polished surface. Downstream commit upgrades the
+ * visual alongside the real repair action.
+ */
+@Composable
+internal fun OnboardingRepairRequiredScreen(onExit: () -> Unit) {
+    // Round-3 §P1 pin: BackHandler wired directly to onExit so
+    // system Back == "Exit onboarding" tap. Enabled=true wins
+    // over any ambient handler up the composition tree because
+    // this screen's BackHandler is installed later (inside this
+    // composable's slot) than the flow's outer routing — AND
+    // because the flow's outer routing intentionally does not
+    // install anything for the MissingKeyRepairRequired state
+    // (see the early-return short-circuit in OnboardingFlowV2Internal).
+    BackHandler(enabled = true) { onExit() }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(DesignV2Tokens.Colors.Surface)
+            .padding(24.dp)
+            .semantics { contentDescription = "OnboardingRepairRequiredScreen" },
+        contentAlignment = Alignment.Center,
+    ) {
+        androidx.compose.foundation.layout.Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            androidx.compose.material3.Text(
+                text = "Identity repair required",
+                color = DesignV2Tokens.Colors.TextPrimary,
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = phantom.android.ui.designv2.DesignV2FontDisplay,
+                    fontSize = 22.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                ),
+            )
+            androidx.compose.foundation.layout.Spacer(
+                Modifier.height(12.dp),
+            )
+            androidx.compose.material3.Text(
+                text = "Your identity was created on disk but the signing key material " +
+                    "is missing or malformed. This should not happen. Tap Exit onboarding " +
+                    "to close the app; then reinstall to try again.",
+                color = DesignV2Tokens.Colors.TextSecondary,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = phantom.android.ui.designv2.DesignV2FontBody,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                ),
+            )
+            androidx.compose.foundation.layout.Spacer(
+                Modifier.height(24.dp),
+            )
+            phantom.android.ui.designv2.components.PhantomButton(
+                text = "Exit onboarding",
+                onClick = onExit,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * C6-a round-5 REDLINE §P1 pin — write the durable
+ * [IdentityRepairMarker] AT THE MOMENT the finalize coroutine
+ * detects [FinalizeOutcome.MissingKeyMaterial], BEFORE feeding
+ * the outcome to `holder.applyFinalizeOutcome`.
+ *
+ * Prior round-4 shape wrote the marker only from the Exit-tap
+ * handler inside `OnboardingRepairRequiredScreen`. That was too
+ * late: between the coroutine reaching `MissingKeyMaterial` and
+ * the user tapping Exit, the flow could be backgrounded / the
+ * process killed. Next launch would see a broken identity on
+ * disk with NO marker → MainActivity's `identity != null →
+ * ChatList` path → user landed on the main app with a malformed
+ * signing key.
+ *
+ * Round-5 semantics:
+ *   - Only fires for [FinalizeOutcome.MissingKeyMaterial].
+ *   - Round-6 §P2 pin: synchronous `.commit()` on the caller's
+ *     dispatcher (the flow's Compose main coroutine scope, i.e.
+ *     `Dispatchers.Main`). NOT `withContext(Dispatchers.IO)` —
+ *     that would dispatch to a real IO pool whose completion
+ *     is invisible to `composeTestRule.waitForIdle`, and the
+ *     detection-time-marker load-bearing test would flake.
+ *     StrictMode may flag the main-thread SharedPreferences
+ *     write in DEBUG; a downstream commit can introduce a
+ *     testable dispatcher / await model to lift the write off
+ *     Main without losing the test's correctness guarantee.
+ *   - Returns `true` on success (caller proceeds to
+ *     `applyFinalizeOutcome`) OR when the outcome is not
+ *     `MissingKeyMaterial` (nothing to persist, caller proceeds).
+ *   - Returns `false` when the marker write itself failed. The
+ *     caller MUST NOT apply the outcome to the holder in that
+ *     case — leaving the holder at `InFlight` means Back stays
+ *     locked and the user can retry Done, which will hit the
+ *     controller's Persisted → Complete short-circuit and try
+ *     the marker write again. Better a retry loop the user
+ *     initiates than a silent transition into
+ *     MissingKeyRepairRequired with no durable anchor.
+ */
+private suspend fun persistMissingKeyMarkerIfNeeded(
+    outcome: FinalizeOutcome,
+    context: android.content.Context,
+): Boolean {
+    if (outcome !is FinalizeOutcome.MissingKeyMaterial) return true
+    // C6-a round-5 §P1-1: SharedPreferences `.commit()` is a
+    // synchronous durable write. We deliberately do NOT wrap in
+    // `withContext(Dispatchers.IO)`: that would dispatch to a
+    // real IO thread pool, and Compose test's `waitForIdle`
+    // (which awaits only main-dispatcher tasks) would return
+    // before the write settled — the marker-was-written-at-
+    // detection assertion in
+    // `OnboardingV2NextLaunchQuarantineTest.broken_flow_writes_marker_at_MissingKeyMaterial_detection_not_at_Exit`
+    // would flake. Calling `.commit()` directly from the
+    // Compose main-scope coroutine is on the same dispatcher
+    // as `holder.applyFinalizeOutcome` below, so `waitForIdle`
+    // covers both writes atomically. A one-key SharedPreferences
+    // `.commit()` is fast enough to keep on Main; StrictMode
+    // may flag it in DEBUG but the trade-off is correctness of
+    // the durable-quarantine ordering.
+    val ok = IdentityRepairMarker.markRepairRequiredBlocking(context)
+    if (!ok) {
+        android.util.Log.e(
+            "OnboardingV2",
+            "persistMissingKeyMarkerIfNeeded: IdentityRepairMarker.markRepairRequiredBlocking " +
+                "returned false — durable marker write to SharedPreferences failed. " +
+                "NOT applying outcome to holder; holder stays InFlight; user can retry " +
+                "Done which will re-attempt the marker write.",
+        )
+    }
+    return ok
+}

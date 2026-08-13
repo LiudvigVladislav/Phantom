@@ -4,7 +4,6 @@
 package phantom.android.screens.onboarding.v2.steps
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,14 +19,11 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -48,28 +44,28 @@ import phantom.android.ui.designv2.components.PhantomButton
 import phantom.android.ui.designv2.components.PhantomInput
 
 /**
- * IdentityKeyStepV2 — Step 2 / "Your identity key" (Commit 3 real body).
+ * IdentityKeyStepV2 — Step 2 / "Your identity key".
  *
- * Per architect REDLINE 2026-08-01 §C1: this step MUST NOT claim a key
- * exists. The identity is created only in `OnboardingFlowV2.finalize()`
- * after Permissions "Done" fires. Here we render:
+ * Per architect REDLINE 2026-08-01 §C1 + C6-b contract: this step
+ * MUST NOT claim a key exists. The identity is created only in
+ * `OnboardingFlowV2.finalize()` after Permissions "Done" fires.
  *
- *   - A PREVIEW card that clearly signals the key does not exist yet
- *     (header "ED25519 · WILL BE GENERATED" when username empty,
- *     "ED25519 · READY TO CREATE" when username valid). Status dot
- *     stays neutral grey — never cyan-glow or green-glow. Body area
- *     shows a static placeholder pattern (`— — — — · — — — —`),
- *     clearly non-hex. Footer: "Generated on device when you finish
- *     onboarding."
- *   - NO Copy / Save backup / Regenerate buttons (redline §C1: those
- *     would falsify the "key exists" claim).
- *   - NO warning banner ("Lose this key ..." is meaningful only after
- *     the key exists — moved to the finale confirmation state).
- *   - Username input via PhantomInput's `leadingContent` slot (@ prefix)
- *     + `trailingContent` slot (status icon on valid / invalid) — added
- *     by Commit 1. Validation is FORMAT-ONLY per redline §C2: no
- *     availability check.
+ * Layout:
+ *   - Title + descriptive paragraph.
+ *   - [IdentityKeyPreviewAnimatedCard] — animated key-preview card.
+ *     C6-b (2026-08-10) added a decorative shuffle animation that
+ *     fires on `usernameValid: false → true`. See
+ *     [docs/tracks/android-onboarding/c6-b-key-preview-animation.md]
+ *     for motion table, deviations from canonical, and test matrix.
+ *     The card DOES NOT expose Copy / Save backup / Regenerate
+ *     affordances — no crypto surface exists yet.
+ *   - Username input via PhantomInput's `leadingContent` (@ prefix)
+ *     + `trailingContent` (status icon) slots. Validation is
+ *     FORMAT-ONLY per redline §C2: no availability check.
  *   - Continue CTA gated by `canAdvance` (username format-valid).
+ *     C6-b contract §2.5 pin: `enabled` bound ONLY to
+ *     `validateUsernameV2(...) == UsernameValidationV2.Valid`; the
+ *     animation state does NOT enter the CTA-enabled expression.
  *
  * Username stored as-typed (case-normalised) per redline §C2 — do NOT
  * strip illegal chars via `.filter` (that would make the InvalidChars
@@ -153,7 +149,12 @@ fun IdentityKeyStepV2(
 
             Spacer(Modifier.height(20.dp))
 
-            IdentityKeyPreviewCard(usernameValid = canAdvance)
+            // C6-b: animated preview card. See
+            // `IdentityKeyPreviewAnimation.kt` and
+            // `docs/tracks/android-onboarding/c6-b-key-preview-animation.md`.
+            // Continue-CTA `enabled` still bound to `canAdvance` —
+            // NOT to any animation state (contract §2.5).
+            IdentityKeyPreviewAnimatedCard(usernameValid = canAdvance)
 
             Spacer(Modifier.height(24.dp))
 
@@ -188,90 +189,6 @@ fun IdentityKeyStepV2(
                 onClick = onContinueClick,
                 enabled = canAdvance,
                 modifier = Modifier.fillMaxWidth(),
-            )
-        }
-    }
-}
-
-@Composable
-private fun IdentityKeyPreviewCard(usernameValid: Boolean) {
-    // Round-1 REDLINE Commit-3 §P2-2 (handoff Onboarding.dc.html): the
-    // key card has a distinct HEADER BAND separated from the body by a
-    // hairline. Body area sits in its own padding block below.
-    val statusText = if (usernameValid) "ED25519 · READY TO CREATE"
-                     else "ED25519 · WILL BE GENERATED"
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
-            .background(DesignV2Tokens.Colors.SurfaceInset)
-            .border(1.dp, DesignV2Tokens.Colors.Border, RoundedCornerShape(18.dp)),
-    ) {
-        // Header band — status + icon + neutral dot.
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_dv2_ed25519_key),
-                contentDescription = null,
-                tint = DesignV2Tokens.Colors.Cyan,
-                modifier = Modifier.size(14.dp),
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = statusText,
-                color = DesignV2Tokens.Colors.Cyan,
-                style = TextStyle(
-                    fontFamily = DesignV2FontMono,
-                    fontSize = 10.5.sp,
-                    fontWeight = FontWeight.Medium,
-                    letterSpacing = 1.6.sp,
-                ),
-                modifier = Modifier.weight(1f),
-            )
-            // Neutral grey dot per redline §C1 — nothing exists yet.
-            Box(
-                modifier = Modifier
-                    .size(7.dp)
-                    .clip(CircleShape)
-                    .background(DesignV2Tokens.Colors.TextQuaternary),
-            )
-        }
-        // Hairline divider between header and body.
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(1.dp)
-                .background(DesignV2Tokens.Colors.Border),
-        )
-        // Body: placeholder pattern + footer.
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
-        ) {
-            Text(
-                text = "— — — —  — — — —\n— — — —  — — — —",
-                color = DesignV2Tokens.Colors.TextTertiary,
-                style = TextStyle(
-                    fontFamily = DesignV2FontMono,
-                    fontSize = 16.5.sp,
-                    fontWeight = FontWeight.Normal,
-                    letterSpacing = 1.6.sp,
-                    lineHeight = 24.sp,
-                ),
-            )
-            Spacer(Modifier.height(12.dp))
-            Text(
-                text = "Generated on device when you finish onboarding.",
-                color = DesignV2Tokens.Colors.TextQuaternary,
-                style = TextStyle(
-                    fontFamily = DesignV2FontMono,
-                    fontSize = 10.5.sp,
-                    fontWeight = FontWeight.Normal,
-                    letterSpacing = 0.4.sp,
-                ),
             )
         }
     }

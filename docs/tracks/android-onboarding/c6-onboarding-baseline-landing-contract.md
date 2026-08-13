@@ -247,9 +247,13 @@ Control-plane doc additions (architect REDLINE-2 F6 — bundled with L1 as first
 - `IdentityKeyPreviewAnimatedCardTest` MUST assert glyphs are exactly one of `·`, `•`, `○`, `.`.
 - `OnboardingV2Step2AnimationSnapshotTest` goldens capture the bullet-family shuffle; if hex glyphs appear the goldens fail.
 
-**Golden manifest:** 6 goldens transferred byte-for-byte from `5193301c`. Verify-only.
+**Golden manifest (Round-8 amendment, 2026-08-14):** 22 goldens = 6 own (from `5193301c` — 2 `OnboardingV2RecoverySnapshotTest` + 3 `OnboardingV2Step2AnimationSnapshotTest` + 1 `OnboardingV2SnapshotTest_onboarding_v2_identity_key_valid`) **+ 16 pulled-forward from `50f1cb8f`** (the 4 identity_key states × 4 `narrow320/pixel5 × fs1/fs2` configs in `OnboardingV2ResponsiveMatrixTest`). Pre-check confirmed all 16 blob SHAs identical between `50f1cb8f` and accepted tip `86c2de99` before transfer; post-checkout verified 16/16 byte-identical.
 
-**Commit body includes:** `Ships sealed OnboardingFinalizeStateHolder + IdentityRepairMarker + Startup route/presentation/error + Step 2 bullet-family animation. Source SHAs (audit branch): cbdcdee8 (C6-a), 5193301c (C6-b). Provenance: android/direct-wss-diagnostics-2026-08-11.`
+**Ownership rationale for the 16 pull-forward:** The bullet-family rendering change to `IdentityKeyStepV2.kt` lands in L3 (C6-b), but the accepted-history commit `50f1cb8f` re-recorded the corresponding 16 `ResponsiveMatrix_identity_key_*` goldens as a separate later commit inside L4's audit range. This is a genuine ownership error in the audit-branch history: goldens whose pixels are caused by an L3 code change were bundled with unrelated L4 stabilization work. Rather than commit a knowingly-red transitional state and rely on L4 to fix it (which would break L3 bisectability), the 16 files move to L3 ownership. L4 explicitly excludes them (§L4 below); endpoint totals stay L3=97 / L4=98 goldens; the raw file-count for L3 goes from 35→52 (36+16) and L4 goes from 48→32 (48-16).
+
+**Endpoint verify:** `./gradlew :apps:android:verifyPaparazziDebug --tests "phantom.android.ui.designv2.*Snapshot*" --tests "phantom.android.ui.designv2.*ResponsiveMatrix*" --tests "phantom.android.ui.designv2.OnboardingV2Recovery*" --tests "phantom.android.ui.designv2.OnboardingV2Step2Animation*" --rerun-tasks` = **97/0/0 GREEN in 1m 25s**.
+
+**Commit body includes:** `Ships sealed OnboardingFinalizeStateHolder + IdentityRepairMarker + Startup route/presentation/error + Step 2 bullet-family animation. Source SHAs (audit branch): cbdcdee8 (C6-a), 5193301c (C6-b), + 16 goldens pulled forward from 50f1cb8f (Round-8 ownership repair — see contract §3 L3 rationale). Provenance: android/direct-wss-diagnostics-2026-08-11.`
 
 ### L4 — `feat(android/onboarding+profile): stabilization block — Finale simplified + Profile Advanced + logo-flash structural fix + rotation via ScreenSaver + late-startup resolver`
 
@@ -294,7 +298,9 @@ Full path listing:
 - `StartupRouteLateWriteIntegrationTest` MUST assert: after rotation with `currentScreen=Profile`, a late startup coroutine completion **does NOT clobber** the route back to `ChatList` — the resolver reads the LIVE value.
 - `OnboardingFlowV2TransitionTest` MUST assert the structural if-branch shape (Welcome mounted OUTSIDE `AnimatedContent`).
 
-**Golden manifest:** 22 goldens transferred byte-for-byte from `86c2de99` (Finale simplified goldens, Step 2 bullet goldens, ProfileQrKeyCard goldens, StartupError, etc.). Verify-only.
+**Golden manifest (Round-8 amendment, 2026-08-14):** 6 goldens transferred byte-for-byte from `86c2de99` — was 22 in Round-1 rev 2, **minus 16 that L3 now owns** (per L3 ownership rationale above). The 6 that stay with L4: Finale simplified goldens + ProfileQrKeyCard goldens + StartupError + any others that reflect L4-scope code changes (Finale simplification, Profile Advanced-collapsible, structural logo-flash, `ScreenSaver` rotation). Verify-only.
+
+**L4 exclusion pin:** during L4 application, the 16 `OnboardingV2ResponsiveMatrixTest_identity_key_{empty,short,valid,invalid}[{narrow320,pixel5}_{fs1,fs2}].png` files MUST NOT change again — they are already at their `86c2de99`-final content on the branch after L3 committed. Verified by pre-check equality between `50f1cb8f` (L3 pull-forward source) and `86c2de99` (L4 endpoint).
 
 **Commit body includes:** `Ships onboarding stabilization block. Source SHAs (audit branch): 5797133f, 50f1cb8f, 86c2de99. Provenance: android/direct-wss-diagnostics-2026-08-11. Supersedes prior dual-key-labels + logo-flash-fix contracts marked SUPERSEDED under docs/tracks/android-onboarding/.`
 
