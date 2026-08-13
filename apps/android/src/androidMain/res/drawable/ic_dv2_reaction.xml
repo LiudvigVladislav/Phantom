@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Converted from design_handoff_phantom_messenger/assets/icons/reaction.svg
+    (Lucide-style 24×24 stroke, currentColor). Consumers:
+      Icon(painter = painterResource(R.drawable.ic_dv2_reaction),
+           tint = DesignV2Tokens.Colors.<role>)
+
+    Converter v2 (2026-07-31): invariant-culture number formatting,
+    per-primitive fill/stroke resolution, near-zero <line> → filled dot.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M22 11v1a10 10 0 1 1-9-10"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M8 14s1.5 2 4 2 4-2 4-2"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M8.255,9 a0.75,0.75 0 1 0 1.5,0 a0.75,0.75 0 1 0 -1.5,0 Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M14.255,9 a0.75,0.75 0 1 0 1.5,0 a0.75,0.75 0 1 0 -1.5,0 Z"
+        android:fillColor="#FFFFFF" />
+    <path
+        android:pathData="M16 5h6"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M19 2v6"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

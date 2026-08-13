@@ -3,6 +3,10 @@
 
 package phantom.android.calls
 
+import android.app.Application
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import phantom.core.transport.CallDisabledReason
 import phantom.core.transport.TransportCapabilities
 import kotlin.test.Test
@@ -17,10 +21,18 @@ import kotlin.test.assertTrue
  * [CallManager.startCall]. It checks [TransportCapabilities.canStartCalls]
  * and logs a structured `CALL_TX blocked_*` line when a call is rejected.
  *
- * Tests run on the JVM (androidUnitTest source set). [android.util.Log]
- * is stubbed as a no-op by AGP's unit-test runner — no device required,
- * no WebRTC native initialisation needed.
+ * L1 baseline-landing Round-6 (2026-08-13, architect direction): this
+ * test class transitively invokes `android.util.Log.i` via production
+ * `CallManagerKt.checkCallCapability`. On L1's post-onboarding-baseline
+ * `androidUnitTest` classpath the AGP null-mock stub for `Log` no longer
+ * supersedes the real `android.util.Log`, so `Log.i` reaches
+ * `println_native` at runtime. Explicit Robolectric runner + bare
+ * `Application` install `ShadowLog` (proper stub) without booting the
+ * production `PhantomApplication` this test does not need. See §L1
+ * compatibility invariant in `docs/tracks/android-onboarding/c6-onboarding-baseline-landing-contract.md`.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], application = Application::class)
 class CallManagerGuardTest {
 
     // ── Blocked cases ────────────────────────────────────────────────────────

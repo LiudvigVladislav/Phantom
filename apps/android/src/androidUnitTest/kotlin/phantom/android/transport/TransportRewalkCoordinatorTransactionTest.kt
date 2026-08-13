@@ -3,6 +3,10 @@
 
 package phantom.android.transport
 
+import android.app.Application
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -45,7 +49,20 @@ import kotlin.test.fail
  * collaborators ([RewalkHybridFacade], [TransportPreferences],
  * release lambda, [RewalkCoordinatorGateProvider]) and observe the
  * call order + side effects.
+ *
+ * L1 baseline-landing Round-5 (2026-08-13, architect direction): this
+ * test drives production code that calls `android.util.Log.i` in
+ * `TransportRewalkCoordinator.seedNetworkPresent`. Before L1, the AGP
+ * null-mock stub returned 0 via `unitTests.isReturnDefaultValues = true`.
+ * L1 adds Compose-UI-test artefacts to the `androidUnitTest` classpath
+ * whose Android SDK jar supersedes that stub, so `Log.i` reaches
+ * `println_native` at runtime. The correct fix is to run this test under
+ * `RobolectricTestRunner`, which installs `ShadowLog` and stubs the
+ * native method — a bare `Application` avoids booting production
+ * `PhantomApplication` machinery this test does not need.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35], application = Application::class)
 class TransportRewalkCoordinatorTransactionTest {
 
     private val livingScopes = mutableListOf<CoroutineScope>()
