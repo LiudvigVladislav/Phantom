@@ -81,4 +81,20 @@
     <changefreq>monthly</changefreq>
     <priority>0.7</priority>
   </url>
+  <url>
+    <loc>https://phntm.pro/writeups/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/writeups/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/writeups/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/writeups/"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://phntm.pro/ru/writeups/</loc>
+    <xhtml:link rel="alternate" hreflang="en" href="https://phntm.pro/writeups/"/>
+    <xhtml:link rel="alternate" hreflang="ru" href="https://phntm.pro/ru/writeups/"/>
+    <xhtml:link rel="alternate" hreflang="x-default" href="https://phntm.pro/writeups/"/>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
 </urlset>
