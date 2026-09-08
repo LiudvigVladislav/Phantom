@@ -36,10 +36,10 @@ and it has not received an independent third-party cryptographic audit.
 **Status checkpoint, 2026-09-08:** the [development status](docs/project/STATUS_2026_09_08.md)
 distinguishes published code, local candidates and bounded device observations.
 Recent delivery, lifecycle and notification corrections remain local candidates;
-this documentation update does not merge or release them. The carrier/VPN matrix
-is closed by owner decision at four accepted host-VPN-on profiles out of eight.
-The four unrun host-VPN-off profiles are excluded from the remaining plan, not
-counted as passes. No all-eight comparison is claimed.
+this documentation update does not merge or release them. I closed the carrier/VPN
+matrix at four accepted host-VPN-on profiles out of eight. I will not run the
+remaining four host-VPN-off profiles or count them as passes. I make no all-eight
+comparison claim.
 
 **Latest tagged pre-release:** [`v0.1.0-alpha.2`](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2).
 The tag is a historical snapshot from 2026-04-30; development on `master` has moved

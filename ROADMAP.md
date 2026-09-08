@@ -14,7 +14,7 @@ take precedence over adding features.
 
 ## Execution order
 
-1. **N1 / WSS-3: closed at the 4/8 boundary.** On 2026-09-08 the owner closed
+1. **N1 / WSS-3: closed at the 4/8 boundary.** On 2026-09-08 I closed
    this measurement track with the four accepted host-VPN-on carrier/phone-VPN
    profiles. The four unrun host-VPN-off profiles will not be conducted and are
    excluded from the remaining plan. They are neither passes nor failures;
@@ -62,8 +62,8 @@ take precedence over adding features.
 
 Critical security, message-loss, identity-loss, abuse-safety or store-compliance
 findings may interrupt this order. Other findings enter the backlog first.
-Only one implementation track runs at a time. Changing order requires an
-explicit owner decision, dependencies and a named acceptance gate.
+Only one implementation track runs at a time. Changing order requires
+my explicit decision, dependencies and a named acceptance gate.
 
 Chat-opening/rendering latency was deferred on 2026-09-08. Correct notification
 routing was observed on the local candidate, but the remaining delay is not

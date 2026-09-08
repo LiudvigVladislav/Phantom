@@ -610,7 +610,7 @@ latency.
 The public status and roadmap now distinguish the published baseline from
 local Privacy/Tor and delivery/lifecycle/notification candidates. The WSS-3
 acceptance boundary remains four host-VPN-on profiles out of eight. On 2026-09-08
-the owner closed WSS-3 at that boundary and excluded the four unrun host-VPN-off
+I closed WSS-3 at that boundary and excluded the four unrun host-VPN-off
 profiles from further execution. No all-eight or release claim is made.
 
 Recent host tests and named device observations are recorded with their limits
@@ -618,8 +618,8 @@ in [the September checkpoint](project/STATUS_2026_09_08.md). Test totals from
 different source trees are not combined into one final run. Infrastructure/Floki,
 long background and Wi-Fi/handoff qualification remain in the ordered plan.
 
-Found chat-opening delay while verifying notification routing; deferred by the
-owner. History was already cached in the recorded repeat, but the expensive UI
+I found a chat-opening delay while verifying notification routing and deferred
+that work. History was already cached in the recorded repeat, but the expensive UI
 operation was not established. No rendering optimization was started. This does
 not displace delivery, recovery, infrastructure or security foundations.
 
