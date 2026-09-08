@@ -16,7 +16,15 @@
 
 ---
 
-## Current state
+## Current checkpoint: 2026-09-08
+
+See [Development Status](project/STATUS_2026_09_08.md) for published versus local
+candidate state, scoped verification and remaining gates. The current execution
+order is [ROADMAP.md](../ROADMAP.md). This is a documentation checkpoint, not a
+source merge, release, deployment or full background-delivery acceptance.
+The June state and older follow-up queues below are historical, not the active plan.
+
+## Historical state: 2026-06-21
 
 **Released:** `v0.1.0-alpha.1` (tag → commit `0246b50f`, GitHub Release published)
 **Branch state:** `master` is the integration target; short-lived feature / canary / docs branches are created per track and deleted after merge. Latest commit at the time of writing: `e601cf3b` (PR #328 R3.6 sticky-per-route Fast REST degradation, 2026-06-21).
@@ -391,6 +399,9 @@ on advice that references prior commits — even from another LLM.
 
 ## Open follow-ups / unfinished items
 
+Historical queue: current priority and gates are in [ROADMAP.md](../ROADMAP.md).
+Do not open work directly from an older queue entry without reconciling its status.
+
 > **Maintenance rule.** Any session that ships a PR or makes a non-trivial
 > decision must check this list — append items that are deferred, mark
 > items that landed, and avoid duplicating across the Session journal.
@@ -593,6 +604,27 @@ latency.
 ---
 
 ## Session journal
+
+### 2026-09-08 - Documentation checkpoint: reliability before feature expansion
+
+The public status and roadmap now distinguish the published baseline from
+local Privacy/Tor and delivery/lifecycle/notification candidates. The WSS-3
+acceptance boundary remains four host-VPN-on profiles out of eight. On 2026-09-08
+I closed WSS-3 at that boundary and excluded the four unrun host-VPN-off
+profiles from further execution. No all-eight or release claim is made.
+
+Recent host tests and named device observations are recorded with their limits
+in [the September checkpoint](project/STATUS_2026_09_08.md). Test totals from
+different source trees are not combined into one final run. Infrastructure/Floki,
+long background and Wi-Fi/handoff qualification remain in the ordered plan.
+
+I found a chat-opening delay while verifying notification routing and deferred
+that work. History was already cached in the recorded repeat, but the expensive UI
+operation was not established. No rendering optimization was started. This does
+not displace delivery, recovery, infrastructure or security foundations.
+
+This entry changes documentation only. Candidate landing, physical campaigns,
+deployment and release remain separate gates. Older journal entries are retained.
 
 Reverse-chronological. Each entry: **goal · outcome · key commits ·
 follow-ups** in compact form. Cross-reference the Decision log above

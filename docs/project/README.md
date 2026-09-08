@@ -6,9 +6,11 @@ This directory holds the **public-facing** project planning artefacts for PHANTO
 
 | File | What |
 |---|---|
-| [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md) | Single source of truth for track status (Reliability / Security / Grant-Readiness / Alpha-2 Features). Updated on every meaningful merge. |
-| [`PHANTOM_ROADMAP_2026.md`](PHANTOM_ROADMAP_2026.md) | Formal product roadmap — phases, milestones, scope boundaries. |
-| [`Roadmap_2.0_to_Execution_Map.md`](Roadmap_2.0_to_Execution_Map.md) | Mapping of the strategic roadmap onto operational engineering phases. |
+| [`ROADMAP.md`](../../ROADMAP.md) | Current execution order and decision gates; no deployment authority. |
+| [`STATUS_2026_09_08.md`](STATUS_2026_09_08.md) | September checkpoint: published baseline, local candidates, scoped checks and deferred work. |
+| [`MASTER_TIMELINE_2026.md`](MASTER_TIMELINE_2026.md) | Historical track and merge records; not a current runtime inventory. |
+| [`PHANTOM_ROADMAP_2026.md`](PHANTOM_ROADMAP_2026.md) | Historical phase plan; old dates and commercial assumptions are not current commitments. |
+| [`Roadmap_2.0_to_Execution_Map.md`](Roadmap_2.0_to_Execution_Map.md) | Historical early execution mapping. |
 | [`Alpha0_Milestone.md`](Alpha0_Milestone.md) | Alpha-0 scope and acceptance criteria (historical, preserved). |
 | [`Alpha2_Migration.md`](Alpha2_Migration.md) | Migration spec for the Alpha-1 → Alpha-2 cutover. |
 | [`Monorepo_Structure.md`](Monorepo_Structure.md) | Top-level repo layout: KMP shared modules, Android app, Rust relay, deploy configs. |

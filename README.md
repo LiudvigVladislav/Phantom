@@ -3,7 +3,7 @@
 # PHANTOM
 
 End-to-end encrypted Android messaging with censorship-resistant transports,
-production-validated against carrier-grade DPI (TSPU) on real Russian mobile networks.
+tested against carrier-grade DPI (TSPU) on selected real Russian mobile networks.
 
 [![Status: Alpha 2](https://img.shields.io/badge/status-alpha%202-orange)](#status)
 [![Release: v0.1.0-alpha.2](https://img.shields.io/badge/release-v0.1.0--alpha.2-orange)](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2)
@@ -32,6 +32,14 @@ and it has not received an independent third-party cryptographic audit.
 ## Status
 
 **Current stage:** Alpha 2, active development on `master`.
+
+**Status checkpoint, 2026-09-08:** the [development status](docs/project/STATUS_2026_09_08.md)
+distinguishes published code, local candidates and bounded device observations.
+Recent delivery, lifecycle and notification corrections remain local candidates;
+this documentation update does not merge or release them. I closed the carrier/VPN
+matrix at four accepted host-VPN-on profiles out of eight. I will not run the
+remaining four host-VPN-off profiles or count them as passes. I make no all-eight
+comparison claim.
 
 **Latest tagged pre-release:** [`v0.1.0-alpha.2`](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2).
 The tag is a historical snapshot from 2026-04-30; development on `master` has moved
@@ -62,17 +70,18 @@ size, authenticated sessions, and delivery destinations.
 - Tor is an emergency text path, not a media or realtime-call transport.
 - Field validation proves specific devices, carriers, routes, and dates—not every carrier or future DPI policy.
 
-### Roadmap by horizon
+### Roadmap priorities
 
-- **Next:** Direct/REST stability hardening across carrier changes, faster first
-  contact bootstrap, stable groups, and encrypted photo/file attachments using
-  the existing media pipeline.
-- **Beta:** harden 1:1 voice/video calls over Direct/REALITY, add a desktop
-  client, expand pluggable transports, and design linked-device identity.
-- **v1.0:** iOS client, public channels, a rate-limited username directory,
-  supported self-hosted relay packaging, and an independent security audit.
-- **Post-v1 research:** BLE/Wi-Fi Direct mesh, Kademlia DHT routing,
-  federation experiments, and post-quantum migration.
+- **First:** consolidate Direct/REST and queued-text delivery reliability, then
+  audit infrastructure. WSS-3 is closed at its explicitly limited 4/8 boundary.
+- **Qualification:** long background/idle operation, Wi-Fi and network/VPN
+  handoffs, followed by representative Private and Ghost mode checks.
+- **Release foundations:** application-wide design, backup/restore, privacy-safe
+  observability, safety and handles, then a full security audit before closed
+  Android alpha qualification.
+- **Later:** media quality and iOS foundations, calls, small groups and public
+  beta. Subscriptions and large groups/channels follow later gates. Desktop,
+  linked-device and other research ideas have no new delivery commitment here.
 
 See [ROADMAP.md](ROADMAP.md), [KNOWN_ISSUES.md](KNOWN_ISSUES.md), and the
 [development journal](docs/PROJECT_LOG.md) for the detailed state.
