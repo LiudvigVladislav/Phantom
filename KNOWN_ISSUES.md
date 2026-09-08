@@ -1,6 +1,14 @@
 # PHANTOM — Known Issues
 
 **Last updated:** 2026-07-19
+**Checkpoint notice, 2026-09-08:** the historical build/platform descriptions
+below do not describe the latest local candidate. See
+[development status](docs/project/STATUS_2026_09_08.md) for text-delivery,
+background, lifecycle and notification verification boundaries. Those local
+corrections are not merged into the public baseline. Neither the older resolved
+items nor selected successful deliveries establish general freedom from message
+loss. Full Android, long unplugged background and non-text completion remain open.
+
 **Build:** `master` at `ea66889f` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, and [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates.
 **Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Irkutsk Oblast (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
 
@@ -47,7 +55,7 @@ This file separates two kinds of items:
 2. Reconnect succeeds within ~1 s once the dead socket is detected and torn down.
 3. Any envelope the peer sent during the gap is delivered immediately on reconnect (store-and-forward keeps it durable).
 
-**Impact.** A message sent to a recipient mid-reconnect arrives ~1–3 s later than usual. **No messages are lost** (PR-H2b processed-envelope ledger neutralises any relay redelivery — see ISSUE-004). On stable Wi-Fi without a stateful middlebox the connection has been stable across multi-minute QA sessions with the same code path and the same relay endpoint. The issue compounds two effects: (a) the OEM-side power management on Tecno HiOS that parks the Wi-Fi radio between transmissions, and (b) stateful network elements on the Russian carrier path that drop a long-lived idle WebSocket without sending a FIN.
+**Impact.** A message sent to a recipient mid-reconnect arrives ~1–3 s later than usual. No loss was observed in the historical reconnect checks cited below. That result is not a general guarantee for storage failures, legitimate reordering or session replacement; see the September checkpoint. On stable Wi-Fi without a stateful middlebox the connection has been stable across multi-minute QA sessions with the same code path and the same relay endpoint. The issue compounds two effects: (a) the OEM-side power management on Tecno HiOS that parks the Wi-Fi radio between transmissions, and (b) stateful network elements on the Russian carrier path that drop a long-lived idle WebSocket without sending a FIN.
 
 **Root cause.** The 2026-05-04 4-test matrix on the same MTS Wi-Fi (Tecno Spark Go vs Pixel 8 Pro emulator on a stable PC) demonstrated the cycle on **both** devices — so OEM radio parking is one cause, not the only one. The actual primary contributor in production on Russian carriers is a stateful network element along the path (Carrier-Grade NAT, transit border filtering / TSPU, or both) that goes one-way silent without an explicit close. PR-H1b (`0baa4196`) diagnosed this as the half-open TCP black-hole pattern from `session_summary` lines (`pings_received=2-5` server-side vs `pings_sent=11` client-side, `since_last_ping_ms ≈ 153 s` on every dying session).
 
@@ -99,6 +107,12 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 ## High Severity (P2)
 
 ### ISSUE-004: First envelope after reconnect+flush occasionally fails MAC verification  ✅ RESOLVED
+
+**Scope clarification, 2026-09-08:** this resolution describes the historical
+redelivery case, not every ordering or completion failure. Subsequent local
+text-delivery work addresses persistence/completion and held-replay behavior;
+it remains a candidate, not a shipped resolution of all such failures. See
+[the status checkpoint](docs/project/STATUS_2026_09_08.md).
 
 **Resolved by PR-H2b (#129, master `7008cf3e`, 2026-05-13).**
 

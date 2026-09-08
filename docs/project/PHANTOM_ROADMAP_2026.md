@@ -1,5 +1,12 @@
 # PHANTOM — 12-Month Strategic Roadmap
 
+> **Historical plan, superseded for current ordering on 2026-09-08.**
+> Use [ROADMAP.md](../../ROADMAP.md) for the execution sequence and
+> [the status checkpoint](STATUS_2026_09_08.md) for verification boundaries.
+> The old dates, feature horizons and premium/recovery assumptions below are
+> preserved for history, not current commitments. Recovery, identity and safety
+> foundations are not paywalled under the current plan.
+
 **Дата:** 28 апреля 2026
 **Период:** Май 2026 — Апрель 2027
 **Темп работы:** Full-time (35-40 ч/нед = ~1700 часов на год)

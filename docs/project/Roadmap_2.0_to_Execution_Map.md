@@ -1,5 +1,10 @@
 # Roadmap 2.0 → Execution Map
 
+> **Historical early execution map.** The current sequence is maintained in
+> [ROADMAP.md](../../ROADMAP.md); the [September status](STATUS_2026_09_08.md)
+> distinguishes published work from local candidates. The original mapping below
+> is retained for context, not authorization to reopen completed foundations.
+
 Этот файл связывает текущий roadmap PHANTOM с практической последовательностью инженерного старта.
 
 ## Что уже хорошо определено в roadmap
