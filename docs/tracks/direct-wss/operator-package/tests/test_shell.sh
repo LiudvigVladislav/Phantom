@@ -259,24 +259,100 @@ rm -rf "$tmpdir"
 #     may carry CRLF on a Windows checkout without breaking macOS use;
 #     but the scripts and Python modules operators actually invoke MUST
 #     be LF. This scoped scan enforces that contract.
-cr_offenders=0
-for f in "$PKG/run-yota-wss-diagnostic.sh" \
-         "$PKG/preflight.sh" \
-         "$PKG/build-handoff-tar.sh" \
-         "$PKG"/lib/*.sh \
-         "$PKG"/tests/*.sh \
-         "$PKG/verify-evidence.py" \
-         "$PKG"/tests/*.py; do
-    if [ -f "$f" ] && LC_ALL=C grep -l $'\r' "$f" > /dev/null 2>&1; then
-        echo "FAIL: CR bytes present in $f"
-        cr_offenders=$((cr_offenders+1))
-    fi
-done
-if [ "$cr_offenders" -eq 0 ]; then
-    echo "PASS: no CR bytes in any executable .sh/.py under the operator-package tree"
+#
+# ── Audit ROUND-30.12: the detector must not depend on the host ───
+#
+# This scan used `grep -l $'\r'`. Under MSYS/Git-Bash grep strips the CR
+# of a CRLF pair before matching, so on Windows the check could never
+# fail for a CRLF file — and did not, while the same file failed the
+# same check on macOS and took a target-platform gate to RED. A gate
+# whose result depends on the machine it runs on is not a gate.
+#
+# Two things changed. Detection counts BYTES with `tr`, which is POSIX
+# and sees CR wherever it is; and the mechanism now proves itself on
+# whatever host is running it before its verdict is believed, so a
+# future platform that also hides CR is caught by its own control
+# rather than by a RED somewhere downstream.
+#
+# The file list is DERIVED the way tests/target-mac-gate.sh derives it,
+# and its size is asserted, because a hand-written list silently went
+# out of date: the previous one omitted run-carrier-vpn-matrix.sh,
+# assemble-review-pack-closure.sh, compare-vpn-matrix.py, schema_wss3.py
+# and verify_evidence_wss3.py — the verifier itself was never scanned.
+
+# wss3_count_cr_bytes <file> — CR (0x0D) byte count, host-independently.
+#   `wc -c` pads its output on BSD (audit ROUND-30.4), so the number
+#   goes through the same de-padding the rest of this suite uses.
+wss3_count_cr_bytes() {
+    LC_ALL=C tr -dc '\r' < "$1" | wc -c | tr -d '[:space:]'
+}
+
+# Controls first: a detector is trusted only after it has been watched
+# to fire. The old `grep` mechanism passes the lone-CR control and FAILS
+# the CRLF one under MSYS, which is exactly how a CRLF file reached a
+# target-platform RED with a green host-local cycle behind it.
+cr_probe=$(mktemp -d)
+printf 'a\r\nb\r\n' > "$cr_probe/crlf"
+printf 'a\rb'       > "$cr_probe/lonecr"
+printf 'a\nb\n'     > "$cr_probe/lf"
+cr_ctl_bad=0
+if [ "$(wss3_count_cr_bytes "$cr_probe/crlf")" != "2" ]; then
+    echo "FAIL: CR control — a CRLF file was not seen as carrying 2 CR bytes"
+    cr_ctl_bad=1
+fi
+if [ "$(wss3_count_cr_bytes "$cr_probe/lonecr")" != "1" ]; then
+    echo "FAIL: CR control — a lone CR was not detected"
+    cr_ctl_bad=1
+fi
+if [ "$(wss3_count_cr_bytes "$cr_probe/lf")" != "0" ]; then
+    echo "FAIL: CR control — a clean LF file was reported as carrying CR"
+    cr_ctl_bad=1
+fi
+rm -rf "$cr_probe"
+if [ "$cr_ctl_bad" -eq 0 ]; then
+    echo "PASS: CR detector proves itself on this host (CRLF and lone CR both detected, LF clean)"
     pass=$((pass+1))
 else
-    echo "FAIL: $cr_offenders file(s) carry CR bytes"
+    echo "FAIL: the CR detector is blind on this host — the sweep below cannot be trusted"
+    fail=$((fail+1))
+fi
+
+# Derived, not hand-written. `ls` output is one path per line here
+# because every shipped name is plain ASCII without spaces, which the
+# count assertion below also guards.
+cr_sh_list=$( (cd "$PKG" && ls -1 ./*.sh lib/*.sh tests/*.sh 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort) )
+cr_py_list=$( (cd "$PKG" && ls -1 ./*.py tests/*.py 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort) )
+cr_sh_count=$(printf '%s\n' "$cr_sh_list" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+cr_py_count=$(printf '%s\n' "$cr_py_list" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+if [ "$cr_sh_count" = "28" ]; then
+    echo "PASS: derived shipped shell list is 28 files (CR sweep is scoped to all of them)"
+    pass=$((pass+1))
+else
+    echo "FAIL: derived shipped shell list is $cr_sh_count files, expected 28 — the CR sweep would be scoped wrong"
+    fail=$((fail+1))
+fi
+
+cr_offenders=0
+cr_scanned=0
+while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    f="$PKG/$rel"
+    [ -f "$f" ] || continue
+    cr_scanned=$((cr_scanned+1))
+    cr_n=$(wss3_count_cr_bytes "$f")
+    if [ "$cr_n" != "0" ]; then
+        echo "FAIL: $cr_n CR byte(s) present in $rel"
+        cr_offenders=$((cr_offenders+1))
+    fi
+done <<EOF
+$cr_sh_list
+$cr_py_list
+EOF
+if [ "$cr_offenders" -eq 0 ]; then
+    echo "PASS: no CR bytes in any of the $cr_scanned shipped .sh/.py files ($cr_sh_count shell + $cr_py_count python)"
+    pass=$((pass+1))
+else
+    echo "FAIL: $cr_offenders of $cr_scanned shipped file(s) carry CR bytes"
     fail=$((fail+1))
 fi
 
@@ -864,6 +940,17 @@ if [ "$rc" = "0" ]; then
     echo "PASS: WSS-2 accepts valid input followed by lone --"; pass=$((pass+1))
 else
     echo "FAIL: WSS-2 rejected valid input with lone -- (rc=$rc)"; fail=$((fail+1))
+fi
+
+echo ""
+
+# ── WSS-3 shell fixtures 1-53 ─────────────────────────────────
+# Sourced (not executed) so pass/fail counters continue across
+# both suites — `bash tests/test_shell.sh` is the single entry
+# point per WSS-3 contract §10.
+if [ -f "$HERE/test_shell_wss3.sh" ]; then
+    # shellcheck source=test_shell_wss3.sh
+    source "$HERE/test_shell_wss3.sh"
 fi
 
 echo ""

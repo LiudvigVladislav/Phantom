@@ -125,12 +125,14 @@ class RestInboundDeduplicator(
         }
     }
 
-    /**
-     * Returns true iff [envelopeId] was emitted via REST and is still
-     * awaiting DMS's `sendDeliveryAck` (i.e. in [pendingAck]). Used by
-     * the wrapper's ACK-routing path to decide whether an outbound delivery
-     * ack should go via REST or via the WS transport.
-     */
+    /** Deferred is neither in-flight nor completed; the next delivery must Emit. */
+    suspend fun park(envelopeId: String) = lock.withLock {
+        pendingAck.remove(envelopeId)
+        recentlyEmitted.remove(envelopeId)
+        Unit
+    }
+
+    /** Processing claim only; REST origin is retained independently by the orchestrator. */
     suspend fun isPending(envelopeId: String): Boolean = lock.withLock {
         envelopeId in pendingAck
     }

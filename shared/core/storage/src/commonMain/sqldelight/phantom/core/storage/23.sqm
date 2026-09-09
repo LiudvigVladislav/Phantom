@@ -1,0 +1,1 @@
+ALTER TABLE decrypt_failed_envelopes ADD COLUMN last_receive_version TEXT;

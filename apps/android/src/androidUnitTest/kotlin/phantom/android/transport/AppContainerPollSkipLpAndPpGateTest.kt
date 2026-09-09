@@ -31,7 +31,11 @@ import kotlin.test.fail
  *                                           fingerprint distinguishable from
  *                                           both the production padded shape
  *                                           and the legacy unpadded shape.
- *   (4) `transportPreferences.privacyMode == PrivacyMode.Standard`
+ *   (4) `privacyModeCoordinator.state.value.effective == PrivacyMode.Standard`
+ *
+ * R-N1.17 retargeted (4) from the stored mode to the EFFECTIVE one. A
+ * debug shortcut must not switch itself on mid-teardown because the
+ * REQUESTED mode moved to Standard while a Ghost socket was still up.
  *                                         — Privacy/Ghost are protected
  *                                           by the uniform-functionality
  *                                           rule (2026-06-06).
@@ -157,8 +161,8 @@ class AppContainerPollSkipLpAndPpGateTest {
             ?: fail("Could not locate `pollSkipLpAndPpProvider = { ... }` lambda in AppContainer.kt.")
         assertTrue(
             lambda.contains("PrivacyMode.Standard") &&
-                lambda.contains("transportPreferences.privacyMode"),
-            "pollSkipLpAndPpProvider lambda MUST require `transportPreferences.privacyMode == " +
+                lambda.contains("privacyModeCoordinator.state.value.effective"),
+            "pollSkipLpAndPpProvider lambda MUST require the EFFECTIVE privacy mode to be " +
                 "PrivacyMode.Standard`. Privacy and Ghost sessions MUST NOT activate the diagnostic " +
                 "strip — the Vladislav-locked uniform-functionality rule (2026-06-06) requires those " +
                 "tiers to receive at least the same wire-shape protections as Standard. The council " +

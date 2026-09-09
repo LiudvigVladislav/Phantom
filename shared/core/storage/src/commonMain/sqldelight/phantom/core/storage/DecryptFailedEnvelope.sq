@@ -18,7 +18,8 @@ CREATE TABLE decrypt_failed_envelopes (
     x3dh_init_present    INTEGER NOT NULL DEFAULT 0,
     wire_frame_json      TEXT    NOT NULL,
     replay_attempt_count INTEGER NOT NULL DEFAULT 0,
-    last_replay_at_ms    INTEGER
+    last_replay_at_ms    INTEGER,
+    last_receive_version TEXT
 );
 
 -- Insert on the hold path. INSERT OR IGNORE because a duplicate
@@ -53,6 +54,14 @@ ORDER BY received_at_ms ASC;
 deleteByEnvelopeId:
 DELETE FROM decrypt_failed_envelopes WHERE envelope_id = ?;
 
+recordFailure:
+UPDATE decrypt_failed_envelopes
+SET error_type = ?,
+    last_receive_version = ?,
+    last_replay_at_ms = ?,
+    replay_attempt_count = replay_attempt_count + 1
+WHERE envelope_id = ?;
+
 -- Called when a replay attempt fails. Bumps the count + sets the
 -- timestamp so we have an audit trail of how many times this envelope
 -- has been re-tried since being held.
@@ -67,6 +76,12 @@ WHERE envelope_id = ?;
 -- evict to keep the table bounded.
 deleteOlderThan:
 DELETE FROM decrypt_failed_envelopes WHERE received_at_ms < ?;
+
+-- Audit ROUND-30.16 — boundary classification. Read-only, keyed on the
+-- primary key, and called only when a delivery has already been found
+-- unsettled, so the happy path pays nothing.
+countByEnvelopeId:
+SELECT COUNT(*) FROM decrypt_failed_envelopes WHERE envelope_id = ?;
 
 -- Diagnostic — surfaces hold-table size and the per-conversation
 -- distribution to logs.

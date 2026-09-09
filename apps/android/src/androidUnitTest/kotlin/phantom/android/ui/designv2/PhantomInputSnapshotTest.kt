@@ -34,6 +34,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseInputSlotsMatrix
  * left for a future component-API extension if the Input focus visual
  * regresses.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomInputSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

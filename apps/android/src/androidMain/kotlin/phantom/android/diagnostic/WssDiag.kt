@@ -95,6 +95,16 @@ object WssDiag {
     enum class DedupGate { FRESH, DUPLICATE, REACK, UNKNOWN }
 
     /**
+     * Audit ROUND-30.16 — why a delivery ended without settling the
+     * envelope, on `recipient_deliver_failed`. Closed set; never carries
+     * an exception message or any decrypted content.
+     */
+    enum class DeliverFailure { THREW, HELD, UNKNOWN_PROCESSING_FAILURE }
+
+    /** Audit ROUND-30.16 — furthest stage reached. Ordered. */
+    enum class DeliverStage { RECEIVED, DECRYPTED, PERSISTED, LEDGER_MARKED, ACK_SENT }
+
+    /**
      * Emit a `WSS_DIAG` event. `Log.i` for machine parseability;
      * production severity so operator captures don't drop it.
      *
@@ -109,6 +119,8 @@ object WssDiag {
         outerTransport: OuterTransport? = null,
         innerRoute: InnerRoute? = null,
         dedupGate: DedupGate? = null,
+        deliverFailure: DeliverFailure? = null,
+        deliverStage: DeliverStage? = null,
         outcomeFlag: OutcomeFlag? = null,
         relayAcceptance: RelayAcceptance? = null,
         sessionEpoch: Long? = null,
@@ -143,6 +155,10 @@ object WssDiag {
             if (outerTransport != null) append(' ').append("outer_transport=").append(outerTransport.name.lowercase())
             if (innerRoute != null) append(' ').append("inner_route=").append(innerRoute.name.lowercase())
             if (dedupGate != null) append(' ').append("dedup_gate=").append(dedupGate.name.lowercase())
+            if (deliverFailure != null)
+                append(' ').append("deliver_failure=").append(deliverFailure.name.lowercase())
+            if (deliverStage != null)
+                append(' ').append("deliver_stage=").append(deliverStage.name.lowercase())
             if (outcomeFlag != null && outcomeFlag != OutcomeFlag.NONE)
                 append(' ').append("outcome_flag=").append(outcomeFlag.name.lowercase())
             if (relayAcceptance != null) append(' ').append("relay_acceptance=").append(relayAcceptance.name.lowercase())
@@ -164,5 +180,6 @@ object WssDiag {
             // DiagnosticBootInitProvider ran.
             Log.i(TAG, fields)
         }
+        BackgroundTrace.observe("wss", fields)
     }
 }

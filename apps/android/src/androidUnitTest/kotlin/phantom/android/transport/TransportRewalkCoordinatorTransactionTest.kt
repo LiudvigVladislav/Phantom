@@ -29,11 +29,13 @@ import phantom.core.transport.RelayTransportConfig
 import phantom.core.transport.RewalkCoordinatorGateProvider
 import phantom.core.transport.RouteChangeOutcome
 import phantom.core.transport.TransportKind
+import phantom.core.transport.TransportManager
 import phantom.core.transport.TransportPreferences
 import phantom.core.transport.WsReconnectGate
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -171,6 +173,7 @@ class TransportRewalkCoordinatorTransactionTest {
         releaseBehaviour: String? = null,
         restartBehaviour: String? = null,
         nowMs: () -> Long = { 1_000L },
+        handOver: (suspend (String) -> Boolean)? = null,
     ): Fixture {
         val prefs = InMemoryPrefs()
         val restartLog = mutableListOf<NetworkChangeReason>()
@@ -182,8 +185,22 @@ class TransportRewalkCoordinatorTransactionTest {
                 when (releaseBehaviour) {
                     "ce" -> throw CancellationException("release CE")
                     "ex" -> throw IllegalStateException("release error")
-                    else -> Unit
+                    "unclean" -> TransportManager.ReleaseOutcome(
+                        xrayFailure = null,
+                        torFailure = IllegalStateException("tor host not released"),
+                    )
+                    // The gate is the WHOLE outcome. A rewalk that read only
+                    // tor would restart on top of a proxy that would not stop.
+                    "unclean_xray" -> TransportManager.ReleaseOutcome(
+                        xrayFailure = IllegalStateException("xray would not stop"),
+                        torFailure = null,
+                    )
+                    else -> cleanRelease()
                 }
+            },
+            handOverConnectOwnership = { reason ->
+                log.add("handOverConnectOwnership")
+                handOver?.invoke(reason) ?: true
             },
             hybridTransportProvider = { hybrid },
             requestServiceRestart = { reason ->
@@ -226,6 +243,292 @@ class TransportRewalkCoordinatorTransactionTest {
     }
 
     // ── 1: Happy path — locked transaction order ────────────────────────────
+
+    // -- R-N1.16 P1-2: ordering BETWEEN components ---------------------
+
+    @Test
+    fun the_connect_lease_is_handed_over_before_the_transport_is_released() = runBlocking {
+        // Review R-N1.16 P1-2. The coordinator released the transport at
+        // step 5 and only asked the service to restart at step 7, so the
+        // service's handover ran AFTER Tor and Xray had been stopped. A
+        // walk still inside TransportManager.connect() was having its
+        // subsystems torn down while it was starting or probing them, and
+        // release() is deliberately not serialised against connect().
+        //
+        // No test inside the service could see this: its source tripwire
+        // only checks the order of its own statements.
+        val log = CallLog()
+        val (coord, _, _) = newCoordinator(log, TracingGate(log), TracingHybrid(log))
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        val handover = observed.indexOf("handOverConnectOwnership")
+        val release = observed.indexOf("release")
+        val restart = observed.indexOf("requestServiceRestart:WIFI_TO_CELLULAR")
+
+        assertTrue(handover >= 0, "the lease is no longer handed over; got $observed")
+        assertTrue(release >= 0, "release step missing; got $observed")
+        assertTrue(
+            handover < release,
+            "the walk must be stopped and joined BEFORE its subsystems are " +
+                "released; observed=$observed",
+        )
+        assertTrue(
+            release < restart,
+            "and the successor is only invited afterwards; observed=$observed",
+        )
+    }
+
+    @Test
+    fun a_handover_that_cannot_confirm_quiescence_abandons_the_rewalk() = runBlocking {
+        // Fail-closed across components. If we could not stop the walk,
+        // tearing its subsystems down is the defect, not the recovery.
+        val log = CallLog()
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            TracingGate(log),
+            TracingHybrid(log),
+            handOver = { false },
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        assertTrue(
+            observed.contains("handOverConnectOwnership"),
+            "the handover must still be attempted; got $observed",
+        )
+        assertTrue(
+            observed.none { it == "release" },
+            "the transport must NOT be released under a walk we could not stop; " +
+                "got $observed",
+        )
+        assertTrue(
+            observed.none { it.startsWith("requestServiceRestart") },
+            "and no successor may be invited; got $observed",
+        )
+        assertTrue(restartLog.isEmpty())
+    }
+
+    @Test
+    fun release_never_runs_while_the_displaced_walk_is_still_executing() = runBlocking {
+        // The behavioural form of the same claim, with a real
+        // ConnectOwnership and a walk that is actually running. The
+        // handover lambda is wired the way AppContainer wires it.
+        val log = CallLog()
+        val walkFinished = java.util.concurrent.atomic.AtomicBoolean(false)
+        val releaseSawWalkRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+        val walkScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            .also { livingScopes.add(it) }
+        val ownership = phantom.core.transport.ConnectOwnership(
+            nextToken = { 1L },
+            handoverTimeoutMs = 5_000L,
+        )
+        val started = CompletableDeferred<Unit>()
+        val walk = walkScope.launch {
+            val me = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+            ownership.claim(
+                "generation_A",
+                phantom.core.transport.ConnectWalkHandle { timeoutMs: Long ->
+                    me?.cancel(CancellationException("ownership_handover"))
+                    me == null || withTimeoutOrNull(timeoutMs) { me.join() } != null
+                },
+            )
+            started.complete(Unit)
+            try {
+                delay(60_000)
+            } finally {
+                walkFinished.set(true)
+            }
+        }
+        started.await()
+
+        val (coord, _, _) = newCoordinator(
+            log,
+            TracingGate(log),
+            TracingHybrid(log),
+            releaseBehaviour = null,
+            handOver = { reason ->
+                when (ownership.handOver(reason)) {
+                    is phantom.core.transport.Handover.Quiesced,
+                    phantom.core.transport.Handover.NothingToStop -> true
+                    else -> false
+                }
+            },
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        assertTrue(walk.isCompleted, "the displaced walk was actually stopped")
+        assertTrue(
+            log.contains("release"),
+            "and the rewalk proceeded; got ${log.snapshot()}",
+        )
+        assertTrue(
+            walkFinished.get(),
+            "the walk's own teardown ran before release was allowed to proceed",
+        )
+        assertFalse(
+            releaseSawWalkRunning.get(),
+            "release must never observe a live walk",
+        )
+    }
+
+    @Test
+    fun the_legacy_path_also_hands_over_before_it_releases() = runBlocking {
+        // R-N1.16 P1-2. The flag-off path is the one that actually runs
+        // when RECONNECT_QUIESCENCE_ENABLED is not "1", so ordering it
+        // only in the typed transaction would leave the defect shipped
+        // wherever the flag is off.
+        val log = CallLog()
+        val (coord, _, _) = newCoordinator(log, gate = null, hybrid = TracingHybrid(log))
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        val handover = observed.indexOf("handOverConnectOwnership")
+        val release = observed.indexOf("release")
+
+        assertTrue(handover >= 0, "the legacy path no longer hands over; got $observed")
+        assertTrue(release >= 0, "release step missing; got $observed")
+        assertTrue(
+            handover < release,
+            "the legacy path must stop the walk before releasing its subsystems; " +
+                "observed=$observed",
+        )
+    }
+
+    @Test
+    fun a_legacy_handover_timeout_excludes_both_release_and_restart() = runBlocking {
+        val log = CallLog()
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            gate = null,
+            hybrid = TracingHybrid(log),
+            handOver = { false },
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        assertTrue(
+            observed.contains("handOverConnectOwnership"),
+            "the handover must still be attempted; got $observed",
+        )
+        assertTrue(
+            observed.none { it == "release" },
+            "a legacy rewalk that could not stop the walk must not release; " +
+                "got $observed",
+        )
+        assertTrue(
+            observed.none { it.startsWith("requestServiceRestart") },
+            "and must not invite a successor; got $observed",
+        )
+        assertTrue(restartLog.isEmpty())
+    }
+
+    @Test
+    fun a_coordinator_timeout_arms_recovery_and_one_connect_follows_typed() = runBlocking {
+        // R-N1.16 P1. The rewalk abandons on a failed handover - no
+        // release, no restart - so the arming that used to live in the
+        // service's restart branch could never be reached from the one
+        // situation that needs it. The coordinator's own handover lambda
+        // must arm.
+        assertRecoveryArmedAfterTimeout(useTypedGate = true)
+    }
+
+    @Test
+    fun a_coordinator_timeout_arms_recovery_and_one_connect_follows_legacy() = runBlocking {
+        assertRecoveryArmedAfterTimeout(useTypedGate = false)
+    }
+
+    private suspend fun assertRecoveryArmedAfterTimeout(useTypedGate: Boolean) {
+        val log = CallLog()
+        val starts = mutableListOf<String>()
+        val recoveryScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            .also { livingScopes.add(it) }
+        val walkScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            .also { livingScopes.add(it) }
+
+        // A walk that ignores cancellation until told otherwise, so the
+        // first join times out the way a wedged teardown would.
+        val stubborn = java.util.concurrent.atomic.AtomicBoolean(true)
+        val ownership = phantom.core.transport.ConnectOwnership(
+            nextToken = { 1L },
+            handoverTimeoutMs = 300L,
+        )
+        val started = CompletableDeferred<Unit>()
+        val walkJob = walkScope.launch {
+            val me = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+            ownership.claim(
+                "generation_A",
+                phantom.core.transport.ConnectWalkHandle { timeoutMs: Long ->
+                    if (stubborn.get()) {
+                        false
+                    } else {
+                        me?.cancel(CancellationException("ownership_handover"))
+                        me == null || withTimeoutOrNull(timeoutMs) { me.join() } != null
+                    }
+                },
+            )
+            started.complete(Unit)
+            try {
+                delay(60_000)
+            } catch (_: CancellationException) {
+                // the walk finally lets go
+            }
+        }
+        started.await()
+
+        val recovery = phantom.core.transport.HandoffRecovery(
+            ownership = ownership,
+            scope = recoveryScope,
+            startOneOrdinaryConnect = { reason -> synchronized(starts) { starts.add(reason) } },
+            intervalMs = 100L,
+        )
+
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            gate = if (useTypedGate) TracingGate(log) else null,
+            hybrid = TracingHybrid(log),
+            handOver = { reason -> recovery.handOverOrArm(reason) },
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        // The rewalk was abandoned: nothing released, nobody restarted.
+        val observed = log.snapshot()
+        assertTrue(observed.none { it == "release" }, "must not release; got $observed")
+        assertTrue(observed.none { it.startsWith("requestServiceRestart") })
+        assertTrue(restartLog.isEmpty())
+        assertTrue(recovery.isArmed(), "but recovery MUST be armed; got $observed")
+        assertTrue(synchronized(starts) { starts.isEmpty() }, "and nothing started yet")
+
+        // The old walk finally becomes joinable; the timer confirms it.
+        stubborn.set(false)
+        val deadline = System.currentTimeMillis() + 10_000
+        while (System.currentTimeMillis() < deadline &&
+            synchronized(starts) { starts.isEmpty() }
+        ) {
+            delay(50)
+        }
+
+        assertTrue(walkJob.isCompleted, "the displaced walk was actually stopped")
+        assertEquals(
+            1,
+            synchronized(starts) { starts.size },
+            "exactly one ordinary connect follows a confirmed join; got $starts",
+        )
+        assertNull(ownership.blockedReason(), "and the lease is usable again")
+        recovery.standDown("test_teardown")
+    }
 
     @Test
     fun happy_path_runs_locked_transaction_in_order() = runBlocking {
@@ -302,6 +605,159 @@ class TransportRewalkCoordinatorTransactionTest {
         assertTrue(log.none { it.startsWith("issueProbeAfterRewalk") })
         assertEquals(1, log.count("release"), "release attempted exactly once")
         assertTrue(restartLog.isEmpty())
+    }
+
+    /**
+     * A release that threw is already refused above. This is the other
+     * half: a release that returned NORMALLY while reporting that a
+     * subsystem did not settle. Nothing threw, so every catch in this
+     * path is silent -- the answer has to be READ.
+     */
+    @Test
+    fun an_unclean_release_revokes_routeChange_and_skips_probe_restart() = runBlocking {
+        val log = CallLog()
+        val gate = TracingGate(log)
+        val hybrid = TracingHybrid(log)
+        val (coord, _, restartLog) =
+            newCoordinator(log, gate, hybrid, releaseBehaviour = "unclean")
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        assertEquals(1, log.count("release"), "release attempted exactly once")
+        assertTrue(
+            log.contains("revokeRouteChange:1:release_not_clean"),
+            "an unclean release must revoke the route change; got ${log.snapshot()}",
+        )
+        assertTrue(
+            log.none { it.startsWith("issueProbeAfterRewalk") },
+            "and must not probe on top of it; got ${log.snapshot()}",
+        )
+        assertTrue(restartLog.isEmpty(), "and must not invite a successor")
+    }
+
+    /**
+     * The same rule on the path that has no gate coordinator. The two
+     * branches diverged once before -- R-N1.16 P1-2 -- and a rule that
+     * holds on only one of them is not a rule.
+     */
+    @Test
+    fun an_unclean_release_excludes_the_restart_on_the_legacy_path() = runBlocking {
+        val log = CallLog()
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            gate = null,
+            hybrid = TracingHybrid(log),
+            releaseBehaviour = "unclean",
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        assertEquals(1, log.count("release"), "the release still runs; got $observed")
+        assertTrue(
+            observed.none { it.startsWith("requestServiceRestart") },
+            "a restart on top of an unsettled subsystem is the defect; got $observed",
+        )
+        assertTrue(restartLog.isEmpty())
+    }
+
+    /**
+     * The positive control for both cases above: with a CLEAN release the
+     * same fixtures go all the way through. Without this, a coordinator
+     * that refused every rewalk would pass them.
+     */
+    @Test
+    fun a_clean_release_still_reaches_the_probe_and_the_restart() = runBlocking {
+        val log = CallLog()
+        val gate = TracingGate(log)
+        val hybrid = TracingHybrid(log)
+        val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        assertTrue(
+            log.none { it.startsWith("revokeRouteChange:1:release_not_clean") },
+            "a clean release must not be read as unclean; got ${log.snapshot()}",
+        )
+        assertTrue(log.contains("issueProbeAfterRewalk:1"), "got ${log.snapshot()}")
+        assertTrue(restartLog.isNotEmpty(), "the successor must still be invited")
+    }
+
+    /**
+     * R-1. The same refusal for the OTHER half of the outcome. Tor settling
+     * cleanly does not make the release clean if Xray did not stop, and a
+     * gate that read only the tor result would restart on top of a live
+     * proxy from the old posture.
+     */
+    @Test
+    fun an_unclean_xray_also_revokes_routeChange_and_skips_probe_restart() = runBlocking {
+        val log = CallLog()
+        val gate = TracingGate(log)
+        val hybrid = TracingHybrid(log)
+        val (coord, _, restartLog) =
+            newCoordinator(log, gate, hybrid, releaseBehaviour = "unclean_xray")
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        assertTrue(
+            log.contains("revokeRouteChange:1:release_not_clean"),
+            "an unclean xray must stop the rewalk too; got ${log.snapshot()}",
+        )
+        assertTrue(log.none { it.startsWith("issueProbeAfterRewalk") })
+        assertTrue(restartLog.isEmpty())
+    }
+
+    /** And on the legacy branch, which diverged from this rule once before. */
+    @Test
+    fun an_unclean_xray_excludes_the_restart_on_the_legacy_path() = runBlocking {
+        val log = CallLog()
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            gate = null,
+            hybrid = TracingHybrid(log),
+            releaseBehaviour = "unclean_xray",
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        assertEquals(1, log.count("release"), "the release still runs; got $observed")
+        assertTrue(
+            observed.none { it.startsWith("requestServiceRestart") },
+            "a restart on top of a live proxy is the defect; got $observed",
+        )
+        assertTrue(restartLog.isEmpty())
+    }
+
+    /**
+     * The positive control for the LEGACY branch specifically. The typed one
+     * has its own; without this, a legacy path that refused every rewalk
+     * would satisfy both refusal tests above and nothing would notice.
+     */
+    @Test
+    fun a_clean_release_still_reaches_the_restart_on_the_legacy_path() = runBlocking {
+        val log = CallLog()
+        val (coord, _, restartLog) = newCoordinator(
+            log,
+            gate = null,
+            hybrid = TracingHybrid(log),
+        )
+        coord.seedNetworkPresent(true)
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        awaitJobDone(coord)
+
+        val observed = log.snapshot()
+        assertEquals(1, log.count("release"), "got $observed")
+        assertTrue(
+            observed.any { it.startsWith("requestServiceRestart") },
+            "a clean legacy rewalk must still invite a successor; got $observed",
+        )
+        assertTrue(restartLog.isNotEmpty())
     }
 
     @Test
@@ -552,7 +1008,8 @@ class TransportRewalkCoordinatorTransactionTest {
         coord = TransportRewalkCoordinator(
             scope = rewalkScope,
             transportPreferences = prefs,
-            releaseTransport = { log.add("release") },
+            releaseTransport = { log.add("release"); cleanRelease() },
+            handOverConnectOwnership = { log.add("handOverConnectOwnership"); true },
             hybridTransportProvider = { hybrid },
             requestServiceRestart = { reason ->
                 log.add("requestServiceRestart:${reason.name}")
@@ -609,7 +1066,8 @@ class TransportRewalkCoordinatorTransactionTest {
         coord = TransportRewalkCoordinator(
             scope = rewalkScope,
             transportPreferences = prefs,
-            releaseTransport = { log.add("release") },
+            releaseTransport = { log.add("release"); cleanRelease() },
+            handOverConnectOwnership = { log.add("handOverConnectOwnership"); true },
             hybridTransportProvider = { hybrid },
             requestServiceRestart = { reason ->
                 log.add("requestServiceRestart:${reason.name}")
@@ -682,3 +1140,9 @@ class TransportRewalkCoordinatorTransactionTest {
         )
     }
 }
+
+/** Both subsystems stopped and nothing is holding threads. */
+private fun cleanRelease() = TransportManager.ReleaseOutcome(
+    xrayFailure = null,
+    torFailure = null,
+)

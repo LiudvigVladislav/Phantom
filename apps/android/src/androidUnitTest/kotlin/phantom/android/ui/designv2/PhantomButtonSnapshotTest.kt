@@ -31,6 +31,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseButtonMatrixB
  * helpers from the debug showcase so state is deterministic for a
  * single Paparazzi render frame.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomButtonSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

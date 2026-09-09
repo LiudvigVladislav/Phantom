@@ -259,6 +259,14 @@ class HybridRelayTransport(
     override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
         wsTransport.disconnectAndJoin(timeoutMs)
 
+    override val teardownIdentity: Long get() = wsTransport.teardownIdentity
+
+    override suspend fun disconnectAndConfirm(
+        timeoutMs: Long,
+        onlyIfIdentity: Long?,
+    ): phantom.core.transport.TransportTeardownResult =
+        wsTransport.disconnectAndConfirm(timeoutMs, onlyIfIdentity)
+
     override suspend fun forceReconnect() = wsTransport.forceReconnect()
 
     override suspend fun sendTyping(toPubKeyHex: String): Boolean =
@@ -526,21 +534,18 @@ class HybridRelayTransport(
         scope.launch {
             wsTransport.outboundAckDeadlineExpired.collect { event ->
                 if (!restCapabilityActive) return@collect
-                // PR-D1d defence-in-depth: also filter on current mode here.
-                // [RestStateMachine.onActiveOutboundAckTimeout] no-ops the event
-                // when state != WsActive (so a duplicate timeout firing after
-                // we've already flipped to RestActive is correctly ignored),
-                // but doing the cheap fast-path read here avoids acquiring
-                // [stateMachineLock] in [submitStateEvent] just to no-op.
-                // [stateMachine.current] is a MutableStateFlow.value read —
-                // thread-safe atomic, no lock required for the snapshot.
-                if (stateMachine.current != RestMode.WsActive) return@collect
+                // Routing still changes only from WsActive. Forward the event
+                // in every mode so a late failure replaces silence-only evidence.
+                val wasWsActive = stateMachine.current == RestMode.WsActive
                 submitStateEvent(
                     RestStateMachine.Event.ActiveOutboundAckTimeout(
                         msgId = event.msgId,
                         ageMs = event.ageMs,
                     )
                 )
+                // Even in fallback this replaces "silence only" presentation evidence.
+                // Actuation and detector telemetry retain their previous mode guard.
+                if (!wasWsActive) return@collect
                 // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
                 wsDegradationDetector?.let { det ->
                     wsDegradationMutex.withLock {
@@ -1362,6 +1367,11 @@ class HybridRelayTransport(
                 )
             }
             RestInboundDeduplicator.Action.ReAck -> {
+                if (processedEnvelopeRepository != null) {
+                    // The persistent check above did not find completion.
+                    restDedup.park(env.id)
+                    return
+                }
                 // DMS has already called sendDeliveryAck → the envelope is
                 // durably stored. The previous /relay/ack-deliver request
                 // must have failed at the network layer. Safe to re-ack.
@@ -1395,12 +1405,19 @@ class HybridRelayTransport(
 
     // ── ACK routing ──────────────────────────────────────────────────────────
 
+    override suspend fun parkInbound(messageId: String) {
+        restDedup.park(messageId)
+    }
+
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
-        // The dedup tracker is the authoritative source of "is this a REST
-        // id?". We optimistically check before WS-delegation so a missing
-        // entry (e.g. an id that was never emitted via REST) falls through
-        // to the WS path with no extra round-trip.
-        val isRestId = restDedup.isPending(messageId)
+        // In-memory bookkeeping is not evidence that the recipient committed.
+        if (processedEnvelopeRepository != null &&
+            !processedEnvelopeRepository.exists(messageId)) {
+            restDedup.park(messageId)
+            Log.w(TAG, "REST_TRACE ack_refused_uncommitted id=${messageId.take(8)}")
+            return false
+        }
+        val isRestId = orchestrator.hasInboundForAck(messageId)
         if (!isRestId) {
             return wsTransport.sendDeliveryAck(messageId)
         }

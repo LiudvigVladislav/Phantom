@@ -17,6 +17,25 @@ interface TransportPreferences {
     var privacyMode: PrivacyMode
 
     /**
+     * N1-F2 R-N1.2 — the privacy posture as seen by the fail-closed REST
+     * egress policy, which MUST distinguish "no preference stored" from
+     * "a preference is stored but cannot be parsed".
+     *
+     * - A MISSING preference retains the intentional legacy default and
+     *   returns [PrivacyMode.Standard].
+     * - A PRESENT but malformed/unreadable preference returns `null`, so
+     *   [PrivacyModeRestEgressPolicy] maps it to
+     *   [RestEgressDecision.AnonymousRequiredButUnavailable] — never
+     *   [RestEgressDecision.DirectAllowed]. A corrupted stored value must
+     *   not silently authorise Direct egress.
+     *
+     * The default mirrors [privacyMode] (there is no malformed state in an
+     * in-memory or enum-typed store); persistence-backed implementations
+     * override this to expose the distinction.
+     */
+    fun privacyModeForEgress(): PrivacyMode? = privacyMode
+
+    /**
      * The transport [TransportManager] last successfully reached the relay
      * through. Used to reorder the strategy chain so a known-good path is
      * tried first on subsequent connects, avoiding the worst-case
@@ -29,9 +48,23 @@ interface TransportPreferences {
 
     /**
      * Count of consecutive chain-walks that ended in
-     * [NoTransportReachableException] since the last success. Surfaces a
-     * "stuck — check your network" UI state once it crosses
-     * [STUCK_FAILURE_THRESHOLD]. Reset to 0 on any successful connect.
+     * [NoTransportReachableException] since the last success, incremented
+     * by `TransportManager.onAllFailed` and reset to 0 on any successful
+     * connect.
+     *
+     * N1-F3: this counter is persisted and is NOT read by anything today.
+     * It used to promise a "stuck - check your network" UI state past a
+     * `STUCK_FAILURE_THRESHOLD` of 3; no code ever consumed either the
+     * counter or the threshold, so the constant was removed rather than
+     * left standing as a claim of coverage that did not exist. The doc
+     * now describes only what the field actually does.
+     *
+     * The retry cadence deliberately does NOT read it. Retry backoff is
+     * driven by [ConnectRetryScheduler]'s own in-memory streak, which
+     * starts from the bottom of the ladder again after a process
+     * restart. That is the conservative direction - a restarted process
+     * retries sooner, not later - and it avoids asserting a persistence
+     * semantics for this field that no test proves.
      */
     var transportFailureCount: Int
 
@@ -39,8 +72,6 @@ interface TransportPreferences {
         /** 24 h. Past this, [lastWorkingTransport] hint is ignored. */
         const val LAST_SUCCESS_TTL_MS: Long = 24L * 3600L * 1000L
 
-        /** 3. Once `transportFailureCount` reaches this, surface stuck-state UI. */
-        const val STUCK_FAILURE_THRESHOLD: Int = 3
     }
 }
 

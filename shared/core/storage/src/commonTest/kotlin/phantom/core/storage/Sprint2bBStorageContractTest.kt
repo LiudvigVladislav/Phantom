@@ -324,12 +324,14 @@ internal class FakePendingRatchetStateRepository : PendingRatchetStateRepository
         stateBlob: String,
         reservedAtMs: Long,
         bootstrapArtifactsBlob: String?,
+        opkBinding: PendingOpkBinding,
     ) {
         store[conversationId] = PendingRatchetStateEntity(
             conversationId = conversationId,
             stateBlob = stateBlob,
             reservedAtMs = reservedAtMs,
             bootstrapArtifactsBlob = bootstrapArtifactsBlob,
+            opkBinding = opkBinding,
         )
     }
 

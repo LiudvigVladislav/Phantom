@@ -28,7 +28,9 @@ actual fun createPreKeyPublishHttpClient(): HttpClient = HttpClient(Darwin)
 // iOS stub — PR-R0.1. The 8192-byte Ktor body streaming bug is Android-only
 // (OkHttp engine adapter). iOS is not a production path yet; throw to surface
 // any accidental invocation at development time.
-actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
+actual fun createPreKeyPublishHttpTransport(
+    @Suppress("UNUSED_PARAMETER") callRegistry: EgressCallRegistry?,
+): PreKeyPublishHttpTransport =
     throw NotImplementedError(
         "Native publish transport is not implemented for iOS. " +
             "iOS production wiring is planned for Beta.",
@@ -53,6 +55,7 @@ actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") httpPhaseLogging: Boolean,
     @Suppress("UNUSED_PARAMETER") k8HoldOverrideProvider: (() -> Int)?,
     @Suppress("UNUSED_PARAMETER") k8ConnectionCloseProvider: (() -> Boolean)?,
+    @Suppress("UNUSED_PARAMETER") callRegistry: EgressCallRegistry?,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is not implemented for iOS. " +

@@ -20,6 +20,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseProfileQrKeyCardAdvancedExpa
  * Single default-viewport golden (Pixel 5, fontScale 1.0) — the
  * architect scope-lock caps this block at one Profile golden.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class ProfileQrKeyCardSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

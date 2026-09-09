@@ -95,6 +95,22 @@ kotlin {
                 // matrix):
                 implementation(libs.androidx.compose.ui.test.junit4)
                 implementation(libs.androidx.compose.ui.test.manifest)
+                // Session-order full-stack rig: a real PhantomDatabase on an
+                // in-memory JDBC driver, so the receive path runs against the
+                // production SqlDelight repositories rather than fakes.
+                implementation(project(":shared:core:storage"))
+                implementation(project(":shared:core:messaging"))
+                implementation(project(":shared:core:crypto"))
+                implementation(libs.sqldelight.runtime)
+                implementation(libs.sqldelight.sqlite.driver)
+                // The JVM bindings ask for a JNA version whose Android
+                // artifact this build has never resolved. Pin the one that
+                // is already part of the build instead; JNA is only the
+                // native-library loader for libsodium here.
+                implementation("com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings-jvm:0.9.2") {
+                    exclude(group = "net.java.dev.jna")
+                }
+                implementation("net.java.dev.jna:jna:5.12.1")
             }
         }
 
@@ -1052,6 +1068,67 @@ dependencies {
     "debugImplementation"(libs.androidx.compose.ui.test.manifest)
 }
 
+// WSS-3 audit ROUND-22 P0-2: canonical producer fixtures under
+// `docs/tracks/direct-wss/operator-package/fixtures/` are the SINGLE
+// canonical shape (contract §5). The Kotlin conformance test loads
+// them as a JVM classpath resource via `getResourceAsStream`. This
+// task copies them into `build/generated/canonicalFixtures/` and
+// registers that directory as a resource root for the AGP unit-test
+// source set. NO second checked-in copy is allowed by architect
+// ROUND-22 P0-2; this generated copy has declared task input/output
+// so incremental builds stay correct.
+val wss3CanonicalFixturesOut =
+    layout.buildDirectory.dir("generated/canonicalFixtures/wss3").get().asFile
+val copyCanonicalWss3Fixtures by tasks.registering(Copy::class) {
+    val srcDir = rootProject.file(
+        "docs/tracks/direct-wss/operator-package/fixtures"
+    )
+    from(srcDir) {
+        include("canonical_network_profile.*.json")
+    }
+    into(wss3CanonicalFixturesOut)
+    inputs.dir(srcDir).withPropertyName("wss3CanonicalFixturesSrc")
+}
+android {
+    // AGP SourceSet API only accepts plain paths, not Providers.
+    sourceSets.getByName("test").resources.srcDir(wss3CanonicalFixturesOut)
+}
+// Ensure `processTestResources` (which packages test-resource
+// directories into the JVM classpath) waits for the copy.
+tasks.matching { it.name.startsWith("processDebugUnitTest") || it.name == "processTestResources" }
+    .configureEach { dependsOn(copyCanonicalWss3Fixtures) }
+
+// The host runner executes complementary JUnit categories in separate Gradle
+// invocations, preserving all Paparazzi plugin/AGP setup on the original task.
+// Regular tests deliberately share a JVM so inter-test leaks remain visible.
+// No property preserves the historical mixed run for diagnostic comparisons.
+val hostTestEngine = providers.gradleProperty("phantomHostTestEngine").orNull
+require(hostTestEngine == null || hostTestEngine in setOf("regular", "paparazzi")) {
+    "phantomHostTestEngine must be regular or paparazzi"
+}
+if (hostTestEngine != null) {
+    tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
+        useJUnit {
+            val category = "phantom.android.testing.PaparazziTestEngine"
+            if (hostTestEngine == "paparazzi") includeCategories(category)
+            else excludeCategories(category)
+        }
+        setForkEvery(if (hostTestEngine == "paparazzi") 1L else 0L)
+        maxParallelForks = 1
+    }
+    // AGP/KMP assign report locations later than the Test configuration above.
+    // Set these after plugin evaluation so the second engine cannot overwrite
+    // the first engine's XML, HTML or binary results.
+    gradle.projectsEvaluated {
+        tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {
+            val resultName = "$name-$hostTestEngine"
+            reports.junitXml.outputLocation.set(layout.buildDirectory.dir("test-results/$resultName"))
+            reports.html.outputLocation.set(layout.buildDirectory.dir("reports/tests/$resultName"))
+            binaryResultsDirectory.set(layout.buildDirectory.dir("test-results/$resultName/binary"))
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // Paparazzi determinism via CONDITIONAL per-class JVM isolation
 // (Onboarding Commit 2 round-2 REDLINE P1-2, 2026-08-01)
@@ -1093,6 +1170,9 @@ gradle.taskGraph.whenReady {
     val paparazziInGraph = allTasks.any { task ->
         val n = task.name
         n.startsWith("recordPaparazzi") || n.startsWith("verifyPaparazzi")
+    }
+    check(!paparazziInGraph || hostTestEngine != "regular") {
+        "A regular host run cannot record or verify Paparazzi snapshots"
     }
     if (paparazziInGraph) {
         tasks.withType(org.gradle.api.tasks.testing.Test::class.java).configureEach {

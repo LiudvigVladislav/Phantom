@@ -95,15 +95,43 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$TMP" "$STAGE"' EXIT
 
 # 2. Extract operator-package tree from git-index (blobs are LF).
-git -C "$REPO_ROOT" archive --format=tar "$REF" \
-    -- docs/tracks/direct-wss/operator-package \
+#
+# Audit ROUND-30.4 P1: `git archive` HONOURS `core.autocrlf`. With
+# `core.autocrlf=true` — the default on a Windows clone — every packaged
+# text file that is not pinned by an `eol=lf` attribute came out CRLF,
+# so `.md`, `.json`, `.gitattributes` and `.gitignore` shipped with line
+# endings the index blobs do not have. The `.sh`/`.py` files were LF
+# only because this package's `.gitattributes` pins them. Disabling both
+# conversion knobs for this one command makes the archive byte-identical
+# to the index blobs for EVERY file, on any host. Step 6a then proves it
+# rather than trusting it.
+ARCHIVE_PREFIX="docs/tracks/direct-wss/operator-package"
+git -C "$REPO_ROOT" -c core.autocrlf=false -c core.eol=lf \
+    archive --format=tar "$REF" -- "$ARCHIVE_PREFIX" \
   | (cd "$TMP" && tar -xf -)
 
 # 3. Reshape into <STAGE>/operator-package/... plus the contract sheet.
 mkdir -p "$STAGE/operator-package"
 cp -R "$TMP/docs/tracks/direct-wss/operator-package/." "$STAGE/operator-package/"
-git -C "$REPO_ROOT" show "$REF:docs/tracks/direct-wss/direct-wss-yota-contract.md" \
-    > "$STAGE/direct-wss-yota-contract.md"
+# Audit ROUND-30.4 P1: `git show <rev>:<path>` applies the same
+# working-tree conversion as a checkout. `git cat-file blob` writes the
+# blob byte-for-byte, which is what "assembled from index blobs" has to
+# mean. Both contract copies below go through it.
+wss3_cat_index_blob() {
+    local path="$1" out="$2" sha
+    sha=$(git -C "$REPO_ROOT" rev-parse "$REF:$path") || return 1
+    git -C "$REPO_ROOT" cat-file blob "$sha" > "$out"
+}
+wss3_cat_index_blob "docs/tracks/direct-wss/direct-wss-yota-contract.md" \
+    "$STAGE/direct-wss-yota-contract.md"
+# Audit ROUND-10 P1-9: the WSS-3 fixture suite greps
+# `wss-3-carrier-vpn-matrix-contract.md` from an OPERATOR-PACKAGE-
+# local path (per `wss3_contract_path` in tests/test_shell_wss3.sh
+# line 121-138). Without this, ~11 contract-invariant fixtures fail
+# on a fresh extraction. Ship it alongside the tests dir so
+# `$WSS3_TEST_ROOT/wss-3-carrier-vpn-matrix-contract.md` resolves.
+wss3_cat_index_blob "docs/tracks/direct-wss/wss-3-carrier-vpn-matrix-contract.md" \
+    "$STAGE/operator-package/wss-3-carrier-vpn-matrix-contract.md"
 
 # 4. Final-mode: stage EXACTLY the supplied APK + sha256 pair.
 if [ "$MODE" = "final" ]; then
@@ -130,7 +158,15 @@ if [ "$MODE" = "final" ]; then
 fi
 
 # 5. Junk-file scan (defence in depth).
-JUNK_PATTERNS=(-name ".DS_Store" -o -name "__pycache__" -o -name "*.pyc")
+#
+# Audit ROUND-30.16: the local `PhantomMessaging:W` capture carries
+# exception text and stack traces and must never be packaged. Keeping it
+# out by writing it elsewhere is a convention; this makes it a gate. A
+# planted raw capture file, or the directory that holds them, fails the
+# build instead of riding along unnoticed.
+JUNK_PATTERNS=(-name ".DS_Store" -o -name "__pycache__" -o -name "*.pyc"
+               -o -name "*.PhantomMessaging.log" -o -name ".local-diag"
+               -o -name "phantom-wss3-local-diag" -o -name "CAPTURE-FAILED")
 if [ "$MODE" = "review" ]; then
     JUNK_PATTERNS+=(-o -name "*.apk" -o -name "*.apk.sha256")
 fi
@@ -154,6 +190,69 @@ done < <(find "$STAGE" \( -name "*.sh" -o -name "*.py" \) -type f -print0)
 if [ "$cr_offenders" -ne 0 ]; then
     exit 1
 fi
+
+# 6a. INDEX-BLOB PARITY GATE (audit ROUND-30.4 P1).
+#
+# The scan above covers two extensions; this covers every tracked file
+# the package ships. For each path tracked at <REF> under the archived
+# prefix, the staged bytes must hash identically to the index blob. Any
+# difference — a CRLF conversion, a truncation, a stray edit — fails the
+# build. Untracked additions (the two contract copies, and in final mode
+# the APK pair) are listed explicitly and checked separately, so nothing
+# is silently exempt.
+parity_checked=0
+parity_bad=0
+while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    staged="$STAGE/operator-package/${rel#$ARCHIVE_PREFIX/}"
+    if [ ! -f "$staged" ]; then
+        echo "build FAILED: tracked file missing from stage: $rel" >&2
+        parity_bad=$((parity_bad+1))
+        continue
+    fi
+    blob_sha=$(git -C "$REPO_ROOT" rev-parse "$REF:$rel")
+    want=$(git -C "$REPO_ROOT" cat-file blob "$blob_sha" | sha256sum | awk '{print $1}')
+    got=$(sha256sum < "$staged" | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+        echo "build FAILED: not byte-identical to the index blob: $rel" >&2
+        echo "  index=$want staged=$got" >&2
+        parity_bad=$((parity_bad+1))
+    fi
+    parity_checked=$((parity_checked+1))
+done < <(git -C "$REPO_ROOT" ls-tree -r --name-only "$REF" -- "$ARCHIVE_PREFIX")
+
+# The two contract copies are staged from `cat-file blob` above; assert
+# the same parity for them so the whole shipped tree is covered.
+for pair in \
+    "docs/tracks/direct-wss/direct-wss-yota-contract.md|$STAGE/direct-wss-yota-contract.md" \
+    "docs/tracks/direct-wss/wss-3-carrier-vpn-matrix-contract.md|$STAGE/operator-package/wss-3-carrier-vpn-matrix-contract.md"; do
+    rel="${pair%%|*}"; staged="${pair#*|}"
+    blob_sha=$(git -C "$REPO_ROOT" rev-parse "$REF:$rel")
+    want=$(git -C "$REPO_ROOT" cat-file blob "$blob_sha" | sha256sum | awk '{print $1}')
+    got=$(sha256sum < "$staged" | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+        echo "build FAILED: not byte-identical to the index blob: $rel" >&2
+        parity_bad=$((parity_bad+1))
+    fi
+    parity_checked=$((parity_checked+1))
+done
+
+# Nothing in the stage may sit outside that accounted set. In review
+# mode every staged file is parity-checked; final mode adds exactly the
+# APK and its sidecar, which are hash-verified separately below.
+unchecked_allowance=0
+if [ "$MODE" = "final" ]; then
+    unchecked_allowance=2
+fi
+staged_total=$(find "$STAGE" -type f | wc -l | tr -d '[:space:]')
+if [ "$staged_total" -ne "$((parity_checked + unchecked_allowance))" ]; then
+    echo "build FAILED: stage holds $staged_total files; parity covered $parity_checked with $unchecked_allowance allowed unchecked" >&2
+    parity_bad=$((parity_bad+1))
+fi
+if [ "$parity_bad" -ne 0 ]; then
+    exit 1
+fi
+echo "index-blob parity: OK — $parity_checked packaged files byte-identical to <$REF>"
 
 # 7. Write the tar at a colon-free tmp path (POSIX -f is safe there),
 #    then `mv` to the requested destination. Only POSIX/BSD-compatible
@@ -186,7 +285,31 @@ if ! (cd "$DRY/operator-package" && bash tests/test_shell.sh) >/dev/null 2>&1; t
 fi
 if ! (cd "$DRY/operator-package" && python3 -m unittest tests.test_verifier) \
         >/dev/null 2>&1; then
-    echo "build FAILED: python fixtures failed from extracted tar" >&2
+    echo "build FAILED: python fixtures (test_verifier) failed from extracted tar" >&2
+    rm -rf "$DRY"; exit 1
+fi
+# Audit ROUND-10 P1-9: the WSS-3 python suite must also gate the
+# bundle so a self-contained tar cannot ship with a broken wss3
+# verifier. Same command shape as test_verifier above.
+if ! (cd "$DRY/operator-package" && python3 -m unittest tests.test_verifier_wss3) \
+        >/dev/null 2>&1; then
+    echo "build FAILED: python fixtures (test_verifier_wss3) failed from extracted tar" >&2
+    rm -rf "$DRY"; exit 1
+fi
+# Audit ROUND-12 P1-#8 — the harness default is all 8 profiles
+# (~50 min on Windows Git Bash). For bundle-validator use we run
+# `--profiles 1` (proves the wiring extracts cleanly and can invoke
+# the real orchestrator end-to-end for at least one profile); the
+# audit-gate all-8-profile evidence lives in the separately-produced
+# review-pack `dry-run-real-all-eight/` tree, generated by hand-
+# running `bash tests/dry_run_matrix_p0_7.sh --both`. `--profiles 1`
+# now exits with rc=2 (subset-run acknowledgement per audit ROUND-12
+# P1-#8); the validator treats rc=2 as OK for the extract check.
+_dry_rc=0
+(cd "$DRY/operator-package" && bash tests/dry_run_matrix_p0_7.sh --both --profiles 1) \
+    >/dev/null 2>&1 || _dry_rc=$?
+if [ "$_dry_rc" -ne 0 ] && [ "$_dry_rc" -ne 2 ]; then
+    echo "build FAILED: real-orchestrator extract-gate failed with rc=$_dry_rc" >&2
     rm -rf "$DRY"; exit 1
 fi
 # In final mode: assert the APK is present at extract time AND its
@@ -207,4 +330,15 @@ if [ "$MODE" = "final" ]; then
 fi
 rm -rf "$DRY"
 
+# ── Audit ROUND-30.10: a machine-checkable FINAL verdict ───────────
+#
+# Every gate above exits non-zero on failure, so reaching this line
+# means all of them passed. What was missing is a line an assembler can
+# test for. R30.9's pack shipped a builder log whose last line was
+# `build FAILED: shell fixtures failed from extracted tar` while the
+# report claimed green, because the reporter read the log's FIRST
+# interesting line and never its verdict. Anything packaging this
+# builder's output must require the line below and refuse to ship
+# otherwise.
+echo "gate-verdict: ALL GATES GREEN (parity, junk, CR, dry-extract shell, python, orchestrator)"
 echo "OK: $OUT_PATH"

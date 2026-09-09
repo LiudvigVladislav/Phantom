@@ -36,6 +36,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseIconAudit
  * `scratchpad/icon-audit-svg-source.html` to A/B-verify each row against
  * the source SVG at 24 px and 48 px.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomIconAuditSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

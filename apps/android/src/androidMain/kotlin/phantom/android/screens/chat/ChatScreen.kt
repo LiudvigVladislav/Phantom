@@ -466,10 +466,20 @@ fun ChatScreen(
         reloadMessages()
         val conv = container.conversationRepo.getConversation(conversationId)
         if (conv != null) {
-            // Privacy Mode: Standard sends read receipts; Private/Ghost suppress
-            // them at the wire level (local state still flips to READ).
-            val privacyPrefs = context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
-            val sendReceipts = privacyPrefs.getString("privacy_mode", "Standard") == "Standard"
+            // R-N1.17: ask the privacy authority for a CAPABILITY rather
+            // than re-deriving one from a stored string.
+            //
+            // This used to read the legacy `privacy_mode` key directly
+            // with a "Standard" default, which made it a second
+            // privacy-policy engine: a missing or unreadable key meant
+            // "send receipts", and mid-switch it saw whichever posture
+            // happened to be written.
+            //
+            // maySendReadReceipts is the intersection of the requested
+            // and effective postures, so a tightening applies at once and
+            // a loosening waits for the switch to complete.
+            val sendReceipts =
+                container.privacyModeCoordinator.state.value.maySendReadReceipts
             container.messagingService?.markConversationRead(
                 conversationId, conv.theirPublicKeyHex, sendReceipts,
             )
@@ -565,9 +575,11 @@ fun ChatScreen(
                 reloadMessages()
                 val conv = container.conversationRepo.getConversation(conversationId)
                 if (conv != null) {
-                    // Honor Privacy Mode (see top of LaunchedEffect above for explanation).
-                    val privacyPrefs = context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
-                    val sendReceipts = privacyPrefs.getString("privacy_mode", "Standard") == "Standard"
+                    // Honor Privacy Mode through the authority - see the
+                    // LaunchedEffect above for why this is a capability
+                    // and not a mode string.
+                    val sendReceipts =
+                        container.privacyModeCoordinator.state.value.maySendReadReceipts
                     container.messagingService?.markConversationRead(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
@@ -1970,16 +1982,63 @@ private fun MessageBubble(
                 }
                 } // end audio/text branch
 
-                // Link preview — shown for messages that contain a URL
+                // Link preview — N1-F2 R-N1.3: NEVER fetched automatically.
+                // Rendering a message must not cause a request to a host
+                // the sender chose. The user taps to load, and the load
+                // goes through the shared egress gate, so Private/Ghost
+                // make no Direct request at all.
                 val urlInMsg = remember(entity.id) { extractUrl(rawText) }
-                var linkPreview by remember(entity.id) { mutableStateOf<LinkPreview?>(null) }
+                var previewState by remember(entity.id) {
+                    mutableStateOf<LinkPreviewState>(LinkPreviewState.Idle)
+                }
 
                 if (urlInMsg != null) {
                     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
-                    LaunchedEffect(entity.id) {
-                        linkPreview = fetchLinkPreview(urlInMsg)
+                    val previewScope = rememberCoroutineScope()
+                    val state = previewState
+                    if (state !is LinkPreviewState.Loaded) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = when (state) {
+                                LinkPreviewState.Idle -> "Tap to load link preview"
+                                LinkPreviewState.Loading -> "Loading preview…"
+                                LinkPreviewState.BlockedByPrivacyMode ->
+                                    "Preview off in this privacy mode"
+                                LinkPreviewState.Unavailable -> "Preview unavailable"
+                                LinkPreviewState.RefusedDestination ->
+                                    "Link points to a local address — preview blocked"
+                                is LinkPreviewState.Loaded -> ""
+                            },
+                            color = if (isSent) Color.White.copy(alpha = 0.6f)
+                                    else CyanAccent.copy(alpha = 0.7f),
+                            fontSize = 11.sp,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable(enabled = state == LinkPreviewState.Idle) {
+                                    previewState = LinkPreviewState.Loading
+                                    previewScope.launch {
+                                        previewState = when (
+                                            val r = container.fetchLinkPreviewHtml(urlInMsg)
+                                        ) {
+                                            is phantom.android.net.GatedAppHttp.Outcome.Ok ->
+                                                parseLinkPreview(urlInMsg, r.value)
+                                                    ?.let { LinkPreviewState.Loaded(it) }
+                                                    ?: LinkPreviewState.Unavailable
+                                            phantom.android.net.GatedAppHttp.Outcome
+                                                .BlockedByPrivacyMode ->
+                                                LinkPreviewState.BlockedByPrivacyMode
+                                            is phantom.android.net.GatedAppHttp.Outcome
+                                                .RefusedDestination ->
+                                                LinkPreviewState.RefusedDestination
+                                            is phantom.android.net.GatedAppHttp.Outcome.Failed ->
+                                                LinkPreviewState.Unavailable
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 6.dp, vertical = 3.dp),
+                        )
                     }
-                    val preview = linkPreview
+                    val preview = (state as? LinkPreviewState.Loaded)?.preview
                     if (preview != null) {
                         Spacer(Modifier.height(6.dp))
                         Column(
@@ -4360,33 +4419,52 @@ private val URL_REGEX = Regex("""https?://[^\s]+""")
 
 private fun extractUrl(text: String): String? = URL_REGEX.find(text)?.value
 
-private suspend fun fetchLinkPreview(url: String): LinkPreview? = withContext(Dispatchers.IO) {
-    runCatching {
-        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        conn.connectTimeout = 3_000
-        conn.readTimeout = 3_000
-        conn.setRequestProperty("User-Agent", "PHANTOM/1.0")
-        conn.instanceFollowRedirects = true
-        if (conn.responseCode !in 200..299) return@runCatching null
-        val html = conn.inputStream.bufferedReader().use { r ->
-            val sb = StringBuilder()
-            val buf = CharArray(1024)
-            var read: Int
-            var total = 0
-            while (r.read(buf).also { read = it } != -1 && total < 32_768) {
-                sb.appendRange(buf, 0, read); total += read
-            }
-            sb.toString()
-        }
-        val title = Regex("""<title[^>]*>([^<]*)</title>""", RegexOption.IGNORE_CASE)
-            .find(html)?.groupValues?.getOrNull(1)?.trim()?.take(80)
-            ?: return@runCatching null
-        val desc = Regex(
-            """<meta[^>]+name=.description.[^>]+content=.([^"']{1,200})""",
-            RegexOption.IGNORE_CASE,
-        ).find(html)?.groupValues?.getOrNull(1)?.trim() ?: ""
-        LinkPreview(url = url, title = title, description = desc)
-    }.getOrNull()
+/**
+ * N1-F2 R-N1.3 P1-1 — link preview is remote-triggered egress.
+ *
+ * The old implementation opened a raw `HttpURLConnection` to a URL
+ * chosen by whoever SENT the message, automatically, on render, with
+ * redirects followed. That is an IP-disclosure primitive: any peer
+ * could learn the recipient's real network origin by sending a link,
+ * in every privacy mode, without the recipient touching anything.
+ *
+ * Owner-approved policy (R-N1.3):
+ *
+ *   - no automatic fetch in ANY mode — the user must tap to load;
+ *   - a tapped load in Standard goes through the shared
+ *     [phantom.core.transport.RestEgressGate] like every other Direct
+ *     call;
+ *   - in Private/Ghost no Direct request is made at all, and none will
+ *     be until a real anonymous transport is bound.
+ *
+ * The HTTP itself lives in [phantom.android.net.GatedAppHttp]; this
+ * function only parses. The response body is bounded by the caller.
+ */
+private fun parseLinkPreview(url: String, html: String): LinkPreview? {
+    val title = Regex("""<title[^>]*>([^<]*)</title>""", RegexOption.IGNORE_CASE)
+        .find(html)?.groupValues?.getOrNull(1)?.trim()?.take(80)
+        ?: return null
+    val desc = Regex(
+        """<meta[^>]+name=.description.[^>]+content=.([^"']{1,200})""",
+        RegexOption.IGNORE_CASE,
+    ).find(html)?.groupValues?.getOrNull(1)?.trim() ?: ""
+    return LinkPreview(url = url, title = title, description = desc)
+}
+
+private sealed class LinkPreviewState {
+    /** Nothing requested yet. No bytes have left the device. */
+    data object Idle : LinkPreviewState()
+    data object Loading : LinkPreviewState()
+    data class Loaded(val preview: LinkPreview) : LinkPreviewState()
+    data object BlockedByPrivacyMode : LinkPreviewState()
+    data object Unavailable : LinkPreviewState()
+
+    /**
+     * The link points at a loopback, private or otherwise non-global
+     * address, directly or after a redirect. Nothing was requested from
+     * it. See [phantom.android.net.PreviewUrlPolicy].
+     */
+    data object RefusedDestination : LinkPreviewState()
 }
 
 private val CircleShape = RoundedCornerShape(50)

@@ -1205,6 +1205,8 @@ class RestFallbackOrchestratorC6Test {
         s6DebugTriggerEnabled: Boolean = false,
         logSink: (String) -> Unit = {},
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
         baseUrl = "https://relay.test",
         identityHex = IDENTITY,
         signingPubkeyHex = "bb".repeat(32),

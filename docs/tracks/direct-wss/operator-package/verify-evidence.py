@@ -113,6 +113,16 @@ RECIPIENT_EVENTS = {
     "recipient_deliver_received",
     "recipient_message_persisted",
     "recipient_ack_deliver_sent",
+    # Audit ROUND-30.16: the delivery postcondition. A fresh delivery
+    # that did not persist, mark the ledger AND ack is a failure, and
+    # now says so in the stream instead of leaving a silent gap between
+    # `recipient_deliver_received` and nothing.
+    "recipient_deliver_failed",
+    # Audit ROUND-30.18: the attempt history for this envelope is
+    # TRUNCATED - more attempts happened than the ordinal range can
+    # name. Present in the stream so the verifier refuses to judge a
+    # partial history instead of silently judging one.
+    "recipient_deliver_attempt_overflow",
 }
 SENDER_EVENTS = {
     "sender_send_attempt_started",
@@ -163,6 +173,15 @@ class WssEvent:
     outer_transport: Optional[str] = None
     inner_route: Optional[str] = None
     dedup_gate: Optional[str] = None
+    # Audit ROUND-30.16 — only on `recipient_deliver_failed`.
+    deliver_failure: Optional[str] = None
+    deliver_stage: Optional[str] = None
+    # Audit ROUND-30.17 — which processing ATTEMPT for this envelope the
+    # event belongs to. An envelope can be delivered more than once; the
+    # attempt, not the envelope, is the unit that owns a terminal
+    # outcome. Parsed as a string and validated where it is used, so a
+    # malformed value is a finding rather than a parse crash.
+    attempt: Optional[str] = None
     outcome_flag: Optional[str] = None
     relay_acceptance: Optional[str] = None
     pin: Optional[str] = None
@@ -305,6 +324,9 @@ def parse_events(path: str, device_label: str) -> tuple[list[WssEvent], list[str
                 outer_transport=fields.get("outer_transport"),
                 inner_route=fields.get("inner_route"),
                 dedup_gate=fields.get("dedup_gate"),
+                deliver_failure=fields.get("deliver_failure"),
+                deliver_stage=fields.get("deliver_stage"),
+                attempt=fields.get("attempt"),
                 outcome_flag=fields.get("outcome_flag"),
                 relay_acceptance=fields.get("relay_acceptance"),
                 pin=fields.get("pin"),

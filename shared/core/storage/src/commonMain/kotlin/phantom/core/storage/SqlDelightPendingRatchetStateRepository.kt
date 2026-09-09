@@ -42,6 +42,7 @@ class SqlDelightPendingRatchetStateRepository(
                         stateBlob              = RatchetStateStorageCodec.decodeFromStorage(it.state_blob, blobCipher),
                         reservedAtMs           = it.reserved_at_ms,
                         bootstrapArtifactsBlob = it.bootstrap_artifacts_blob,
+                        opkBinding = PendingOpkBinding.fromStorage(it.opk_key_id_hex, it.opk_binding_known),
                     )
                 }
         }
@@ -51,12 +52,15 @@ class SqlDelightPendingRatchetStateRepository(
         stateBlob: String,
         reservedAtMs: Long,
         bootstrapArtifactsBlob: String?,
+        opkBinding: PendingOpkBinding,
     ): Unit = withContext(Dispatchers.IO) {
         db.pendingRatchetStateQueries.upsert(
             conversation_id          = conversationId,
             state_blob               = RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher),
             reserved_at_ms           = reservedAtMs,
             bootstrap_artifacts_blob = bootstrapArtifactsBlob,
+            opk_key_id_hex = (opkBinding as? PendingOpkBinding.Bound)?.opkKeyIdHex,
+            opk_binding_known = if (opkBinding == PendingOpkBinding.Unknown) 0L else 1L,
         )
     }
 
@@ -73,6 +77,7 @@ class SqlDelightPendingRatchetStateRepository(
                     stateBlob              = RatchetStateStorageCodec.decodeFromStorage(it.state_blob, blobCipher),
                     reservedAtMs           = it.reserved_at_ms,
                     bootstrapArtifactsBlob = it.bootstrap_artifacts_blob,
+                    opkBinding = PendingOpkBinding.fromStorage(it.opk_key_id_hex, it.opk_binding_known),
                 )
             }
         }
