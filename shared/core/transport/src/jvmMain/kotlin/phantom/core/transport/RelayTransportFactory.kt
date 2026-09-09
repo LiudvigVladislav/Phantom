@@ -28,7 +28,9 @@ actual fun createPreKeyPublishHttpClient(): HttpClient = HttpClient(OkHttp)
 // Tests inject a FakePreKeyPublishHttpTransport directly into PreKeyApiClient
 // rather than calling this factory, so this function need not produce a working
 // implementation. Throwing makes accidental invocation visible at test time.
-actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
+actual fun createPreKeyPublishHttpTransport(
+    @Suppress("UNUSED_PARAMETER") callRegistry: EgressCallRegistry?,
+): PreKeyPublishHttpTransport =
     throw NotImplementedError(
         "Native publish transport factory is Android-only. " +
             "Inject a FakePreKeyPublishHttpTransport in tests.",
@@ -53,6 +55,7 @@ actual fun createRestFallbackTransport(
     @Suppress("UNUSED_PARAMETER") httpPhaseLogging: Boolean,
     @Suppress("UNUSED_PARAMETER") k8HoldOverrideProvider: (() -> Int)?,
     @Suppress("UNUSED_PARAMETER") k8ConnectionCloseProvider: (() -> Boolean)?,
+    @Suppress("UNUSED_PARAMETER") callRegistry: EgressCallRegistry?,
 ): RestFallbackTransport =
     throw NotImplementedError(
         "Native REST fallback transport is Android-only. " +

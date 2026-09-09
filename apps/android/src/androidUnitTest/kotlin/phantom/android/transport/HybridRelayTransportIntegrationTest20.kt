@@ -23,6 +23,9 @@ import phantom.core.transport.MediaCapabilities
 import phantom.core.transport.PollResponse
 import phantom.core.transport.ProbeIssueResult
 import phantom.core.transport.RelayMessage
+import phantom.core.transport.RestEgressDecision
+import phantom.core.transport.RestEgressGate
+import phantom.core.transport.RestEgressPolicy
 import phantom.core.transport.RestFallbackOrchestrator
 import phantom.core.transport.RestFallbackResponse
 import phantom.core.transport.RestFallbackTransport
@@ -303,6 +306,8 @@ class HybridRelayTransportIntegrationTest20 {
 
     private fun newOrchestrator(transport: RestFallbackTransport): RestFallbackOrchestrator =
         RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
             baseUrl = "https://relay.test",
             identityHex = "aa".repeat(32),
             signingPubkeyHex = "bb".repeat(32),

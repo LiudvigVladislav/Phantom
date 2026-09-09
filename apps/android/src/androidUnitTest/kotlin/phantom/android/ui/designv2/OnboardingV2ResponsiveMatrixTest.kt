@@ -68,6 +68,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingWelcomeV2
  * Total: 4 configs × 15 states = 60 goldens.
  */
 @RunWith(Parameterized::class)
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class OnboardingV2ResponsiveMatrixTest(
     private val deviceConfig: DeviceConfig,
     private val fontScale: Float,

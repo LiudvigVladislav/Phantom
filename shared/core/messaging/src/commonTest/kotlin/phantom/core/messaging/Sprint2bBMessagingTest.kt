@@ -603,9 +603,10 @@ class Sprint2bBMessagingTest {
             stateBlob: String,
             reservedAtMs: Long,
             bootstrapArtifactsBlob: String?,
+            opkBinding: phantom.core.storage.PendingOpkBinding,
         ) {
             store[conversationId] = PendingRatchetStateEntity(
-                conversationId, stateBlob, reservedAtMs, bootstrapArtifactsBlob,
+                conversationId, stateBlob, reservedAtMs, bootstrapArtifactsBlob, opkBinding,
             )
         }
         override suspend fun delete(conversationId: String) { store.remove(conversationId) }

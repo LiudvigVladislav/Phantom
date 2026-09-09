@@ -26,6 +26,25 @@ class TransportPreferencesAndroid(
             prefs.edit().putString(KEY_PRIVACY_MODE, value.name).apply()
         }
 
+    /**
+     * N1-F2 R-N1.2 — fail-closed egress read.
+     *
+     * Missing key  -> [PrivacyMode.Standard] (intentional legacy default).
+     * Present+valid -> the parsed mode.
+     * Present+MALFORMED -> `null`, which the egress policy maps to
+     *   AnonymousRequiredButUnavailable. The plain [privacyMode] getter
+     *   keeps collapsing malformed to Standard for the UX default; this
+     *   security read must NOT, or a corrupted preference would silently
+     *   authorise Direct egress.
+     */
+    override fun privacyModeForEgress(): PrivacyMode? {
+        val raw = prefs.getString(KEY_PRIVACY_MODE, null)
+            ?: return PrivacyMode.Standard // key absent: legacy default.
+        // key present: a value that will not parse is a corrupted store,
+        // NOT a Standard default.
+        return runCatching { PrivacyMode.valueOf(raw) }.getOrNull()
+    }
+
     override var lastWorkingTransport: TransportKind?
         get() = prefs.getString(KEY_LAST_WORKING, null)
             ?.let { runCatching { TransportKind.valueOf(it) }.getOrNull() }

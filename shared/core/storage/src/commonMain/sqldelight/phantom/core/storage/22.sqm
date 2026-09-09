@@ -1,0 +1,32 @@
+-- 22.sqm — record, on the pending row itself, which local one-time
+-- pre-key its candidate was derived with. Upgrades schema 22 -> 23:
+-- SQLDelight migration N.sqm runs when oldVersion <= N < newVersion.
+--
+-- Until now the binding was inferred at promotion time from
+-- `opk_reservation.conversation_id`. That inference is correct only
+-- while the invariant "at most one reservation per conversation, and
+-- it backs the pending row" holds, and it cannot express the two
+-- states a promotion must tell apart:
+--
+--   * this candidate owes a specific local key, and promoting it
+--     without spending that key leaves the key republishable;
+--   * this candidate used no local key at all (an OUTBOUND INITIATOR
+--     pending: the `x3dhInit` in its artifacts names the PEER's pool),
+--     and spending anything for it would destroy a live local key.
+--
+-- `opk_binding_known = 0` is neither of those: it means nothing wrote
+-- a binding for this row. It must never be read as "no key was used".
+--
+-- Initiator artifacts identify a candidate derived without a local OPK.
+-- Old responder rows have no durable key provenance. Even one reservation
+-- with a matching timestamp is not a candidate identity, so these rows
+-- remain Unknown until an authenticated bootstrap writes a new binding.
+-- A headerless legacy candidate can therefore remain blocked after upgrade;
+-- spending a guessed key or silently spending none is not a safe migration.
+
+ALTER TABLE pending_ratchet_state ADD COLUMN opk_key_id_hex TEXT;
+
+ALTER TABLE pending_ratchet_state ADD COLUMN opk_binding_known INTEGER NOT NULL DEFAULT 0;
+
+UPDATE pending_ratchet_state SET opk_binding_known = 1
+WHERE bootstrap_artifacts_blob IS NOT NULL;

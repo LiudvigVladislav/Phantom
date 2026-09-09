@@ -151,6 +151,10 @@ sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sq
 sqldelight-coroutines = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
 sqldelight-android-driver = { module = "app.cash.sqldelight:android-driver", version.ref = "sqldelight" }
 sqldelight-native-driver = { module = "app.cash.sqldelight:native-driver", version.ref = "sqldelight" }
+# N1-F1 R-N1.8: JVM SQLite driver, TEST-ONLY. Lets host tests build a real
+# PhantomDatabase in memory and prove that the inbound settlement transaction
+# actually rolls back; a fake repository cannot. Never shipped.
+sqldelight-sqlite-driver = { module = "app.cash.sqldelight:sqlite-driver", version.ref = "sqldelight" }
 
 # Libsodium (ISC license — safe commercially; activate in core:crypto implementation)
 libsodium-bindings = { module = "com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings", version.ref = "libsodium-bindings" }

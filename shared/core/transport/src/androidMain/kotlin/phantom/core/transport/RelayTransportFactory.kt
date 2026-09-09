@@ -10,6 +10,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
@@ -326,7 +327,14 @@ actual fun createPreKeyPublishHttpClient(): HttpClient {
  * The cost (TLS handshake per call) is acceptable: publish runs at most 3 times
  * per onboarding/rotation event, never per message.
  */
-private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTransport {
+private class AndroidNativeOkHttpPreKeyPublishTransport(
+    /**
+     * N1-F2 R-N1.3 — registry of abortable in-flight native calls, so a
+     * privacy-mode revocation can abort a pre-key publish blocked in
+     * `Call.execute()`.
+     */
+    private val callRegistry: EgressCallRegistry? = null,
+) : PreKeyPublishHttpTransport {
     override suspend fun publish(
         url: String,
         bodyBytes: ByteArray,
@@ -406,23 +414,26 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
         // plaintext is propagated into `PublishResult.Failure` for log
         // visibility on rejected publishes).
 
-        client.newCall(request).execute().use { response ->
-            // Phase 1 — headers received. Retained from the diagnostic
-            // round 2 trace because it confirms the carrier delivered
-            // the response status. The full trace shape was useful for
-            // the 2026-06-16 discrimination run and stays in place as
-            // a debug-build diagnostic for any future similar stall.
-            if (requestId.isNotEmpty()) {
-                val headersElapsed = System.currentTimeMillis() - startMs
-                relayLog(
-                    RelayLogLevel.INFO,
-                    "T2_PUBLISH_PHASE phase=headers_received " +
-                        "request_id=$requestId " +
-                        "status=${response.code} " +
-                        "protocol=${response.protocol} " +
-                        "elapsedMs=$headersElapsed",
-                )
-            }
+        val call = client.newCall(request)
+        val egressToken = callRegistry?.registerOrRefuse("prekey_publish") { call.cancel() }
+        try {
+            call.execute().use { response ->
+                // Phase 1 — headers received. Retained from the diagnostic
+                // round 2 trace because it confirms the carrier delivered
+                // the response status. The full trace shape was useful for
+                // the 2026-06-16 discrimination run and stays in place as
+                // a debug-build diagnostic for any future similar stall.
+                if (requestId.isNotEmpty()) {
+                    val headersElapsed = System.currentTimeMillis() - startMs
+                    relayLog(
+                        RelayLogLevel.INFO,
+                        "T2_PUBLISH_PHASE phase=headers_received " +
+                            "request_id=$requestId " +
+                            "status=${response.code} " +
+                            "protocol=${response.protocol} " +
+                            "elapsedMs=$headersElapsed",
+                    )
+                }
 
             // Phase 2 — body read decision: skip on 2xx, read on non-2xx.
             val bodyReadStartMs = System.currentTimeMillis()
@@ -491,12 +502,19 @@ private class AndroidNativeOkHttpPreKeyPublishTransport : PreKeyPublishHttpTrans
                 // nullable as defence-in-depth.
                 protocol = response.protocol.toString(),
             )
+            }
+        } finally {
+            if (egressToken != null) {
+                withContext(NonCancellable) { callRegistry?.unregister(egressToken) }
+            }
         }
     }
 }
 
-actual fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport =
-    AndroidNativeOkHttpPreKeyPublishTransport()
+actual fun createPreKeyPublishHttpTransport(
+    callRegistry: EgressCallRegistry?,
+): PreKeyPublishHttpTransport =
+    AndroidNativeOkHttpPreKeyPublishTransport(callRegistry = callRegistry)
 
 /**
  * Android production [RestFallbackTransport] — PR-D1.
@@ -513,8 +531,10 @@ actual fun createRestFallbackTransport(
     httpPhaseLogging: Boolean,
     k8HoldOverrideProvider: (() -> Int)?,
     k8ConnectionCloseProvider: (() -> Boolean)?,
+    callRegistry: EgressCallRegistry?,
 ): RestFallbackTransport =
     AndroidNativeOkHttpRestFallbackTransport(
+        callRegistry = callRegistry,
         socksProxyPort = socksProxyPort,
         debugBodyLogging = debugBodyLogging,
         pollSkipLpAndPpProvider = pollSkipLpAndPpProvider,

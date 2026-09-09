@@ -85,7 +85,48 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_CHECKPOINT -> handleCheckpoint(context)
             SUB_PAIRED_COUNT_REPORT -> handlePairedCountReport(context)
             SUB_SIGNED_PREKEY_READINESS -> handleSignedPrekeyReadiness(context)
+            SUB_NETWORK_PROFILE_REPORT -> handleNetworkProfileReport(context, intent)
+            SUB_NETWORK_PROFILE_STATE_REPORT -> handleNetworkProfileStateReport(context)
             else -> Log.w(TAG, "rejected: dispatch fell through for subcommand=$subcommand")
+        }
+    }
+
+    private fun handleNetworkProfileReport(context: Context, intent: Intent) {
+        // WSS-3 §4.5: bounded debug-only additive subcommand. Dispatch
+        // to [DiagnosticNetworkProfileReporter]. The reporter writes to
+        // a FIXED app-owned path (never a caller-controlled path); the
+        // extras whitelist above rejects everything except
+        // `checkpoint_key_hex`. This handler intentionally does NOT emit
+        // to Log — the reporter's `Contract` clause requires silence
+        // (no leakage into logcat) for the diagnostic path.
+        val key = intent.getStringExtra(EXTRA_CHECKPOINT_KEY_HEX)
+        if (!DiagnosticNetworkProfileReporter.isValidCheckpointKeyHex(key)) return
+        val pendingResult = goAsync()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        scope.launch {
+            try {
+                DiagnosticNetworkProfileReporter.run(context, key!!)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    private fun handleNetworkProfileStateReport(context: Context) {
+        // Audit ROUND-10 P0-1: phone MUST NOT participate in HMAC egress
+        // scheme. This subcommand runs the reporter WITHOUT any HTTP
+        // fetch or HMAC computation. Emitted JSON drops the
+        // `egress_fingerprint` object entirely. No `checkpoint_key_hex`
+        // extra is accepted (extras whitelist for this subcommand is
+        // empty).
+        val pendingResult = goAsync()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        scope.launch {
+            try {
+                DiagnosticNetworkProfileReporter.runStateOnly(context)
+            } finally {
+                pendingResult.finish()
+            }
         }
     }
 
@@ -387,6 +428,7 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         internal const val EXTRA_CELL_ID = "cell_id"
         internal const val EXTRA_SEQUENCE = "sequence"
         internal const val EXTRA_EMITTER_ID = "emitter_id"
+        internal const val EXTRA_CHECKPOINT_KEY_HEX = "checkpoint_key_hex"
 
         internal const val SUB_PIN = "pin"
         internal const val SUB_SEND = "send"
@@ -398,12 +440,18 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
         internal const val SUB_CHECKPOINT = "checkpoint"
         internal const val SUB_PAIRED_COUNT_REPORT = "paired_count_report"
         internal const val SUB_SIGNED_PREKEY_READINESS = "signed_prekey_readiness"
+        internal const val SUB_NETWORK_PROFILE_REPORT = "network_profile_report"
+        // Audit ROUND-10 P0-1: state-only variant for the phone.
+        // Skips HTTP/HMAC entirely; accepts NO extras.
+        internal const val SUB_NETWORK_PROFILE_STATE_REPORT = "network_profile_state_report"
 
         internal val ALLOWED_SUBCOMMANDS = setOf(
             SUB_PIN, SUB_SEND, SUB_CANARY, SUB_SET_EMITTER_ID,
             SUB_DUAL_SIM_REPORT, SUB_HEALTH, SUB_CLEAR,
             SUB_CHECKPOINT, SUB_PAIRED_COUNT_REPORT,
             SUB_SIGNED_PREKEY_READINESS,
+            SUB_NETWORK_PROFILE_REPORT,
+            SUB_NETWORK_PROFILE_STATE_REPORT,
         )
 
         internal val ALLOWED_PINS = setOf("none", "wss", "rest")
@@ -422,6 +470,14 @@ class DiagnosticCommandReceiver : BroadcastReceiver() {
             SUB_CHECKPOINT to emptySet(),
             SUB_PAIRED_COUNT_REPORT to emptySet(),
             SUB_SIGNED_PREKEY_READINESS to emptySet(),
+            // WSS-3 §4.5: `network_profile_report` accepts EXACTLY one
+            // extra beyond `subcommand` — the orchestrator-supplied
+            // HMAC key. No `report_target`, no `output` path, no other
+            // caller-controlled input. Round-2 blocker 5 enforcement.
+            SUB_NETWORK_PROFILE_REPORT to setOf(EXTRA_CHECKPOINT_KEY_HEX),
+            // Audit ROUND-10 P0-1: state-only subcommand for the phone.
+            // Accepts NO extras — the phone never receives an HMAC key.
+            SUB_NETWORK_PROFILE_STATE_REPORT to emptySet(),
         )
 
         private val RUN_ID_EXTRA = setOf('.', '_', '-')

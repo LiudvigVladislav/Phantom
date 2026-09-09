@@ -19,10 +19,89 @@ import phantom.core.storage.db.PhantomDatabase
  * [SqlDelightRatchetStateRepository] receives, per the L3 alias-reuse
  * lock (`phantom_ratchet_wrap_v1`).
  */
+@OptIn(kotlin.time.ExperimentalTime::class)
 class SqlDelightSessionTransactionRepository(
     private val db: PhantomDatabase,
     private val blobCipher: KeystoreBlobCipher = IdentityCipher,
+    /**
+     * Test seam, a no-op in production. Called at named points INSIDE
+     * [commitInboundMessage]'s transaction, so a test can fail the
+     * transaction AFTER some of its writes have already been issued and
+     * then check that none of them survived.
+     *
+     * Without this, an injected failure can only be thrown before the
+     * repository is entered, which measures the caller's behaviour and
+     * says nothing about atomicity.
+     *
+     * Points, in order: `after_state`, `after_message`.
+     */
+    private val transactionProbe: (String) -> Unit = {},
+    private val clock: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() },
 ) : SessionTransactionRepository {
+
+    override suspend fun listReceiveArchiveVersions(conversationId: String, nowMs: Long): List<ReceiveSessionArchiveVersion> =
+        withContext(Dispatchers.IO) {
+            db.receiveSessionArchiveQueries.getUnexpiredVersions(conversationId, nowMs).executeAsList().map {
+                ReceiveSessionArchiveVersion(it.archive_id, it.revision)
+            }
+        }
+
+    override suspend fun listReceiveArchives(conversationId: String, nowMs: Long): List<ReceiveSessionArchive> =
+        withContext(Dispatchers.IO) {
+            db.receiveSessionArchiveQueries.getUnexpired(conversationId, nowMs).executeAsList().map {
+                ReceiveSessionArchive(it.archive_id, it.revision,
+                    RatchetStateStorageCodec.decodeFromStorage(it.state_blob, blobCipher), it.expires_at_ms)
+            }
+        }
+
+    override suspend fun deleteExpiredReceiveArchives(nowMs: Long): Unit = withContext(Dispatchers.IO) {
+        db.receiveSessionArchiveQueries.deleteExpired(nowMs)
+    }
+
+    override suspend fun replaceActiveSession(conversationId: String, stateBlob: String, nowMs: Long): Unit =
+        withContext(Dispatchers.IO) {
+            db.transaction {
+                replaceOrRetainActive(conversationId,
+                    RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher), false, nowMs)
+            }
+        }
+
+    /** Caller holds the transaction. Never evict a usable chain to make room. */
+    private fun archiveBlob(conversationId: String, storedBlob: String, nowMs: Long) {
+        if (db.receiveSessionArchiveQueries.countUnexpired(conversationId, nowMs).executeAsOne() >=
+            ReceiveSessionArchivePolicy.MAX_PER_CONVERSATION) throw ReceiveSessionArchiveFull()
+        db.receiveSessionArchiveQueries.deleteExpired(nowMs)
+        val expires = if (nowMs > Long.MAX_VALUE - ReceiveSessionArchivePolicy.RETENTION_MS)
+            Long.MAX_VALUE else nowMs + ReceiveSessionArchivePolicy.RETENTION_MS
+        val wrapped = RatchetStateStorageCodec.encodeForStorage(
+            RatchetStateStorageCodec.decodeFromStorage(storedBlob, blobCipher), blobCipher)
+        db.receiveSessionArchiveQueries.insertArchive(conversationId, wrapped, expires)
+    }
+
+    private fun archiveActive(conversationId: String, nowMs: Long) {
+        db.ratchetStateQueries.getRatchetState(conversationId).executeAsOneOrNull()?.let {
+            archiveBlob(conversationId, it, nowMs)
+        }
+    }
+
+    private fun replaceOrRetainActive(conversationId: String, storedBlob: String,
+        keepActive: Boolean, nowMs: Long) {
+        val active = db.ratchetStateQueries.getRatchetState(conversationId).executeAsOneOrNull()
+        if (keepActive && active != null) {
+            archiveBlob(conversationId, storedBlob, nowMs)
+        } else {
+            if (active != null) archiveBlob(conversationId, active, nowMs)
+            db.ratchetStateQueries.upsertRatchetState(conversationId, storedBlob)
+        }
+    }
+
+    private fun archiveReplacedInitiatorPending(conversationId: String, nextArtifacts: String?, nowMs: Long) {
+        val old = db.pendingRatchetStateQueries.getByConversationId(conversationId).executeAsOneOrNull()
+        if (old?.bootstrap_artifacts_blob != null && old.bootstrap_artifacts_blob != nextArtifacts &&
+            PendingOpkBinding.fromStorage(old.opk_key_id_hex, old.opk_binding_known) == PendingOpkBinding.None) {
+            archiveBlob(conversationId, old.state_blob, nowMs)
+        }
+    }
 
     override suspend fun commitBootstrap(
         opkKeyIdHex: String,
@@ -40,7 +119,7 @@ class SqlDelightSessionTransactionRepository(
             val reservation = db.opkReservationQueries
                 .getByOpkKeyId(opkKeyIdHex)
                 .executeAsOneOrNull()
-            if (reservation == null) {
+            if (reservation == null || reservation.conversation_id != conversationId) {
                 // The reservation we set in L4 phase 1 has been
                 // released between then and now (e.g. an L7 cap
                 // eviction or L6 sweep raced with this callback).
@@ -86,6 +165,8 @@ class SqlDelightSessionTransactionRepository(
             // backing OPK" holds. Both promotePendingToActive's and
             // evictPendingCandidate's `getByConversationId(...).executeAsOneOrNull()`
             // calls are therefore well-defined.
+            archiveReplacedInitiatorPending(conversationId, bootstrapArtifactsBlob,
+                clock())
             val priorReservations = db.opkReservationQueries
                 .getByConversationId(conversationId)
                 .executeAsList()
@@ -103,6 +184,8 @@ class SqlDelightSessionTransactionRepository(
                 state_blob               = RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher),
                 reserved_at_ms           = reservation.reserved_at_ms,
                 bootstrap_artifacts_blob = bootstrapArtifactsBlob,
+                opk_key_id_hex = opkKeyIdHex,
+                opk_binding_known = 1L,
             )
             true
         }
@@ -168,6 +251,7 @@ class SqlDelightSessionTransactionRepository(
         // and `evictPendingCandidate`'s `getByConversationId`
         // lookups are therefore well-defined after this UPSERT.
         db.transaction {
+            archiveReplacedInitiatorPending(conversationId, bootstrapArtifactsBlob, nowMs)
             val staleReservations = db.opkReservationQueries
                 .getByConversationId(conversationId)
                 .executeAsList()
@@ -179,6 +263,8 @@ class SqlDelightSessionTransactionRepository(
                 state_blob               = RatchetStateStorageCodec.encodeForStorage(stateBlob, blobCipher),
                 reserved_at_ms           = nowMs,
                 bootstrap_artifacts_blob = bootstrapArtifactsBlob,
+                opk_key_id_hex = null,
+                opk_binding_known = 1L,
             )
         }
     }
@@ -199,6 +285,7 @@ class SqlDelightSessionTransactionRepository(
                     .executeAsOneOrNull()
                     ?: return@transactionWithResult false
 
+                archiveActive(conversationId, clock())
                 // Copy the encrypted state_blob verbatim — both tables
                 // share the same `rs1:` + Base64 + Keystore-wrap
                 // envelope per the L3 alias-reuse lock, so a
@@ -233,4 +320,133 @@ class SqlDelightSessionTransactionRepository(
                 true
             }
         }
+
+    override suspend fun commitInboundMessage(
+        conversationId: String,
+        envelopeId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+        message: MessageEntity,
+        advancedStateBlob: String?,
+        promotePending: Boolean,
+        expectedOpkKeyIdHex: String?,
+        stateTarget: InboundStateTarget,
+    ): InboundCommitOutcome = withContext(Dispatchers.IO) {
+        db.transactionWithResult {
+            val archiveTarget = stateTarget as? InboundStateTarget.Archive
+            if (archiveTarget != null) {
+                require(!promotePending && expectedOpkKeyIdHex == null && advancedStateBlob != null)
+                val stored = db.receiveSessionArchiveQueries.getArchive(archiveTarget.id, conversationId)
+                    .executeAsOneOrNull()
+                if (stored == null || stored.revision != archiveTarget.revision || stored.expires_at_ms <= clock()) {
+                    return@transactionWithResult InboundCommitOutcome.ArchiveUnavailable
+                }
+            }
+            // Pending owns its local-key binding. A later frame can omit
+            // a header or name a peer's key; neither changes that debt.
+            val pending = if (promotePending) {
+                db.pendingRatchetStateQueries.getByConversationId(conversationId)
+                    .executeAsOneOrNull()
+                    ?: return@transactionWithResult InboundCommitOutcome.PendingMissing
+            } else null
+            val boundKeyId = if (pending != null) {
+                when (val binding = PendingOpkBinding.fromStorage(
+                    pending.opk_key_id_hex, pending.opk_binding_known,
+                )) {
+                    PendingOpkBinding.Unknown ->
+                        return@transactionWithResult InboundCommitOutcome.PendingBindingUnknown
+                    PendingOpkBinding.None -> null
+                    is PendingOpkBinding.Bound -> binding.opkKeyIdHex
+                }.also { storedKey ->
+                    if (expectedOpkKeyIdHex != null && expectedOpkKeyIdHex != storedKey) {
+                        return@transactionWithResult InboundCommitOutcome.PendingBindingMismatch
+                    }
+                }
+            } else expectedOpkKeyIdHex
+            // Validate before ANY writes, in the same transaction.
+            val boundReservation = boundKeyId?.let { opkId ->
+                val row = db.opkReservationQueries
+                    .getByOpkKeyId(opkId)
+                    .executeAsOneOrNull()
+                if (row == null || row.conversation_id != conversationId) {
+                    return@transactionWithResult InboundCommitOutcome.ReservationMissing
+                }
+                row
+            }
+            if (archiveTarget != null) {
+                val advanced = RatchetStateStorageCodec.encodeForStorage(requireNotNull(advancedStateBlob), blobCipher)
+                if (archiveTarget.activate) {
+                    // A fresh authenticated inbound selects this live chain.
+                    // Move, don't copy: no stale pre-advance state survives.
+                    db.receiveSessionArchiveQueries.deleteArchive(archiveTarget.id, conversationId)
+                    replaceOrRetainActive(conversationId, advanced, false, nowMs)
+                } else {
+                    db.receiveSessionArchiveQueries.advanceArchive(advanced,
+                        archiveTarget.id, conversationId, archiveTarget.revision)
+                }
+            } else if (pending != null) {
+                // Same promotion as [promotePendingToActive], inlined so
+                // it shares this transaction with the message row: the
+                // one-time pre-key is consumed only if the message that
+                // consumed it is durable too.
+                // The caller may supply the state the message itself
+                // advanced to. It does, whenever the envelope was decrypted
+                // UNDER the pending session: writing that advance into the
+                // pending row first and committing afterwards would leave
+                // the pending row ahead of a message that never became
+                // durable. With no state supplied, the pending blob is
+                // copied verbatim -- both tables share one envelope, so a
+                // decode/re-encode would be pure overhead.
+                replaceOrRetainActive(
+                    conversationId = conversationId,
+                    storedBlob = advancedStateBlob
+                        ?.let { RatchetStateStorageCodec.encodeForStorage(it, blobCipher) }
+                        ?: pending.state_blob,
+                    keepActive = stateTarget == InboundStateTarget.KeepActive,
+                    nowMs = nowMs,
+                )
+                db.pendingRatchetStateQueries.deleteByConversationId(conversationId)
+                if (boundReservation != null) {
+                    db.localOneTimePreKeyQueries.deleteByKeyId(boundReservation.opk_key_id_hex)
+                    db.opkReservationQueries.release(boundReservation.opk_key_id_hex)
+                }
+            } else {
+                if (advancedStateBlob != null) {
+                    val advanced = RatchetStateStorageCodec.encodeForStorage(advancedStateBlob, blobCipher)
+                    if (stateTarget == InboundStateTarget.ReplaceActive || stateTarget == InboundStateTarget.KeepActive) {
+                        replaceOrRetainActive(conversationId, advanced, stateTarget == InboundStateTarget.KeepActive, nowMs)
+                    } else db.ratchetStateQueries.upsertRatchetState(conversationId, advanced)
+                }
+                if (boundReservation != null) {
+                    db.localOneTimePreKeyQueries.deleteByKeyId(boundReservation.opk_key_id_hex)
+                    db.opkReservationQueries.release(boundReservation.opk_key_id_hex)
+                }
+            }
+
+            transactionProbe("after_state")
+            db.messageQueries.insertMessage(
+                id = message.id,
+                conversation_id = message.conversationId,
+                ciphertext = message.ciphertext,
+                plaintext_cache = message.plaintextCache,
+                sent = if (message.sent) 1L else 0L,
+                status = message.status.name.lowercase(),
+                created_at = message.createdAt,
+                expires_at_ms = message.expiresAtMs,
+            )
+            transactionProbe("after_message")
+            db.processedEnvelopeQueries.markProcessed(
+                envelope_id = envelopeId,
+                conversation_id = conversationId,
+                sender_pubkey_hex = senderPubKeyHex,
+                payload_type = payloadType,
+                status = ProcessedEnvelopeRepository.Status.PROCESSED.wire,
+                created_at_ms = nowMs,
+            )
+            db.decryptFailedEnvelopeQueries.deleteByEnvelopeId(envelopeId)
+            transactionProbe("after_completion")
+            InboundCommitOutcome.Committed
+        }
+    }
 }

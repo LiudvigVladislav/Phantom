@@ -12,6 +12,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseToggleMatrix
 /**
  * PhantomToggle matrix golden — 4 cells: on / off / disabled-on / disabled-off.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomToggleSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

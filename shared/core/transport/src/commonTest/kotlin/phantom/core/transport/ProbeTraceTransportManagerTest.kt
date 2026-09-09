@@ -38,6 +38,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { kind, _ -> kind == TransportKind.Direct },
             nowMs = { 1_000L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -78,6 +79,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { _, _ -> false },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Ghost).privacyMode),
         )
 
         assertFailsWith<NoTransportReachableException> { mgr.connect() }
@@ -109,6 +111,7 @@ class ProbeTraceTransportManagerTest {
             },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -148,6 +151,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { kind, _ -> kind == TransportKind.Reality },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Private).privacyMode),
         )
 
         mgr.connect()
@@ -185,6 +189,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { kind, _ -> kind == TransportKind.Tor },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Private).privacyMode),
         )
 
         mgr.connect() // Reality fails → falls through to Tor
@@ -217,6 +222,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { _, _ -> true },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Ghost).privacyMode),
         )
 
         mgr.connect()
@@ -247,6 +253,7 @@ class ProbeTraceTransportManagerTest {
             nowMs = { 0L },
             log = log,
             vpnDetector = { false },
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -275,6 +282,7 @@ class ProbeTraceTransportManagerTest {
             nowMs = { 0L },
             log = log,
             vpnDetector = { true }, // VPN ON
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -311,6 +319,7 @@ class ProbeTraceTransportManagerTest {
             nowMs = { 0L },
             log = log,
             vpnDetector = { false }, // VPN OFF
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -334,6 +343,7 @@ class ProbeTraceTransportManagerTest {
             probe = TransportProbe { _, _ -> true },
             nowMs = { 0L },
             log = log,
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
 
         mgr.connect()
@@ -352,7 +362,15 @@ class ProbeTraceTransportManagerTest {
         private val flow = MutableStateFlow<TorState>(TorState.Ready(socksPort = 9050))
         override val state: StateFlow<TorState> = flow.asStateFlow()
         override suspend fun start(bridgeProfile: BridgeProfile) { /* already Ready */ }
-        override suspend fun stop() { flow.value = TorState.Off }
+        override suspend fun stop(budget: TorBudget): TorStopResponse {
+            flow.value = TorState.Off
+            return freeStopResponse()
+        }
+
+        override suspend fun awaitRelease(
+            attempt: TorStopAttempt,
+            budget: TorBudget,
+        ): TorStopResult = freeStopResponse().result
     }
 
     private fun fakeXray(): XrayService = object : XrayService {

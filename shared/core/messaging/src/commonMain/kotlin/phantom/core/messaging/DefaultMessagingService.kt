@@ -4,6 +4,7 @@
 package phantom.core.messaging
 
 import com.benasher44.uuid.uuid4
+import com.ionspin.kotlin.crypto.hash.Hash
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.coroutines.flow.Flow
@@ -40,6 +41,8 @@ import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.ConversationRepository
 import phantom.core.storage.DecryptFailedEnvelopeRepository
+import phantom.core.storage.ControlEventCommitRepository
+import phantom.core.storage.InboundCommitRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
@@ -74,6 +77,37 @@ class DefaultMessagingService(
      * always wires the real SQLDelight repository through AppContainer.
      */
     private val processedEnvelopeRepository: ProcessedEnvelopeRepository? = null,
+    /**
+     * N1-F1 R-N1.8 — settles an inbound user message and its ledger
+     * entry in ONE transaction. When present, the receive path uses it
+     * instead of writing the row and the ledger separately, which is
+     * what left the loss window this closes.
+     *
+     * Nullable for the same call-site reason as
+     * [processedEnvelopeRepository]; production wires the SQLDelight
+     * implementation through AppContainer. With it absent the path
+     * still persists BEFORE the ledger, so the ordering defect is gone
+     * either way — only the atomicity is.
+     */
+    private val inboundCommitRepository: InboundCommitRepository? = null,
+    /**
+     * N1-F1b R-N1.12 — settles a DB-backed control event and its ledger
+     * entry in ONE transaction. When present, the six control types
+     * whose whole effect is a single idempotent statement use it instead
+     * of acting first and relying on a ledger written before them.
+     *
+     * Nullable for the same call-site reason as the others; production
+     * wires the SQLDelight implementation through AppContainer, and
+     * `AppContainerCommitWiringTest` pins that it does — without a test
+     * the wiring could be deleted, still compile, and silently degrade
+     * to the fallback below.
+     *
+     * With it absent the behaviour is NOT the pre-round one: the
+     * fallback performs the action and writes the ledger AFTER it,
+     * deliberately reversing the old order. That gives the correct
+     * ordering without atomicity; only the repository gives both.
+     */
+    private val controlEventCommitRepository: ControlEventCommitRepository? = null,
     private val scope: CoroutineScope,
     private val json: Json = Json { ignoreUnknownKeys = true },
     private val reactionRepository: ReactionRepository? = null,
@@ -318,7 +352,19 @@ class DefaultMessagingService(
     override val incomingMessages: Flow<IncomingMessage> = _incomingMessages.asSharedFlow()
 
     private val startReceivingLock = Mutex()
+    private val inboundDeliveryLock = Mutex()
     private var receiving = false   // guarded by startReceivingLock
+
+    private val heldReplay = if (sessionTransactionRepository != null) {
+        decryptFailedEnvelopeRepository?.let { repository ->
+            HeldInboundReplay(repository, ::receiveHeldEnvelope, onFailure = { failure ->
+                messagingLog(MessagingLogLevel.WARN,
+                    "DECRYPT_TRACE replay_storage_unavailable errorClass=${failure::class.simpleName}")
+            }, beforePass = {
+                sessionTransactionRepository.deleteExpiredReceiveArchives(Clock.System.now().toEpochMilliseconds())
+            })
+        }
+    } else null
 
     // Guard against duplicate in-flight delivery: if startReceiving() is somehow
     // called twice a SharedFlow delivers to both collectors simultaneously. The
@@ -327,6 +373,52 @@ class DefaultMessagingService(
     // two coroutines from entering handleDeliver for the same messageId at all.
     private val processingLock = Mutex()
     private val activeProcessing = mutableSetOf<String>()
+
+    // Audit ROUND-30.18: the ordinal range is ONE contract, named on
+    // both sides. R30.17 left the producer unbounded while the verifier
+    // rejected anything above a limit it had invented for itself, so the
+    // two ends of the same field disagreed about its domain.
+    //
+    // Reaching this bound means one envelope was redelivered a thousand
+    // times without ever settling, which is a redelivery loop rather
+    // than a delivery. Both ends report it instead of wrapping,
+    // clamping or silently continuing: the producer says so in the log,
+    // and the verifier treats an out-of-range ordinal as untrustworthy
+    // evidence. Neither side invents the number.
+    private val deliverAttemptOrdinalMax = DELIVER_ATTEMPT_ORDINAL_MAX
+
+    // ── Audit ROUND-30.17: the attempt boundary ─────────────────
+    //
+    // R30.16 recorded one terminal outcome per ENVELOPE, which cannot
+    // describe the run it was built for: an unacked delivery is
+    // redelivered, and the second fresh processing of the same envelope
+    // produced a second terminal record that the verifier then read as
+    // corrupt evidence. The unit of outcome is an ATTEMPT, not an
+    // envelope.
+    //
+    // This counter names attempts. It is incremented under
+    // `processingLock` in the same critical section that claims the
+    // envelope, so two deliveries of one envelope cannot share a number
+    // and cannot interleave: `activeProcessing` already refuses a
+    // concurrent claim, so attempt N is fully terminal before N+1 can
+    // be claimed. That is the race-freedom the ordinal relies on, and it
+    // is a property of the existing lock rather than a new assumption.
+    //
+    // An ordinal carries no time, no identity and no content, so it
+    // widens nothing the diagnostic could leak.
+    //
+    // Audit ROUND-30.18: the map is PRUNED when an envelope settles, so
+    // it holds only the envelopes with an unfinished retry chain rather
+    // than every id this service has ever seen. A settled envelope can
+    // never produce another attempt — the dedup ledger short-circuits
+    // its redeliveries — so dropping its counter cannot renumber
+    // anything. An UNSETTLED envelope keeps its entry precisely because
+    // its chain may continue.
+    private val deliveryAttemptCounter = mutableMapOf<String, Int>()
+
+    // Audit ROUND-30.18: envelopes whose attempt history has already
+    // been declared truncated. Pruned with the counter on settlement.
+    private val overflowAnnounced = mutableSetOf<String>()
 
     // Per-conversation Mutex protects every load → encrypt/decrypt → save sequence
     // on the Double Ratchet state. Without this lock two concurrent sendMessage()
@@ -462,16 +554,15 @@ class DefaultMessagingService(
      * On the FIRST message of a fresh conversation the session does
      * not yet exist. We:
      *   1. Fetch the peer's PreKeyBundle from the relay
-     *   2. Run [SessionManager.initiatorBootstrap] (verifies SPK signature,
-     *      runs X3DH 4-DH, persists fresh RatchetState, asserts F15)
+     *   2. Run [SessionManager.initiatorBootstrapInMemory] (verifies SPK
+     *      signature, runs X3DH 4-DH, asserts F15 without publishing active)
      *   3. Encrypt under the freshly-bootstrapped state
      *   4. Wrap result in a [WireFrame] WITH `x3dhInit` + the local
      *      signing pubkey so the recipient can mirror the bootstrap
      *
-     * On every subsequent message the session is loaded as-is and the
-     * resulting WireFrame has `x3dhInit = null` and
-     * `senderSigningPublicKeyHex = null` — wasted bytes once the
-     * recipient cached them.
+     * Eligible pending candidates retain their bootstrap header on reuse.
+     * Only an active initiator without an outbound pending candidate may
+     * send without that header. An expired candidate requires fresh bootstrap.
      */
     // Visibility: `internal` so Sprint 2b-C M-2bC-2/3/5 cells can
     // exercise the outbound encrypt path directly without standing
@@ -579,6 +670,13 @@ class DefaultMessagingService(
                 pendingArtifacts.recipientPubkeyHex == recipientPublicKeyHex &&
                 !sessionSuspect &&
                 sessionTransactionRepository != null
+            messagingLog(MessagingLogLevel.INFO,
+                "SEND_TRACE pending_reuse_decision " +
+                    "pendingPresent=${pendingEntity != null} artifactsValid=${pendingArtifacts != null} " +
+                    "withinTtl=${pendingEntity != null && (nowMs - pendingEntity.reservedAtMs) < PENDING_TTL_MS} " +
+                    "recipientMatches=${pendingArtifacts?.recipientPubkeyHex == recipientPublicKeyHex} " +
+                    "suspect=$sessionSuspect transactionAvailable=${sessionTransactionRepository != null} " +
+                    "reusable=$canReusePending")
             if (canReusePending) {
                 messagingLog(
                     MessagingLogLevel.INFO,
@@ -681,7 +779,11 @@ class DefaultMessagingService(
             // INITIATOR session sits in a pending slot until the first
             // successful reply.
             // ═════════════════════════════════════════════════════════
-            val canTakeExistingSessionPath = existingState != null &&
+            // Reuse was already attempted above. An outbound pending candidate
+            // that is expired or unusable does not attest that the active slot
+            // still matches the peer, including rows from older app versions.
+            val hasOutboundPending = pendingEntity?.bootstrapArtifactsBlob != null
+            val canTakeExistingSessionPath = !hasOutboundPending && existingState != null &&
                 existingState.role == SessionRole.INITIATOR &&
                 !sessionSuspect
             if (canTakeExistingSessionPath) {
@@ -702,6 +804,7 @@ class DefaultMessagingService(
                 // Fetch their bundle, run 4-DH, ship the bootstrap
                 // header with the first message.
                 val bootstrapReason = when {
+                    hasOutboundPending -> "outbound_pending_not_reusable"
                     existingState == null -> "no_session_row"
                     existingState.role == SessionRole.RESPONDER -> "responder_role_redirected"
                     sessionSuspect -> "session_suspect"
@@ -801,8 +904,7 @@ class DefaultMessagingService(
                 )
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE bootstrap_init_start conv=$convTag")
                 val pkBundle = PreKeyBundle.fromWire(wireBundle)
-                val bootstrap = sessionManager.initiatorBootstrap(
-                    conversationId = conversationId,
+                val bootstrap = sessionManager.initiatorBootstrapInMemory(
                     localIdentityKeyPair = localKeyPair,
                     bundle = pkBundle,
                 )
@@ -930,7 +1032,8 @@ class DefaultMessagingService(
                     //     mutex so concurrent sends + the replay decrypt
                     //     cannot race on the ratchet state.
                     if (decryptFailedEnvelopeRepository != null) {
-                        replayHeldEnvelopesAfterRepair(conversationId, convTag)
+                        if (heldReplay != null) heldReplay.request()
+                        else replayHeldEnvelopesAfterRepair(conversationId, convTag)
                     }
                 }
                 wireFrame
@@ -2259,6 +2362,7 @@ class DefaultMessagingService(
             return
         }
         messagingLog(MessagingLogLevel.INFO, "RECV_DIAG startReceiving_first_call")
+        heldReplay?.start(scope)
 
         // PR-D2b.1 (2026-05-17): durable voice finalizer. Runs once per
         // startReceiving, before the live chunk subscription, so any voice
@@ -2589,10 +2693,194 @@ class DefaultMessagingService(
         )
     }
 
-    private suspend fun handleDeliver(deliver: RelayMessage.Deliver) {
+    /**
+     * N1-F1 R-N1.9 — the R-N1.8 in-flight marker is gone, and this is
+     * why.
+     *
+     * It existed to stop a concurrent redelivery re-entering
+     * `ratchet.decrypt`. Two older mechanisms already do that, and both
+     * cover a wider window than it did:
+     *
+     *  - the incoming collector is sequential —
+     *    `transport.incoming.onEach { handleDeliver(it) }.launchIn(scope)`,
+     *    and `startReceiving` refuses a second collector;
+     *  - `activeProcessing` claims the envelope id at the top of
+     *    [handleDeliver] and releases it only in the outermost
+     *    `finally`, so a duplicate claim returns before reaching any
+     *    dedupe gate.
+     *
+     * Removed only after
+     * `aSecondDeliveryIsNotProcessedWhileTheFirstIsOpen_sequentialCollectorOnly`
+     * was shown to hold both with the marker and without it.
+     *
+     * Precisely what is measured: the collector is sequential. The
+     * `activeProcessing` guard is a second line of defence that no test
+     * exercises — disabling it leaves the messaging suite green — so it
+     * is read from source, not measured. Stated narrowly on purpose.
+     */
+
+    /**
+     * N1-F1b R-N1.12 — settle a control event and its ledger entry.
+     *
+     * With [controlEventCommitRepository] wired, the action and the
+     * ledger write commit in one transaction; a failure throws and the
+     * caller's ack is never reached, so the relay keeps the envelope.
+     *
+     * Without it (older call sites built without storage), [fallback]
+     * performs the action and the ledger entry is written after it —
+     * the correct ORDER, without the atomicity. Either way nothing marks
+     * the envelope processed before the action has been attempted.
+     */
+    /**
+     * N1-F1b — control types settled atomically with their ledger entry,
+     * and therefore excluded from the shared pre-parse ledger write.
+     * Everything not listed here keeps the old behaviour; see
+     * [ControlEventCommitRepository] for why each exclusion stands.
+     *
+     * The condition for adding a type is not "its handler settles" but
+     * "EVERY TERMINAL EXIT of its branch settles". R-N1.12 added
+     * TYPE_REACTION on the strength of its two well-formed shapes and
+     * left a third exit — a null emoji — acking with no ledger entry at
+     * all. A single unsettled exit reopens the whole window for that
+     * type, so the branch, not the happy path, is the unit to check.
+     */
+    private val ATOMICALLY_SETTLED_CONTROL_TYPES = setOf(
+        MessagePayload.TYPE_DELETE,
+        MessagePayload.TYPE_EDIT,
+        MessagePayload.TYPE_DISAPPEARING_TIMER,
+        MessagePayload.TYPE_REACTION,
+        MessagePayload.TYPE_PIN,
+        MessagePayload.TYPE_READ_RECEIPT,
+    )
+
+    /**
+     * N1-F1b R-N1.13 — settle an envelope that carries no applicable
+     * action.
+     *
+     * A control frame can be decrypted and then turn out to have nothing
+     * to do: a reaction with no emoji, or one arriving with no
+     * repository able to store it. There is no action to pair the ledger
+     * write with, so no transaction is needed — but the envelope has
+     * been through the ratchet and must be recorded before it is acked,
+     * or the redelivery re-enters decrypt on an advanced chain.
+     *
+     * [reason] appears in the log only; the ledger row records the real
+     * payload type, as every other settled envelope does.
+     */
+    private suspend fun settleIgnoredControlEvent(
+        deliver: RelayMessage.Deliver,
+        conversationId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        reason: String,
+    ) {
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "CONTROL_SETTLE ignored type=$payloadType reason=$reason " +
+                "msgId=${deliver.messageId.take(8)}",
+        )
+        processedEnvelopeRepository?.markProcessed(
+            envelopeId = deliver.messageId,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payloadType,
+            status = ProcessedEnvelopeRepository.Status.PROCESSED,
+            nowMs = Clock.System.now().toEpochMilliseconds(),
+        )
+    }
+
+    private suspend fun settleControlEvent(
+        action: ControlEventCommitRepository.Action,
+        deliver: RelayMessage.Deliver,
+        conversationId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        fallback: suspend () -> Unit,
+    ) {
+        val repo = controlEventCommitRepository
+        if (repo != null) {
+            repo.commitControlEvent(
+                action = action,
+                envelopeId = deliver.messageId,
+                conversationId = conversationId,
+                senderPubKeyHex = senderPubKeyHex,
+                payloadType = payloadType,
+                nowMs = Clock.System.now().toEpochMilliseconds(),
+            )
+            return
+        }
+        fallback()
+        processedEnvelopeRepository?.markProcessed(
+            envelopeId = deliver.messageId,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payloadType,
+            status = ProcessedEnvelopeRepository.Status.PROCESSED,
+            nowMs = Clock.System.now().toEpochMilliseconds(),
+        )
+    }
+
+    // Ordinary receive and local replay share one serialization point, so
+    // a replayed envelope can never interleave with a live delivery on the
+    // same chain. The body below is unchanged apart from the extra flag.
+    private suspend fun handleDeliver(deliver: RelayMessage.Deliver, localReplay: Boolean = false) = inboundDeliveryLock.withLock {
+        handleDeliverSerialized(deliver, localReplay)
+    }
+
+    private suspend fun handleDeliverSerialized(deliver: RelayMessage.Deliver, localReplay: Boolean) {
+        var r3017Attempt = 0
+        var r3017Suppress = false
+        // Audit ROUND-30.18: one overflow record per envelope, not one
+        // per redelivery. The marker says the history is truncated; a
+        // thousand copies of it would not say it better.
+        var r3017OverflowAnnounced = overflowAnnounced.contains(deliver.messageId)
         val claimed = processingLock.withLock {
-            if (deliver.messageId in activeProcessing) false
-            else { activeProcessing.add(deliver.messageId); true }
+            if (deliver.messageId in activeProcessing) {
+                false
+            } else {
+                activeProcessing.add(deliver.messageId)
+                // Audit ROUND-30.17: the attempt is numbered here, in the
+                // same critical section that claims the envelope, so the
+                // number and the exclusive claim cannot disagree.
+                r3017Attempt = (deliveryAttemptCounter[deliver.messageId] ?: 0) + 1
+                deliveryAttemptCounter[deliver.messageId] = r3017Attempt
+                if (r3017Attempt > deliverAttemptOrdinalMax) {
+                    // Audit ROUND-30.18: past the shared bound the
+                    // per-attempt records stop, and the stream SAYS so.
+                    //
+                    // Going quiet was the comfortable answer and the
+                    // wrong one: attempt 1001 can still deliver or fail,
+                    // and a verifier reading only the first thousand
+                    // would render RED or GREEN on a truncated history
+                    // without ever knowing it was truncated. A log line
+                    // is not evidence.
+                    //
+                    // So the recipient emits one structured overflow
+                    // record from the same closed authority, and the
+                    // verifier refuses to judge the profile at all
+                    // (`integrity_ok=false`, `NOT_EVALUABLE`) rather
+                    // than judging part of it. Delivery itself carries
+                    // on untouched: a diagnostic must never decide
+                    // whether a message arrives.
+                    r3017Suppress = true
+                    if (!r3017OverflowAnnounced) {
+                        r3017OverflowAnnounced = true
+                        WssDiagBridgeHolder.instance?.emit(
+                            event = "recipient_deliver_attempt_overflow",
+                            correlationId = deliver.messageId,
+                            role = WssDiagBridge.Role.RECIPIENT,
+                        )
+                    }
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "delivery attempt ordinal ${'$'}r3017Attempt exceeds " +
+                            "${'$'}deliverAttemptOrdinalMax for " +
+                            "id=${'$'}{deliver.messageId.take(12)}… — redelivery loop; " +
+                            "WSS_DIAG attempt records suppressed for it",
+                    )
+                }
+                true
+            }
         }
         if (!claimed) {
             messagingLog(
@@ -2601,6 +2889,27 @@ class DefaultMessagingService(
             )
             return
         }
+        // ── Audit ROUND-30.16: delivery-outcome observation ─────────
+        // The 2026-08-26 physical smoke produced two
+        // `recipient_deliver_received dedup_gate=fresh` for one envelope
+        // and nothing else — no persist, no ack, twice — and the shipped
+        // evidence stream never said a delivery had FAILED.
+        //
+        // The handler leaves without settling the envelope from dozens of
+        // places, and one of them, the hold-on-MAC branch, returns null
+        // rather than throwing. Instrumenting the branches would mean
+        // editing architect-locked cryptographic code and would still
+        // miss whichever exit was added next. So the observation lives at
+        // the single outer boundary instead: these flags record how far
+        // the delivery got, and the `finally` below decides.
+        //
+        // Nothing here changes control flow. Every assignment is adjacent
+        // to a diagnostic emit that already existed.
+        var r3016GateWasFresh = false
+        var r3016Decrypted = false
+        var r3016Persisted = false
+        var r3016AckSent = false
+        var r3016Threw = false
         try {
         messagingLog(
             MessagingLogLevel.INFO,
@@ -2645,6 +2954,9 @@ class DefaultMessagingService(
             // (older test setups, no SQLDelight) we fall through to the
             // legacy `messages.id` check below. Production always wires
             // the real repository.
+            // The ledger means "settled durably — ack and skip". It no
+            // longer means "seen", which is what let R-N1.8's predecessor
+            // ack away messages that were never stored.
             if (processedEnvelopeRepository?.exists(deliver.messageId) == true) {
                 messagingLog(
                     MessagingLogLevel.INFO,
@@ -2702,7 +3014,12 @@ class DefaultMessagingService(
                 correlationId = deliver.messageId,
                 role = WssDiagBridge.Role.RECIPIENT,
                 dedupGate = WssDiagBridge.DedupGate.FRESH,
+                attempt = if (r3017Suppress) null else r3017Attempt,
             )
+            // Audit ROUND-30.16: only a FRESH delivery owes a settlement.
+            // The two duplicate branches above have already re-acked and
+            // returned, so they are settled by definition.
+            r3016GateWasFresh = true
 
             val rawPayloadBytes = deliver.payload.decodeBase64Bytes()
 
@@ -2758,8 +3075,22 @@ class DefaultMessagingService(
             // transport.incoming.onEach, but a parallel sendMessage on the same
             // conversation could still observe a half-saved state.
             val mutex = mutexFor(conversationId)
-            val plainBytes: ByteArray? = mutex.withLock {
+            // Set by the locked section when the message, the advanced
+            // chain state and the completion entry were made durable in
+            // ONE transaction. The downstream text branch then skips its
+            // own insert: the row is already there.
+            var committedAtomically = false
+            val plainBytes: ByteArray? = withReceiveLock(mutex) withLock@ {
+                // The live collector and local replay use the same lock. A
+                // completion may have happened since the outer fast check.
+                if (processedEnvelopeRepository?.exists(deliver.messageId) == true) {
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@withLock null
+                }
+                if (!heldRetryIsDue(conversationId, deliver.messageId)) return@withLock null
                 val state = sessionManager.tryLoadSession(conversationId)
+                val hasReceiveArchives = state == null && sessionTransactionRepository?.listReceiveArchiveVersions(
+                    conversationId, Clock.System.now().toEpochMilliseconds()).orEmpty().isNotEmpty()
                 // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — DECRYPT_TRACE
                 // attempt marker. Emitted before EVERY ratchet.decrypt call so
                 // the next-session DECRYPT_TRACE pipeline can correlate
@@ -2775,7 +3106,9 @@ class DefaultMessagingService(
                         "sessionExists=${state != null} " +
                         "x3dhInitPresent=${wireFrame.x3dhInit != null}",
                 )
-                if (state != null) {
+                val pendingWithoutActive = state == null && sessionTransactionRepository != null &&
+                    pendingRatchetStateRepository?.get(conversationId) != null
+                if (state != null || pendingWithoutActive || hasReceiveArchives) {
                     // Existing session — decrypt directly first. The peer's
                     // signing pubkey carried alongside the frame is ignored
                     // here; identity-key change handling is a separate path
@@ -2794,44 +3127,57 @@ class DefaultMessagingService(
                     // frame the receiver could already decrypt.
                     messagingLog(
                         MessagingLogLevel.INFO,
-                        "Session loaded: conv=${conversationId.take(24)}… decrypting…",
+                        if (state != null) "Session loaded: conv=${conversationId.take(24)}… decrypting…"
+                        else "Active session absent: conv=${conversationId.take(24)} pending candidate available",
                     )
-                    try {
-                        val (newState, decrypted) = ratchet.decrypt(state, encrypted)
-                        sessionManager.saveSession(conversationId, newState)
-                        messagingLog(
-                            MessagingLogLevel.INFO,
-                            "Decrypt OK: plaintextBytes=${decrypted.size}",
-                        )
-                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
-                        // observability-only DECRYPT_TRACE ok marker.
-                        messagingLog(
-                            MessagingLogLevel.INFO,
-                            "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
-                                "conv=${conversationId.take(8)} " +
-                                "plaintextBytes=${decrypted.size} " +
-                                "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
-                                "bootstrap=false",
-                        )
-                        // PR-H2b: record the envelope id BEFORE we leave
-                        // the per-conversation mutex so a concurrent
-                        // redelivery cannot squeak through the ledger
-                        // check and re-enter ratchet.decrypt. payload_type
-                        // is only known after JSON-parsing the plaintext
-                        // below; we record "unknown" here and rely on the
-                        // markProcessed INSERT OR IGNORE semantics if a
-                        // second markProcessed call later wants to refine
-                        // it (it won't — there's no such call path).
-                        processedEnvelopeRepository?.markProcessed(
-                            envelopeId = deliver.messageId,
-                            conversationId = conversationId,
-                            senderPubKeyHex = senderPubKeyHex,
-                            payloadType = "unknown",
-                            status = ProcessedEnvelopeRepository.Status.PROCESSED,
-                            nowMs = Clock.System.now().toEpochMilliseconds(),
-                        )
-                        decrypted
-                    } catch (e: IllegalArgumentException) {
+                    // R-N1.9's single post-decrypt point is kept, but the
+                    // state is no longer written here: the receive advance,
+                    // the message row, the ledger entry and the held/pending/
+                    // OPK/archive changes are committed together below, so a
+                    // failed commit cannot leave an advanced chain behind a
+                    // message that does not exist.
+                    // ONLY the decrypt runs inside the handler that treats a
+                    // failure as a broken session. Every storage operation
+                    // lives below it: `IllegalArgumentException` is a type a
+                    // database layer is entitled to throw, and a storage call
+                    // left inside this `try` could arm a session repair --
+                    // spending a one-time pre-key to fix a session that was
+                    // never broken. Wrapping storage calls one at a time
+                    // would leave the same trap for the next one added; the
+                    // boundary is what has to be right.
+                    var decryptedPair: Pair<phantom.core.crypto.RatchetState, ByteArray>? = null
+                    val e: IllegalArgumentException? = try {
+                        if (state != null) decryptedPair = ratchet.decrypt(state, encrypted)
+                        null
+                    } catch (rejected: IllegalArgumentException) {
+                        rejected
+                    }
+                    if (decryptedPair == null) {
+                        val recovered = decryptArchivedReceive(sessionTransactionRepository?.listReceiveArchives(
+                            conversationId, Clock.System.now().toEpochMilliseconds()).orEmpty(), encrypted)
+                        if (recovered != null) {
+                            val outcome = commitInboundTextMessage(
+                                deliver, conversationId, senderPubKeyHex, ciphertext,
+                                recovered.plaintext, recovered.advancedState,
+                                stateTarget = phantom.core.storage.InboundStateTarget.Archive(
+                                    recovered.archive.id, recovered.archive.revision, activate = !localReplay),
+                            )
+                            committedAtomically = outcome == InboundTextCommit.Committed
+                            if (!committedAtomically) {
+                                if (outcome == InboundTextCommit.Unsupported) {
+                                    holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "unsupported")
+                                }
+                                return@withLock null
+                            }
+                            messagingLog(MessagingLogLevel.INFO,
+                                "DECRYPT_TRACE archived_receive_committed msgId=${deliver.messageId.take(8)}")
+                            return@withLock recovered.plaintext
+                        }
+                    }
+                    // No active row is a normal pending-only state, not a
+                    // fabricated crypto failure. Both cases use the same
+                    // authenticated pending decrypt and atomic promotion below.
+                    val fromDecryptFailure: ByteArray? = if (decryptedPair == null) {
                         // PR-CRYPTO-SESSION-REPAIR1 commit 3c (architect P2
                         // 2026-05-30 on PR #243): the pre-commit-3 destructive-
                         // ack warning ("…ack-deliver'ing to clear relay store…")
@@ -2843,8 +3189,8 @@ class DefaultMessagingService(
                         // hold mode ("ack-deliver'ing" while no ack actually
                         // fires). The DECRYPT_TRACE `action=hold|ack` lines
                         // remain the canonical action source for both modes.
-                        if (e.message?.contains("MAC", ignoreCase = true) == true ||
-                            e.message?.contains("verification", ignoreCase = true) == true
+                        if (pendingWithoutActive || e?.message?.contains("MAC", ignoreCase = true) == true ||
+                            e?.message?.contains("verification", ignoreCase = true) == true
                         ) {
                             // ═════════════════════════════════════════════════════════
                             // Sprint 2b-C Slice 4 — pending fallback BEFORE inbound
@@ -2903,13 +3249,33 @@ class DefaultMessagingService(
                                     // pending updated; future inbound retries
                                     // the fallback (idempotent through
                                     // markProcessed ledger below).
-                                    pendingRatchetStateRepository.upsert(
-                                        conversationId = conversationId,
-                                        stateBlob = json.encodeToString(advancedPendingState),
-                                        reservedAtMs = pendingEntity.reservedAtMs,
-                                        bootstrapArtifactsBlob = pendingEntity.bootstrapArtifactsBlob,
-                                    )
-                                    val promoted = sessionTxForPending.promotePendingToActive(conversationId)
+                                    // The advance is NOT written to the pending
+                                    // row first. Doing that and committing
+                                    // afterwards leaves the pending row ahead of
+                                    // a message that never became durable -- and
+                                    // for an envelope without `x3dhInit` no fresh
+                                    // bootstrap can put it back. The state travels
+                                    // into the commit instead, where it becomes
+                                    // active only alongside the message.
+                                    val commitCarriesPromotion =
+                                        canCommitInboundTextMessage(decryptedPlaintext)
+                                    if (!commitCarriesPromotion) {
+                                        pendingRatchetStateRepository.upsert(
+                                            conversationId = conversationId,
+                                            stateBlob = json.encodeToString(advancedPendingState),
+                                            reservedAtMs = pendingEntity.reservedAtMs,
+                                            bootstrapArtifactsBlob = pendingEntity.bootstrapArtifactsBlob,
+                                            opkBinding = pendingEntity.opkBinding,
+                                        )
+                                    }
+                                    // Plain text goes through the one commit
+                                    // that carries the message, the promotion
+                                    // and the completion entry together.
+                                    val promoted = if (commitCarriesPromotion) {
+                                        false
+                                    } else {
+                                        sessionTxForPending.promotePendingToActive(conversationId)
+                                    }
                                     // PR #317 review P1-2 (2026-06-15) — REMOVED
                                     // the safety-net `saveSession(advancedPendingState)`
                                     // that fired on promote=false. The original safety
@@ -2968,14 +3334,39 @@ class DefaultMessagingService(
                                             "elapsedMs=${Clock.System.now().toEpochMilliseconds() - pendingDecryptStartMs} " +
                                             promotionLog,
                                     )
-                                    processedEnvelopeRepository?.markProcessed(
-                                        envelopeId = deliver.messageId,
-                                        conversationId = conversationId,
-                                        senderPubKeyHex = senderPubKeyHex,
-                                        payloadType = "unknown",
-                                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
-                                        nowMs = Clock.System.now().toEpochMilliseconds(),
-                                    )
+                                    if (commitCarriesPromotion) {
+                                        committedAtomically = commitInboundTextMessage(
+                                            deliver = deliver,
+                                            conversationId = conversationId,
+                                            senderPubKeyHex = senderPubKeyHex,
+                                            ciphertext = ciphertext,
+                                            plaintext = decryptedPlaintext,
+                                            advancedState = advancedPendingState,
+                                            promotePending = true,
+                                            // The pending row, not this frame's
+                                            // optional header, owns the local key.
+                                        ) == InboundTextCommit.Committed
+                                        if (!committedAtomically) {
+                                            messagingLog(
+                                                MessagingLogLevel.WARN,
+                                                "DECRYPT_TRACE inbound_commit_pending_missing " +
+                                                    "msgId=${deliver.messageId.take(8)} " +
+                                                    "conv=${conversationId.take(8)} via=pending_fallback",
+                                            )
+                                            return@withLock null
+                                        }
+                                    }
+                                    // N1-F1 R-N1.9: nothing is written here for any
+                                    // other payload type. The early PROCESSED write
+                                    // that stood here marked the envelope settled
+                                    // before the payload was even parsed, so a failure
+                                    // between here and the settlement left a ledger
+                                    // entry with no message and the redelivery was
+                                    // ack-and-skipped. Non-text types write their entry
+                                    // once, with the real type, at the single
+                                    // post-decrypt point; text writes it inside the
+                                    // transaction above (search: R-N1.9 single
+                                    // post-decrypt point).
                                     return@withLock decryptedPlaintext
                                 }
                                 // Pending decrypt also failed MAC → log + fall
@@ -3098,47 +3489,65 @@ class DefaultMessagingService(
                                 // on-disk session row remains byte-identical
                                 // to its pre-receive content (mini-lock
                                 // §Scope item 5 CENTRAL invariant).
-                                val repairResult: Result<Pair<RatchetState, ByteArray>> = try {
-                                    val candidate = sessionManager.recipientBootstrapInMemory(
-                                        conversationId = conversationId,
-                                        envelopeId = deliver.messageId,
-                                        localIdentityKeyPair = localKeyPair,
-                                        senderIdentityPublicKeyHex = senderPubKeyHex,
-                                        x3dhInit = inboundX3dhInit,
+                                // A reservation left behind by an attempt of
+                                // OURS that rolled back would otherwise make
+                                // this retry look like a collision with a
+                                // different derivation, and the envelope
+                                // would be held for good.
+                                //
+                                // It is NOT released here. Releasing before
+                                // the envelope is authenticated would let a
+                                // forged frame strip the protection of the
+                                // candidate already waiting: the forgery
+                                // fails a moment later, the failure path
+                                // releases, and the earlier pending row is
+                                // left unguarded. The row is left exactly
+                                // where it is; this attempt proceeds
+                                // alongside it, and only a COMMIT -- which
+                                // needs a decrypt that authenticates --
+                                // consumes anything.
+                                // Any reservation this conversation already
+                                // holds is adopted, whatever envelope id it
+                                // names: a retry under the SAME id after a
+                                // restart meets its own row too.
+                                val preexistingReservation = inboundX3dhInit.opkKeyIdHex
+                                    ?.let { opkId ->
+                                        val existing = opkReservationRepository.get(opkId)
+                                        existing != null &&
+                                            existing.conversationId == conversationId
+                                    } ?: false
+                                // Ownership is decided by whether THIS attempt
+                                // created the row, reported by the reserve
+                                // itself. Comparing envelope ids cannot decide
+                                // it: a forged frame replayed under the
+                                // original id would look like the owner and
+                                // release a reservation it never made.
+                                var reservationCreatedHere = false
+                                if (preexistingReservation) {
+                                    messagingLog(
+                                        MessagingLogLevel.INFO,
+                                        "DECRYPT_TRACE own_reservation_adopted " +
+                                            "msgId=${deliver.messageId.take(8)} " +
+                                            "conv=${conversationId.take(8)}",
                                     )
-                                    val (advancedState, decryptedPlaintext) =
-                                        ratchet.decrypt(candidate, encrypted)
-                                    Result.success(advancedState to decryptedPlaintext)
-                                } catch (ce: kotlinx.coroutines.CancellationException) {
-                                    // Cancellation is a coroutine lifecycle
-                                    // signal, not a crypto verdict — re-throw
-                                    // so the structured-concurrency parent can
-                                    // observe it. The runCatching variant
-                                    // (which would have caught it as Throwable)
-                                    // is the regression vector documented in
-                                    // VoiceV2Sender.kt:73-91 and re-confirmed
-                                    // by Vladislav P2 review of this PR's
-                                    // Commit 2 `23394e8f`.
-                                    throw ce
-                                } catch (t: Throwable) {
-                                    Result.failure(t)
                                 }
+                                val repairResult = authenticateRepairCandidate(
+                                    conversationId, deliver.messageId, senderPubKeyHex,
+                                    inboundX3dhInit, encrypted, preexistingReservation,
+                                ) { reservationCreatedHere = it }
                                 if (repairResult.isSuccess) {
-                                    val (advancedState, decryptedPlaintext) =
+                                    val (candidateState, advancedState, decryptedPlaintext) =
                                         repairResult.getOrThrow()
                                     // ═════════════════════════════════════
                                     // Sprint 2b-C Slice 4 — removed the
                                     // pre-Slice-4 `saveSession + commitBootstrap`
-                                    // dual-write. The candidate's advanced
-                                    // state goes through `commitBootstrap`
-                                    // (writes pending) then
-                                    // `promotePendingToActive` (atomically
-                                    // copies pending->active + consumes OPK +
-                                    // releases reservation). Net effect:
-                                    // active row is the advanced state, OPK
-                                    // is consumed AT THIS SITE for the first
-                                    // time (deferred-consume contract per
-                                    // amended L4).
+                                    // dual-write. For atomic text delivery,
+                                    // pending retains the authenticated candidate
+                                    // BEFORE this message. The advanced state,
+                                    // message, completion, and OPK consumption
+                                    // become durable in one commit below.
+                                    // The non-text legacy path still promotes
+                                    // its advanced pending state separately.
                                     //
                                     // Branch matrix (PR #317 Round 3 P2-B
                                     // 2026-06-16):
@@ -3176,25 +3585,33 @@ class DefaultMessagingService(
                                     //       blocks below for the deferred-
                                     //       consume invariant rationale.
                                     //
-                                    // All branches return decrypted plaintext
-                                    // — Slice 4 lock: successful decrypt is
-                                    // not held; the log line carries the
-                                    // promotion verdict for diagnostics.
+                                    // Atomic text rejection returns no plaintext
+                                    // to the completion path; the envelope is held
+                                    // without a ledger entry or acknowledgement.
                                     // ═════════════════════════════════════
                                     val opkIdForCommit = inboundX3dhInit.opkKeyIdHex
                                     val sessionTx = sessionTransactionRepository
                                     var promoted = false
+                                    // Set when the promotion is deferred into the
+                                    // atomic commit below.
+                                    var promoteOnCommit = false
+                                    // Set when the chain advance is deferred into
+                                    // that same commit instead of being saved on
+                                    // its own.
+                                    var saveOnCommit = false
                                     var commitSucceeded = false
                                     val noOpkPath = opkIdForCommit == null && sessionTx != null
                                     val legacyFixturePath = sessionTx == null
                                     if (opkIdForCommit != null && sessionTx != null) {
-                                        val advancedStateJson = json.encodeToString(advancedState)
-                                        val committed = sessionTx.commitBootstrap(
-                                            opkKeyIdHex = opkIdForCommit,
-                                            conversationId = conversationId,
-                                            stateBlob = advancedStateJson,
-                                            bootstrapArtifactsBlob = null,
-                                        )
+                                        // A pending text candidate must not spend the
+                                        // first message's position before that message
+                                        // is durable. A headerless successor could
+                                        // otherwise promote past the missing message.
+                                        val pendingState = if (canCommitInboundTextMessage(decryptedPlaintext))
+                                            candidateState else advancedState
+                                        val pendingStateJson = json.encodeToString(pendingState)
+                                        val committed = commitRepairCandidate(deliver, conversationId,
+                                            senderPubKeyHex, wireFrame, opkIdForCommit, pendingStateJson)
                                         commitSucceeded = committed
                                         if (!committed) {
                                             messagingLog(
@@ -3242,6 +3659,30 @@ class DefaultMessagingService(
                                             // above for the full tradeoff
                                             // rationale (§ADR-029 amendment
                                             // 2026-06-15).
+                                            //
+                                            // Stage 1 of the delivery-completion
+                                            // fix adds the missing half. Nothing
+                                            // was written: no pending row, no
+                                            // chain advance, no promotion. The
+                                            // envelope therefore is not finished
+                                            // with either -- writing the ledger
+                                            // entry and the message here, and
+                                            // acknowledging on that, is the same
+                                            // shortcut this stage removes, and it
+                                            // would leave the peer's only copy
+                                            // dropped against a session that was
+                                            // never adopted.
+                                            if (canCommitInboundTextMessage(decryptedPlaintext)) {
+                                                messagingLog(
+                                                    MessagingLogLevel.WARN,
+                                                    "DECRYPT_TRACE inbound_commit_not_taken " +
+                                                        "msgId=${deliver.messageId.take(8)} " +
+                                                        "conv=${conversationId.take(8)} " +
+                                                        "via=candidate_commit_failed",
+                                                )
+                                                holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "commit")
+                                                return@withLock null
+                                            }
                                         } else {
                                             val evicted = pendingSessionCapEnforcer?.enforce() ?: 0
                                             if (evicted > 0) {
@@ -3259,7 +3700,26 @@ class DefaultMessagingService(
                                             // active + deletes pending +
                                             // releases reservation + deletes
                                             // local OPK. All in one tx.
-                                            promoted = sessionTx.promotePendingToActive(conversationId)
+                                            // Stage 1 of the delivery-completion
+                                            // fix: when the atomic commit can
+                                            // carry this envelope, the promotion
+                                            // travels WITH the message row and
+                                            // the completion entry instead of
+                                            // landing in a transaction of its
+                                            // own. Consuming the one-time
+                                            // pre-key in a separate commit is
+                                            // the same class of defect as
+                                            // advancing the chain separately:
+                                            // the key is spent for a message
+                                            // that may never become durable.
+                                            promoteOnCommit = canCommitInboundTextMessage(
+                                                decryptedPlaintext,
+                                            )
+                                            promoted = if (promoteOnCommit) {
+                                                false
+                                            } else {
+                                                sessionTx.promotePendingToActive(conversationId)
+                                            }
                                             // PR #317 review P1-2 — REMOVED the
                                             // safety-net `saveSession` for the
                                             // promote-false case for the same
@@ -3276,16 +3736,29 @@ class DefaultMessagingService(
                                         // active directly. The deferred-
                                         // consume invariant doesn't apply
                                         // because no OPK is being consumed.
-                                        sessionManager.saveSession(conversationId, advancedState)
+                                        // Deferred into the same commit as the
+                                        // message when this is plain text; the
+                                        // legacy write stays for everything else.
+                                        saveOnCommit = canCommitInboundTextMessage(decryptedPlaintext)
+                                        if (!saveOnCommit) {
+                                            saveReplacementSession(conversationId, advancedState)
+                                        }
                                     } else {
                                         // Branch (A) — legacy fixture without
                                         // Sprint 2b-C wiring. Production
                                         // never enters this branch.
-                                        sessionManager.saveSession(conversationId, advancedState)
+                                        // Deferred into the same commit as the
+                                        // message when this is plain text; the
+                                        // legacy write stays for everything else.
+                                        saveOnCommit = canCommitInboundTextMessage(decryptedPlaintext)
+                                        if (!saveOnCommit) {
+                                            saveReplacementSession(conversationId, advancedState)
+                                        }
                                     }
                                     val promotionLogSegment = when {
                                         noOpkPath -> "promotion=skipped reason=no_opk_in_x3dh_init"
                                         legacyFixturePath -> "promotion=skipped reason=legacy_fixture"
+                                        promoteOnCommit -> "promotion=deferred_to_commit"
                                         promoted -> "promotion=true"
                                         !commitSucceeded ->
                                             "promotion=false reason=reservation_released_between_phases"
@@ -3306,14 +3779,71 @@ class DefaultMessagingService(
                                     // line ~2363 (same payload_type=unknown
                                     // placeholder, same INSERT OR IGNORE
                                     // semantic).
-                                    processedEnvelopeRepository?.markProcessed(
-                                        envelopeId = deliver.messageId,
-                                        conversationId = conversationId,
-                                        senderPubKeyHex = senderPubKeyHex,
-                                        payloadType = "unknown",
-                                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
-                                        nowMs = Clock.System.now().toEpochMilliseconds(),
-                                    )
+                                    if (saveOnCommit) {
+                                        committedAtomically = commitInboundTextMessage(
+                                            deliver = deliver,
+                                            conversationId = conversationId,
+                                            senderPubKeyHex = senderPubKeyHex,
+                                            ciphertext = ciphertext,
+                                            plaintext = decryptedPlaintext,
+                                            advancedState = advancedState,
+                                            stateTarget = phantom.core.storage.InboundStateTarget.ReplaceActive,
+                                        ) == InboundTextCommit.Committed
+                                        if (!committedAtomically) {
+                                            messagingLog(
+                                                MessagingLogLevel.WARN,
+                                                "DECRYPT_TRACE inbound_commit_not_taken " +
+                                                    "msgId=${deliver.messageId.take(8)} " +
+                                                    "conv=${conversationId.take(8)} via=repair_no_opk",
+                                            )
+                                            return@withLock null
+                                        }
+                                    } else if (promoteOnCommit) {
+                                        // One transaction: pending -> active,
+                                        // the one-time pre-key consumed, its
+                                        // reservation released, the message
+                                        // row, and the completion entry.
+                                        committedAtomically = commitInboundTextMessage(
+                                            deliver = deliver,
+                                            conversationId = conversationId,
+                                            senderPubKeyHex = senderPubKeyHex,
+                                            ciphertext = ciphertext,
+                                            plaintext = decryptedPlaintext,
+                                            advancedState = advancedState,
+                                            promotePending = true,
+                                            expectedOpkKeyIdHex = inboundX3dhInit.opkKeyIdHex,
+                                        ) == InboundTextCommit.Committed
+                                        if (!committedAtomically) {
+                                            // The pending row was gone, or the
+                                            // reservation this candidate depended
+                                            // on was not there any more, so the
+                                            // commit wrote nothing at all. The
+                                            // envelope is not finished with:
+                                            // no ledger entry, no ack, and the
+                                            // relay still holds it.
+                                            messagingLog(
+                                                MessagingLogLevel.WARN,
+                                                "DECRYPT_TRACE inbound_commit_pending_missing " +
+                                                    "msgId=${deliver.messageId.take(8)} " +
+                                                    "conv=${conversationId.take(8)}",
+                                            )
+                                            return@withLock null
+                                        }
+                                        // The promotion really happened -- inside
+                                        // the same transaction as the message.
+                                        messagingLog(
+                                            MessagingLogLevel.INFO,
+                                            "DECRYPT_TRACE inbound_commit_promoted " +
+                                                "msgId=${deliver.messageId.take(8)} " +
+                                                "conv=${conversationId.take(8)} promotion=true",
+                                        )
+                                    }
+                                    // N1-F1 R-N1.9: no other payload type is
+                                    // settled here. Writing the ledger before the
+                                    // payload is parsed marked the envelope done
+                                    // ahead of the work it settles; non-text types
+                                    // write their entry once, with the real type,
+                                    // at the single post-decrypt point.
                                     // Return the decrypted plaintext to flow
                                     // back into the normal downstream payload
                                     // processing — same block-return shape as
@@ -3324,6 +3854,10 @@ class DefaultMessagingService(
                                     return@withLock decryptedPlaintext
                                 } else {
                                     val err = repairResult.exceptionOrNull()
+                                    if (err is PreKeyReadFailed) {
+                                        holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "prekey")
+                                        return@withLock null
+                                    }
                                     messagingLog(
                                         MessagingLogLevel.WARN,
                                         "DECRYPT_TRACE inbound_repair_fail msgId=${deliver.messageId.take(8)} " +
@@ -3356,7 +3890,15 @@ class DefaultMessagingService(
                                     // here would compromise the other
                                     // in-flight derivation. Skip release
                                     // in that case.
-                                    if (err !is phantom.core.messaging.SessionBootstrapException.OpkReservationConflict) {
+                                    // `ownStaleReservation` means the row was
+                                    // already there, protecting an earlier
+                                    // candidate. This attempt did not create
+                                    // it and must not destroy it: otherwise a
+                                    // forged envelope would strip that
+                                    // protection simply by failing.
+                                    if (err !is phantom.core.messaging.SessionBootstrapException.OpkReservationConflict &&
+                                        reservationCreatedHere
+                                    ) {
                                         inboundX3dhInit.opkKeyIdHex?.let { opkId ->
                                             opkReservationRepository.release(opkId)
                                         }
@@ -3424,67 +3966,13 @@ class DefaultMessagingService(
                             // re-introduce the silent destructive loss this
                             // PR exists to prevent.
                             // ═════════════════════════════════════════════════════════
-                            if (holdMacFailures && decryptFailedEnvelopeRepository != null) {
+                            if ((holdMacFailures || heldReplay != null) && decryptFailedEnvelopeRepository != null) {
                                 // Local-capture the non-null repository so
                                 // the smart-cast holds inside the runCatching
                                 // lambda (Kotlin smart-cast doesn't propagate
                                 // a class-property nullability check across
                                 // a lambda boundary).
-                                val heldRepo: DecryptFailedEnvelopeRepository =
-                                    decryptFailedEnvelopeRepository
-                                val nowMs = Clock.System.now().toEpochMilliseconds()
-                                val holdResult = runCatching {
-                                    // Architect-locked inner-WireFrame JSON
-                                    // semantic (PR #243 95c7aae0): encode the
-                                    // SAME `wireFrame` object the receive path
-                                    // just decoded, so the replay loop in
-                                    // commit 5 can decode → re-feed
-                                    // `wireFrame.encryptedMessage` into
-                                    // `ratchet.decrypt` under the fresh
-                                    // ratchet.
-                                    val wireFrameJson = json.encodeToString(wireFrame)
-                                    heldRepo.insert(
-                                        envelopeId = deliver.messageId,
-                                        conversationId = conversationId,
-                                        senderPubKeyHex = senderPubKeyHex,
-                                        errorType = "mac",
-                                        receivedAtMs = nowMs,
-                                        x3dhInitPresent = wireFrame.x3dhInit != null,
-                                        wireFrameJson = wireFrameJson,
-                                    )
-                                    conversationRepository.setSessionSuspect(
-                                        conversationId = conversationId,
-                                        setAtMs = nowMs,
-                                    )
-                                }
-                                if (holdResult.isSuccess) {
-                                    messagingLog(
-                                        MessagingLogLevel.WARN,
-                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
-                                            "sender=${senderPubKeyHex.take(8)} " +
-                                            "conv=${conversationId.take(8)} " +
-                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
-                                            "action=hold",
-                                    )
-                                } else {
-                                    // Storage failure inside hold path: we
-                                    // STILL skip ack so the envelope is not
-                                    // silently destroyed. The relay redelivers
-                                    // next session; if hold path keeps failing
-                                    // we get repeated redeliveries until the
-                                    // relay's 7-day TTL evicts. action=hold_
-                                    // storage_error makes this state grep-able.
-                                    val err = holdResult.exceptionOrNull()
-                                    messagingLog(
-                                        MessagingLogLevel.WARN,
-                                        "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} " +
-                                            "sender=${senderPubKeyHex.take(8)} " +
-                                            "conv=${conversationId.take(8)} " +
-                                            "x3dhInitPresent=${wireFrame.x3dhInit != null} " +
-                                            "action=hold_storage_error " +
-                                            "errorClass=${err?.let { it::class.simpleName } ?: "Unknown"}",
-                                    )
-                                }
+                                holdMacFailure(deliver, conversationId, senderPubKeyHex, wireFrame, !localReplay)
                                 return@withLock null
                             }
                             // ═════════════════════════════════════════════════════════
@@ -3518,7 +4006,7 @@ class DefaultMessagingService(
                                 MessagingLogLevel.WARN,
                                 "Permanent decrypt failure (MAC error) — ack-deliver'ing to clear " +
                                     "relay store. id=${deliver.messageId.take(12)}… " +
-                                    "conv=${conversationId.take(16)}… err=${e.message}",
+                                    "conv=${conversationId.take(16)}… err=${e?.message ?: "active_session_absent"}",
                             )
                             messagingLog(
                                 MessagingLogLevel.WARN,
@@ -3555,10 +4043,69 @@ class DefaultMessagingService(
                             MessagingLogLevel.WARN,
                             "DECRYPT_TRACE fail_other msgId=${deliver.messageId.take(8)} " +
                                 "conv=${conversationId.take(8)} " +
-                                "errorClass=${e::class.simpleName} " +
+                                "errorClass=${e?.let { it::class.simpleName }} " +
                                 "action=rethrow",
                         )
-                        throw e
+                        throw checkNotNull(e)
+                    } else null
+                    val pair = decryptedPair
+                    if (pair == null) {
+                        fromDecryptFailure
+                    } else {
+                        val newState = pair.first
+                        val decrypted = pair.second
+                        // One durable moment. The chain advance, the
+                        // message row and the completion entry all mean
+                        // "this envelope is finished with", so they are
+                        // committed together or not at all. Writing the
+                        // chain here and the row later is what let a
+                        // failed insert spend a chain position and mark
+                        // an envelope processed that nobody has.
+                        val textCommit = commitInboundTextMessage(
+                            deliver = deliver,
+                            conversationId = conversationId,
+                            senderPubKeyHex = senderPubKeyHex,
+                            ciphertext = ciphertext,
+                            plaintext = decrypted,
+                            advancedState = newState,
+                        )
+                        if (textCommit is InboundTextCommit.Rejected) return@withLock null
+                        committedAtomically = textCommit == InboundTextCommit.Committed
+                        if (!committedAtomically) {
+                            // Legacy wiring (no transaction repository) or
+                            // a payload this stage does not cover yet.
+                            // Unchanged behaviour, including its ordering.
+                            sessionManager.saveSession(conversationId, newState)
+                        }
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "Decrypt OK: plaintextBytes=${decrypted.size}",
+                        )
+                        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+                        // observability-only DECRYPT_TRACE ok marker.
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                                "conv=${conversationId.take(8)} " +
+                                "plaintextBytes=${decrypted.size} " +
+                                "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                                "bootstrap=false",
+                        )
+                        // N1-F1 R-N1.9: nothing is recorded here.
+                        //
+                        // PR-H2b wrote the DURABLE ledger at this point,
+                        // before leaving the per-conversation mutex, to
+                        // stop a concurrent redelivery re-entering
+                        // ratchet.decrypt. It ran before the payload was
+                        // parsed, so the entry claimed type "unknown" and
+                        // an INSERT OR IGNORE later could not refine it.
+                        //
+                        // Post-decrypt bookkeeping is done ONCE, at the
+                        // single point every branch converges on: text
+                        // inside the transaction above, every other type
+                        // there with its real type (search: R-N1.9 single
+                        // post-decrypt point).
+                        decrypted
                     }
                 } else {
                     // Fresh session — require x3dhInit on the wire. The
@@ -3567,6 +4114,10 @@ class DefaultMessagingService(
                     // session.
                     val x3dhInit = wireFrame.x3dhInit
                     if (x3dhInit == null) {
+                        if (heldReplay != null) {
+                            holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "mac")
+                            return@withLock null
+                        }
                         // Legacy Alpha 1 bare-EncryptedMessage envelope that
                         // survived the migration in the relay store. We
                         // cannot decrypt it (session was wiped, no x3dhInit
@@ -3607,71 +4158,126 @@ class DefaultMessagingService(
                         transport.sendDeliveryAck(deliver.messageId)
                         return@withLock null
                     }
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "Bootstrapping recipient session: conv=${conversationId.take(24)}…",
-                    )
-                    val freshState = sessionManager.recipientBootstrap(
-                        conversationId = conversationId,
-                        envelopeId = deliver.messageId,
-                        localIdentityKeyPair = localKeyPair,
-                        senderIdentityPublicKeyHex = senderPubKeyHex,
-                        x3dhInit = x3dhInit,
-                    )
-                    val (advancedState, decrypted) = ratchet.decrypt(freshState, encrypted)
-                    sessionManager.saveSession(conversationId, advancedState)
-
-                    // TODO PR C commit 12 (or follow-up): persist
-                    // wireFrame.senderSigningPublicKeyHex on the
-                    // ConversationEntity (or a new PeerSigningKey table)
-                    // so future SPK rotations from this peer can be
-                    // verified against it. For Alpha 2 we trust the
-                    // bundle's signing key on each fetch; the cache
-                    // hardens the rotation path which lands in Phase 5.
-
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
-                    )
-                    // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
-                    // DECRYPT_TRACE ok for the bootstrap path. `bootstrap=true`
-                    // distinguishes this from the existing-session ok line so
-                    // the next-session DECRYPT_TRACE pipeline can compute
-                    // "fresh sessions per hour" diagnostics without parsing
-                    // session state.
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
-                            "conv=${conversationId.take(8)} " +
-                            "plaintextBytes=${decrypted.size} " +
-                            "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
-                            "bootstrap=true",
-                    )
-                    // PR-H2b: same ledger insert as the existing-session
-                    // branch above. Bootstrap path lands here once per
-                    // conversation; subsequent messages take the existing
-                    // branch.
-                    processedEnvelopeRepository?.markProcessed(
-                        envelopeId = deliver.messageId,
+                    // Extracted so `handleDeliver` stays inside the JVM
+                    // method-size limit; the body is unchanged.
+                    val firstContact = receiveOnFirstContact(
+                        deliver = deliver,
                         conversationId = conversationId,
                         senderPubKeyHex = senderPubKeyHex,
-                        payloadType = "unknown",
-                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
-                        nowMs = Clock.System.now().toEpochMilliseconds(),
-                    )
-                    decrypted
+                        ciphertext = ciphertext,
+                        encrypted = encrypted,
+                        x3dhInit = x3dhInit,
+                        decryptStartMs = decryptStartMs,
+                    ) ?: return@withLock null
+                    committedAtomically = firstContact.committed
+                    firstContact.plaintext
                 }
             }
 
             // Legacy/garbage envelope was already ack'd inside withLock —
             // skip downstream payload processing.
             if (plainBytes == null) return@runCatching
+            // Audit ROUND-30.16: plaintext exists, so decrypt succeeded.
+            // Read at the handler level from the value the locked section
+            // returned — no cryptographic branch is touched.
+            r3016Decrypted = true
+
+            // ── R-N1.9 single post-decrypt point ────────────────────
+            //
+            // Every decrypt branch — existing session, pending fallback,
+            // inbound repair, first bootstrap — returns its plaintext
+            // out of the one `mutex.withLock` above, so this is the only
+            // line all four pass through, and it sits before the payload
+            // is parsed and before anything is settled.
+            //
+            // R-N1.8 fixed the existing-session branch in place and left
+            // the other three writing the durable ledger inside their own
+            // branches. Three of the four decrypt paths therefore still
+            // lost messages, bootstrap — the first message of every new
+            // conversation — among them. Four branch-local fixes would
+            // have been four things to keep in step; this is one.
+            //
+            // What happens here: NOTHING durable. That is the point. The
+            // ledger entry is written with the message row in a single
+            // transaction further down, and for non-message payloads
+            // after the payload type is known. Nothing may mark this
+            // envelope settled until the work it settles has landed.
+            //
+            // The in-process race PR-H2b guarded with an early durable
+            // write is covered without one, and neither mechanism is new.
+            //
+            // MEASURED: the incoming collector is sequential —
+            // `transport.incoming.onEach { handleDeliver(it) }
+            // .launchIn(scope)`, with startReceiving refusing a second
+            // collector. Pinned by
+            // `aSecondDeliveryIsNotProcessedWhileTheFirstIsOpen_sequentialCollectorOnly`,
+            // which was run against the previous in-flight marker and
+            // again after its removal.
+            //
+            // READ FROM SOURCE, NOT MEASURED: `activeProcessing` claims
+            // the envelope id at the top of this handler and releases it
+            // only in the outermost `finally`. No test exercises it —
+            // disabling the guard entirely leaves the messaging suite
+            // green (mutation MUT-ACTIVEPROCESSING, NOT OBSERVED). It is
+            // a second line of defence, described here as exactly that.
+            //
+            // An earlier revision of this comment claimed the race was
+            // excluded by two proven mechanisms, and cited a test that no
+            // longer exists. Both claims are withdrawn. The phrasing is
+            // spelled out rather than quoted so a text sweep for the old
+            // wording does not match this withdrawal note.
 
             val payload = json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
             messagingLog(
                 MessagingLogLevel.INFO,
                 "Payload parsed: type=${payload.type} textLen=${payload.text.length}",
             )
+
+            // N1-F1 R-N1.8 — the ledger write, split by payload type.
+            //
+            // PR-H2b wrote it once, right after decrypt, for EVERY type.
+            // Only TYPE_MESSAGE persists a message row, and only that
+            // row could be lost by the ledger running ahead of it — so
+            // only that type defers its ledger entry into the atomic
+            // commit below.
+            //
+            // The remaining types write their entry here, with the type
+            // now known instead of "unknown", and BEFORE those branches
+            // ack. PR-H2b's protection against re-entering
+            // ratchet.decrypt on a redelivery is unchanged for them.
+            //
+            // N1-F1b R-N1.12: the six types in
+            // [ATOMICALLY_SETTLED_CONTROL_TYPES] are excluded — they now
+            // settle their action and their ledger entry together, in one
+            // transaction, further down. What is left here is the set
+            // that CANNOT do that yet, each for a stated reason recorded
+            // in ControlEventCommitRepository's kdoc: group messages
+            // advance a ratcheting sender key, call signalling has no
+            // durable state and duplicates are not benign, key rotation
+            // also deletes a session, and audio chunks are durable only
+            // in the 1:1 configuration.
+            //
+            // For the types that remain, this write is still AHEAD of the
+            // handler that acts on it, and that is the open half of
+            // F-1b. R-N1.8 justified the position by saying nothing was
+            // at stake for these types because they persist no message
+            // row; that was wrong — user state is at stake — and the
+            // claim was withdrawn in R-N1.9. It stands here only because
+            // each remaining type cannot be settled atomically yet, for
+            // the reasons listed above.
+            if (
+                payload.type != MessagePayload.TYPE_MESSAGE &&
+                payload.type !in ATOMICALLY_SETTLED_CONTROL_TYPES
+            ) {
+                processedEnvelopeRepository?.markProcessed(
+                    envelopeId = deliver.messageId,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                    nowMs = Clock.System.now().toEpochMilliseconds(),
+                )
+            }
 
             // Route group-related messages to GroupMessagingService before 1:1 handling.
             if (payload.type in MessagePayload.GROUP_TYPES) {
@@ -4056,7 +4662,18 @@ class DefaultMessagingService(
             // re-delivering the same control message on every reconnect for up
             // to RELAY_ENVELOPE_TTL_SECS (7 days).
             if (payload.type == MessagePayload.TYPE_DELETE && payload.targetMessageId.isNotEmpty()) {
-                messageRepository.deleteMessage(payload.targetMessageId)
+                // N1-F1b: action + ledger in one transaction; the ack
+                // below only runs if it committed.
+                settleControlEvent(
+                    action = ControlEventCommitRepository.Action.DeleteMessage(
+                        payload.targetMessageId,
+                    ),
+                    deliver = deliver,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    fallback = { messageRepository.deleteMessage(payload.targetMessageId) },
+                )
                 _incomingMessages.emit(
                     IncomingMessage(
                         id = payload.targetMessageId,
@@ -4070,7 +4687,21 @@ class DefaultMessagingService(
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_EDIT && payload.targetMessageId.isNotEmpty()) {
-                messageRepository.updateMessageText(payload.targetMessageId, payload.text)
+                settleControlEvent(
+                    action = ControlEventCommitRepository.Action.EditMessageText(
+                        messageId = payload.targetMessageId,
+                        text = payload.text,
+                    ),
+                    deliver = deliver,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    fallback = {
+                        messageRepository.updateMessageText(
+                            payload.targetMessageId, payload.text,
+                        )
+                    },
+                )
                 _incomingMessages.emit(
                     IncomingMessage(
                         id = payload.targetMessageId,
@@ -4088,34 +4719,119 @@ class DefaultMessagingService(
                 // Only apply non-zero timers from peers — peer cannot silently disable
                 // disappearing messages on the local device (local user controls Off via UI).
                 if (secs > 0L) {
-                    conversationRepository.setDisappearingTimer(conversationId, secs)
+                    settleControlEvent(
+                        action = ControlEventCommitRepository.Action.SetDisappearingTimer(
+                            conversationId = conversationId,
+                            seconds = secs,
+                        ),
+                        deliver = deliver,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        fallback = {
+                            conversationRepository.setDisappearingTimer(conversationId, secs)
+                        },
+                    )
+                } else {
+                    // Zero is ignored on purpose (a peer may not
+                    // silently disable the timer), but the envelope
+                    // still has to be settled before the ack.
+                    processedEnvelopeRepository?.markProcessed(
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                    )
                 }
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
             if (payload.type == MessagePayload.TYPE_REACTION && payload.targetMessageId.isNotEmpty()) {
                 val em = payload.emoji
-                val repo = reactionRepository
+                val reactionRepo = reactionRepository
                 messagingLog(
                     MessagingLogLevel.INFO,
                     "Reaction received: target=${payload.targetMessageId.take(12)}… " +
                         "sender=${senderPubKeyHex.take(16)}… emoji=${em ?: "<null>"} " +
-                        "repoSet=${repo != null}",
+                        "repoSet=${reactionRepo != null}",
                 )
-                if (em == null || repo == null) {
+                // N1-F1b R-N1.13 — EVERY terminal exit of this branch
+                // settles the envelope before it acks.
+                //
+                // R-N1.12 excluded TYPE_REACTION from the shared
+                // pre-parse ledger write and then settled only the two
+                // well-formed shapes. This exit acked and returned with
+                // no ledger entry at all, so a lost ack let the
+                // redelivery re-enter decrypt on an advanced ratchet and
+                // MAC-fail — the very thing the ledger exists to stop.
+                // Excluding a TYPE is only safe if every EXIT of its
+                // branch settles.
+                if (em == null) {
+                    // Malformed control frame: there is no action to
+                    // apply, but the envelope has still been decrypted
+                    // and must not be offered to the ratchet again.
+                    settleIgnoredControlEvent(
+                        deliver = deliver,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        reason = "null_emoji",
+                    )
                     transport.sendDeliveryAck(deliver.messageId)
                     return@runCatching
                 }
-                if (em.isEmpty()) {
-                    repo.deleteReaction(payload.targetMessageId, senderPubKeyHex)
+                if (controlEventCommitRepository == null && reactionRepo == null) {
+                    // No way to apply the reaction at all. Settle the
+                    // envelope anyway rather than ack an unrecorded one.
+                    settleIgnoredControlEvent(
+                        deliver = deliver,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        reason = "no_reaction_repository",
+                    )
+                    transport.sendDeliveryAck(deliver.messageId)
+                    return@runCatching
+                }
+                val reactionAction = if (em.isEmpty()) {
+                    ControlEventCommitRepository.Action.DeleteReaction(
+                        messageId = payload.targetMessageId,
+                        senderKeyHex = senderPubKeyHex,
+                    )
                 } else {
-                    repo.upsertReaction(
+                    ControlEventCommitRepository.Action.UpsertReaction(
                         messageId = payload.targetMessageId,
                         senderKeyHex = senderPubKeyHex,
                         emoji = em,
-                        createdAt = Clock.System.now().toEpochMilliseconds(),
+                        createdAtMs = Clock.System.now().toEpochMilliseconds(),
                     )
                 }
+                settleControlEvent(
+                    action = reactionAction,
+                    deliver = deliver,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    // Reached only when the commit repository is absent
+                    // AND reactionRepository is present — the guard above
+                    // returns for every other combination, so the
+                    // reaction is applied through whichever path exists.
+                    fallback = {
+                        val r = reactionRepo!!
+                        if (em.isEmpty()) {
+                            r.deleteReaction(payload.targetMessageId, senderPubKeyHex)
+                        } else {
+                            r.upsertReaction(
+                                messageId = payload.targetMessageId,
+                                senderKeyHex = senderPubKeyHex,
+                                emoji = em,
+                                createdAt = Clock.System.now().toEpochMilliseconds(),
+                            )
+                        }
+                    },
+                )
                 messagingLog(MessagingLogLevel.INFO, "Reaction upserted/deleted OK")
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
@@ -4126,10 +4842,23 @@ class DefaultMessagingService(
                 // On unpin (pinned=false) we clear the column to null so the
                 // next pin gets a fresh attribution.
                 val pinnedFlag = payload.pinned ?: false
-                messageRepository.pinMessage(
-                    messageId = payload.targetMessageId,
-                    pinned = pinnedFlag,
-                    pinnedByPubkey = if (pinnedFlag) senderPubKeyHex else null,
+                settleControlEvent(
+                    action = ControlEventCommitRepository.Action.PinMessage(
+                        messageId = payload.targetMessageId,
+                        pinned = pinnedFlag,
+                        pinnedByPubkeyHex = if (pinnedFlag) senderPubKeyHex else null,
+                    ),
+                    deliver = deliver,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    fallback = {
+                        messageRepository.pinMessage(
+                            messageId = payload.targetMessageId,
+                            pinned = pinnedFlag,
+                            pinnedByPubkey = if (pinnedFlag) senderPubKeyHex else null,
+                        )
+                    },
                 )
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
@@ -4154,7 +4883,20 @@ class DefaultMessagingService(
                 // status locally — no DB row is created for the receipt itself.
                 // C-2: receipt arrived via the sealed Double Ratchet pipeline,
                 // so the relay never saw `from`, `to`, or `messageId`.
-                messageRepository.updateStatus(payload.targetMessageId, MessageStatus.READ)
+                settleControlEvent(
+                    action = ControlEventCommitRepository.Action.MarkRead(
+                        payload.targetMessageId,
+                    ),
+                    deliver = deliver,
+                    conversationId = conversationId,
+                    senderPubKeyHex = senderPubKeyHex,
+                    payloadType = payload.type,
+                    fallback = {
+                        messageRepository.updateStatus(
+                            payload.targetMessageId, MessageStatus.READ,
+                        )
+                    },
+                )
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
@@ -4167,8 +4909,13 @@ class DefaultMessagingService(
                 MessagingLogLevel.INFO,
                 "Inserting message into DB: id=${deliver.messageId.take(12)}… conv=${conversationId.take(24)}…",
             )
-            messageRepository.insertMessage(
-                MessageEntity(
+            // The strong text transaction has already written the row, the
+            // receive state, the completion entry and the held/pending/OPK/
+            // archive changes together. Nothing is repeated here, and a
+            // REJECTED commit never reaches this point: those branches return
+            // without settling the envelope, so the relay redelivers it.
+            if (!committedAtomically) {
+                val inboundRow = MessageEntity(
                     id = deliver.messageId,
                     conversationId = conversationId,
                     ciphertext = ciphertext,
@@ -4178,7 +4925,45 @@ class DefaultMessagingService(
                     createdAt = nowMs,
                     expiresAtMs = expiresAtMs,
                 )
-            )
+                // N1-F1 R-N1.8 — settle the row and the ledger together.
+                //
+                // This is the compatibility path for payloads the text
+                // transaction does not accept and for call sites built
+                // without the session transaction repository. Both tables
+                // live in the same SQLDelight database, so this is one
+                // transaction: either the message exists AND the envelope is
+                // recorded as processed, or neither is true and the relay's
+                // redelivery finds a clean slate. The ack below is the only
+                // thing that follows, and it follows the commit.
+                //
+                // The null branch is for call sites built without storage
+                // wiring (older tests). It keeps the ORDER right — row
+                // first, ledger second — so a crash between them leaves a
+                // message with no ledger entry, which a redelivery
+                // deduplicates on the legacy messages.id gate. It does not
+                // give atomicity; only the repository does.
+                val commitRepo = inboundCommitRepository
+                if (commitRepo != null) {
+                    commitRepo.commitInboundMessage(
+                        message = inboundRow,
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                    )
+                } else {
+                    messageRepository.insertMessage(inboundRow)
+                    processedEnvelopeRepository?.markProcessed(
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                    )
+                }
+            }
             messagingLog(MessagingLogLevel.INFO, "DB insertMessage OK")
             // Direct WSS Yota-First diagnostic §4 —
             // recipient_message_persisted. Fires STRICTLY AFTER
@@ -4189,7 +4974,9 @@ class DefaultMessagingService(
                 event = "recipient_message_persisted",
                 correlationId = deliver.messageId,
                 role = WssDiagBridge.Role.RECIPIENT,
+                attempt = r3017Attempt,
             )
+            r3016Persisted = true
 
             // Create conversation as REQUEST if unknown sender, keep TRUSTED if already known.
             val existing = conversationRepository.getConversation(conversationId)
@@ -4303,13 +5090,18 @@ class DefaultMessagingService(
                 event = "recipient_ack_deliver_sent",
                 correlationId = deliver.messageId,
                 role = WssDiagBridge.Role.RECIPIENT,
+                attempt = r3017Attempt,
             )
+            r3016AckSent = true
 
             messagingLog(
                 MessagingLogLevel.INFO,
                 "handleDeliver DONE for id=${deliver.messageId.take(12)}… (ack-deliver sent)",
             )
         }.onFailure { e ->
+            if (e is CancellationException) throw e
+            messagingLog(MessagingLogLevel.WARN,
+                "DECRYPT_TRACE receive_failed msgId=${deliver.messageId.take(8)} errorClass=${e::class.simpleName}")
             // Previously this branch was silent ("avoids leaking error details"). That policy hides
             // legitimate bugs (decrypt mismatch, DB unique-constraint, parse error, UI callback
             // throwing) and produces crashes with no context. Log with full stack so a future QA
@@ -4319,11 +5111,121 @@ class DefaultMessagingService(
                 "handleDeliver FAILED for id=${deliver.messageId.take(12)}… (${e::class.simpleName}): ${e.message}",
                 e,
             )
+            r3016Threw = true
         }
         } finally {
-            processingLock.withLock { activeProcessing.remove(deliver.messageId) }
+            // ── Audit ROUND-30.18: classify and emit, THEN release ─────
+            //
+            // R30.17 released the claim first and reported second, then
+            // documented the opposite. Once `activeProcessing` no longer
+            // holds the id, attempt N+1 can be claimed while attempt N is
+            // still querying the ledger and assembling its record, so the
+            // terminal record could land after the delivery it precedes.
+            // The ordering was asserted in the code comments, the commit
+            // message, the contract and the handoff, and was never true.
+            //
+            // The order is now the one that was claimed. The release is
+            // in its own `finally`, so a diagnostic that throws cannot
+            // strand the envelope as permanently in-flight — a
+            // diagnostic must never be able to break delivery.
+            try {
+                r3016ReportUnsettledDelivery(
+                    envelopeId = deliver.messageId,
+                    gateWasFresh = r3016GateWasFresh,
+                    decrypted = r3016Decrypted,
+                    persisted = r3016Persisted,
+                    ackSent = r3016AckSent,
+                    threw = r3016Threw,
+                    attempt = r3017Attempt,
+                    suppress = r3017Suppress,
+                )
+            } finally {
+                withContext(NonCancellable) {
+                processingLock.withLock {
+                    activeProcessing.remove(deliver.messageId)
+                    // Audit ROUND-30.18: a settled envelope's chain is
+                    // over, so its counter goes with the claim. Done
+                    // under the same lock that hands out ordinals, so a
+                    // prune can never race a numbering.
+                    if (r3016AckSent && r3016Persisted) {
+                        deliveryAttemptCounter.remove(deliver.messageId)
+                        overflowAnnounced.remove(deliver.messageId)
+                    } else if (r3017OverflowAnnounced) {
+                        overflowAnnounced.add(deliver.messageId)
+                    }
+                }
+                if (!r3016AckSent) transport.parkInbound(deliver.messageId)
+                }
+            }
         }
     }
+
+    /**
+     * Audit ROUND-30.16 — the delivery postcondition, in one place.
+     *
+     * A fresh delivery has settled its envelope only when the message row
+     * was persisted, the processed-envelope ledger records it, and the
+     * delivery ack was handed to the transport. Anything else is a
+     * failure and is reported as one, whether the handler threw or simply
+     * returned.
+     *
+     * The classification is deliberately fail-closed: an unsettled
+     * delivery that nothing explains is reported as
+     * `UNKNOWN_PROCESSING_FAILURE`, never as benign. Only closed enums
+     * and the envelope id leave this function — no exception text, no
+     * conversation, no key material, no plaintext.
+     *
+     * Costs nothing when the diagnostic bridge is absent, which is every
+     * release build: the first check returns before any query runs.
+     */
+    private suspend fun r3016ReportUnsettledDelivery(
+        envelopeId: String,
+        gateWasFresh: Boolean,
+        decrypted: Boolean,
+        persisted: Boolean,
+        ackSent: Boolean,
+        threw: Boolean,
+        attempt: Int,
+        suppress: Boolean,
+    ) {
+        val bridge = WssDiagBridgeHolder.instance ?: return
+        if (!gateWasFresh) return
+        // Past the shared ordinal bound the diagnostic says nothing
+        // rather than saying something the verifier must refuse.
+        if (suppress) return
+
+        val ledgerMarked = runCatching {
+            processedEnvelopeRepository?.exists(envelopeId)
+        }.getOrNull()
+
+        if (persisted && ackSent && ledgerMarked == true) return
+
+        val held = runCatching {
+            decryptFailedEnvelopeRepository?.existsByEnvelopeId(envelopeId)
+        }.getOrNull()
+
+        val verdict = classifyDeliveryOutcome(
+            decrypted = decrypted,
+            persisted = persisted,
+            ledgerMarked = ledgerMarked,
+            ackSent = ackSent,
+            threw = threw,
+            held = held,
+        ) ?: return
+        bridge.emit(
+            event = "recipient_deliver_failed",
+            correlationId = envelopeId,
+            role = WssDiagBridge.Role.RECIPIENT,
+            deliverFailure = verdict.first,
+            deliverStage = verdict.second,
+            // Audit ROUND-30.17: the record terminates THIS attempt. It
+            // is emitted from the `finally` that runs before the next
+            // claim can succeed, so it cannot race behind eligibility
+            // for the retry it precedes.
+            attempt = attempt,
+        )
+    }
+
 
     /**
      * Encrypts [payload] under the Double Ratchet and ships it as a
@@ -4379,6 +5281,9 @@ class DefaultMessagingService(
     ) {
         val unreadMessages = messageRepository.getMessages(conversationId)
             .filter { !it.sent && it.status != MessageStatus.READ }
+        // The local badge records opening the conversation, not receipt delivery.
+        // Do not reset it again after network suspension: new messages may arrive.
+        conversationRepository.resetUnread(conversationId)
         unreadMessages.forEach { msg ->
             if (sendReceipt) {
                 // C-2: route the read receipt through the sealed Double Ratchet
@@ -4397,7 +5302,6 @@ class DefaultMessagingService(
             }
             messageRepository.updateStatus(msg.id, MessageStatus.READ)
         }
-        conversationRepository.resetUnread(conversationId)
     }
 
     override suspend fun sendCallSignal(
@@ -4416,6 +5320,445 @@ class DefaultMessagingService(
         sendSealedPayload(payload, conversationId, toPubKeyHex)
     }
 
+    /**
+     * Make an inbound TEXT message durable in one transaction: the
+     * message row, the advanced receive-chain state and the completion
+     * entry together.
+     *
+     * A storage failure propagates without being mistaken for a
+     * cryptographic rejection. Cancellation keeps its original type;
+     * only the durable ledger can settle whether a cancelled wait committed.
+     */
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun receiveHeldEnvelope(entry: DecryptFailedEnvelopeRepository.Entry) {
+        // This is a locally stored, previously unwrapped frame, not a new
+        // assertion of sender identity from the network. Reuse all receive
+        // branches, including pending/first-contact and atomic completion.
+        if (deriveConversationId(entry.senderPubKeyHex) != entry.conversationId) return
+        handleDeliver(RelayMessage.Deliver(
+            from = entry.senderPubKeyHex,
+            sealedSender = "",
+            payload = Base64.encode(MessagePadding.pad(entry.wireFrameJson.encodeToByteArray())),
+            messageId = entry.envelopeId,
+        ), localReplay = true)
+    }
+
+    // Non-inline by design: otherwise Kotlin folds the entire crypto/repair
+    // coroutine into handleDeliverSerialized and exceeds the JVM 64KB limit.
+    // The lock still covers the exact same receive block, including suspension.
+    private suspend fun withReceiveLock(mutex: Mutex, receive: suspend () -> ByteArray?): ByteArray? {
+        mutex.lock()
+        try {
+            return receive()
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    @OptIn(ExperimentalUnsignedTypes::class, ExperimentalEncodingApi::class)
+    private suspend fun receiveVersion(conversationId: String): String {
+        fun projection(state: RatchetState?): String? = state?.let {
+            json.encodeToString(it.copy(sendingChainKey = null, sendCount = 0))
+        }
+        val pending = pendingRatchetStateRepository?.get(conversationId)
+        val parts = listOf(
+            projection(sessionManager.tryLoadSession(conversationId)),
+            projection(pending?.let { json.decodeFromString<RatchetState>(it.stateBlob) }),
+        ) + sessionTransactionRepository?.listReceiveArchiveVersions(conversationId,
+            Clock.System.now().toEpochMilliseconds()).orEmpty().map {
+                "${it.id}:${it.revision}"
+            }
+        // Store only a digest, never another copy of the chain's secret material.
+        // One compatibility pass reclassifies legacy "mac" rows that may have
+        // failed on a locked prekey. The tag is stable across process restarts;
+        // genuine MAC failures retain the ordinary version-gated retry rule.
+        return "prekey-read-v1:" + Base64.encode(Hash.sha256(json.encodeToString(parts).encodeToByteArray().toUByteArray()).toByteArray())
+    }
+
+    private suspend fun heldRetryIsDue(conversationId: String, envelopeId: String): Boolean {
+        if (heldReplay == null) return true
+        val entry = decryptFailedEnvelopeRepository?.listByConversation(conversationId)
+            ?.firstOrNull { it.envelopeId == envelopeId } ?: return true
+        val version = receiveVersion(conversationId)
+        if (entry.lastReceiveVersion == null || entry.lastReceiveVersion != version) return true
+        if (entry.errorType != "commit" && entry.errorType != "prekey") return false
+        val elapsed = Clock.System.now().toEpochMilliseconds() - (entry.lastReplayAtMs ?: 0L)
+        return elapsed < 0L || elapsed >= HeldInboundReplay.RETRY_INTERVAL_MS
+    }
+
+    private fun heldWireFrame(ciphertext: ByteArray): WireFrame = try {
+        json.decodeFromString<WireFrame>(ciphertext.decodeToString())
+    } catch (legacy: SerializationException) {
+        WireFrame(encryptedMessage = json.decodeFromString<phantom.core.crypto.EncryptedMessage>(ciphertext.decodeToString()))
+    }
+
+    private suspend fun commitRepairCandidate(
+        deliver: RelayMessage.Deliver, conversationId: String, senderPubKeyHex: String,
+        wireFrame: WireFrame, opkId: String, stateBlob: String,
+    ): Boolean = try {
+        requireNotNull(sessionTransactionRepository).commitBootstrap(opkId, conversationId, stateBlob, null)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Throwable) {
+        holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "commit")
+        throw InboundCommitFailed(failure)
+    }
+
+    // Kept out of the large receive coroutine to stay below the JVM method limit.
+    private suspend fun authenticateRepairCandidate(
+        conversationId: String, envelopeId: String, senderPubKeyHex: String,
+        x3dhInit: X3dhInitHeader, encrypted: phantom.core.crypto.EncryptedMessage,
+        adoptOwnReservation: Boolean, onReservationCreated: (Boolean) -> Unit,
+    ): Result<Triple<RatchetState, RatchetState, ByteArray>> {
+        var stage = "bootstrap"
+        return try {
+            val candidate = sessionManager.recipientBootstrapInMemory(
+                conversationId = conversationId,
+                envelopeId = envelopeId,
+                localIdentityKeyPair = localKeyPair,
+                senderIdentityPublicKeyHex = senderPubKeyHex,
+                x3dhInit = x3dhInit,
+                adoptOwnConversationReservation = adoptOwnReservation,
+                onReservationCreated = onReservationCreated,
+            )
+            stage = "decrypt"
+            val (advancedState, plaintext) = ratchet.decrypt(candidate, encrypted)
+            Result.success(Triple(candidate, advancedState, plaintext))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            messagingLog(MessagingLogLevel.WARN,
+                "DECRYPT_TRACE repair_candidate_failed msgId=${envelopeId.take(8)} " +
+                    "stage=$stage errorClass=${failure::class.simpleName} " +
+                    "causeClass=${failure.cause?.let { it::class.simpleName } ?: "None"}")
+            Result.failure(failure)
+        }
+    }
+
+    private suspend fun holdMacFailure(
+        deliver: RelayMessage.Deliver, conversationId: String, senderPubKeyHex: String, wireFrame: WireFrame,
+        markSuspect: Boolean,
+    ) {
+        val stored = holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "mac")
+        try {
+            if (markSuspect) conversationRepository.setSessionSuspect(conversationId, Clock.System.now().toEpochMilliseconds())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            messagingLog(MessagingLogLevel.WARN, "DECRYPT_TRACE suspect_write_failed errorClass=${failure::class.simpleName}")
+        }
+        messagingLog(MessagingLogLevel.WARN,
+            "DECRYPT_TRACE fail_mac msgId=${deliver.messageId.take(8)} sender=${senderPubKeyHex.take(8)} " +
+                "conv=${conversationId.take(8)} x3dhInitPresent=${wireFrame.x3dhInit != null} " +
+                "action=${if (stored) "hold" else "hold_storage_error"}")
+    }
+
+    private suspend fun holdForRetry(
+        deliver: RelayMessage.Deliver, conversationId: String, senderPubKeyHex: String,
+        wireFrame: WireFrame, reason: String,
+    ): Boolean {
+        val repository = decryptFailedEnvelopeRepository ?: return false
+        if (heldReplay == null && !holdMacFailures) return false
+        try {
+            val now = Clock.System.now().toEpochMilliseconds()
+            repository.insert(deliver.messageId, conversationId, senderPubKeyHex, reason,
+                now, wireFrame.x3dhInit != null, json.encodeToString(wireFrame))
+            if (heldReplay != null) repository.recordFailure(
+                deliver.messageId, reason, receiveVersion(conversationId), now,
+            )
+            messagingLog(MessagingLogLevel.INFO,
+                "DECRYPT_TRACE hold_recorded msgId=${deliver.messageId.take(8)} errorType=$reason")
+            return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            // Parking is performed at the transport boundary even if THIS
+            // write failed. The unacknowledged relay copy can still return.
+            messagingLog(MessagingLogLevel.WARN,
+                "DECRYPT_TRACE hold_storage_error errorClass=${failure::class.simpleName}")
+            return false
+        }
+    }
+
+    private class InboundCommitFailed(cause: Throwable) : Exception(
+        "inbound commit failed: ${cause::class.simpleName}",
+        cause,
+    )
+
+    private sealed interface InboundTextCommit {
+        data object Unsupported : InboundTextCommit
+        data object Committed : InboundTextCommit
+        data class Rejected(val reason: phantom.core.storage.InboundCommitOutcome) : InboundTextCommit
+    }
+
+    /**
+     * Can this envelope be finished in one commit? Answers the same
+     * question [commitInboundTextMessage] answers, WITHOUT writing
+     * anything, so a caller can decide before it takes a step it cannot
+     * take back -- promoting a pending session, for instance.
+     */
+    private fun canCommitInboundTextMessage(plaintext: ByteArray): Boolean {
+        if (sessionTransactionRepository == null) return false
+        val payload = runCatching {
+            json.decodeFromString<MessagePayload>(plaintext.decodeToString())
+        }.getOrNull() ?: return false
+        return payload.type == MessagePayload.TYPE_MESSAGE
+    }
+
+    private suspend fun saveReplacementSession(conversationId: String, state: RatchetState) {
+        val tx = sessionTransactionRepository
+        if (tx == null) sessionManager.saveSession(conversationId, state)
+        else tx.replaceActiveSession(conversationId, json.encodeToString(state),
+            Clock.System.now().toEpochMilliseconds())
+    }
+
+    private class ArchivedDecrypt(
+        val archive: phantom.core.storage.ReceiveSessionArchive,
+        val advancedState: RatchetState,
+        val plaintext: ByteArray,
+    )
+
+    private fun decryptArchivedReceive(
+        archives: List<phantom.core.storage.ReceiveSessionArchive>,
+        encrypted: phantom.core.crypto.EncryptedMessage,
+    ): ArchivedDecrypt? {
+        for (archive in archives) {
+            // Decoding/storage failures are not MAC failures. No record is
+            // updated until a successful decrypt is atomically committed.
+            val state = json.decodeFromString<RatchetState>(archive.stateBlob)
+            val decrypted = try { ratchet.decrypt(state, encrypted) }
+                catch (rejected: IllegalArgumentException) { continue }
+            return ArchivedDecrypt(archive, decrypted.first, decrypted.second)
+        }
+        return null
+    }
+
+    private suspend fun commitInboundTextMessage(
+        deliver: RelayMessage.Deliver,
+        conversationId: String,
+        senderPubKeyHex: String,
+        ciphertext: ByteArray,
+        plaintext: ByteArray,
+        advancedState: phantom.core.crypto.RatchetState?,
+        promotePending: Boolean = false,
+        /**
+         * The one-time pre-key this envelope's candidate was derived
+         * with, or null when none was used. Bound inside the transaction;
+         * see the storage contract for what a mismatch means.
+         */
+        expectedOpkKeyIdHex: String? = null,
+        stateTarget: phantom.core.storage.InboundStateTarget = phantom.core.storage.InboundStateTarget.Active,
+    ): InboundTextCommit {
+        val sessionTx = sessionTransactionRepository ?: return InboundTextCommit.Unsupported
+        val payload = runCatching {
+            json.decodeFromString<MessagePayload>(plaintext.decodeToString())
+        }.getOrNull() ?: return InboundTextCommit.Unsupported
+        if (payload.type != MessagePayload.TYPE_MESSAGE) return InboundTextCommit.Unsupported
+
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        var actualTarget = stateTarget
+        val outcome = runCatching {
+            val target = if ((promotePending || stateTarget == phantom.core.storage.InboundStateTarget.ReplaceActive) &&
+                decryptFailedEnvelopeRepository?.listByConversation(conversationId)
+                    ?.any { it.envelopeId == deliver.messageId } == true
+            ) phantom.core.storage.InboundStateTarget.KeepActive else stateTarget
+            actualTarget = target
+            val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
+            val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+            sessionTx.commitInboundMessage(
+            conversationId = conversationId,
+            envelopeId = deliver.messageId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payload.type,
+            nowMs = nowMs,
+            message = MessageEntity(
+                id = deliver.messageId,
+                conversationId = conversationId,
+                ciphertext = ciphertext,
+                plaintextCache = payload.text,
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = nowMs,
+                expiresAtMs = expiresAtMs,
+            ),
+            advancedStateBlob = advancedState?.let {
+                json.encodeToString(phantom.core.crypto.RatchetState.serializer(), it)
+            },
+            promotePending = promotePending,
+            expectedOpkKeyIdHex = expectedOpkKeyIdHex,
+            stateTarget = target,
+            )
+        }.getOrElse { cause ->
+            // Cancellation is not a storage failure. It travels on
+            // unchanged, because turning it into [InboundCommitFailed]
+            // would tell every handler above that the database refused
+            // something it never refused.
+            //
+            // And a cancelled WAIT says nothing about whether the
+            // transaction committed: the write may already be durable.
+            // Nothing here may conclude "not written" from cancellation;
+            // only a read of the database can answer that, which is what
+            // the ledger check on the next delivery does.
+            if (cause is kotlinx.coroutines.CancellationException) throw cause
+            // Never surfaced as Unsupported: "nothing was committed" and
+            // "this stage does not cover the case" are different answers
+            // and the caller must not confuse them. Never surfaced as an
+            // IllegalArgumentException either -- see [InboundCommitFailed].
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE inbound_commit_failed msgId=${deliver.messageId.take(8)} " +
+                    "conv=${conversationId.take(8)} " +
+                    "errorClass=${cause::class.simpleName}",
+            )
+            holdForRetry(deliver, conversationId, senderPubKeyHex,
+                heldWireFrame(ciphertext), "commit")
+            throw InboundCommitFailed(cause)
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE inbound_commit msgId=${deliver.messageId.take(8)} " +
+                "conv=${conversationId.take(8)} outcome=$outcome target=${inboundTargetLabel(actualTarget)}",
+        )
+        return if (outcome == phantom.core.storage.InboundCommitOutcome.Committed) {
+            heldReplay?.request()
+            InboundTextCommit.Committed
+        } else {
+            holdForRetry(deliver, conversationId, senderPubKeyHex,
+                heldWireFrame(ciphertext), "commit")
+            InboundTextCommit.Rejected(outcome)
+        }
+    }
+
+    private fun inboundTargetLabel(target: phantom.core.storage.InboundStateTarget): String = when (target) {
+        phantom.core.storage.InboundStateTarget.Active -> "active_advance"
+        phantom.core.storage.InboundStateTarget.ReplaceActive -> "active_replace"
+        phantom.core.storage.InboundStateTarget.KeepActive -> "keep_active"
+        is phantom.core.storage.InboundStateTarget.Archive ->
+            if (target.activate) "archive_activate" else "archive_advance"
+    }
+
+    /** What the first-contact bootstrap produced. */
+    private class FirstContactResult(
+        val plaintext: ByteArray,
+        val committed: Boolean,
+    )
+
+    /**
+     * First contact: no session yet, and the frame carries an X3DH
+     * header.
+     *
+     * Extracted from `handleDeliver` for one reason only -- that method
+     * had reached the JVM 64KB limit. Rejected commits return no plaintext
+     * and cannot reach the legacy completion path below.
+     */
+    private suspend fun receiveOnFirstContact(
+        deliver: RelayMessage.Deliver,
+        conversationId: String,
+        senderPubKeyHex: String,
+        ciphertext: ByteArray,
+        encrypted: phantom.core.crypto.EncryptedMessage,
+        x3dhInit: X3dhInitHeader,
+        decryptStartMs: Long,
+    ): FirstContactResult? {
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "Bootstrapping recipient session: conv=${conversationId.take(24)}…",
+        )
+        // Derived WITHOUT consuming anything. The wrapper that
+        // used to be called here released the reservation and
+        // deleted the one-time pre-key first, then saved the
+        // session in a separate step: a failure between the two
+        // left the receiver with neither the key nor a session,
+        // and nothing could recover it. The key is now spent by
+        // the same commit that makes the message durable.
+        var freshReservationCreated = false
+        val freshState = try { sessionManager.recipientBootstrapInMemory(
+            conversationId = conversationId,
+            envelopeId = deliver.messageId,
+            localIdentityKeyPair = localKeyPair,
+            senderIdentityPublicKeyHex = senderPubKeyHex,
+            x3dhInit = x3dhInit,
+            adoptOwnConversationReservation = true,
+            onReservationCreated = { freshReservationCreated = it },
+        ) } catch (failure: PreKeyReadFailed) {
+            messagingLog(MessagingLogLevel.WARN,
+                "DECRYPT_TRACE repair_candidate_failed msgId=${deliver.messageId.take(8)} " +
+                    "stage=bootstrap errorClass=PreKeyReadFailed causeClass=${failure.cause?.let { it::class.simpleName } ?: "None"}")
+            holdForRetry(deliver, conversationId, senderPubKeyHex, heldWireFrame(ciphertext), "prekey")
+            return null
+        }
+        val decryptedPair = try {
+            ratchet.decrypt(freshState, encrypted)
+        } catch (rejected: IllegalArgumentException) {
+            holdForRetry(deliver, conversationId, senderPubKeyHex,
+                heldWireFrame(ciphertext), "mac")
+            return null
+        }
+        val (advancedState, decrypted) = decryptedPair
+        // Rejection must never fall back to the non-atomic legacy path.
+        val textCommit = commitInboundTextMessage(
+            deliver = deliver,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            ciphertext = ciphertext,
+            plaintext = decrypted,
+            advancedState = advancedState,
+            expectedOpkKeyIdHex = x3dhInit.opkKeyIdHex,
+        )
+        if (textCommit is InboundTextCommit.Rejected) return null
+        val committedAtomically = textCommit == InboundTextCommit.Committed
+        if (!committedAtomically) {
+            // Not a text payload, or no transaction repository:
+            // the legacy sequence, with the same consumption the
+            // old wrapper performed, kept together with the save.
+            sessionManager.finishFirstContactBootstrap(
+                conversationId = conversationId,
+                state = advancedState,
+                opkKeyIdHex = x3dhInit.opkKeyIdHex,
+            )
+        }
+        // Recorded for the log below; the reserve outcome is what
+        // ownership is decided by anywhere it matters.
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE first_contact_reservation " +
+                "msgId=${deliver.messageId.take(8)} created=$freshReservationCreated",
+        )
+
+        // TODO PR C commit 12 (or follow-up): persist
+        // wireFrame.senderSigningPublicKeyHex on the
+        // ConversationEntity (or a new PeerSigningKey table)
+        // so future SPK rotations from this peer can be
+        // verified against it. For Alpha 2 we trust the
+        // bundle's signing key on each fetch; the cache
+        // hardens the rotation path which lands in Phase 5.
+
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "Decrypt OK after bootstrap: plaintextBytes=${decrypted.size}",
+        )
+        // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) —
+        // DECRYPT_TRACE ok for the bootstrap path. `bootstrap=true`
+        // distinguishes this from the existing-session ok line so
+        // the next-session DECRYPT_TRACE pipeline can compute
+        // "fresh sessions per hour" diagnostics without parsing
+        // session state.
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE ok msgId=${deliver.messageId.take(8)} " +
+                "conv=${conversationId.take(8)} " +
+                "plaintextBytes=${decrypted.size} " +
+                "elapsedMs=${Clock.System.now().toEpochMilliseconds() - decryptStartMs} " +
+                "bootstrap=true",
+        )
+        // N1-F1 R-N1.9: the bootstrap branch records nothing here either.
+        // It used to carry its own copy of the early PR-H2b write -- the
+        // first message of every new conversation settled before the
+        // payload was parsed. The commit above already wrote the entry for
+        // text; anything else is settled once, with its real type, at the
+        // single post-decrypt point.
+        return FirstContactResult(decrypted, committedAtomically)
+    }
     private fun deriveConversationId(theirPublicKeyHex: String): String {
         val keys = listOf(identity.publicKeyHex, theirPublicKeyHex).sorted()
         return "${keys[0]}_${keys[1]}"
@@ -5052,4 +6395,44 @@ class PeerBundleMissingException(
             }
         }
     }
+}
+
+
+/**
+ * Audit ROUND-30.16 — the delivery postcondition as a pure
+ * function, so every input combination can be asserted directly
+ * instead of being reachable only through a live delivery.
+ *
+ * Returns `null` when the delivery settled the envelope, otherwise
+ * the failure classification and the furthest stage reached.
+ *
+ * `ledgerMarked` and `held` are nullable because the repositories
+ * behind them are optional and a query can fail; `null` means "not
+ * established", never "false". That distinction is what makes the
+ * classification fail-closed: a delivery nothing can explain is
+ * reported as `UNKNOWN_PROCESSING_FAILURE`, never as benign.
+ */
+internal fun classifyDeliveryOutcome(
+    decrypted: Boolean,
+    persisted: Boolean,
+    ledgerMarked: Boolean?,
+    ackSent: Boolean,
+    threw: Boolean,
+    held: Boolean?,
+): Pair<WssDiagBridge.DeliverFailure, WssDiagBridge.DeliverStage>? {
+    // Settled means all three, and `ledgerMarked` must be KNOWN true.
+    if (persisted && ackSent && ledgerMarked == true) return null
+    val failure = when {
+        threw -> WssDiagBridge.DeliverFailure.THREW
+        held == true -> WssDiagBridge.DeliverFailure.HELD
+        else -> WssDiagBridge.DeliverFailure.UNKNOWN_PROCESSING_FAILURE
+    }
+    val stage = when {
+        ackSent -> WssDiagBridge.DeliverStage.ACK_SENT
+        ledgerMarked == true -> WssDiagBridge.DeliverStage.LEDGER_MARKED
+        persisted -> WssDiagBridge.DeliverStage.PERSISTED
+        decrypted -> WssDiagBridge.DeliverStage.DECRYPTED
+        else -> WssDiagBridge.DeliverStage.RECEIVED
+    }
+    return failure to stage
 }

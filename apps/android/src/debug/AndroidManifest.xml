@@ -26,6 +26,32 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        WSS-3 Carrier x VPN Matrix (§4.5 permission-contract): the
+        DiagnosticNetworkProfileReporter (debug-only helper class)
+        needs to read WifiManager.isWifiEnabled() to prove Wi-Fi is
+        OFF while the phone is on cellular. That API requires
+        ACCESS_WIFI_STATE, which the production manifest at
+        apps/android/src/androidMain/AndroidManifest.xml does NOT
+        declare. Adding it in the debug source-set overlay only:
+
+          - release-merged manifest is unchanged (permission never
+            ships to production users) — proved by
+            DiagnosticProductionManifestOmitsAccessWifiStateTest
+            (static source-set read);
+          - debug-merged manifest carries it exactly once — proved
+            by DiagnosticDebugManifestContainsAccessWifiStateTest;
+          - if a future toolchain change ever silently drops it,
+            the reporter catches SecurityException and emits
+            wifi_enabled=null + wifi_read_error="SECURITY_EXCEPTION"
+            (fail-closed, never a fabricated boolean) — proved by
+            DiagnosticNetworkProfileReporterSecurityExceptionFailsClosedTest.
+
+        See docs/tracks/direct-wss/wss-3-carrier-vpn-matrix-contract.md
+        §4.5 and Round-4 change log blocker 3.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <application>
         <!--
             Trek 2 Stage 2B-B (C6 review-fix round 10): the

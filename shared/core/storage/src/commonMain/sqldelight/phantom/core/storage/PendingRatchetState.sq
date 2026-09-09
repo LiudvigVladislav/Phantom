@@ -35,18 +35,34 @@
 -- contracts against this schema; M-2bB-8 pins the L6 join-based sweep
 -- using this table's conversation_id column.
 
+-- opk_key_id_hex / opk_binding_known (22.sqm) record which LOCAL
+-- one-time pre-key this candidate was derived with. Three states, and
+-- a promotion must tell them apart:
+--   known=1, hex NOT NULL — this candidate owes exactly that key; the
+--       promotion spends it, and refuses if its reservation is gone.
+--   known=1, hex NULL     — no local key was used (OUTBOUND INITIATOR:
+--       the x3dhInit in bootstrap_artifacts_blob names the PEER's
+--       pool). The promotion spends nothing and touches no reservation.
+--   known=0               — nothing recorded a binding. NOT the same
+--       as "no key was used"; the promotion refuses rather than guess.
+-- The binding belongs on THIS row because the row outlives the frame
+-- that created it: a later frame carrying no x3dhInit header says
+-- nothing about which key this candidate already owes.
 CREATE TABLE pending_ratchet_state (
     conversation_id          TEXT    NOT NULL PRIMARY KEY,
     state_blob               TEXT    NOT NULL,
     reserved_at_ms           INTEGER NOT NULL,
-    bootstrap_artifacts_blob TEXT
+    bootstrap_artifacts_blob TEXT,
+    opk_key_id_hex           TEXT,
+    opk_binding_known        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX idx_pending_ratchet_state_reserved_at_ms
     ON pending_ratchet_state(reserved_at_ms);
 
 getByConversationId:
-SELECT state_blob, reserved_at_ms, bootstrap_artifacts_blob
+SELECT state_blob, reserved_at_ms, bootstrap_artifacts_blob,
+       opk_key_id_hex, opk_binding_known
 FROM pending_ratchet_state
 WHERE conversation_id = ?;
 
@@ -56,15 +72,18 @@ INSERT OR REPLACE INTO pending_ratchet_state(
     conversation_id,
     state_blob,
     reserved_at_ms,
-    bootstrap_artifacts_blob
-) VALUES (?, ?, ?, ?);
+    bootstrap_artifacts_blob,
+    opk_key_id_hex,
+    opk_binding_known
+) VALUES (?, ?, ?, ?, ?, ?);
 
 -- L7 cap-8 eviction + Sprint 2b-C promotion path.
 deleteByConversationId:
 DELETE FROM pending_ratchet_state WHERE conversation_id = ?;
 
 getAll:
-SELECT conversation_id, state_blob, reserved_at_ms, bootstrap_artifacts_blob
+SELECT conversation_id, state_blob, reserved_at_ms, bootstrap_artifacts_blob,
+       opk_key_id_hex, opk_binding_known
 FROM pending_ratchet_state
 ORDER BY reserved_at_ms ASC;
 

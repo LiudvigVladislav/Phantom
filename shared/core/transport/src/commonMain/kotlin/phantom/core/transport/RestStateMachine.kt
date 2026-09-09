@@ -10,6 +10,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
+/** Presentation evidence only; neither value changes routing or probation. */
+enum class RestRecoveryCause { InboundSilence, FailureOrUnknown }
+
+data class RestModeSnapshot(
+    val mode: RestMode,
+    val recoveryCause: RestRecoveryCause = RestRecoveryCause.FailureOrUnknown,
+)
+
 /**
  * Pure state machine for WS ↔ REST fallback mode selection — PR-D1.
  *
@@ -163,6 +171,11 @@ class RestStateMachine(
 ) : WsReconnectGateProvider, RewalkCoordinatorGateProvider {
     private val _state = MutableStateFlow<RestMode>(RestMode.WsActive)
     val state: StateFlow<RestMode> = _state.asStateFlow()
+    private val _snapshot = MutableStateFlow(RestModeSnapshot(RestMode.WsActive))
+    /** Mode and its presentation evidence are published together after each event. */
+    val snapshot: StateFlow<RestModeSnapshot> = _snapshot.asStateFlow()
+    private var recoveryCause = RestRecoveryCause.FailureOrUnknown
+    private var recoveryRequired = false
 
     // ── RC-RECONNECT-QUIESCENCE1 gate surface (2026-06-22) ──────────────────
 
@@ -381,16 +394,34 @@ class RestStateMachine(
      * [issueProbeAfterRewalk], [awaitAndClaimProbe], etc.).
      */
     suspend fun onEvent(event: Event) {
-        when (event) {
-            is Event.WsSessionConnected -> onWsSessionConnected(event)
-            is Event.WsSessionEnded -> onWsSessionEnded(event)
-            is Event.WsFrameTextReceived -> onWsFrameText()
-            is Event.NetworkChanged -> onNetworkChanged(event)
-            is Event.WsOutboundAckReceived -> onWsOutboundAck()
-            is Event.WsAliveTickElapsed -> onAliveTick()
-            is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
-            is Event.InboundIdleTimeout -> onInboundIdleTimeout(event)
-            is Event.RestPollDegraded -> onRestPollDegraded(event)
+        // Stronger evidence must replace silence even when the mode does not change.
+        // A stale lifecycle event can conservatively show recovery, never hide failure.
+        if (event is Event.WsSessionEnded || event is Event.ActiveOutboundAckTimeout ||
+            event is Event.NetworkChanged
+        ) {
+            recoveryRequired = true
+            recoveryCause = RestRecoveryCause.FailureOrUnknown
+        } else if (event is Event.WsSessionConnected && current != RestMode.WsActive) {
+            recoveryCause = RestRecoveryCause.FailureOrUnknown
+        }
+        try {
+            when (event) {
+                is Event.WsSessionConnected -> onWsSessionConnected(event)
+                is Event.WsSessionEnded -> onWsSessionEnded(event)
+                is Event.WsFrameTextReceived -> onWsFrameText()
+                is Event.NetworkChanged -> onNetworkChanged(event)
+                is Event.WsOutboundAckReceived -> onWsOutboundAck()
+                is Event.WsAliveTickElapsed -> onAliveTick()
+                is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
+                is Event.InboundIdleTimeout -> onInboundIdleTimeout(event)
+                is Event.RestPollDegraded -> onRestPollDegraded(event)
+            }
+        } finally {
+            val next = RestModeSnapshot(current, recoveryCause)
+            if (_snapshot.value != next) {
+                _snapshot.value = next
+                log("REST_TRACE presentation mode=${next.mode} cause=${next.recoveryCause}")
+            }
         }
     }
 
@@ -819,6 +850,7 @@ class RestStateMachine(
         if (_state.value == RestMode.WsCandidate) {
             transitionToWsActive("ws_outbound_ack")
         }
+        if (current == RestMode.WsActive) recoveryRequired = false
         // Any outbound ACK on WS counts as a healthy round-trip: reset
         // accumulated failure counters even when already in WsActive.
         activeFailCount = 0
@@ -990,6 +1022,11 @@ class RestStateMachine(
     private suspend fun transitionToRest(reason: String) {
         val from = _state.value
         if (from == RestMode.RestActive) return
+        recoveryCause = if (reason == "inbound_idle_timeout" && !recoveryRequired) {
+            RestRecoveryCause.InboundSilence
+        } else {
+            RestRecoveryCause.FailureOrUnknown
+        }
         activeFailCount = 0
         idleFailCount = 0
         candidateEnteredAtMs = null
@@ -1130,6 +1167,8 @@ class RestStateMachine(
             return
         }
 
+        recoveryRequired = false
+        recoveryCause = RestRecoveryCause.FailureOrUnknown
         activeFailCount = 0
         idleFailCount = 0
         candidateEnteredAtMs = null

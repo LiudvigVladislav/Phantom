@@ -32,6 +32,8 @@ class WssDiagBridgeAdapterTest {
             val role: WssDiagBridge.Role,
             val outcomeFlag: WssDiagBridge.OutcomeFlag,
             val dedupGate: WssDiagBridge.DedupGate?,
+            val deliverFailure: WssDiagBridge.DeliverFailure? = null,
+            val deliverStage: WssDiagBridge.DeliverStage? = null,
         )
         val rows = mutableListOf<Row>()
         override fun emit(
@@ -40,8 +42,12 @@ class WssDiagBridgeAdapterTest {
             role: WssDiagBridge.Role,
             outcomeFlag: WssDiagBridge.OutcomeFlag,
             dedupGate: WssDiagBridge.DedupGate?,
+            deliverFailure: WssDiagBridge.DeliverFailure?,
+            deliverStage: WssDiagBridge.DeliverStage?,
+            attempt: Int?,
         ) {
-            rows += Row(event, correlationId, role, outcomeFlag, dedupGate)
+            rows += Row(event, correlationId, role, outcomeFlag, dedupGate,
+                        deliverFailure, deliverStage)
         }
     }
 

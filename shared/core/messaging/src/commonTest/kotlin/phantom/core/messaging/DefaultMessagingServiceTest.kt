@@ -4,6 +4,7 @@
 package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -39,6 +40,7 @@ import phantom.core.transport.TransportState
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -238,9 +240,10 @@ private class FakeRatchetStateRepository : RatchetStateRepository {
  */
 private class PreSeededRatchetStateRepository(
     seedFor: List<String>,
+    seedState: phantom.core.crypto.RatchetState? = null,
 ) : RatchetStateRepository {
     private val seedJson: String = run {
-        val state = phantom.core.crypto.RatchetState(
+        val state = seedState ?: phantom.core.crypto.RatchetState(
             rootKey = ByteArray(32),
             sendingChainKey = ByteArray(32),
             receivingChainKey = ByteArray(32),
@@ -270,12 +273,29 @@ private class PreSeededRatchetStateRepository(
  * and oneTimePreKeyRepository are never consulted. Provide minimal
  * implementations so SessionManager construction succeeds.
  */
-private class FakeLocalSignedPreKeyRepository :
-    phantom.core.storage.LocalSignedPreKeyRepository {
-    override suspend fun get(): phantom.core.storage.LocalSignedPreKeyEntity? = null
+private class FakeLocalSignedPreKeyRepository(
+    /**
+     * N1-F1 R-N1.9: when non-null, `get()` serves this entity so
+     * `SessionManager.recipientBootstrap` can resolve the targeted SPK
+     * instead of throwing `SpkNotFound`. Needed to drive the FIRST
+     * BOOTSTRAP decrypt branch, which every earlier fixture skipped by
+     * pre-seeding a ratchet state.
+     */
+    private val stored: phantom.core.storage.LocalSignedPreKeyEntity? = null,
+) : phantom.core.storage.LocalSignedPreKeyRepository {
+    override suspend fun get(): phantom.core.storage.LocalSignedPreKeyEntity? = stored
     override suspend fun upsert(entity: phantom.core.storage.LocalSignedPreKeyEntity) {}
     override suspend fun clear() {}
 }
+
+/** N1-F1 R-N1.9: the SPK a bootstrap fixture targets. */
+internal fun r19StoredSpk(keyId: Long = 7L) = phantom.core.storage.LocalSignedPreKeyEntity(
+    keyId = keyId,
+    publicKeyHex = "11".repeat(32),
+    privateKeyHex = "22".repeat(32),
+    createdAtMs = 1_000L,
+    signatureHex = "33".repeat(64),
+)
 
 private class FakeLocalOneTimePreKeyRepository :
     phantom.core.storage.LocalOneTimePreKeyRepository {
@@ -353,6 +373,7 @@ private class FakeRelayTransport : RelayTransport {
      * gate manually in between coroutine resumes.
      */
     var sendSuccessLimit: Int = Int.MAX_VALUE
+    var beforeSend: suspend () -> Unit = {}
     override suspend fun connect(
         relayUrl: String,
         identityPublicKeyHex: String,
@@ -362,6 +383,7 @@ private class FakeRelayTransport : RelayTransport {
     ) {}
     override suspend fun disconnect() {}
     override suspend fun send(message: RelayMessage.Send): Boolean {
+        beforeSend()
         sent += message
         if (sent.size <= sendSuccessLimit) return true
         return sendShouldSucceed
@@ -402,6 +424,31 @@ private class PassthroughDoubleRatchet : DoubleRatchet {
 // (marker present in persisted state) or not (pre-decrypt state
 // preserved). Without this marker, plain Passthrough's
 // `state to ciphertext` would make every saved state look identical.
+// R-N1.14 (review P2-1). Passthrough, but it COUNTS decrypt entries.
+//
+// The redelivery fixture used to infer "did not re-enter decrypt" from
+// the number of message rows. A control envelope writes no row, so that
+// number is 0 before and 0 after whatever the code does: the assertion
+// held even when the envelope was decrypted a second time. This counter
+// observes the thing the fixture is named for.
+private class CountingPassthroughDoubleRatchet : DoubleRatchet {
+    var decryptCalls = 0
+        private set
+
+    override fun encrypt(state: RatchetState, plaintext: ByteArray): Pair<RatchetState, EncryptedMessage> =
+        state to EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(state: RatchetState, message: EncryptedMessage): Pair<RatchetState, ByteArray> {
+        decryptCalls++
+        return state to message.ciphertext
+    }
+}
+
 private class MarkingPassthroughDoubleRatchet : DoubleRatchet {
     override fun encrypt(state: RatchetState, plaintext: ByteArray): Pair<RatchetState, EncryptedMessage> =
         state to EncryptedMessage(
@@ -475,6 +522,11 @@ private class PassthroughX3DH : X3DHProtocol {
 class DefaultMessagingServiceTest {
 
     private val json = Json { ignoreUnknownKeys = true }
+    // Session-order reproduction plaintexts.
+    private val TEXT_S = "S: the message that established the session"
+    private val TEXT_A = "A: sent first"
+    private val TEXT_B = "B: sent second, delivered first"
+    private val TEXT_C = "C: typed after the failure"
     private val identity = IdentityRecord(
         id = "id-1",
         username = "alice",
@@ -497,9 +549,1175 @@ class DefaultMessagingServiceTest {
     private val recentReceivedAtMs: Long
         get() = Clock.System.now().toEpochMilliseconds() - 1_000L
 
+    // =================================================================
+    // N1-F1 R-N1.8 -- inbound settlement fault injection.
+    //
+    // The defect: the processed-envelope ledger was written immediately
+    // after decrypt, ~1350 lines before the message row was inserted. A
+    // process death in between left a ledger entry with no message; the
+    // redelivery hit the dedupe gate, was ack-delivered, the relay
+    // dropped the envelope, and the message was gone silently.
+    //
+    // What every case below establishes:
+    //   - no premature ledger entry: a failed settlement leaves the
+    //     envelope unmarked, so the relay keeps it and the redelivery is
+    //     never ack-and-skipped. That is the F-1 loss window;
+    //   - no ack before durable settlement;
+    //   - no duplicate row or ledger entry;
+    //   - conditional convergence: a redelivery THAT DECRYPTS settles
+    //     exactly once.
+    //
+    // What they do NOT establish: that a production redelivery decrypts
+    // at all. These fixtures use ratchet fakes that decrypt the same
+    // ciphertext repeatedly; the real ratchet has advanced and been
+    // saved by the time settlement runs, so a real redelivery may
+    // MAC-fail into the hold/repair machinery. That residual is named in
+    // the round documentation and is NOT closed here.
+    // =================================================================
+
+    private fun r18TextEnvelope(
+        envelopeId: String,
+        text: String,
+    ): phantom.core.transport.RelayMessage.Deliver {
+        val payload = MessagePayload(type = MessagePayload.TYPE_MESSAGE, text = text)
+        val plaintextJsonBytes = json
+            .encodeToString(MessagePayload.serializer(), payload)
+            .encodeToByteArray()
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = plaintextJsonBytes,
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val wireFrameBytes = json
+            .encodeToString(WireFrame.serializer(), wireFrame)
+            .encodeToByteArray()
+        val padded = phantom.core.crypto.MessagePadding.pad(wireFrameBytes)
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val payloadB64 = kotlin.io.encoding.Base64.encode(padded)
+        return phantom.core.transport.RelayMessage.Deliver(
+            from = "ccdd",
+            sealedSender = "",
+            payload = payloadB64,
+            messageId = envelopeId,
+        )
+    }
+
+    // -- Window 1: settlement dies before writing anything -------------
+    @Test
+    fun settlementFailureBeforeAnyWrite_leavesNoLedgerEntryAndNoAck() = runTest {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        commit.fault = FaultingInboundCommitRepository.Fault.BEFORE_ANY_WRITE
+        transport.deliver(r18TextEnvelope("env-w1", "first attempt"))
+        testScheduler.runCurrent()
+
+        assertNull(msgRepo.getMessageById("env-w1"), "no row must exist after a failed settlement")
+        assertFalse(ledger.exists("env-w1"), "the ledger must not run ahead of the row")
+        assertFalse(
+            "env-w1" in transport.ackedDelivers,
+            "ack MUST NOT be sent when settlement failed: the relay is the only remaining copy",
+        )
+
+        commit.fault = FaultingInboundCommitRepository.Fault.NONE
+        transport.deliver(r18TextEnvelope("env-w1", "first attempt"))
+        testScheduler.runCurrent()
+
+        assertNotNull(msgRepo.getMessageById("env-w1"), "the redelivery must persist the message")
+        assertTrue(ledger.exists("env-w1"))
+        assertTrue("env-w1" in transport.ackedDelivers, "ack follows a successful settlement")
+        assertEquals(
+            1, msgRepo.messages.count { it.id == "env-w1" },
+            "convergence must not duplicate the message",
+        )
+    }
+
+    // -- Window 2: row written, ledger not -----------------------------
+    @Test
+    fun settlementFailureAfterRowBeforeLedger_doesNotAck_andRedeliveryDoesNotDuplicate() = runTest {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        commit.fault = FaultingInboundCommitRepository.Fault.AFTER_ROW_BEFORE_LEDGER
+        transport.deliver(r18TextEnvelope("env-w2", "half settled"))
+        testScheduler.runCurrent()
+
+        assertNotNull(msgRepo.getMessageById("env-w2"), "the row landed")
+        assertFalse(ledger.exists("env-w2"), "the ledger did not")
+        assertFalse("env-w2" in transport.ackedDelivers, "a partial settlement MUST NOT ack")
+
+        transport.deliver(r18TextEnvelope("env-w2", "half settled"))
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, msgRepo.messages.count { it.id == "env-w2" },
+            "the redelivery must not duplicate the already-persisted row",
+        )
+        assertTrue(
+            "env-w2" in transport.ackedDelivers,
+            "with the row durably present the redelivery may safely ack",
+        )
+    }
+
+    // -- Window 3: both written, death before the ack ------------------
+    @Test
+    fun deathAfterSettlementBeforeAck_redeliveryAcksAndSkips_withoutDuplicating() = runTest {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        commit.fault = FaultingInboundCommitRepository.Fault.AFTER_BOTH_BEFORE_ACK
+        transport.deliver(r18TextEnvelope("env-w3", "settled but unacked"))
+        testScheduler.runCurrent()
+
+        assertNotNull(msgRepo.getMessageById("env-w3"), "the message is durably settled")
+        assertTrue(ledger.exists("env-w3"))
+        assertFalse("env-w3" in transport.ackedDelivers, "the ack never happened")
+
+        transport.deliver(r18TextEnvelope("env-w3", "settled but unacked"))
+        testScheduler.runCurrent()
+
+        assertTrue("env-w3" in transport.ackedDelivers, "the redelivery clears the relay")
+        assertEquals(
+            1, msgRepo.messages.count { it.id == "env-w3" },
+            "ack-and-skip must not duplicate",
+        )
+        assertEquals(
+            1, commit.attempts,
+            "the redelivery must not re-enter settlement: the ledger gate handles it",
+        )
+    }
+
+    // -- Window 4: the message repository refuses the insert -----------
+    @Test
+    fun persistRefusal_doesNotMarkTheLedger_andDoesNotAck() = runTest {
+        val transport = FakeRelayTransport()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val throwing = FakeMessageRepository(
+            insertMessageException = IllegalStateException("disk full"),
+        )
+        val service = buildService(
+            this, msgRepo = throwing, transport = transport,
+            processedRepo = ledger, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        transport.deliver(r18TextEnvelope("env-w4", "insert refused"))
+        testScheduler.runCurrent()
+
+        assertFalse(
+            ledger.exists("env-w4"),
+            "THE defect: a refused insert must never leave a PROCESSED ledger entry behind, " +
+                "or the redelivery is acked and the message is lost for good",
+        )
+        assertFalse("env-w4" in transport.ackedDelivers, "a refused insert must not ack")
+    }
+
+    // -- Non-vacuity: the original ordering must fail this -------------
+    @Test
+    fun aFailedPersistDoesNotMarkTheEnvelopeProcessed() = runTest {
+        // Under the original markProcessed-before-persist shape the
+        // ledger is written right after decrypt, so the first (failing)
+        // attempt leaves a PROCESSED entry with no row; the redelivery
+        // then hits the ledger gate, acks, skips, and the message never
+        // arrives. This fixture is what that shape must fail.
+        val transport = FakeRelayTransport()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val msgRepo = FakeMessageRepository()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        commit.fault = FaultingInboundCommitRepository.Fault.BEFORE_ANY_WRITE
+        transport.deliver(r18TextEnvelope("env-nv", "must survive"))
+        testScheduler.runCurrent()
+        assertNull(msgRepo.getMessageById("env-nv"))
+
+        commit.fault = FaultingInboundCommitRepository.Fault.NONE
+        transport.deliver(r18TextEnvelope("env-nv", "must survive"))
+        testScheduler.runCurrent()
+
+        val row = msgRepo.getMessageById("env-nv")
+        assertNotNull(
+            row,
+            "the message was lost: the first attempt failed to persist but still marked the " +
+                "envelope processed, so the redelivery was ack-and-skipped by the dedupe gate. " +
+                "That is exactly the F-1 loss window.",
+        )
+        assertEquals("must survive", row.plaintextCache)
+        assertTrue("env-nv" in transport.ackedDelivers)
+    }
+
+    // -- Non-message payloads keep their PR-H2b ledger coverage --------
+    //
+    // The ledger write used to happen once, right after decrypt, for
+    // EVERY payload type. Deferring the MESSAGE type into the atomic
+    // settlement must not quietly drop it for the types that never
+    // persist a row: without a ledger entry, a redelivered read receipt
+    // or timer frame re-enters ratchet.decrypt on an advanced chain and
+    // MAC-fails, which is the exact regression PR-H2b existed to stop.
+    @Test
+    fun aNonMessagePayloadStillGetsALedgerEntry_andItsRealTypeNotUnknown() = runTest {
+        val transport = FakeRelayTransport()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val msgRepo = FakeMessageRepository()
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        val payload = MessagePayload(
+            type = MessagePayload.TYPE_DISAPPEARING_TIMER,
+            text = "",
+            disappearingTimerSecs = 60L,
+        )
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = json
+                    .encodeToString(MessagePayload.serializer(), payload)
+                    .encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val padded = phantom.core.crypto.MessagePadding.pad(
+            json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray(),
+        )
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val b64 = kotlin.io.encoding.Base64.encode(padded)
+
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd", sealedSender = "", payload = b64, messageId = "env-timer",
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertTrue(
+            ledger.exists("env-timer"),
+            "a payload with no message row still needs its ledger entry, or a redelivery " +
+                "re-enters ratchet.decrypt on an advanced chain",
+        )
+        assertTrue("env-timer" in transport.ackedDelivers, "the timer branch acks as before")
+
+        // The type is now known at the point of the write, so the row
+        // records what it actually was instead of the old "unknown".
+        assertEquals(
+            MessagePayload.TYPE_DISAPPEARING_TIMER,
+            ledger.payloadTypeOf("env-timer"),
+            "the ledger entry must record the real payload type",
+        )
+
+        // A redelivery is ack-and-skipped with no second decrypt.
+        transport.deliver(
+            phantom.core.transport.RelayMessage.Deliver(
+                from = "ccdd", sealedSender = "", payload = b64, messageId = "env-timer",
+            ),
+        )
+        testScheduler.runCurrent()
+        assertEquals(0, msgRepo.messages.size, "a timer frame must never become a message row")
+    }
+
+    // -- Why the in-flight marker could be removed ---------------------
+    //
+    // PR-H2b wrote the durable ledger immediately after decrypt so that
+    // "a concurrent redelivery cannot squeak through the ledger check
+    // and re-enter ratchet.decrypt". R-N1.8 replaced that with an
+    // in-memory in-flight marker covering the same race.
+    //
+    // What THIS fixture proves: the incoming collector is SEQUENTIAL.
+    // `transport.incoming.onEach { handleDeliver(it) }.launchIn(scope)`
+    // processes one envelope at a time, so a second delivery emitted
+    // while the first is still settling waits rather than entering
+    // handleDeliver alongside it. Run once with the marker present and
+    // again after its removal; both pass, which is why the removal is
+    // safe.
+    //
+    // What it does NOT prove: anything about `activeProcessing`. Both
+    // deliveries arrive through the same sequential collector, so the
+    // duplicate-claim guard is never exercised. Disabling that guard
+    // entirely leaves this whole suite green (mutation
+    // MUT-ACTIVEPROCESSING, NOT OBSERVED), so it is a second line of
+    // defence read from source, not a measured one. An earlier draft of
+    // this comment claimed both mechanisms were proven here; that was
+    // wider than the check and is withdrawn.
+    @Test
+    fun aSecondDeliveryIsNotProcessedWhileTheFirstIsOpen_sequentialCollectorOnly() = runTest {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val release = kotlinx.coroutines.CompletableDeferred<Unit>()
+        commit.parkOn = release
+
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        transport.deliver(r18TextEnvelope("env-conc", "held open"))
+        testScheduler.runCurrent()
+        assertTrue(commit.parked.isCompleted, "the first settlement must be open")
+        assertEquals(1, commit.attempts)
+
+        // Second delivery of the SAME envelope while the first is open.
+        transport.deliver(r18TextEnvelope("env-conc", "held open"))
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, commit.attempts,
+            "a delivery arriving during an open settlement must not re-enter settlement",
+        )
+
+        release.complete(Unit)
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, msgRepo.messages.count { it.id == "env-conc" },
+            "exactly one row",
+        )
+        assertTrue(ledger.exists("env-conc"))
+        assertTrue("env-conc" in transport.ackedDelivers)
+    }
+
+    // -- R-N1.9: the same fault, in each decrypt branch ----------------
+    //
+    // R-N1.8 fixed the existing-session branch and left the early
+    // PROCESSED write in pending fallback, inbound repair and first
+    // bootstrap. Every R-N1.8 fixture pre-seeded a ratchet state, so all
+    // of them entered the existing-session branch and none could have
+    // caught it. These drive the branches separately.
+
+    /**
+     * Builds a wire frame carrying an x3dhInit header, which is what
+     * routes a delivery into the bootstrap branch when no session exists.
+     */
+    private fun r19BootstrapEnvelope(
+        envelopeId: String,
+        text: String,
+        spkKeyId: Long = 7L,
+    ): phantom.core.transport.RelayMessage.Deliver {
+        val payload = MessagePayload(type = MessagePayload.TYPE_MESSAGE, text = text)
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = json
+                    .encodeToString(MessagePayload.serializer(), payload)
+                    .encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = X3dhInitHeader(
+                ephemeralPubKeyHex = "44".repeat(32),
+                spkKeyId = spkKeyId,
+            ),
+            senderSigningPublicKeyHex = null,
+        )
+        val padded = phantom.core.crypto.MessagePadding.pad(
+            json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray(),
+        )
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val b64 = kotlin.io.encoding.Base64.encode(padded)
+        return phantom.core.transport.RelayMessage.Deliver(
+            from = "ccdd", sealedSender = "", payload = b64, messageId = envelopeId,
+        )
+    }
+
+    /**
+     * What every branch fixture actually establishes, stated narrowly
+     * because an earlier round stated it wider than the check.
+     *
+     * PROVEN here:
+     *  - a failed settlement leaves NO ledger entry, NO row and NO ack,
+     *    so the relay keeps the envelope and the redelivery is not
+     *    ack-and-skipped. That is the F-1 loss window, and it is what
+     *    these fixtures exist for;
+     *  - a redelivery that CAN still be decrypted settles exactly once —
+     *    one row, one ledger entry, one ack, no duplicate.
+     *
+     * NOT proven here: that a production redelivery can be decrypted at
+     * all. These fixtures use ratchet fakes that decrypt the same
+     * ciphertext repeatedly. The real ratchet has already advanced and
+     * been saved by the time settlement runs, so a real redelivery may
+     * MAC-fail and land in the decrypt-failed hold/repair machinery
+     * instead. That is a known residual, recorded in the round
+     * documentation; it is NOT closed by these tests and they must not
+     * be read as closing it.
+     */
+    private suspend fun r19AssertNoPrematureLedgerOrAck(
+        deliver: phantom.core.transport.RelayMessage.Deliver,
+        branch: String,
+        transport: FakeRelayTransport,
+        msgRepo: FakeMessageRepository,
+        ledger: FakeProcessedEnvelopeLedger,
+        commit: FaultingInboundCommitRepository,
+        service: DefaultMessagingService,
+        runCurrent: () -> Unit,
+    ) {
+        val id = deliver.messageId
+
+        commit.fault = FaultingInboundCommitRepository.Fault.BEFORE_ANY_WRITE
+        transport.deliver(deliver)
+        runCurrent()
+
+        assertFalse(
+            ledger.exists(id),
+            "$branch: a failed settlement must leave NO ledger entry. With one there, the " +
+                "redelivery below is ack-and-skipped and the message is lost for good.",
+        )
+        assertNull(msgRepo.getMessageById(id), "$branch: no row after a failed settlement")
+        assertFalse(id in transport.ackedDelivers, "$branch: no ack before durable settlement")
+
+        commit.fault = FaultingInboundCommitRepository.Fault.NONE
+        transport.deliver(deliver)
+        runCurrent()
+
+        // Decryptable-redelivery convergence only: the fake ratchet
+        // decrypts the same ciphertext again, which the production one
+        // may not. See this helper's kdoc.
+        assertNotNull(
+            msgRepo.getMessageById(id),
+            "$branch: a redelivery that decrypts must settle, not be skipped",
+        )
+        assertTrue(ledger.exists(id), "$branch: and settle the ledger")
+        assertTrue(id in transport.ackedDelivers, "$branch: and ack")
+        assertEquals(1, msgRepo.messages.count { it.id == id }, "$branch: exactly one row")
+    }
+
+    @Test
+    fun existingSessionBranch_neverMarksTheLedgerBeforeSettlement() = runTest {
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+        r19AssertNoPrematureLedgerOrAck(
+            r18TextEnvelope("env-existing", "existing"), "existing-session",
+            transport, msgRepo, ledger, commit, service,
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun firstBootstrapBranch_neverMarksTheLedgerBeforeSettlement() = runTest {
+        // No pre-seeded session: tryLoadSession returns null and the
+        // x3dhInit header routes this into the bootstrap branch, which is
+        // the normal path for the FIRST message of every conversation and
+        // was left unfixed by R-N1.8.
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+            seedSessions = emptyList(), storedSpk = r19StoredSpk(),
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+        r19AssertNoPrematureLedgerOrAck(
+            r19BootstrapEnvelope("env-bootstrap", "first ever"), "first-bootstrap",
+            transport, msgRepo, ledger, commit, service,
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun pendingFallbackBranch_neverMarksTheLedgerBeforeSettlement() = runTest {
+        // The active session MAC-fails and a pending ratchet state
+        // decrypts instead. R-N1.8 left an early PROCESSED write in this
+        // branch, so a settlement failure here lost the message exactly
+        // as it did before the round.
+        val convId = "aabb_ccdd"
+        val marker = 0x12.toByte()
+        val pendingState = phantom.core.crypto.RatchetState(
+            rootKey = ByteArray(32) { marker },
+            sendingChainKey = ByteArray(32) { 0x22.toByte() },
+            receivingChainKey = ByteArray(32) { 0x32.toByte() },
+            sendingRatchetPublicKey = ByteArray(32) { 0x42.toByte() },
+            sendingRatchetPrivateKey = ByteArray(32) { 0x52.toByte() },
+            receivingRatchetPublicKey = ByteArray(32) { 0x62.toByte() },
+            role = phantom.core.crypto.SessionRole.INITIATOR,
+        )
+        val pendingRepo = FakePendingRatchetStateRepoForSprint2bC()
+        pendingRepo.upsert(
+            conversationId = convId,
+            stateBlob = json.encodeToString(
+                phantom.core.crypto.RatchetState.serializer(), pendingState,
+            ),
+            reservedAtMs = 100L,
+            bootstrapArtifactsBlob = null,
+        )
+
+        // The pending branch is gated on `pendingEntity != null &&
+        // sessionTxForPending != null`. Without the transaction repo the
+        // delivery falls through to the MAC-fail path instead, which is
+        // a different branch with a different (legitimate) FAILED_MAC
+        // ledger write -- the first draft of this fixture missed that and
+        // failed loudly rather than passing for the wrong reason.
+        val opkResRepo = FakeOpkReservationRepoForSprint2bC()
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val sessionTxRepo = CapturingPromoteTxRepo(pendingRepo, opkResRepo, commit)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+            ratchet = ActiveFailsPendingPassesRatchet(marker),
+            pendingRatchetStateRepository = pendingRepo,
+            sessionTransactionRepository = sessionTxRepo,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        // Not the generic helper: a successful pending decrypt PROMOTES
+        // the pending state to active, so a second delivery would arrive
+        // through the existing-session branch and this fixture would stop
+        // testing the pending one. The pending row is re-seeded before the
+        // redelivery to keep the branch under test constant -- which is
+        // also the real shape of the crash being modelled, where the
+        // settlement never committed.
+        val deliver = r18TextEnvelope("env-pending", "via pending")
+        val reseed: suspend () -> Unit = {
+            pendingRepo.upsert(
+                conversationId = convId,
+                stateBlob = json.encodeToString(
+                    phantom.core.crypto.RatchetState.serializer(), pendingState,
+                ),
+                reservedAtMs = 100L,
+                bootstrapArtifactsBlob = null,
+            )
+        }
+
+        commit.fault = FaultingInboundCommitRepository.Fault.BEFORE_ANY_WRITE
+        transport.deliver(deliver)
+        testScheduler.runCurrent()
+
+        assertFalse(
+            ledger.exists("env-pending"),
+            "pending-fallback: a failed settlement must leave NO ledger entry. With one " +
+                "there, the redelivery is ack-and-skipped and the message is lost for good.",
+        )
+        assertNull(msgRepo.getMessageById("env-pending"), "pending-fallback: no row")
+        assertFalse(
+            "env-pending" in transport.ackedDelivers,
+            "pending-fallback: no ack before durable settlement",
+        )
+
+        reseed()
+        commit.fault = FaultingInboundCommitRepository.Fault.NONE
+        transport.deliver(deliver)
+        testScheduler.runCurrent()
+
+        assertNotNull(
+            msgRepo.getMessageById("env-pending"),
+            "pending-fallback: a redelivery that decrypts must settle, not be skipped. The " +
+                "pending row is re-seeded above, so this is decryptable-redelivery " +
+                "convergence, not proof that production could decrypt it.",
+        )
+        assertTrue(ledger.exists("env-pending"), "pending-fallback: and settle the ledger")
+        assertTrue("env-pending" in transport.ackedDelivers, "pending-fallback: and ack")
+        assertEquals(
+            1, msgRepo.messages.count { it.id == "env-pending" },
+            "pending-fallback: exactly one row",
+        )
+    }
+
+    @Test
+    fun inboundRepairBranch_neverMarksTheLedgerBeforeSettlement() = runTest {
+        // Active session MAC-fails, no pending row exists, and the wire
+        // frame carries an x3dhInit -- which arms the inbound-repair
+        // branch. R-N1.8 left an early PROCESSED write there too.
+        //
+        // The ratchet passes only for the state that recipientBootstrap
+        // produces (all-zero root key from PassthroughX3DH) and fails for
+        // the pre-seeded active session, so every delivery routes into
+        // repair rather than the existing-session branch.
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingInboundCommitRepository(msgRepo, ledger)
+        val service = buildService(
+            this, msgRepo = msgRepo, transport = transport,
+            processedRepo = ledger, inboundCommit = commit, scope = backgroundScope,
+            ratchet = ActiveFailsPendingPassesRatchet(0x00.toByte()),
+            seedSessions = listOf("aabb_ccdd"),
+            storedSpk = r19StoredSpk(),
+            activeRatchetSeed = phantom.core.crypto.RatchetState(
+                rootKey = ByteArray(32) { 0x77.toByte() },
+                sendingChainKey = ByteArray(32),
+                receivingChainKey = ByteArray(32),
+                sendingRatchetPublicKey = ByteArray(32),
+                sendingRatchetPrivateKey = ByteArray(32),
+                receivingRatchetPublicKey = ByteArray(32),
+            ),
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        r19AssertNoPrematureLedgerOrAck(
+            r19BootstrapEnvelope("env-repair", "via repair"), "inbound-repair",
+            transport, msgRepo, ledger, commit, service,
+        ) { testScheduler.runCurrent() }
+    }
+
+    // =================================================================
+    // N1-F1b R-N1.12 -- control events settle with their ledger entry.
+    //
+    // The ledger used to be written for every non-message payload as
+    // soon as the type was known, before any handler ran. A repository
+    // failure in the handler left the envelope recorded as processed
+    // with the action never applied, and the redelivery was
+    // ack-and-skipped. A delete that did not delete, an edit that was
+    // lost, a reaction that never landed.
+    //
+    // Each case below asserts, for one control type:
+    //   - a failed settlement leaves NO ledger entry, NO action applied
+    //     and NO ack, so the relay keeps the envelope;
+    //   - a successful settlement applies the action, records the
+    //     ledger, and only then acks.
+    //
+    // Six types are covered. GROUP_TYPES, CALL_TYPES, KEY_ROTATION,
+    // AUDIO_CHUNK and VOICE_V2 keep their pre-action ledger write and
+    // are deliberately not touched -- see ControlEventCommitRepository.
+    // =================================================================
+
+    private fun r12ControlEnvelope(
+        envelopeId: String,
+        payload: MessagePayload,
+    ): phantom.core.transport.RelayMessage.Deliver {
+        val wireFrame = WireFrame(
+            encryptedMessage = phantom.core.crypto.EncryptedMessage(
+                ratchetPublicKey = ByteArray(32),
+                messageIndex = 0,
+                ciphertext = json
+                    .encodeToString(MessagePayload.serializer(), payload)
+                    .encodeToByteArray(),
+                nonce = ByteArray(24),
+            ),
+            x3dhInit = null,
+            senderSigningPublicKeyHex = null,
+        )
+        val padded = phantom.core.crypto.MessagePadding.pad(
+            json.encodeToString(WireFrame.serializer(), wireFrame).encodeToByteArray(),
+        )
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val b64 = kotlin.io.encoding.Base64.encode(padded)
+        return phantom.core.transport.RelayMessage.Deliver(
+            from = "ccdd", sealedSender = "", payload = b64, messageId = envelopeId,
+        )
+    }
+
+    private class R12Rig(
+        val transport: FakeRelayTransport,
+        val messages: FakeMessageRepository,
+        val conversations: FakeConversationRepository,
+        val reactions: FakeReactionRepository,
+        val ledger: FakeProcessedEnvelopeLedger,
+        val commit: FaultingControlEventCommitRepository,
+        val service: DefaultMessagingService,
+    )
+
+    private suspend fun r12Rig(scope: kotlinx.coroutines.test.TestScope): R12Rig {
+        val transport = FakeRelayTransport()
+        val messages = FakeMessageRepository()
+        val conversations = FakeConversationRepository()
+        val reactions = FakeReactionRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingControlEventCommitRepository(
+            messages, conversations, reactions, ledger,
+        )
+        val service = buildService(
+            scope, msgRepo = messages, convRepo = conversations, transport = transport,
+            reactionRepo = reactions, processedRepo = ledger,
+            controlEventCommit = commit, scope = scope.backgroundScope,
+        )
+        return R12Rig(transport, messages, conversations, reactions, ledger, commit, service)
+    }
+
+    /**
+     * The shared contract: the failed settlement must leave nothing
+     * behind and must not ack; the successful one must apply, record and
+     * then ack.
+     */
+    private suspend fun r12AssertSettlesAtomically(
+        rig: R12Rig,
+        type: String,
+        payload: MessagePayload,
+        actionApplied: suspend () -> Boolean,
+        runCurrent: () -> Unit,
+    ) {
+        val failId = "env-$type-fail"
+        rig.commit.fail = true
+        rig.transport.deliver(r12ControlEnvelope(failId, payload))
+        runCurrent()
+
+        assertFalse(
+            rig.ledger.exists(failId),
+            "$type: a failed settlement must leave NO ledger entry -- with one there, the " +
+                "redelivery is ack-and-skipped and the action is lost for good",
+        )
+        assertFalse(
+            actionApplied(),
+            "$type: a failed settlement must not apply the action",
+        )
+        assertFalse(
+            failId in rig.transport.ackedDelivers,
+            "$type: no ack before the settlement commits",
+        )
+
+        val okId = "env-$type-ok"
+        rig.commit.fail = false
+        rig.transport.deliver(r12ControlEnvelope(okId, payload))
+        runCurrent()
+
+        assertTrue(actionApplied(), "$type: a committed settlement applies the action")
+        assertTrue(rig.ledger.exists(okId), "$type: and records the ledger entry")
+        assertTrue(okId in rig.transport.ackedDelivers, "$type: and then acks")
+    }
+
+    @Test
+    fun deleteControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        rig.messages.insertMessage(
+            MessageEntity(
+                id = "target", conversationId = "aabb_ccdd",
+                ciphertext = ByteArray(0), plaintextCache = "x", sent = false,
+                status = MessageStatus.DELIVERED, createdAt = 1L, expiresAtMs = null,
+            ),
+        )
+        r12AssertSettlesAtomically(
+            rig, "delete",
+            MessagePayload(type = MessagePayload.TYPE_DELETE, text = "", targetMessageId = "target"),
+            actionApplied = { rig.messages.getMessageById("target") == null },
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun editControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        rig.messages.insertMessage(
+            MessageEntity(
+                id = "target", conversationId = "aabb_ccdd",
+                ciphertext = ByteArray(0), plaintextCache = "before", sent = false,
+                status = MessageStatus.DELIVERED, createdAt = 1L, expiresAtMs = null,
+            ),
+        )
+        r12AssertSettlesAtomically(
+            rig, "edit",
+            MessagePayload(
+                type = MessagePayload.TYPE_EDIT, text = "after", targetMessageId = "target",
+            ),
+            actionApplied = { rig.messages.getMessageById("target")?.plaintextCache == "after" },
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun disappearingTimerControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        // setDisappearingTimer is `UPDATE conversation ... WHERE id = ?`
+        // in SQL and a no-op without a row; the fake mirrors that, so the
+        // conversation has to exist for the action to be observable.
+        rig.conversations.upsertConversation(
+            phantom.core.storage.ConversationEntity(
+                id = "aabb_ccdd",
+                theirUsername = "peer",
+                theirPublicKeyHex = "cc".repeat(32),
+                lastMessagePreview = null,
+                lastMessageAt = null,
+                unreadCount = 0L,
+            ),
+        )
+        r12AssertSettlesAtomically(
+            rig, "disappearing_timer",
+            MessagePayload(
+                type = MessagePayload.TYPE_DISAPPEARING_TIMER, text = "",
+                disappearingTimerSecs = 60L,
+            ),
+            actionApplied = { rig.conversations.getDisappearingTimer("aabb_ccdd") == 60L },
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun reactionControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        r12AssertSettlesAtomically(
+            rig, "reaction",
+            MessagePayload(
+                type = MessagePayload.TYPE_REACTION, text = "",
+                targetMessageId = "target", emoji = "\uD83D\uDC4D",
+            ),
+            actionApplied = { rig.reactions.getReactions("target").isNotEmpty() },
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun pinControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        rig.messages.insertMessage(
+            MessageEntity(
+                id = "target", conversationId = "aabb_ccdd",
+                ciphertext = ByteArray(0), plaintextCache = "x", sent = false,
+                status = MessageStatus.DELIVERED, createdAt = 1L, expiresAtMs = null,
+            ),
+        )
+        r12AssertSettlesAtomically(
+            rig, "pin",
+            MessagePayload(
+                type = MessagePayload.TYPE_PIN, text = "",
+                targetMessageId = "target", pinned = true,
+            ),
+            actionApplied = { rig.messages.getMessageById("target")?.pinned == true },
+        ) { testScheduler.runCurrent() }
+    }
+
+    @Test
+    fun readReceiptControlEvent_settlesAtomically() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        rig.messages.insertMessage(
+            MessageEntity(
+                id = "target", conversationId = "aabb_ccdd",
+                ciphertext = ByteArray(0), plaintextCache = "x", sent = true,
+                status = MessageStatus.SENT, createdAt = 1L, expiresAtMs = null,
+            ),
+        )
+        r12AssertSettlesAtomically(
+            rig, "read_receipt",
+            MessagePayload(
+                type = MessagePayload.TYPE_READ_RECEIPT, text = "", targetMessageId = "target",
+            ),
+            actionApplied = {
+                rig.messages.statusUpdates["target"] == MessageStatus.READ
+            },
+        ) { testScheduler.runCurrent() }
+    }
+
+    // -- R-N1.13: every terminal exit of the reaction branch settles ----
+    //
+    // R-N1.12 excluded TYPE_REACTION from the shared pre-parse ledger
+    // write and settled only its two well-formed shapes. A third exit --
+    // a null emoji, or no repository able to apply the reaction --
+    // ack'd and returned with no ledger entry at all, so a lost ack let
+    // the redelivery re-enter decrypt on an advanced ratchet.
+
+    @Test
+    fun reactionWithNullEmoji_recordsTheLedgerBeforeAcking() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+
+        val id = "env-react-null"
+        rig.transport.deliver(
+            r12ControlEnvelope(
+                id,
+                MessagePayload(
+                    type = MessagePayload.TYPE_REACTION,
+                    text = "",
+                    targetMessageId = "target",
+                    emoji = null,
+                ),
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertTrue(
+            rig.ledger.exists(id),
+            "a reaction with no emoji has nothing to apply, but the envelope was still " +
+                "decrypted: without a ledger entry a redelivery re-enters the ratchet and " +
+                "MAC-fails",
+        )
+        assertTrue(id in rig.transport.ackedDelivers, "and only then may it ack")
+        assertEquals(
+            0, rig.commit.attempts,
+            "there is no action to settle atomically -- the ledger-only path is used",
+        )
+    }
+
+    @Test
+    fun reactionWithNullEmoji_lostAck_redeliveryDoesNotReenterDecrypt() = runTest {
+        // R-N1.14 (review P2-1). The previous version of this fixture
+        // claimed the redelivery did not re-enter decrypt or settlement,
+        // and observed neither: it compared message-row counts, which
+        // stay 0 either way because a control envelope writes no row,
+        // and `commit.attempts`, which is 0 on the null-emoji path
+        // whatever happens. It also asserted the id was PRESENT in
+        // `ackedDelivers`, which was already true after the first
+        // delivery.
+        //
+        // This version counts ratchet decrypt entries directly and takes
+        // the ack COUNT as a delta. The two are INDEPENDENT claims and
+        // each has its own mutation; one mutation cannot move both:
+        //
+        //   no second decrypt  <- MUT-DEDUPE-GATE
+        //                         (fails here with expected:<1> was:<2>)
+        //   the redelivery is  <- MUT-DUPLICATE-NO-REACK
+        //   re-acked              (fails here with expected:<2> was:<1>)
+        //
+        // MUT-DEDUPE-GATE cannot discriminate the ack half: with the gate
+        // off the branch runs in full and acks anyway, and this test
+        // fails on the decrypt counter before it reaches the ack count.
+        val transport = FakeRelayTransport()
+        val messages = FakeMessageRepository()
+        val conversations = FakeConversationRepository()
+        val reactions = FakeReactionRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingControlEventCommitRepository(
+            messages, conversations, reactions, ledger,
+        )
+        val ratchet = CountingPassthroughDoubleRatchet()
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations, transport = transport,
+            reactionRepo = reactions, processedRepo = ledger,
+            controlEventCommit = commit, ratchet = ratchet, scope = backgroundScope,
+        )
+        service.startReceiving(); testScheduler.runCurrent()
+
+        val id = "env-react-null-redeliver"
+        val payload = MessagePayload(
+            type = MessagePayload.TYPE_REACTION, text = "",
+            targetMessageId = "target", emoji = null,
+        )
+
+        transport.deliver(r12ControlEnvelope(id, payload))
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, ratchet.decryptCalls,
+            "precondition: the first delivery is decrypted exactly once",
+        )
+        assertEquals(1, transport.ackedDelivers.count { it == id }, "and acked once")
+        assertTrue(ledger.exists(id), "and settled, or the redelivery has nothing to match on")
+
+        // The ack was written but the relay never saw it, so the envelope
+        // comes back. It must be recognised from the ledger, not offered
+        // to the ratchet again: the chain has advanced and a second
+        // decrypt of the same envelope MAC-fails.
+        transport.deliver(r12ControlEnvelope(id, payload))
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, ratchet.decryptCalls,
+            "the redelivery must NOT re-enter ratchet.decrypt -- this is the whole " +
+                "point of the ledger entry written on the null-emoji exit",
+        )
+        assertEquals(
+            2, transport.ackedDelivers.count { it == id },
+            "but it must be acked AGAIN, or the relay keeps redelivering it forever",
+        )
+        assertEquals(
+            0, commit.attempts,
+            "and it must not re-enter settlement",
+        )
+        assertEquals(0, messages.messages.size, "and must create no row")
+    }
+
+    @Test
+    fun reactionWorksWithTheCommitRepositoryAndNoReactionRepository() = runTest {
+        // The commit repository writes the reaction row itself, so
+        // requiring a separate reactionRepository was wrong.
+        val transport = FakeRelayTransport()
+        val messages = FakeMessageRepository()
+        val conversations = FakeConversationRepository()
+        val reactions = FakeReactionRepository()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val commit = FaultingControlEventCommitRepository(
+            messages, conversations, reactions, ledger,
+        )
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations, transport = transport,
+            reactionRepo = null, processedRepo = ledger,
+            controlEventCommit = commit, scope = backgroundScope,
+        )
+        service.startReceiving(); testScheduler.runCurrent()
+
+        val id = "env-react-nolocalrepo"
+        transport.deliver(
+            r12ControlEnvelope(
+                id,
+                MessagePayload(
+                    type = MessagePayload.TYPE_REACTION, text = "",
+                    targetMessageId = "target", emoji = "\uD83D\uDD25",
+                ),
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertEquals(
+            1, commit.attempts,
+            "with the commit repository wired the reaction settles through it, whether or " +
+                "not a separate reactionRepository exists",
+        )
+        assertTrue(reactions.getReactions("target").isNotEmpty(), "and the reaction is applied")
+        assertTrue(ledger.exists(id))
+        assertTrue(id in transport.ackedDelivers)
+    }
+
+    @Test
+    fun reactionWithNoActionRepositoryAtAll_stillRecordsTheLedger() = runTest {
+        // Neither commit nor reaction repository. There is no way to
+        // apply the reaction, but acking an unrecorded envelope is worse
+        // than not applying it.
+        val transport = FakeRelayTransport()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val service = buildService(
+            this, transport = transport, reactionRepo = null,
+            processedRepo = ledger, scope = backgroundScope,
+        )
+        service.startReceiving(); testScheduler.runCurrent()
+
+        val id = "env-react-norepo"
+        transport.deliver(
+            r12ControlEnvelope(
+                id,
+                MessagePayload(
+                    type = MessagePayload.TYPE_REACTION, text = "",
+                    targetMessageId = "target", emoji = "\uD83D\uDC4D",
+                ),
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertTrue(
+            ledger.exists(id),
+            "with no repository able to apply the reaction the envelope must still be " +
+                "recorded, or the redelivery re-enters decrypt",
+        )
+        assertTrue(id in transport.ackedDelivers)
+    }
+
+    // -- R-N1.13: the ledger is written BEFORE the ack, not merely as
+    // well as it. Both fixtures below fail the ledger write and require
+    // that no ack follows. Without them, a fixture asserting "the row
+    // exists and the ack happened" would hold whichever order the code
+    // used, and the ordering claim would be wider than its check.
+
+    @Test
+    fun reactionWithNullEmoji_aFailedLedgerWriteBlocksTheAck() = runTest {
+        val rig = r12Rig(this)
+        rig.service.startReceiving(); testScheduler.runCurrent()
+        rig.ledger.failMarkProcessed = true
+
+        val id = "env-react-null-ledgerfail"
+        rig.transport.deliver(
+            r12ControlEnvelope(
+                id,
+                MessagePayload(
+                    type = MessagePayload.TYPE_REACTION,
+                    text = "",
+                    targetMessageId = "target",
+                    emoji = null,
+                ),
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertFalse(
+            rig.ledger.exists(id),
+            "the injected failure must leave no ledger row",
+        )
+        assertFalse(
+            id in rig.transport.ackedDelivers,
+            "the ack must come AFTER the ledger write, so a failed ledger write means no " +
+                "ack: the relay keeps the envelope and redelivers it, which is the " +
+                "fail-closed outcome. An ack here would prove the settle does not gate it",
+        )
+    }
+
+    @Test
+    fun reactionWithNoActionRepositoryAtAll_aFailedLedgerWriteBlocksTheAck() = runTest {
+        val transport = FakeRelayTransport()
+        val ledger = FakeProcessedEnvelopeLedger()
+        val service = buildService(
+            this, transport = transport, reactionRepo = null,
+            processedRepo = ledger, scope = backgroundScope,
+        )
+        service.startReceiving(); testScheduler.runCurrent()
+        ledger.failMarkProcessed = true
+
+        val id = "env-react-norepo-ledgerfail"
+        transport.deliver(
+            r12ControlEnvelope(
+                id,
+                MessagePayload(
+                    type = MessagePayload.TYPE_REACTION, text = "",
+                    targetMessageId = "target", emoji = "\uD83D\uDC4D",
+                ),
+            ),
+        )
+        testScheduler.runCurrent()
+
+        assertFalse(ledger.exists(id), "the injected failure must leave no ledger row")
+        assertFalse(
+            id in transport.ackedDelivers,
+            "same ordering requirement on the exit that has no repository at all",
+        )
+    }
+
     private suspend fun buildService(
         testScope: TestScope,
         msgRepo: FakeMessageRepository = FakeMessageRepository(),
+        // N1-F1 R-N1.9: the conversations whose ratchet state is
+        // pre-seeded. Pass an empty list to leave tryLoadSession
+        // returning null, which is what routes a delivery into the
+        // FIRST BOOTSTRAP branch instead of the existing-session one.
+        seedSessions: List<String>? = null,
+        // N1-F1 R-N1.9: the ratchet state the seeded conversations get.
+        // Lets a fixture make the ACTIVE session distinguishable from the
+        // one recipientBootstrap produces, so a state-discriminating
+        // ratchet can route deliveries into the repair branch.
+        activeRatchetSeed: phantom.core.crypto.RatchetState? = null,
+        // N1-F1 R-N1.9: served to SessionManager so recipientBootstrap
+        // can resolve the targeted signed pre-key.
+        storedSpk: phantom.core.storage.LocalSignedPreKeyEntity? = null,
         convRepo: FakeConversationRepository = FakeConversationRepository(),
         transport: FakeRelayTransport = FakeRelayTransport(),
         reactionRepo: FakeReactionRepository? = null,
@@ -507,6 +1725,12 @@ class DefaultMessagingServiceTest {
         // `messages.id` guard remains the only protection (mirrors
         // pre-H2b behaviour for tests that don't care about idempotency).
         processedRepo: phantom.core.storage.ProcessedEnvelopeRepository? = null,
+        // N1-F1 R-N1.8: optional atomic settlement repository. When
+        // non-null the receive path settles the message row and the
+        // ledger through it instead of writing them separately.
+        inboundCommit: phantom.core.storage.InboundCommitRepository? = null,
+        // N1-F1b R-N1.12: atomic control-event settlement.
+        controlEventCommit: phantom.core.storage.ControlEventCommitRepository? = null,
         // PR-H2b: optional scope override. Tests that call
         // service.startReceiving() must pass `backgroundScope` so the
         // long-running incoming collector is cancelled when the test
@@ -556,7 +1780,7 @@ class DefaultMessagingServiceTest {
         // path lands in commit 11. To keep the existing send/receive
         // wire-flow tests meaningful, we pre-seed `ratchetRepo` with a
         // constant state for the conversation each test exercises.
-        val ratchetRepo = PreSeededRatchetStateRepository(seedFor = listOf(
+        val ratchetRepo = PreSeededRatchetStateRepository(seedState = activeRatchetSeed, seedFor = seedSessions ?: listOf(
             // Tests pass conversationId values directly to OutgoingMessage
             // (sendMessage uses message.conversationId verbatim, not the
             // derived id) and use deriveConversationId on the receive path
@@ -573,7 +1797,7 @@ class DefaultMessagingServiceTest {
         val sessionManager = SessionManager(
             x3dh = PassthroughX3DH(),
             ratchetStateRepository = ratchetRepo,
-            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(storedSpk),
             oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
             identityCrypto = FakeIdentityCrypto(),
             json = json,
@@ -587,6 +1811,8 @@ class DefaultMessagingServiceTest {
             messageRepository = msgRepo,
             conversationRepository = convRepo,
             processedEnvelopeRepository = processedRepo,
+            inboundCommitRepository = inboundCommit,
+            controlEventCommitRepository = controlEventCommit,
             scope = scope,
             json = json,
             reactionRepository = reactionRepo,
@@ -660,6 +1886,30 @@ class DefaultMessagingServiceTest {
     }
 
     /**
+     * N1-F2 (2026-08-29) mandatory test 8 — a send the transport
+     * refuses (which now includes the fail-closed REST egress policy
+     * refusing Private/Ghost dispatch) leaves the user's message
+     * DURABLE in the repository with status QUEUED. It is never
+     * deleted and never falsely marked SENT. "No Silent Downgrade"
+     * must not become "silent discard".
+     */
+    @Test
+    fun sendMessage_blockedTransport_keepsRowDurablyQueued() = runTest {
+        val msgRepo = FakeMessageRepository()
+        val transport = FakeRelayTransport().apply {
+            sendSuccessLimit = 0
+            sendShouldSucceed = false
+        }
+        val service = buildService(this, msgRepo = msgRepo, transport = transport)
+        service.sendMessage(
+            OutgoingMessage(id = "msg-n1f2", conversationId = "conv-1", recipientPublicKeyHex = "ccdd", text = "held")
+        )
+        val row = msgRepo.getMessageById("msg-n1f2")
+        assertNotNull(row, "blocked send must remain durable — row was deleted or never inserted")
+        assertEquals(MessageStatus.QUEUED, msgRepo.statusUpdates["msg-n1f2"])
+    }
+
+    /**
      * §12 Round-8 audit P1: `sender_enqueue` must fire AFTER
      * `insertMessage` returns. The Round-7 code emitted from an
      * `.also{}` on the entity constructor, which runs BEFORE
@@ -674,6 +1924,9 @@ class DefaultMessagingServiceTest {
             override fun emit(
                 event: String, correlationId: String, role: WssDiagBridge.Role,
                 outcomeFlag: WssDiagBridge.OutcomeFlag, dedupGate: WssDiagBridge.DedupGate?,
+                deliverFailure: WssDiagBridge.DeliverFailure?,
+                deliverStage: WssDiagBridge.DeliverStage?,
+                attempt: Int?,
             ) {
                 emitted += "$event:$correlationId"
             }
@@ -712,6 +1965,9 @@ class DefaultMessagingServiceTest {
             override fun emit(
                 event: String, correlationId: String, role: WssDiagBridge.Role,
                 outcomeFlag: WssDiagBridge.OutcomeFlag, dedupGate: WssDiagBridge.DedupGate?,
+                deliverFailure: WssDiagBridge.DeliverFailure?,
+                deliverStage: WssDiagBridge.DeliverStage?,
+                attempt: Int?,
             ) {
                 emitted += "$event:$correlationId"
             }
@@ -1937,6 +3193,84 @@ class DefaultMessagingServiceTest {
     }
 
     // ── C-2: read receipts via sealed Double Ratchet pipeline ─────────────────
+
+    private suspend fun unreadReceiptFixture(
+        testScope: TestScope,
+        transport: FakeRelayTransport,
+    ): Pair<DefaultMessagingService, FakeConversationRepository> {
+        val messages = FakeMessageRepository()
+        val conversations = FakeConversationRepository()
+        conversations.upsertConversation(ConversationEntity(
+            id = "conv-1", theirUsername = "bob", theirPublicKeyHex = "ccdd",
+            lastMessagePreview = "", lastMessageAt = 0L, unreadCount = 1,
+            trustTier = phantom.core.storage.TrustTier.TRUSTED, blocked = false,
+        ))
+        messages.insertMessage(MessageEntity(
+            id = "unread-1", conversationId = "conv-1", ciphertext = ByteArray(0),
+            plaintextCache = "hello", sent = false, status = MessageStatus.DELIVERED,
+            createdAt = 0L,
+        ))
+        return buildService(testScope, msgRepo = messages, convRepo = conversations,
+            transport = transport) to conversations
+    }
+
+    @Test
+    fun markConversationRead_clearsBadgeBeforeReceiptNetworkCompletes() = runTest {
+        val reachedSend = CompletableDeferred<Unit>()
+        val releaseSend = CompletableDeferred<Unit>()
+        val transport = FakeRelayTransport().apply {
+            beforeSend = { reachedSend.complete(Unit); releaseSend.await() }
+        }
+        val (service, conversations) = unreadReceiptFixture(this, transport)
+        val reading = launch { service.markConversationRead("conv-1", "ccdd", true) }
+        try {
+            kotlinx.coroutines.withTimeout(1_000) { reachedSend.await() }
+            assertFalse(reading.isCompleted, "receipt must still be waiting for the network")
+            assertEquals(0, conversations.getConversation("conv-1")?.unreadCount,
+                "local unread badge must not wait for receipt delivery")
+        } finally {
+            releaseSend.complete(Unit)
+            kotlinx.coroutines.withTimeout(1_000) { reading.join() }
+        }
+        assertEquals(1, transport.sent.size, "the receipt must still be sent")
+    }
+
+    @Test
+    fun markConversationRead_receiptCompletionDoesNotClearNewUnread() = runTest {
+        val transport = FakeRelayTransport()
+        val (service, conversations) = unreadReceiptFixture(this, transport)
+        transport.beforeSend = { conversations.incrementUnread("conv-1") }
+        service.markConversationRead("conv-1", "ccdd", true)
+        assertEquals(1, conversations.getConversation("conv-1")?.unreadCount,
+            "a new unread arrival during receipt delivery must survive completion")
+        assertEquals(1, transport.sent.size)
+    }
+
+    @Test
+    fun markConversationRead_failedReceiptDoesNotKeepBadgeUnread() = runTest {
+        val transport = FakeRelayTransport().apply {
+            beforeSend = { throw IllegalStateException("receipt transport failed") }
+        }
+        val (service, conversations) = unreadReceiptFixture(this, transport)
+        kotlin.test.assertFailsWith<IllegalStateException> {
+            service.markConversationRead("conv-1", "ccdd", true)
+        }
+        assertEquals(0, conversations.getConversation("conv-1")?.unreadCount)
+        assertTrue(transport.sent.isEmpty())
+    }
+
+    @Test
+    fun markConversationRead_cancelledReceiptDoesNotKeepBadgeUnread() = runTest {
+        val transport = FakeRelayTransport().apply {
+            beforeSend = { throw kotlinx.coroutines.CancellationException("receipt cancelled") }
+        }
+        val (service, conversations) = unreadReceiptFixture(this, transport)
+        kotlin.test.assertFailsWith<kotlinx.coroutines.CancellationException> {
+            service.markConversationRead("conv-1", "ccdd", true)
+        }
+        assertEquals(0, conversations.getConversation("conv-1")?.unreadCount)
+        assertTrue(transport.sent.isEmpty())
+    }
 
     @Test
     fun markConversationRead_sendsOneReadReceiptPerUnreadMessage() = runTest {
@@ -5665,6 +6999,165 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    private class ContinuityRig(
+        val service: DefaultMessagingService,
+        val active: PreSeededRatchetStateRepository,
+        val pending: FakePendingRatchetStateRepoForSprint2bC,
+        val sessions: SessionManager,
+        val api: CountingPreKeyApiForSprint2bC,
+        val recipientHex: String,
+        val receiverState: (WireFrame) -> phantom.core.crypto.RatchetState,
+        val clock: LongArray,
+    ) {
+        suspend fun send(text: String, afterEncrypt: suspend (WireFrame) -> Unit = {}): WireFrame =
+            service.encryptUnderLock("continuity", recipientHex, text.encodeToByteArray(), afterEncrypt)
+    }
+
+    // Real bootstrap + ratchet, fake storage boundaries. SQLDelight composition
+    // is covered separately; no network timer or elapsed wall-clock race here.
+    private suspend fun continuityRig(scope: kotlinx.coroutines.CoroutineScope): ContinuityRig {
+        LibsodiumInitializer.initialize()
+        val x3dh = phantom.core.crypto.LibsodiumX3DH()
+        val alice = x3dh.generateDhKeyPair()
+        val bob = x3dh.generateDhKeyPair()
+        val spk = x3dh.generateDhKeyPair()
+        val signing = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobHex = bob.publicKey.bytes.toHexStringLower()
+        val bundle = phantom.core.transport.PreKeyBundle(
+            identity_pubkey_hex = bobHex,
+            signing_pubkey_hex = signing.publicKey.toByteArray().toHexStringLower(),
+            signed_pre_key = phantom.core.transport.WireSignedPreKey(
+                key_id = 7L, public_key_hex = spk.publicKey.bytes.toHexStringLower(),
+                created_at_ms = 0L,
+                signature_hex = phantom.core.crypto.SignedPreKeySigner.sign(
+                    spk.publicKey, 0L, signing.secretKey.toByteArray(),
+                ).toHexStringLower(),
+            ),
+            one_time_pre_key = null,
+        )
+        val active = PreSeededRatchetStateRepository(seedFor = emptyList())
+        val pending = FakePendingRatchetStateRepoForSprint2bC()
+        val reservations = FakeOpkReservationRepoForSprint2bC()
+        val sessions = SessionManager(x3dh, active, FakeLocalSignedPreKeyRepository(),
+            FakeLocalOneTimePreKeyRepository(), FakeIdentityCrypto(), json)
+        val api = CountingPreKeyApiForSprint2bC(bundle)
+        val clock = longArrayOf(1_000L)
+        val service = DefaultMessagingService(
+            identity = identity.copy(publicKeyHex = alice.publicKey.bytes.toHexStringLower()),
+            localKeyPair = alice, ratchet = phantom.core.crypto.LibsodiumDoubleRatchet(),
+            sessionManager = sessions, transport = FakeRelayTransport(),
+            messageRepository = FakeMessageRepository(), conversationRepository = FakeConversationRepository(),
+            scope = scope, json = json, preKeyApi = api,
+            signingKeyProvider = { phantom.core.identity.IdentitySigningKeyPair(
+                phantom.core.identity.SigningPublicKey(signing.publicKey.toByteArray()),
+                phantom.core.identity.SigningPrivateKey(signing.secretKey.toByteArray()),
+            ) },
+            pendingRatchetStateRepository = pending,
+            sessionTransactionRepository = FakePendingOnlyTxRepo(pending, reservations),
+            nowMsProvider = { clock[0] },
+        )
+        return ContinuityRig(service, active, pending, sessions, api, bobHex, { wire ->
+            val hex = requireNotNull(wire.x3dhInit).ephemeralPubKeyHex
+            val bytes = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            x3dh.recipientHandshake4DH(bob, spk, null, alice.publicKey,
+                phantom.core.crypto.DhPublicKey(bytes))
+        }, clock)
+    }
+
+    @Test
+    fun continuity_bootstrap_to_pending_does_not_publish_an_unadvanced_active() = runTest {
+        val f = continuityRig(backgroundScope)
+        val first = f.send("first")
+        val crypto = phantom.core.crypto.LibsodiumDoubleRatchet()
+        assertEquals("first", crypto.decrypt(f.receiverState(first), first.encryptedMessage).second.decodeToString())
+        assertNotNull(f.pending.get("continuity"))
+        assertNull(f.active.getRatchetState("continuity"), "outbound candidate must not leak into active")
+    }
+
+    @Test
+    fun continuity_expired_pending_never_rewinds_to_the_initial_sending_position() = runTest {
+        val f = continuityRig(backgroundScope)
+        val crypto = phantom.core.crypto.LibsodiumDoubleRatchet()
+        val first = f.send("first")
+        val receiver = crypto.decrypt(f.receiverState(first), first.encryptedMessage).first
+        f.clock[0] += DefaultMessagingService.PENDING_TTL_MS
+        val next = f.send("after ttl")
+        // Exercise actual decryption BEFORE the header assertion: the original
+        // defect re-encrypts position zero, already consumed by the receiver.
+        val rx = if (next.x3dhInit != null) f.receiverState(next) else receiver
+        assertEquals("after ttl", crypto.decrypt(rx, next.encryptedMessage).second.decodeToString())
+        assertNotNull(next.x3dhInit)
+        assertEquals(2, f.api.fetchBundleCalls)
+    }
+
+    @Test
+    fun continuity_pending_reuse_advances_the_same_real_chain_before_expiry() = runTest {
+        val f = continuityRig(backgroundScope)
+        val crypto = phantom.core.crypto.LibsodiumDoubleRatchet()
+        val first = f.send("first")
+        val receiver = crypto.decrypt(f.receiverState(first), first.encryptedMessage).first
+        f.clock[0] += DefaultMessagingService.PENDING_TTL_MS - 1L
+        val next = f.send("next")
+        assertEquals(first.x3dhInit, next.x3dhInit)
+        assertEquals(1, next.encryptedMessage.messageIndex)
+        assertEquals("next", crypto.decrypt(receiver, next.encryptedMessage).second.decodeToString())
+        assertEquals(1, f.api.fetchBundleCalls)
+        assertEquals(1_000L, f.pending.get("continuity")!!.reservedAtMs)
+    }
+
+    @Test
+    fun continuity_outbound_failure_keeps_the_existing_receiver_state() = runTest {
+        val f = continuityRig(backgroundScope)
+        val seeded = PreSeededRatchetStateRepository(seedFor = listOf("continuity"))
+        val state = json.decodeFromString<phantom.core.crypto.RatchetState>(seeded.getRatchetState("continuity")!!)
+            .copy(role = phantom.core.crypto.SessionRole.RESPONDER)
+        f.sessions.saveSession("continuity", state)
+        val before = f.active.getRatchetState("continuity")
+        assertFailsWith<IllegalStateException> { f.send("fails") { error("outbound insert failed") } }
+        assertEquals(before, f.active.getRatchetState("continuity"), "failed outbound cannot replace active")
+        assertNull(f.pending.get("continuity"))
+    }
+
+    @Test
+    fun continuity_expired_pending_cannot_fall_back_to_an_older_initiator_active() = runTest {
+        val f = continuityRig(backgroundScope)
+        val first = f.send("first")
+        // Model a persisted active/pending pair from the old implementation.
+        val pendingState = json.decodeFromString<phantom.core.crypto.RatchetState>(f.pending.get("continuity")!!.stateBlob)
+        f.sessions.saveSession("continuity", pendingState)
+        f.clock[0] += DefaultMessagingService.PENDING_TTL_MS
+        val next = f.send("fresh candidate required")
+        assertNotNull(next.x3dhInit, "expired outbound pending is not evidence the active chain is peer-current")
+        assertNotEquals(first.x3dhInit, next.x3dhInit)
+        assertEquals(2, f.api.fetchBundleCalls)
+    }
+
+    @Test
+    fun continuity_cancelled_outbound_does_not_publish_a_candidate() = runTest {
+        val f = continuityRig(backgroundScope)
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            f.send("cancelled") { throw kotlinx.coroutines.CancellationException("cancel outbound") }
+        }
+        assertNull(f.active.getRatchetState("continuity"))
+        assertNull(f.pending.get("continuity"))
+    }
+
+    @Test
+    fun continuity_confirmed_active_without_pending_keeps_its_sending_position() = runTest {
+        val f = continuityRig(backgroundScope)
+        val crypto = phantom.core.crypto.LibsodiumDoubleRatchet()
+        val first = f.send("first")
+        val receiver = crypto.decrypt(f.receiverState(first), first.encryptedMessage).first
+        // Seed the already-promoted state, not a claim about the promotion path.
+        f.active.upsertRatchetState("continuity", f.pending.get("continuity")!!.stateBlob)
+        f.pending.delete("continuity")
+        val next = f.send("active continuation")
+        assertNull(next.x3dhInit)
+        assertEquals(1, next.encryptedMessage.messageIndex)
+        assertEquals("active continuation", crypto.decrypt(receiver, next.encryptedMessage).second.decodeToString())
+        assertEquals(1, f.api.fetchBundleCalls)
+    }
+
     private suspend fun freshBundleForSprint2bC(recipientPubkeyHex: String): phantom.core.transport.PreKeyBundle {
         // Mint a real Ed25519 signing keypair + sign the SPK so
         // SessionManager.initiatorBootstrap's signature verify passes.
@@ -5757,6 +7250,515 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // SESSION ORDER REPRODUCTION (layer 2) — the hold queue on top of the
+    // real crypto.
+    //
+    // Layer 1 lives in `SessionOrderReproTest` and establishes the crypto
+    // half: the receive chain has no skipped-key store, so a message that
+    // arrives before its predecessor is rejected, the rejection leaves the
+    // stored state untouched, and the SAME ciphertext decrypts once the
+    // chain reaches its position.
+    //
+    // These cases put that under the real receive path: real X3DH
+    // bootstrap, real `LibsodiumDoubleRatchet`, the real hold-on-MAC
+    // branch, the processed-envelope ledger and the held-envelope
+    // registry. Nothing is stubbed to fail; every rejection below is
+    // produced by delivery order alone.
+    //
+    // The rig mirrors the field run. A session already exists, because
+    // the two devices had been exchanging messages: envelope S is
+    // delivered by the builder and takes the bootstrap path, consuming
+    // the one-time pre-key. A, B and C follow on that established
+    // session and all carry the SAME cached bootstrap header (initiator
+    // pending reuse), which is why a later repair attempt meets an OPK
+    // that has already been consumed.
+    // ═══════════════════════════════════════════════════════════════════
+
+    private class OrderRig(
+        val convId: String,
+        val msgRepo: FakeMessageRepository,
+        val convRepo: FakeConversationRepository,
+        val processedRepo: FakeProcessedEnvelopeLedger,
+        val heldRepo: FakeDecryptFailedEnvelopeLedger,
+        val transport: FakeRelayTransport,
+        val opkDeleteCalls: MutableList<String>,
+        /** Deliver envelope `which` (S, A, B, C or TAMPERED) as `messageId`. */
+        val deliver: suspend (which: String, messageId: String) -> Unit,
+    ) {
+        fun texts(): List<String?> = msgRepo.messages.map { it.plaintextCache }
+    }
+
+    /**
+     * Two real parties, four consecutive messages, and Bob's real receive
+     * path with the hold queue enabled.
+     *
+     * @param seedSession deliver S so a session exists before the test
+     *   body runs. False leaves the conversation un-bootstrapped, which
+     *   is a different code path.
+     */
+    private suspend fun buildOrderRig(
+        testScope: TestScope,
+        seedSession: Boolean = true,
+    ): OrderRig {
+        LibsodiumInitializer.initialize()
+        val real = phantom.core.crypto.LibsodiumX3DH()
+        val realRatchet = phantom.core.crypto.LibsodiumDoubleRatchet()
+
+        val aliceX25519 = real.generateDhKeyPair()
+        val bobX25519 = real.generateDhKeyPair()
+        val bobSpkPair = real.generateDhKeyPair()
+        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
+        val bobOpkPair = real.generateDhKeyPair()
+        val bobOpkIdHex = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
+        val bobSpkRepo = object : phantom.core.storage.LocalSignedPreKeyRepository {
+            private var stored: phantom.core.storage.LocalSignedPreKeyEntity? =
+                phantom.core.storage.LocalSignedPreKeyEntity(
+                    keyId = 7L,
+                    publicKeyHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobSpkPair.privateKey.bytes.toHexStringLower(),
+                    createdAtMs = 1_000L,
+                    signatureHex = "00".repeat(64),
+                )
+            override suspend fun get() = stored
+            override suspend fun upsert(entity: phantom.core.storage.LocalSignedPreKeyEntity) {
+                stored = entity
+            }
+            override suspend fun clear() { stored = null }
+        }
+        val opkDeleteCalls = mutableListOf<String>()
+        val bobOpkRepo = object : phantom.core.storage.LocalOneTimePreKeyRepository {
+            private val store = mutableMapOf(
+                bobOpkIdHex to phantom.core.storage.LocalOneTimePreKeyEntity(
+                    keyIdHex = bobOpkIdHex,
+                    publicKeyHex = bobOpkPair.publicKey.bytes.toHexStringLower(),
+                    privateKeyHex = bobOpkPair.privateKey.bytes.toHexStringLower(),
+                    uploadedAtMs = 0L,
+                ),
+            )
+            override suspend fun get(keyIdHex: String) = store[keyIdHex]
+            override suspend fun getAll() = store.values.toList()
+            override suspend fun count() = store.size
+            override suspend fun insert(entity: phantom.core.storage.LocalOneTimePreKeyEntity) {
+                store[entity.keyIdHex] = entity
+            }
+            override suspend fun insertAll(
+                entities: List<phantom.core.storage.LocalOneTimePreKeyEntity>,
+            ) { entities.forEach { insert(it) } }
+            override suspend fun deleteByKeyId(keyIdHex: String) {
+                opkDeleteCalls.add(keyIdHex)
+                store.remove(keyIdHex)
+            }
+            override suspend fun clear() { store.clear() }
+        }
+
+        // Alice's own session manager, used only to run the initiator
+        // bootstrap and to hold her sending ratchet.
+        val aliceSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = FakeRatchetStateRepository(),
+            signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
+            oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        val bundleForBob = PreKeyBundle(
+            identityPubkeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            signingPubkeyHex = bobSigning.publicKey.toByteArray().toHexStringLower(),
+            signedPreKeyId = 7L,
+            signedPreKeyPublicHex = bobSpkPair.publicKey.bytes.toHexStringLower(),
+            signedPreKeyCreatedAtMs = 1_000L,
+            signedPreKeySignatureHex = phantom.core.crypto.SignedPreKeySigner.sign(
+                bobSpkPair.publicKey,
+                1_000L,
+                bobSigning.secretKey.toByteArray(),
+            ).toHexStringLower(),
+            oneTimePreKeyIdHex = bobOpkIdHex,
+            oneTimePreKeyPublicHex = bobOpkPair.publicKey.bytes.toHexStringLower(),
+        )
+        val aliceBootstrap = aliceSessionMgr.initiatorBootstrap(
+            conversationId = "alice-side-order-repro",
+            localIdentityKeyPair = aliceX25519,
+            bundle = bundleForBob,
+        )
+
+        // Four messages on one sending chain: positions 0, 1, 2, 3.
+        var aliceState = aliceBootstrap.ratchetState
+        fun payload(text: String, at: Long): ByteArray = json.encodeToString(
+            MessagePayload.serializer(),
+            MessagePayload(text = text, sentAt = at, senderUsername = "alice"),
+        ).encodeToByteArray()
+        fun next(text: String, at: Long): phantom.core.crypto.EncryptedMessage {
+            val (advanced, encrypted) = realRatchet.encrypt(aliceState, payload(text, at))
+            aliceState = advanced
+            return encrypted
+        }
+
+        val encryptedS = next(TEXT_S, 1_700_000_000_000L)
+        val encryptedA = next(TEXT_A, 1_700_000_001_000L)
+        val encryptedB = next(TEXT_B, 1_700_000_002_000L)
+        val encryptedC = next(TEXT_C, 1_700_000_003_000L)
+
+        // Every frame carries the same bootstrap header: S needs it, and
+        // A, B and C carry the cached copy exactly as an initiator with a
+        // live pending session does.
+        fun frameOf(encrypted: phantom.core.crypto.EncryptedMessage): String {
+            val frame = WireFrame(
+                encryptedMessage = encrypted,
+                x3dhInit = aliceBootstrap.x3dhInit,
+                senderSigningPublicKeyHex = "ee".repeat(32),
+            )
+            val bytes = json.encodeToString(WireFrame.serializer(), frame).encodeToByteArray()
+            @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+            return kotlin.io.encoding.Base64.encode(phantom.core.crypto.MessagePadding.pad(bytes))
+        }
+        val tampered = frameOf(
+            encryptedA.copy(
+                ciphertext = encryptedA.ciphertext.copyOf()
+                    .also { it[0] = (it[0].toInt() xor 0x01).toByte() },
+            ),
+        )
+        val payloads = mapOf(
+            "S" to frameOf(encryptedS),
+            "A" to frameOf(encryptedA),
+            "B" to frameOf(encryptedB),
+            "C" to frameOf(encryptedC),
+            "TAMPERED" to tampered,
+        )
+
+        val sealedSenderBytes = phantom.core.crypto.SealedSender.seal(
+            fromPubKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+            toPublicKeyBytes = bobX25519.publicKey.bytes,
+        )
+
+        val bobIdentity = phantom.core.identity.IdentityRecord(
+            id = "bob-order-repro",
+            username = "bob",
+            publicKeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+            dhPrivateKeyHex = bobX25519.privateKey.bytes.toHexStringLower(),
+            createdAt = 0L,
+        )
+        val bobSessionMgr = SessionManager(
+            x3dh = real,
+            ratchetStateRepository = FakeRatchetStateRepository(),
+            signedPreKeyRepository = bobSpkRepo,
+            oneTimePreKeyRepository = bobOpkRepo,
+            identityCrypto = phantom.core.identity.LibsodiumIdentityCrypto(),
+            json = json,
+        )
+        val transport = FakeRelayTransport()
+        val msgRepo = FakeMessageRepository()
+        val convRepo = FakeConversationRepository()
+        val processedRepo = FakeProcessedEnvelopeLedger()
+        val heldRepo = FakeDecryptFailedEnvelopeLedger()
+
+        val convId = listOf(
+            bobIdentity.publicKeyHex,
+            aliceX25519.publicKey.bytes.toHexStringLower(),
+        ).sorted().let { "${it[0]}_${it[1]}" }
+        // The suspect flag is an UPDATE on an existing row, so the row has
+        // to be there before the hold path runs.
+        convRepo.upsertConversation(
+            ConversationEntity(
+                id = convId,
+                theirUsername = "alice",
+                theirPublicKeyHex = aliceX25519.publicKey.bytes.toHexStringLower(),
+                lastMessagePreview = "",
+                lastMessageAt = 0L,
+                unreadCount = 0,
+                sessionSuspect = false,
+                sessionSuspectSetAtMs = null,
+            ),
+        )
+
+        val service = DefaultMessagingService(
+            identity = bobIdentity,
+            localKeyPair = bobX25519,
+            ratchet = phantom.core.crypto.LibsodiumDoubleRatchet(),
+            sessionManager = bobSessionMgr,
+            transport = transport,
+            messageRepository = msgRepo,
+            conversationRepository = convRepo,
+            processedEnvelopeRepository = processedRepo,
+            scope = testScope.backgroundScope,
+            json = json,
+            preKeyApi = ThrowingPreKeyApi,
+            signingKeyProvider = { ThrowingSigningKey },
+            decryptFailedEnvelopeRepository = heldRepo,
+            holdMacFailures = true,
+        )
+        service.startReceiving()
+        testScope.testScheduler.runCurrent()
+
+        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+        val deliverFn: suspend (String, String) -> Unit = { which, messageId ->
+            transport.deliver(
+                RelayMessage.Deliver(
+                    from = "",
+                    sealedSender = kotlin.io.encoding.Base64.encode(sealedSenderBytes),
+                    payload = payloads.getValue(which),
+                    messageId = messageId,
+                ),
+            )
+        }
+
+        if (seedSession) {
+            deliverFn("S", "env-S")
+            testScope.testScheduler.runCurrent()
+        }
+
+        return OrderRig(
+            convId = convId,
+            msgRepo = msgRepo,
+            convRepo = convRepo,
+            processedRepo = processedRepo,
+            heldRepo = heldRepo,
+            transport = transport,
+            opkDeleteCalls = opkDeleteCalls,
+            deliver = deliverFn,
+        )
+    }
+
+    /** Positive control: in order, every message reaches the chat. */
+    @Test
+    fun order_repro_in_order_A_then_B_are_both_delivered() = runTest {
+        val rig = buildOrderRig(this)
+        assertEquals(listOf(TEXT_S), rig.texts(), "the seed message establishes the session")
+        assertEquals(1, rig.opkDeleteCalls.size, "the seed consumes exactly one one-time pre-key")
+
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts())
+        assertEquals(0, rig.heldRepo.rows.size, "nothing may be held on the ordered path")
+        assertTrue(rig.processedRepo.exists("env-A"))
+        assertTrue(rig.processedRepo.exists("env-B"))
+        assertEquals(
+            1, rig.opkDeleteCalls.size,
+            "A and B decrypt on the existing session; no further OPK is consumed",
+        )
+    }
+
+    /**
+     * The requested order: B, then A, then the repeat of B, then a new C.
+     *
+     * This is the field sequence on the real receive path, and it
+     * measures what the field logs could not: whether the held envelope
+     * is recoverable once its predecessor lands.
+     */
+    @Test
+    fun order_repro_B_then_A_then_repeat_B_then_new_C() = runTest {
+        val rig = buildOrderRig(this)
+
+        // ── B arrives before A ──────────────────────────────────────────
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S), rig.texts(),
+            "B must not reach the chat: it cannot be authenticated at A's chain position",
+        )
+        assertEquals(
+            listOf("env-B"), rig.heldRepo.rows.keys.toList(),
+            "B must be HELD, not dropped",
+        )
+        assertEquals("mac", rig.heldRepo.rows.getValue("env-B").errorType)
+        assertFalse(
+            "env-B" in rig.transport.ackedDelivers,
+            "a held envelope must never be acked -- the relay copy is the only one left",
+        )
+        assertFalse(
+            rig.processedRepo.exists("env-B"),
+            "a held envelope must not be marked processed, or redelivery would be skipped",
+        )
+        assertTrue(
+            rig.convRepo.getConversation(rig.convId)?.sessionSuspect == true,
+            "the conversation is marked suspect so the next outbound repairs it",
+        )
+
+        // ── A arrives second and decrypts ───────────────────────────────
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A), rig.texts(),
+            "A decrypts even though B was rejected before it",
+        )
+        // Recorded, not fixed: a successful INBOUND message does not
+        // replay the held queue. `replayHeldEnvelopesAfterRepair` is
+        // reachable only from the outbound send path, so B stays held
+        // although the chain has just reached its position.
+        assertEquals(
+            listOf("env-B"), rig.heldRepo.rows.keys.toList(),
+            "B is still held after A succeeded -- nothing on the inbound path replays it",
+        )
+
+        // ── the relay redelivers the very same B ────────────────────────
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(),
+            "the identical B decrypts on redelivery once A has been consumed",
+        )
+        assertTrue(
+            "env-B" in rig.transport.ackedDelivers,
+            "the recovered envelope is acked so the relay can drop it",
+        )
+
+        // ── a new message C, typed after all of it ──────────────────────
+        rig.deliver("C", "env-C")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A, TEXT_B, TEXT_C), rig.texts(),
+            "with the gap closed, the new message decrypts normally",
+        )
+    }
+
+    /**
+     * The field order, where the redelivery of B kept arriving before A
+     * had been processed and the newly typed message came in behind it.
+     *
+     * C is rejected for as long as B is unconsumed, and the repair it
+     * then attempts meets a one-time pre-key that the session bootstrap
+     * already consumed -- which is where `OpkNotFound` comes from. The
+     * missing key is a CONSEQUENCE of the ordering failure, not its
+     * cause.
+     */
+    @Test
+    fun order_repro_new_C_is_held_while_B_stays_unconsumed() = runTest {
+        val rig = buildOrderRig(this)
+
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+        assertEquals(listOf(TEXT_S, TEXT_A), rig.texts())
+
+        // The newly typed message, with B still outstanding.
+        rig.deliver("C", "env-C")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A), rig.texts(),
+            "C must not reach the chat while the gap at B is open",
+        )
+        assertEquals(
+            setOf("env-B", "env-C"), rig.heldRepo.rows.keys.toSet(),
+            "both the out-of-order message and the new one are held",
+        )
+        assertFalse("env-C" in rig.transport.ackedDelivers)
+        assertFalse(rig.processedRepo.exists("env-C"))
+
+        // Consuming B is what unblocks C. Nothing else changes.
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+        rig.deliver("C", "env-C")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A, TEXT_B, TEXT_C), rig.texts(),
+            "every message is recoverable by redelivery in chain order",
+        )
+    }
+
+    /**
+     * The first-contact path now retains an out-of-order frame without
+     * consuming the chain or acknowledging it. This component fixture
+     * does not wire atomic storage or automatic replay: it proves the
+     * hold/authentication boundary, while the full-stack test proves replay.
+     */
+    @Test
+    fun order_repro_an_out_of_order_first_message_is_held_without_ack() = runTest {
+        val rig = buildOrderRig(this, seedSession = false)
+
+        rig.deliver("B", "env-B-first")
+        testScheduler.runCurrent()
+
+        assertEquals(emptyList(), rig.texts(), "B cannot decrypt as the first message")
+        assertEquals(
+            setOf("env-B-first"), rig.heldRepo.rows.keys.toSet(),
+            "the bootstrap path retains the frame without declaring it processed",
+        )
+        assertFalse(
+            "env-B-first" in rig.transport.ackedDelivers,
+            "the safe half: the envelope is not acked, so the relay copy survives",
+        )
+        assertFalse(rig.processedRepo.exists("env-B-first"))
+
+        // The session is still bootstrappable afterwards: S decrypts and
+        // the conversation starts normally.
+        rig.deliver("S", "env-S")
+        testScheduler.runCurrent()
+        assertEquals(listOf(TEXT_S), rig.texts(), "the failed first envelope did not poison the session")
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+        rig.deliver("B", "env-B-first")
+        testScheduler.runCurrent()
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts())
+        assertTrue("env-B-first" in rig.transport.ackedDelivers)
+    }
+
+    /**
+     * Authenticity control. A forged ciphertext at the right position is
+     * held, never acked and never marked processed, and it does not
+     * advance the chain, so the genuine A still decrypts afterwards.
+     *
+     * A fix for ordering must keep every line of this test true.
+     */
+    @Test
+    fun order_repro_a_tampered_envelope_is_rejected_and_does_not_disturb_the_chain() = runTest {
+        val rig = buildOrderRig(this)
+
+        rig.deliver("TAMPERED", "env-forged")
+        testScheduler.runCurrent()
+
+        assertEquals(listOf(TEXT_S), rig.texts(), "a forged envelope must never reach the chat")
+        assertFalse("env-forged" in rig.transport.ackedDelivers)
+        assertFalse(rig.processedRepo.exists("env-forged"))
+
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+        assertEquals(
+            listOf(TEXT_S, TEXT_A), rig.texts(),
+            "the forgery consumed nothing: A still decrypts at its position",
+        )
+    }
+
+    /**
+     * Duplicate control. A redelivered envelope that was already
+     * processed must not decrypt twice and must not advance the chain a
+     * second time -- otherwise a duplicate would open exactly the gap
+     * this reproduction is about.
+     */
+    @Test
+    fun order_repro_a_duplicate_of_a_delivered_envelope_is_skipped() = runTest {
+        val rig = buildOrderRig(this)
+
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+        rig.deliver("A", "env-A")
+        testScheduler.runCurrent()
+
+        assertEquals(
+            listOf(TEXT_S, TEXT_A), rig.texts(),
+            "a duplicate must not be stored twice",
+        )
+        assertEquals(0, rig.heldRepo.rows.size, "a duplicate must not be held")
+
+        // The chain was not advanced by the duplicate: B still decrypts.
+        rig.deliver("B", "env-B")
+        testScheduler.runCurrent()
+        assertEquals(
+            listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(),
+            "the duplicate did not consume B's chain position",
+        )
+    }
+
     private class InboundRepairRig(
         val convId: String,
         val bobMsgRepo: FakeMessageRepository,
@@ -5783,6 +7785,17 @@ private class FakeProcessedEnvelopeLedger : phantom.core.storage.ProcessedEnvelo
     )
     private val store = mutableMapOf<String, Row>()
 
+    /**
+     * N1-F1b R-N1.13 - when set, [markProcessed] throws instead of
+     * recording. Asserting that the ledger row EXISTS and that an ack
+     * HAPPENED does not prove the ledger was written FIRST; both are
+     * true at the end either way. Failing the ledger write and
+     * observing that no ack follows is what proves the order.
+     *
+     * Defaults to false, so no existing fixture changes behaviour.
+     */
+    var failMarkProcessed: Boolean = false
+
     override suspend fun exists(envelopeId: String): Boolean = store.containsKey(envelopeId)
 
     override suspend fun markProcessed(
@@ -5793,10 +7806,16 @@ private class FakeProcessedEnvelopeLedger : phantom.core.storage.ProcessedEnvelo
         status: phantom.core.storage.ProcessedEnvelopeRepository.Status,
         nowMs: Long,
     ) {
+        if (failMarkProcessed) {
+            error("injected ledger failure for envelope $envelopeId")
+        }
         if (envelopeId !in store) {
             store[envelopeId] = Row(payloadType, status, nowMs)
         }
     }
+
+    /** N1-F1 R-N1.8: what payload type was recorded for [envelopeId]. */
+    fun payloadTypeOf(envelopeId: String): String? = store[envelopeId]?.payloadType
 
     override suspend fun deleteOlderThan(olderThanMs: Long) {
         store.entries.removeAll { it.value.createdAtMs < olderThanMs }
@@ -6163,10 +8182,11 @@ private class FakePendingRatchetStateRepoForSprint2bC :
         stateBlob: String,
         reservedAtMs: Long,
         bootstrapArtifactsBlob: String?,
+        opkBinding: phantom.core.storage.PendingOpkBinding,
     ) {
         upsertCalls++
         store[conversationId] = phantom.core.storage.PendingRatchetStateEntity(
-            conversationId, stateBlob, reservedAtMs, bootstrapArtifactsBlob,
+            conversationId, stateBlob, reservedAtMs, bootstrapArtifactsBlob, opkBinding,
         )
     }
     override suspend fun delete(conversationId: String) { store.remove(conversationId) }
@@ -6254,6 +8274,42 @@ private class FakePendingOnlyTxRepo(
  *
  * Encrypt is passthrough (never invoked by the inbound flow we test).
  */
+/**
+ * N1-F1 R-N1.9 — routes EVERY delivery through the pending-fallback
+ * branch.
+ *
+ * `FirstFailThenPassRatchet` fails only the first decrypt call of the
+ * service's life, so a fixture that delivers twice takes the pending
+ * branch once and the active branch afterwards. This one decides by the
+ * STATE it is handed: the active session MAC-fails every time, the
+ * pending state decrypts every time. That keeps the branch under test
+ * constant across a redelivery.
+ */
+private class ActiveFailsPendingPassesRatchet(
+    private val pendingMarker: Byte,
+) : phantom.core.crypto.DoubleRatchet {
+    override fun encrypt(
+        state: phantom.core.crypto.RatchetState,
+        plaintext: ByteArray,
+    ): Pair<phantom.core.crypto.RatchetState, phantom.core.crypto.EncryptedMessage> =
+        state to phantom.core.crypto.EncryptedMessage(
+            ratchetPublicKey = state.sendingRatchetPublicKey,
+            messageIndex = state.sendCount,
+            ciphertext = plaintext,
+            nonce = ByteArray(24),
+        )
+
+    override fun decrypt(
+        state: phantom.core.crypto.RatchetState,
+        message: phantom.core.crypto.EncryptedMessage,
+    ): Pair<phantom.core.crypto.RatchetState, ByteArray> {
+        if (state.rootKey.isEmpty() || state.rootKey[0] != pendingMarker) {
+            throw IllegalArgumentException("MAC verification failed (active session)")
+        }
+        return state to message.ciphertext
+    }
+}
+
 private class FirstFailThenPassRatchet : phantom.core.crypto.DoubleRatchet {
     private var decryptCallCount: Int = 0
     override fun encrypt(
@@ -6291,6 +8347,15 @@ private class FirstFailThenPassRatchet : phantom.core.crypto.DoubleRatchet {
 private class CapturingPromoteTxRepo(
     private val pendingRepo: phantom.core.storage.PendingRatchetStateRepository,
     private val opkResRepo: phantom.core.storage.OpkReservationRepository,
+    /**
+     * N1 integration: text now completes through the SESSION transaction,
+     * so a fixture that only implements the older promote/bootstrap API
+     * would send every text envelope into the "not implemented" hold path
+     * and stop measuring the branch it names. Supplying the faulting
+     * commit here keeps the same fault switch, the same assertions and the
+     * same branch under test, on the path production actually takes.
+     */
+    private val inboundCommit: FaultingInboundCommitRepository? = null,
 ) : phantom.core.storage.SessionTransactionRepository {
     var promoteCalls: Int = 0
     var lastPromotedConversationId: String? = null
@@ -6327,6 +8392,52 @@ private class CapturingPromoteTxRepo(
         nowMs: Long,
     ) {
         pendingRepo.upsert(conversationId, stateBlob, nowMs, bootstrapArtifactsBlob)
+    }
+
+    /**
+     * All-or-nothing, like the SQL implementation: the injected fault
+     * fires BEFORE the row, the ledger entry and the promotion, so a
+     * refusal leaves none of the three behind. A promotion asked for
+     * without a pending row writes nothing and reports it, rather than
+     * settling half of the envelope.
+     */
+    override suspend fun commitInboundMessage(
+        conversationId: String,
+        envelopeId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+        message: phantom.core.storage.MessageEntity,
+        advancedStateBlob: String?,
+        promotePending: Boolean,
+        expectedOpkKeyIdHex: String?,
+        stateTarget: phantom.core.storage.InboundStateTarget,
+    ): phantom.core.storage.InboundCommitOutcome {
+        val commit = requireNotNull(inboundCommit) {
+            "this fixture reaches the atomic text commit; build it with the faulting commit"
+        }
+        val pending = if (promotePending) {
+            pendingRepo.get(conversationId)
+                ?: return phantom.core.storage.InboundCommitOutcome.PendingMissing
+        } else {
+            null
+        }
+        commit.commitInboundMessage(
+            message = message,
+            envelopeId = envelopeId,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payloadType,
+            nowMs = nowMs,
+        )
+        if (pending != null) {
+            promoteCalls++
+            lastPromotedConversationId = conversationId
+            lastPromotedStateBlob = advancedStateBlob ?: pending.stateBlob
+            pendingRepo.delete(conversationId)
+            opkResRepo.getByConversationId(conversationId)?.let { opkResRepo.release(it.opkKeyIdHex) }
+        }
+        return phantom.core.storage.InboundCommitOutcome.Committed
     }
 }
 
@@ -6395,4 +8506,141 @@ private class CountingPreKeyApiForSprint2bC(
         requesterPubkeyHex: String?,
     ): phantom.core.transport.PreKeyStatus =
         phantom.core.transport.PreKeyStatus(remaining_opks = 0, signed_prekey_age_days = null)
+}
+
+/**
+ * Settlement repository that can fail in any window, including one the
+ * real SQL implementation cannot produce.
+ *
+ * [Fault.AFTER_ROW_BEFORE_LEDGER] is deliberately expressible here and
+ * NOT expressible in `SqlDelightInboundCommitRepository`, because there
+ * both writes are one transaction. The fixture using it therefore
+ * proves the CALLER behaves correctly even if that state somehow
+ * occurred, while `InboundCommitAtomicityTest` proves the real
+ * implementation cannot occur in it.
+ */
+/**
+ * N1-F1b R-N1.12 — control-event settlement that can fail on demand.
+ *
+ * Applies the action against the same in-memory fakes the service uses,
+ * then records the ledger entry, so a fixture can assert the pair. When
+ * [fail] is set nothing is applied and nothing is recorded, modelling a
+ * transaction that rolled back.
+ */
+private class FaultingControlEventCommitRepository(
+    private val messages: FakeMessageRepository,
+    private val conversations: FakeConversationRepository,
+    private val reactions: FakeReactionRepository,
+    private val ledger: FakeProcessedEnvelopeLedger,
+) : phantom.core.storage.ControlEventCommitRepository {
+
+    var fail: Boolean = false
+    var attempts: Int = 0
+
+    override suspend fun commitControlEvent(
+        action: phantom.core.storage.ControlEventCommitRepository.Action,
+        envelopeId: String,
+        conversationId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+    ) {
+        attempts++
+        if (fail) {
+            // A rolled-back transaction: neither half is visible.
+            throw IllegalStateException("control settlement failed")
+        }
+        when (action) {
+            is phantom.core.storage.ControlEventCommitRepository.Action.DeleteMessage ->
+                messages.deleteMessage(action.messageId)
+            is phantom.core.storage.ControlEventCommitRepository.Action.EditMessageText ->
+                messages.updateMessageText(action.messageId, action.text)
+            is phantom.core.storage.ControlEventCommitRepository.Action.SetDisappearingTimer ->
+                conversations.setDisappearingTimer(action.conversationId, action.seconds)
+            is phantom.core.storage.ControlEventCommitRepository.Action.UpsertReaction ->
+                reactions.upsertReaction(
+                    action.messageId, action.senderKeyHex, action.emoji, action.createdAtMs,
+                )
+            is phantom.core.storage.ControlEventCommitRepository.Action.DeleteReaction ->
+                reactions.deleteReaction(action.messageId, action.senderKeyHex)
+            is phantom.core.storage.ControlEventCommitRepository.Action.PinMessage ->
+                messages.pinMessage(
+                    action.messageId, action.pinned, action.pinnedByPubkeyHex,
+                )
+            is phantom.core.storage.ControlEventCommitRepository.Action.MarkRead ->
+                messages.updateStatus(action.messageId, MessageStatus.READ)
+        }
+        ledger.markProcessed(
+            envelopeId = envelopeId,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payloadType,
+            status = phantom.core.storage.ProcessedEnvelopeRepository.Status.PROCESSED,
+            nowMs = nowMs,
+        )
+    }
+}
+
+private class FaultingInboundCommitRepository(
+    private val messages: FakeMessageRepository,
+    private val ledger: FakeProcessedEnvelopeLedger,
+) : phantom.core.storage.InboundCommitRepository {
+
+    enum class Fault {
+        /** Commit succeeds. */
+        NONE,
+
+        /** Dies before writing anything — a persist refusal. */
+        BEFORE_ANY_WRITE,
+
+        /** Row written, ledger not. Unreachable for the SQL implementation. */
+        AFTER_ROW_BEFORE_LEDGER,
+
+        /** Both written, then the process dies before the ack. */
+        AFTER_BOTH_BEFORE_ACK,
+    }
+
+    var fault: Fault = Fault.NONE
+    var attempts: Int = 0
+
+    /**
+     * When set, the commit blocks on this until completed. Used to hold
+     * a settlement open while a second delivery of the same envelope is
+     * emitted, so the in-process concurrency guarantee is observable.
+     */
+    var parkOn: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    val parked = kotlinx.coroutines.CompletableDeferred<Unit>()
+
+    override suspend fun commitInboundMessage(
+        message: phantom.core.storage.MessageEntity,
+        envelopeId: String,
+        conversationId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+    ) {
+        attempts++
+        parkOn?.let { gate ->
+            if (!parked.isCompleted) parked.complete(Unit)
+            gate.await()
+        }
+        if (fault == Fault.BEFORE_ANY_WRITE) {
+            throw IllegalStateException("settlement failed before any write")
+        }
+        messages.insertMessage(message)
+        if (fault == Fault.AFTER_ROW_BEFORE_LEDGER) {
+            throw IllegalStateException("ledger write failed after the row landed")
+        }
+        ledger.markProcessed(
+            envelopeId = envelopeId,
+            conversationId = conversationId,
+            senderPubKeyHex = senderPubKeyHex,
+            payloadType = payloadType,
+            status = phantom.core.storage.ProcessedEnvelopeRepository.Status.PROCESSED,
+            nowMs = nowMs,
+        )
+        if (fault == Fault.AFTER_BOTH_BEFORE_ACK) {
+            throw IllegalStateException("process died after the commit, before the ack")
+        }
+    }
 }

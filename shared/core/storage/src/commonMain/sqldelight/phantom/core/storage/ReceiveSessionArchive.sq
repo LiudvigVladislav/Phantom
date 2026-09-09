@@ -1,0 +1,47 @@
+CREATE TABLE receive_session_archive (
+    archive_id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    state_blob TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX receive_archive_conversation ON receive_session_archive(conversation_id);
+CREATE INDEX receive_archive_expiry ON receive_session_archive(expires_at_ms);
+
+getUnexpired:
+SELECT * FROM receive_session_archive
+WHERE conversation_id = :conversationId AND expires_at_ms > :nowMs
+ORDER BY archive_id DESC;
+
+getArchive:
+SELECT * FROM receive_session_archive WHERE archive_id = ? AND conversation_id = ?;
+
+getUnexpiredVersions:
+SELECT archive_id, revision FROM receive_session_archive
+WHERE conversation_id = :conversationId AND expires_at_ms > :nowMs
+ORDER BY archive_id DESC;
+
+countUnexpired:
+SELECT count(*) FROM receive_session_archive
+WHERE conversation_id = :conversationId AND expires_at_ms > :nowMs;
+
+insertArchive:
+INSERT INTO receive_session_archive(conversation_id, state_blob, expires_at_ms)
+VALUES (?, ?, ?);
+
+advanceArchive:
+UPDATE receive_session_archive SET state_blob = ?, revision = revision + 1
+WHERE archive_id = ? AND conversation_id = ? AND revision = ?;
+
+deleteExpired:
+DELETE FROM receive_session_archive WHERE expires_at_ms <= ?;
+
+deleteArchive:
+DELETE FROM receive_session_archive WHERE archive_id = ? AND conversation_id = ?;
+
+deleteByConversation:
+DELETE FROM receive_session_archive WHERE conversation_id = ?;
+
+deleteAllArchives:
+DELETE FROM receive_session_archive;

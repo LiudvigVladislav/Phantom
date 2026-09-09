@@ -6,7 +6,9 @@ package phantom.android.screens.onboarding.v2
 import android.app.Application
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.runTest
+import org.junit.Rule
 import org.junit.Test
+import phantom.android.testing.ModelSnapshotRule
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -37,6 +39,9 @@ import kotlin.test.assertIs
 @Config(sdk = [35], application = Application::class)
 @OptIn(ExperimentalCoroutinesApi::class)
 class OnboardingV2PrivacyFinalizeOrderingTest {
+
+    @get:Rule
+    val snapshots = ModelSnapshotRule()
 
     private val fakeHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
 

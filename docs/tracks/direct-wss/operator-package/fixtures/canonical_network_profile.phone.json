@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "at_wall_ms": 1786817000000,
+  "at_monotonic_ms": 138480000,
+  "has_transport_vpn": false,
+  "active_network_present": true,
+  "active_network_kind": "CELLULAR",
+  "wifi_enabled": false,
+  "mobile_data_enabled": true,
+  "active_data_subscription_id": 1,
+  "active_data_sim_operator_numeric": "25011",
+  "process_uid": 10123,
+  "app_debuggable": true
+}

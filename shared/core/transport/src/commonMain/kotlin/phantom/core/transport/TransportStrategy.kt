@@ -57,6 +57,16 @@ enum class TransportStrategy(val chain: List<TransportKind>) {
 data class ConnectedTransport(
     val kind: TransportKind,
     val socksPort: Int?,
+    /**
+     * The policy epoch this result was validated under.
+     *
+     * R-N1.16 P1: a caller must refuse a result whose epoch is no longer
+     * current, because `connect()` returning says nothing about what
+     * happened between the return and the socket being opened. Defaults
+     * to -1 so a hand-built instance is inert rather than silently
+     * trusted; production values come from [TransportManager.connect].
+     */
+    val policyEpoch: Long = -1L,
 )
 
 /**
@@ -64,6 +74,27 @@ data class ConnectedTransport(
  * was tried and none reached the relay. The caller (foreground service) should
  * surface this to the user as a "no network paths working" UI state.
  */
+/**
+ * A walk finished under a privacy policy that is no longer in force.
+ *
+ * R-N1.16 P1. Thrown INSTEAD of publishing, so nothing records a
+ * last-working hint, nothing moves `TransportManager.state` to
+ * `Connected`, and no caller receives a `ConnectedTransport` it could
+ * open a socket over.
+ *
+ * The walk is discarded rather than retried in place: the live policy
+ * implies a different chain, and whoever changed the policy owns
+ * starting the next connect.
+ */
+class TransportPolicyChangedException(
+    val attempted: TransportKind,
+    val startedUnder: TransportStrategy,
+    val liveNow: TransportStrategy,
+) : Exception(
+    "transport $attempted was reachable but the privacy policy changed from " +
+        "$startedUnder to $liveNow while the chain was being walked; discarding",
+)
+
 class NoTransportReachableException(
     val attempts: List<TransportAttemptFailure>,
 ) : Exception(

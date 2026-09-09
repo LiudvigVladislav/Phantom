@@ -41,7 +41,57 @@ data class PendingRatchetStateEntity(
     val stateBlob: String,
     val reservedAtMs: Long,
     val bootstrapArtifactsBlob: String?,
+    /**
+     * Which LOCAL one-time pre-key this candidate was derived with.
+     * See [PendingOpkBinding]: it is a property of the candidate, not
+     * of any later frame, so it is stored on the row.
+     */
+    val opkBinding: PendingOpkBinding = PendingOpkBinding.Unknown,
 )
+
+/**
+ * What a pending candidate owes the local one-time pre-key pool.
+ *
+ * The three cases are deliberately distinct. A promotion that treats
+ * [Unknown] as [None] finishes a session while leaving the key that
+ * backed it in the pool, republishable and reusable by a different
+ * peer; one that treats [None] as a binding destroys a live local key
+ * that had nothing to do with this candidate.
+ */
+sealed interface PendingOpkBinding {
+
+    /**
+     * The candidate was derived with this local one-time pre-key. Its
+     * promotion spends that key and releases exactly its reservation;
+     * if that reservation is no longer there, the promotion writes
+     * nothing at all.
+     */
+    data class Bound(val opkKeyIdHex: String) : PendingOpkBinding
+
+    /**
+     * No local one-time pre-key was used. The OUTBOUND INITIATOR case:
+     * the `x3dhInit` cached in `bootstrapArtifactsBlob` names a key in
+     * the PEER's pool. A promotion spends nothing and must leave every
+     * reservation this conversation happens to hold alone.
+     */
+    data object None : PendingOpkBinding
+
+    /**
+     * Nothing recorded a binding for this row. Not a synonym for
+     * [None] -- it carries no claim either way, so a promotion that
+     * needs the answer refuses instead of guessing. Legacy rows without
+     * unambiguous provenance retain this value after migration.
+     */
+    data object Unknown : PendingOpkBinding
+
+    companion object {
+        internal fun fromStorage(keyId: String?, known: Long): PendingOpkBinding = when {
+            known != 1L -> Unknown
+            keyId != null -> Bound(keyId)
+            else -> None
+        }
+    }
+}
 
 /**
  * Storage interface for the Sprint 2b-B L3 `pending_ratchet_state`
@@ -83,6 +133,12 @@ interface PendingRatchetStateRepository {
         stateBlob: String,
         reservedAtMs: Long,
         bootstrapArtifactsBlob: String? = null,
+        /**
+         * Carried through verbatim. A caller rewriting an existing
+         * row's state must pass that row's own binding: the candidate
+         * still owes whatever it owed before the rewrite.
+         */
+        opkBinding: PendingOpkBinding = PendingOpkBinding.Unknown,
     )
 
     /**

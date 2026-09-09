@@ -4,6 +4,7 @@
 package phantom.core.transport
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
@@ -64,6 +65,13 @@ class AndroidNativeOkHttpMediaUploadTransport(
     private val connectTimeoutMs: Long = CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Long = READ_TIMEOUT_MS,
     private val writeTimeoutMs: Long = WRITE_TIMEOUT_MS,
+    /**
+     * N1-F2 R-N1.3 — registry of abortable in-flight native calls, so a
+     * privacy-mode revocation can abort a media chunk transfer blocked
+     * in `Call.execute()`. Null keeps the pre-R-N1.3 behaviour and is
+     * used only by tests that do not exercise revocation.
+     */
+    private val callRegistry: EgressCallRegistry? = null,
 ) : MediaUploadTransport {
 
     /**
@@ -181,12 +189,20 @@ class AndroidNativeOkHttpMediaUploadTransport(
             var statusCode: Int
             var headersOnlyElapsedMs = 0L
             var duplicateHeader = false
-            client.newCall(request).execute().use { response: Response ->
-                statusCode = response.code
-                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
-                duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
-                // 204 is body-less by RFC. Drain anyway to free the connection.
-                try { response.body?.bytes() } catch (_: Throwable) {}
+            val call = client.newCall(request)
+            val egressToken = callRegistry?.registerOrRefuse("media_chunk") { call.cancel() }
+            try {
+                call.execute().use { response: Response ->
+                    statusCode = response.code
+                    headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                    duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
+                    // 204 is body-less by RFC. Drain anyway to free the connection.
+                    try { response.body?.bytes() } catch (_: Throwable) {}
+                }
+            } finally {
+                if (egressToken != null) {
+                    withContext(NonCancellable) { callRegistry?.unregister(egressToken) }
+                }
             }
             val totalElapsedMs = System.currentTimeMillis() - startMs
             log(
@@ -265,21 +281,29 @@ class AndroidNativeOkHttpMediaUploadTransport(
             var bodyReadError: Throwable? = null
             var rawBody = ""
             var duplicateHeader = false
-            client.newCall(request).execute().use { response: Response ->
-                statusCode = response.code
-                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
-                duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
-                // PR-M2d.1: idempotency-aware body-read. Tele2 Layer B can
-                // drop response bodies after a valid status line arrived.
-                // We capture the status first; if status indicates the relay
-                // accepted/stored the chunk, body-read failure is non-fatal.
-                // For 204 (Prefer=minimal path) there is no body to read; for
-                // 201/200 (legacy path) we drain it but tolerate timeout.
-                rawBody = try {
-                    response.body?.string() ?: ""
-                } catch (e: Throwable) {
+            val call = client.newCall(request)
+            val egressToken = callRegistry?.registerOrRefuse("media_chunk") { call.cancel() }
+            try {
+                call.execute().use { response: Response ->
+                    statusCode = response.code
+                    headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                    duplicateHeader = response.headers["X-Chunk-Duplicate"] == "1"
+                    // PR-M2d.1: idempotency-aware body-read. Tele2 Layer B can
+                    // drop response bodies after a valid status line arrived.
+                    // We capture the status first; if status indicates the relay
+                    // accepted/stored the chunk, body-read failure is non-fatal.
+                    // For 204 (Prefer=minimal path) there is no body to read; for
+                    // 201/200 (legacy path) we drain it but tolerate timeout.
+                    rawBody = try {
+                        response.body?.string() ?: ""
+                    } catch (e: Throwable) {
                     bodyReadError = e
                     ""
+                }
+                }
+            } finally {
+                if (egressToken != null) {
+                    withContext(NonCancellable) { callRegistry?.unregister(egressToken) }
                 }
             }
             val totalElapsedMs = System.currentTimeMillis() - startMs
@@ -388,18 +412,26 @@ class AndroidNativeOkHttpMediaUploadTransport(
             var totalHeader: String? = null
             var ciphertext: ByteArray = ByteArray(0)
             var bodyReadError: Throwable? = null
-            client.newCall(request).execute().use { response: Response ->
-                statusCode = response.code
-                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
-                totalHeader = response.headers["X-Chunk-Total"]
-                if (statusCode == 200) {
-                    try {
-                        ciphertext = response.body?.bytes() ?: ByteArray(0)
-                    } catch (e: Throwable) {
-                        bodyReadError = e
-                    }
-                } else {
+            val call = client.newCall(request)
+            val egressToken = callRegistry?.registerOrRefuse("media_chunk") { call.cancel() }
+            try {
+                call.execute().use { response: Response ->
+                    statusCode = response.code
+                    headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                    totalHeader = response.headers["X-Chunk-Total"]
+                    if (statusCode == 200) {
+                        try {
+                            ciphertext = response.body?.bytes() ?: ByteArray(0)
+                        } catch (e: Throwable) {
+                            bodyReadError = e
+                        }
+                    } else {
                     try { response.body?.bytes() } catch (_: Throwable) {}
+                }
+                }
+            } finally {
+                if (egressToken != null) {
+                    withContext(NonCancellable) { callRegistry?.unregister(egressToken) }
                 }
             }
             val totalElapsedMs = System.currentTimeMillis() - startMs
@@ -494,11 +526,19 @@ class AndroidNativeOkHttpMediaUploadTransport(
             var statusCode: Int
             var headersOnlyElapsedMs = 0L
             val rawBody: String
-            client.newCall(request).execute().use { response: Response ->
-                statusCode = response.code
-                headersOnlyElapsedMs = System.currentTimeMillis() - startMs
-                rawBody = response.body?.string() ?: ""
-            }
+            val call = client.newCall(request)
+            val egressToken = callRegistry?.registerOrRefuse("media_chunk") { call.cancel() }
+            try {
+                call.execute().use { response: Response ->
+                    statusCode = response.code
+                    headersOnlyElapsedMs = System.currentTimeMillis() - startMs
+                    rawBody = response.body?.string() ?: ""
+                }
+                } finally {
+                    if (egressToken != null) {
+                        withContext(NonCancellable) { callRegistry?.unregister(egressToken) }
+                    }
+                }
             val totalElapsedMs = System.currentTimeMillis() - startMs
             log(
                 "MEDIA_HTTP download_response mediaId=${mediaId.take(8)} idx=$idx " +

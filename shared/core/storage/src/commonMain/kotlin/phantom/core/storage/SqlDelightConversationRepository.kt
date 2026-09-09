@@ -92,7 +92,10 @@ class SqlDelightConversationRepository(
 
     override suspend fun deleteConversation(id: String): Unit =
         withContext(Dispatchers.IO) {
-            db.conversationQueries.deleteConversation(id)
+            db.transaction {
+                db.receiveSessionArchiveQueries.deleteByConversation(id)
+                db.conversationQueries.deleteConversation(id)
+            }
         }
 
     override suspend fun setVerified(conversationId: String, verified: Boolean): Unit =

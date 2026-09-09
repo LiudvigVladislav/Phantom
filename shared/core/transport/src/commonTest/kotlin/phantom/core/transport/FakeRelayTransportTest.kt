@@ -80,6 +80,13 @@ class FakeRelayTransportTest {
         }
 
         override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean = true
+
+        /**
+         * Deliberately NOT overridden: `disconnectAndConfirm` is inherited
+         * from [RelayTransport], and this fake is how that default gets
+         * exercised. KtorRelayTransport overrides it; every other
+         * implementation relies on this one.
+         */
     }
 
     @Test
@@ -164,5 +171,48 @@ class FakeRelayTransportTest {
 
         assertEquals(2, collected.size)
         assertTrue(collected.all { it == "alice-key" })
+    }
+
+    // ----------------------------------------------------------------
+    // R-N1.17 P1 - the inherited confirmation default
+    // ----------------------------------------------------------------
+
+    @Test
+    fun theDefaultConfirmationRefusesAnIdentityItDoesNotOwn() = runTest {
+        // The default exists for implementations whose closes happen
+        // inside the join. It still has to honour the identity binding, or
+        // a deferred shutdown would tear down a successor's transport
+        // through any transport that did not override it.
+        val transport = FakeRelayTransport()
+
+        val result = transport.disconnectAndConfirm(
+            timeoutMs = 100,
+            onlyIfIdentity = transport.teardownIdentity + 1,
+        )
+
+        assertTrue(result.supersededIdentity, "an identity it does not own is refused")
+        assertFalse(result.ran, "and nothing is torn down")
+        assertFalse(result.confirmed)
+    }
+
+    @Test
+    fun theDefaultConfirmationRunsForTheIdentityItOwns() = runTest {
+        // The control, and the default's actual contract: for a transport
+        // whose closes are inside the join, a joined loop IS a closed
+        // socket.
+        val transport = FakeRelayTransport()
+
+        val result = transport.disconnectAndConfirm(
+            timeoutMs = 100,
+            onlyIfIdentity = transport.teardownIdentity,
+        )
+
+        assertTrue(result.ran)
+        assertTrue(result.loopJoined)
+        assertTrue(
+            result.closesConfirmed,
+            "the default reports the join as the close, which is true for it",
+        )
+        assertTrue(result.confirmed)
     }
 }

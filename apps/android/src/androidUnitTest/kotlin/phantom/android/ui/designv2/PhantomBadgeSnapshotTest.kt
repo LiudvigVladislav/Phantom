@@ -28,6 +28,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseBadgeMatrix
  * 99 / 250 (99+ overflow) plus dotOnly, so every Badge public surface has
  * a review PNG.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomBadgeSnapshotTest {
 
     @get:Rule

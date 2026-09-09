@@ -15,7 +15,10 @@ import phantom.core.transport.TransportPreferences
  * nothing needs tearing down.
  *
  * Round-2 REDLINE on Commit 4 §P1-1: the pre-REDLINE shape wrote
- * only `transportPreferences.privacyMode = mode`. But `ChatScreen`'s
+ * only `transportPreferences.privacyMode = mode`. The legacy mirror was
+ * historically read directly by `ChatScreen`; R-N1.17 replaced that with
+ * a capability from `PrivacyModeCoordinator`, and this function is now
+ * reached only through the coordinator's persistence adapter.
  * read-receipt gate reads a separate `phantom_prefs.privacy_mode`
  * legacy SharedPreferences key. Skipping the mirror meant a user
  * selecting Private got Private transport routing but kept sending

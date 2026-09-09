@@ -13,6 +13,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseAvatarMatrix
  * PhantomAvatar matrix golden — 4 sizes (32/40/48/64dp) × 3 badge combos
  * (plain, online, online+verified) + a flat-fill row.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomAvatarSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

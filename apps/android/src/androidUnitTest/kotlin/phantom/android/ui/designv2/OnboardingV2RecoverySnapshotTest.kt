@@ -30,6 +30,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingTransientStartupEr
  * consistent with how every other CTA-reachability guarantee in
  * the OnboardingV2 stack is pinned.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class OnboardingV2RecoverySnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

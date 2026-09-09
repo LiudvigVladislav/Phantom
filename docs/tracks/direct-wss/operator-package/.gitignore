@@ -5,6 +5,15 @@
 android-debug-diagnostic.apk
 # Evidence dirs are per-run artefacts — never tracked.
 evidence/
+# WSS-3 segregated runtime state store per contract §3.6 — chmod-0600
+# host-vpn-service + arm-token files, distinct from evidence, never
+# packaged into the handoff tarball. Ignored so operators can never
+# accidentally commit their VPN provider identity.
+.runtime/
 # Python cache from running the fixture tests.
 __pycache__/
 tests/__pycache__/
+# Mock ADB scratch state — per-serial logcat buffers and cached JSON
+# used by the synthetic Mac dry-run and shell fixtures. Recreated at
+# will; must never be tracked or packaged.
+lib/.mock-adb.*

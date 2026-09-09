@@ -278,7 +278,44 @@ class RestFallbackOrchestrator(
      * k11-5c-authenticated-poll-clone-mini-lock.md` §1.5 + §2.3.
      */
     private val debugSessionTokenObserver: ((token: String, expiresInMs: Long) -> Unit)? = null,
+    /**
+     * N1-F2 (2026-08-29) — the single fail-closed REST egress
+     * authority (see [RestEgressPolicy]). Consulted live at EVERY
+     * choke point: [bootstrap], [sendEnvelope], [ackInbound],
+     * [ackInboundAndAdvanceCursor], each poll-loop iteration, and the
+     * universal token funnel [acquireOrRefreshToken] (which also
+     * covers the [getChallenge] HTTP hop and cached-token reuse, so a
+     * session created under Standard is unusable after a switch to
+     * Private/Ghost). Deliberately REQUIRED with no default: a
+     * construction site cannot silently opt into fail-open Direct
+     * egress.
+     *
+     * R-N1.2: promoted from a bare policy to the revocable
+     * [RestEgressGate]. The gate still answers the live policy question
+     * (fast-path refusal at method entry, below) AND owns the
+     * dispatch-bound leases that [RestEgressGate.revokeAndJoin] cancels
+     * on a Standard -> Private/Ghost switch. Every actual
+     * `transport.*` network call runs inside [RestEgressGate.dispatch].
+     */
+    private val egressGate: RestEgressGate,
 ) {
+
+    /**
+     * N1-F2 — evaluate the egress policy for one operation. Returns
+     * the decision when the operation must be refused, or null when
+     * Direct egress is allowed. Diagnostics carry ONLY the operation
+     * label and decision name — never identity, tokens, envelope ids
+     * beyond what existing logs already carry, or message content.
+     */
+    private fun egressBlocked(operation: String): RestEgressDecision? {
+        val decision = egressGate.decide()
+        if (decision is RestEgressDecision.DirectAllowed) return null
+        log(
+            "REST_EGRESS blocked operation=$operation " +
+                "decision=${decision::class.simpleName}",
+        )
+        return decision
+    }
 
     /**
      * Trek 2 Stage 2B-B (C6, L10) — draw a single jitter factor
@@ -738,6 +775,13 @@ class RestFallbackOrchestrator(
      * `restFallback=true`).
      */
     suspend fun bootstrap(): RelayCapabilities {
+        // N1-F2: in Private/Ghost no bootstrap HTTP may leave at all.
+        // Capabilities collapse to SAFE_DEFAULTS (restFallback=false)
+        // so every downstream consumer stays dormant.
+        if (egressBlocked("bootstrap") != null) {
+            _capabilities.value = RelayCapabilities.SAFE_DEFAULTS
+            return RelayCapabilities.SAFE_DEFAULTS
+        }
         val token = acquireOrRefreshToken(reason = "bootstrap", forceRefresh = true)
         if (token == null) {
             log("REST_TRACE capability_disabled reason=auth_session_failed")
@@ -1061,6 +1105,15 @@ class RestFallbackOrchestrator(
         sequenceTs: Long,
         sealedSenderBase64: String = "",
     ): SendOutcome {
+        // N1-F2: refuse BEFORE any request body is built or dispatched.
+        // The caller keeps the message durably queued (DMS marks the
+        // row QUEUED on a failed send) — nothing is discarded.
+        egressBlocked("send")?.let { decision ->
+            return SendOutcome.Failed(
+                statusCode = null,
+                reason = "egress_policy_${decision::class.simpleName}",
+            )
+        }
         if (!_capabilities.value.restFallback) {
             return SendOutcome.DisabledByCapability
         }
@@ -1116,7 +1169,9 @@ class RestFallbackOrchestrator(
             )
             val attemptStart = now()
             val outcome = runCatching {
-                transport.send(url = url, token = token, idempotencyKey = envelopeId, body = body)
+                egressGate.dispatch("send") {
+                    transport.send(url = url, token = token, idempotencyKey = envelopeId, body = body)
+                }
             }
             val attemptElapsed = now() - attemptStart
 
@@ -1270,6 +1325,14 @@ class RestFallbackOrchestrator(
      * persistence succeeds — same pattern as PR-V0b voice ACK.
      */
     suspend fun ackInbound(envelopeId: String): AckOutcome {
+        // N1-F2: refuse before dispatch; the relay keeps the envelope
+        // and redelivery remains the self-healing path.
+        egressBlocked("ack")?.let { decision ->
+            return AckOutcome.Failed(
+                statusCode = null,
+                reason = "egress_policy_${decision::class.simpleName}",
+            )
+        }
         if (!_capabilities.value.restFallback) {
             return AckOutcome.DisabledByCapability
         }
@@ -1284,7 +1347,9 @@ class RestFallbackOrchestrator(
         )
         val url = "$baseUrl/relay/ack-deliver"
         val body = AckDeliverRequest(id = envelopeId)
-        val response = runCatching { transport.ackDeliver(url, token, body) }
+        val response = runCatching {
+            egressGate.dispatch("ack_deliver") { transport.ackDeliver(url, token, body) }
+        }
         if (response.isFailure) {
             val ex = response.exceptionOrNull()!!
             log("REST_TRACE ack_fail id=${envelopeId.take(8)} reason=${ex::class.simpleName}")
@@ -1368,7 +1433,19 @@ class RestFallbackOrchestrator(
      *
      * Cells M11 + M-B20 + M-B27 + M-B29 pin this.
      */
+    /** REST origin survives parking the downstream processing claim. */
+    suspend fun hasInboundForAck(envelopeId: String): Boolean = _inboundStateMutex.withLock {
+        _pendingSeqForAck.containsKey(envelopeId)
+    }
+
     suspend fun ackInboundAndAdvanceCursor(envelopeId: String): AckOutcome {
+        // N1-F2: same refusal shape as [ackInbound].
+        egressBlocked("ack_advance")?.let { decision ->
+            return AckOutcome.Failed(
+                statusCode = null,
+                reason = "egress_policy_${decision::class.simpleName}",
+            )
+        }
         // Phase 0 — cancellable: relay ack call.
         val ackOutcome = ackInbound(envelopeId)
         if (ackOutcome !is AckOutcome.Acked) {
@@ -1579,6 +1656,12 @@ class RestFallbackOrchestrator(
         // `kotlinx.coroutines.currentCoroutineContext()` inside this
         // suspend fun.
         while (currentCoroutineContext().isActive) {
+            // N1-F2: a runtime switch to Private/Ghost STOPS polling at
+            // the next iteration boundary — the loop exits instead of
+            // spinning against a closed policy. Re-entry to Standard
+            // restores polling through the existing state-machine and
+            // bootstrap-retry paths.
+            if (egressBlocked("poll_loop") != null) break
             val mode = stateMachine.state.value
             if (mode == RestMode.WsActive) break
 
@@ -1713,16 +1796,18 @@ class RestFallbackOrchestrator(
                     // gate is computed once per call in the companion
                     // helper so M2's 9-cell matrix can pin it without
                     // standing up an orchestrator.
-                    transport.poll(
-                        url = "$baseUrl/relay/poll",
-                        token = token,
-                        sinceSeq = lastSeenSeq,
-                        longPollOptIn = longPollEnabled,
-                        readTimeoutMs = computeLongPollReadTimeoutMs(
-                            longPollEnabled = longPollEnabled,
-                            pollHoldSecs = _capabilities.value.pollHoldSecs,
-                        ),
-                    )
+                    egressGate.dispatch("poll") {
+                        transport.poll(
+                            url = "$baseUrl/relay/poll",
+                            token = token,
+                            sinceSeq = lastSeenSeq,
+                            longPollOptIn = longPollEnabled,
+                            readTimeoutMs = computeLongPollReadTimeoutMs(
+                                longPollEnabled = longPollEnabled,
+                                pollHoldSecs = _capabilities.value.pollHoldSecs,
+                            ),
+                        )
+                    }
                 }
                 val elapsed = now() - startMs
 
@@ -1938,6 +2023,8 @@ class RestFallbackOrchestrator(
         // line above. `wsActivePollJob.cancel()` from `stop()` cannot exit
         // this loop via `scope.isActive`.
         while (currentCoroutineContext().isActive) {
+            // N1-F2: same stop-at-iteration-boundary rule as [pollLoop].
+            if (egressBlocked("ws_active_poll_loop") != null) break
             val token = acquireOrRefreshToken(
                 reason = if (staleToken != null) "ws_active_poll_401" else "ws_active_poll",
                 staleToken = staleToken,
@@ -2044,16 +2131,18 @@ class RestFallbackOrchestrator(
                     // Same L1 + L2 gating as the legacy poll site below —
                     // both call sites of `transport.poll(...)` carry the
                     // same Stage 2B-A header and timeout invariants.
-                    transport.poll(
-                        url = "$baseUrl/relay/poll",
-                        token = token,
-                        sinceSeq = sinceSeq,
-                        longPollOptIn = longPollEnabled,
-                        readTimeoutMs = computeLongPollReadTimeoutMs(
-                            longPollEnabled = longPollEnabled,
-                            pollHoldSecs = _capabilities.value.pollHoldSecs,
-                        ),
-                    )
+                    egressGate.dispatch("ws_active_poll") {
+                        transport.poll(
+                            url = "$baseUrl/relay/poll",
+                            token = token,
+                            sinceSeq = sinceSeq,
+                            longPollOptIn = longPollEnabled,
+                            readTimeoutMs = computeLongPollReadTimeoutMs(
+                                longPollEnabled = longPollEnabled,
+                                pollHoldSecs = _capabilities.value.pollHoldSecs,
+                            ),
+                        )
+                    }
                 }
                 val elapsed = now() - startMs
 
@@ -2281,6 +2370,19 @@ class RestFallbackOrchestrator(
         staleToken: String? = null,
         forceRefresh: Boolean = false,
     ): String? = tokenMutex.withLock {
+        // N1-F2: the universal funnel. Fires BEFORE cached-token reuse
+        // so a session token minted under Standard cannot authorise
+        // anything after the user switches to Private/Ghost. This is a
+        // cheap early exit, NOT the security boundary: it avoids
+        // building a request that would be refused anyway. The boundary
+        // is [RestEgressGate.dispatch], which re-reads the policy under
+        // its own lock immediately before each of `auth_challenge` and
+        // `auth_session`. R-N1.2 claimed this pre-check meant "no
+        // identity-bearing HTTP is even constructed"; that was wrong
+        // while the challenge itself was ungated.
+        if (egressBlocked("token_$reason") != null) {
+            return@withLock null
+        }
         val cached = sessionToken
         val expiresInMs = tokenExpiresAt - now()
 
@@ -3662,8 +3764,15 @@ class RestFallbackOrchestrator(
         // error, breaking structured-concurrency teardown and
         // letting the L7 bad-MAC path leak a refresh attempt that
         // was cancelled mid-flight.
+        // N1-F2 R-N1.3 P1-1: the challenge GET carries the long-term
+        // identity in its query string and is a Direct REST request in
+        // its own right. R-N1.2 gated only `authSession` below, so the
+        // challenge escaped the dispatch boundary entirely: it was
+        // never registered as a lease, so `revokeAndJoin` could neither
+        // cancel it nor wait for it. It now goes through the same
+        // authority as every other Direct call.
         val challengeHex = try {
-            getChallenge(identityHex)
+            egressGate.dispatch("auth_challenge") { getChallenge(identityHex) }
         } catch (ce: CancellationException) {
             throw ce
         } catch (ex: Throwable) {
@@ -3691,7 +3800,9 @@ class RestFallbackOrchestrator(
 
         val startMs = now()
         val response: RestFallbackResponse<AuthSessionResponse> = try {
-            transport.authSession(url = "$baseUrl/auth/session", body = body)
+            egressGate.dispatch("auth_session") {
+                transport.authSession(url = "$baseUrl/auth/session", body = body)
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (ex: Throwable) {

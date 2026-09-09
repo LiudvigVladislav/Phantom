@@ -61,6 +61,7 @@ class SqlDelightDecryptFailedEnvelopeRepository(
                     wireFrameJson = row.wire_frame_json,
                     replayAttemptCount = row.replay_attempt_count,
                     lastReplayAtMs = row.last_replay_at_ms,
+                    lastReceiveVersion = row.last_receive_version,
                 )
             }
     }
@@ -78,9 +79,20 @@ class SqlDelightDecryptFailedEnvelopeRepository(
             )
         }
 
+    override suspend fun recordFailure(
+        envelopeId: String, errorType: String, receiveVersion: String, nowMs: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        db.decryptFailedEnvelopeQueries.recordFailure(errorType, receiveVersion, nowMs, envelopeId)
+    }
+
     override suspend fun deleteOlderThan(olderThanMs: Long): Unit =
         withContext(Dispatchers.IO) {
             db.decryptFailedEnvelopeQueries.deleteOlderThan(olderThanMs)
+        }
+
+    override suspend fun existsByEnvelopeId(envelopeId: String): Boolean =
+        withContext(Dispatchers.IO) {
+            db.decryptFailedEnvelopeQueries.countByEnvelopeId(envelopeId).executeAsOne() > 0L
         }
 
     override suspend fun count(): Long = withContext(Dispatchers.IO) {

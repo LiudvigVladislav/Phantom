@@ -17,6 +17,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseIconContactSheet
  * pipeline (clipping, blank paths, primitive-to-pathData translation errors,
  * viewport / stroke-width mistakes) with a single review PNG per revision.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomIconContactSheetSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

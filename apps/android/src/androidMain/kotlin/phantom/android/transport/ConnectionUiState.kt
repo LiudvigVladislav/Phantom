@@ -4,6 +4,8 @@
 package phantom.android.transport
 
 import phantom.core.transport.RestMode
+import phantom.core.transport.RestModeSnapshot
+import phantom.core.transport.RestRecoveryCause
 import phantom.core.transport.TransportState
 
 /**
@@ -35,7 +37,7 @@ sealed class ConnectionUiState {
     /** RestMode.RestActive — REST fallback is delivering envelopes. */
     object LimitedRealtime : ConnectionUiState()
 
-    /** RestMode.WsCandidate — WS came back, REST polling continues until promotion. */
+    /** WS probation following a failure, route change, or unknown cause. */
     object Recovering : ConnectionUiState()
 
     /** RestMode.WsActive + WS Connecting — cold-start / first connect. */
@@ -75,9 +77,22 @@ sealed class ConnectionUiState {
 internal fun deriveConnectionUiState(
     wsState: TransportState,
     restMode: RestMode,
-): ConnectionUiState = when (restMode) {
+): ConnectionUiState = deriveConnectionUiState(wsState, RestModeSnapshot(restMode))
+
+/**
+ * Silence alone is not a diagnosed connection failure. Keep the limited-realtime
+ * indication while its probation runs, never promote it to Online here. Missing
+ * evidence and a raw WS failure retain the conservative Recovering indication.
+ */
+internal fun deriveConnectionUiState(
+    wsState: TransportState,
+    snapshot: RestModeSnapshot,
+): ConnectionUiState = when (snapshot.mode) {
     RestMode.RestActive  -> ConnectionUiState.LimitedRealtime   // priority 1
-    RestMode.WsCandidate -> ConnectionUiState.Recovering        // priority 2
+    RestMode.WsCandidate -> if (
+        snapshot.recoveryCause == RestRecoveryCause.InboundSilence &&
+        wsState == TransportState.Connected
+    ) ConnectionUiState.LimitedRealtime else ConnectionUiState.Recovering
     RestMode.WsActive    -> when (wsState) {                    // priority 3+
         TransportState.Connected    -> ConnectionUiState.Online
         TransportState.Connecting   -> ConnectionUiState.Connecting

@@ -40,6 +40,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingWelcomeV2
  * / FinaleConfirmation) don't get goldens this commit — they'd add
  * churn for a body that's replaced in Commits 3-5.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class OnboardingV2SnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

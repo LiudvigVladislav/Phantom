@@ -17,6 +17,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -570,6 +572,16 @@ class KtorRelayTransport(
     private val transportScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var reconnectJob: Job? = null
 
+    /**
+     * R-N1.17 P1: identity of the connection currently owned here.
+     *
+     * Bumped wherever a reconnect generation is launched. A teardown that
+     * quotes an older value is one whose connection has been replaced, and
+     * it must not touch the one that replaced it.
+     */
+    @Volatile private var teardownIdentityValue: Long = 0L
+    override val teardownIdentity: Long get() = teardownIdentityValue
+
     // PR-F2 (2026-05-12): serialize connect() and forceReconnect() calls
     // so racing watchdogs / lifecycle callbacks cannot each spawn their own
     // reconnect loop. Test #26 relay log captured 5 simultaneous
@@ -618,6 +630,128 @@ class KtorRelayTransport(
      * GC — better than letting the transport accumulate an unbounded
      * number of hung coroutines across repeated teardowns.
      */
+    /**
+     * A close that was dispatched and has not yet succeeded.
+     *
+     * R-N1.17 P1. `teardownAndJoin` DETACHES `session` and
+     * `currentGenerationClient` and hands them to cleanup tasks. Once
+     * detached, the transport no longer holds them - so a close that
+     * failed or hung could not be retried by anyone: the next teardown
+     * found both fields null, dispatched nothing, and an empty set of
+     * closes reported `closesConfirmed = true`. The permit machinery is
+     * built on that retry, and there was nothing to retry with.
+     *
+     * The action closes over the reference, so re-dispatching it closes
+     * the SAME socket - not whatever the transport happens to own now. A
+     * connection made since is untouched by construction, not by a check.
+     */
+    private class PendingClose(
+        val identity: Long,
+        val label: String,
+        val action: suspend () -> Unit,
+    ) {
+        /**
+         * An attempt on this close is running.
+         *
+         * R-N1.17 P1: retaining the entry made a retry possible, and by
+         * itself it made a DUPLICATE possible too. A close that parks
+         * stays in the registry, so the next teardown would dispatch the
+         * same action again beside the one still running - two concurrent
+         * closes of one socket, each holding a cleanup slot, until the cap
+         * is full and further closes are refused outright.
+         *
+         * The entry is retried, not re-entered. Guarded by
+         * [pendingClosesMutex].
+         */
+        var inFlight: Boolean = false
+    }
+
+    /**
+     * Closeables a teardown must detach alongside the session and client.
+     *
+     * R-N1.17 P1: empty in production. It exists so the detach-and-remember
+     * step can be walked by a fixture, and it is walked by the SAME code -
+     * the production refs and these go into one list and through one loop.
+     *
+     * The alternative was a seam that put entries straight into the
+     * pending registry, and that seam skipped the very line whose absence
+     * was the defect: a close that is dispatched without being remembered
+     * cannot be retried, because the reference is gone.
+     */
+    private val extraDetachables = mutableListOf<Detachable>()
+
+    /**
+     * Something a teardown must detach and shut down.
+     *
+     * R-N1.17 P1: TWO parts, because `close()` on a Ktor `HttpClient` or a
+     * `WebSocketSession` only STARTS the shutdown. It returns while the
+     * engine is still winding down, so a cleanup that returns when
+     * `close()` returns says the socket is gone when it may not be - and
+     * the entry would leave the registry, and the permit with it.
+     *
+     * [completion] is the resource's own Job. Awaiting it is what makes
+     * "closed" a fact rather than a request. A resource that never
+     * completes keeps its cleanup running, which keeps the entry owed and
+     * the teardown unconfirmed: fail-closed, and bounded by the cleanup
+     * cap rather than by pretending.
+     */
+    private class Detachable(
+        val label: String,
+        val close: suspend () -> Unit,
+        val completion: () -> Job?,
+    )
+
+    internal suspend fun addDetachableForTest(
+        label: String,
+        close: suspend () -> Unit,
+        completion: () -> Job? = { null },
+    ) {
+        pendingClosesMutex.withLock { extraDetachables += Detachable(label, close, completion) }
+    }
+
+    private val pendingClosesMutex = Mutex()
+    private val pendingCloses = mutableListOf<PendingClose>()
+
+    private suspend fun rememberPendingClose(
+        identity: Long,
+        label: String,
+        action: suspend () -> Unit,
+    ) {
+        pendingClosesMutex.withLock {
+            pendingCloses += PendingClose(identity, label, action)
+        }
+    }
+
+    private suspend fun forgetPendingClose(entry: PendingClose) {
+        pendingClosesMutex.withLock { pendingCloses.remove(entry) }
+    }
+
+    /**
+     * The entries this teardown may dispatch: everything owed that nobody
+     * is already working on. Claimed in one critical section, so two
+     * teardowns cannot both take the same one.
+     */
+    private suspend fun claimIdlePendingCloses(): List<PendingClose> =
+        pendingClosesMutex.withLock {
+            pendingCloses.filter { !it.inFlight }.onEach { it.inFlight = true }
+        }
+
+    /** Release a claim without discharging the entry: the close is owed again. */
+    private suspend fun releasePendingClaim(entry: PendingClose) {
+        pendingClosesMutex.withLock { entry.inFlight = false }
+    }
+
+    /**
+     * How many closes are still owed, whether or not an attempt on them is
+     * running. Zero is the only confirmable state.
+     */
+    internal suspend fun pendingCloseCount(): Int =
+        pendingClosesMutex.withLock { pendingCloses.size }
+
+    /** How many are being attempted right now. For assertions. */
+    internal suspend fun pendingCloseInFlightCount(): Int =
+        pendingClosesMutex.withLock { pendingCloses.count { it.inFlight } }
+
     private val cleanupCounterMutex = Mutex()
     private var cleanupInflight: Int = 0
     private val cleanupCap: Int = 8
@@ -636,7 +770,10 @@ class KtorRelayTransport(
      * Decrement of [cleanupInflight] happens in a finally guarded by
      * [NonCancellable] so a propagating cancellation never leaks a slot.
      */
-    private suspend fun maybeLaunchCleanup(label: String, action: suspend () -> Unit) {
+    private suspend fun maybeLaunchCleanup(
+        label: String,
+        action: suspend () -> Unit,
+    ): Deferred<Boolean>? {
         val accepted = cleanupCounterMutex.withLock {
             if (cleanupInflight >= cleanupCap) {
                 false
@@ -650,20 +787,37 @@ class KtorRelayTransport(
                 RelayLogLevel.WARN,
                 "${genTag()} cleanup budget exhausted ($cleanupCap in flight); refusing $label — ref abandoned to GC",
             )
-            return
+            // R-N1.17 P1: null, not Unit. A refused cleanup is a close
+            // that will never happen, and a caller asking for confirmation
+            // has to be able to tell that apart from one that ran.
+            return null
         }
-        cleanupScope.launch {
+        // R-N1.17 P1: `async`, and the value is whether the close actually
+        // SUCCEEDED. This used to be a `launch`, and every failure path
+        // below completes it normally - the exceptions are swallowed on
+        // purpose, so the coroutine ends cleanly whether the socket closed
+        // or threw. Joining such a Job proves the cleanup finished
+        // running, which is not the same fact as the socket being closed,
+        // and confirmation built on it would be confirmation of nothing.
+        return cleanupScope.async {
             try {
                 action()
+                true
             } catch (ce: CancellationException) {
                 // best-effort cleanup — swallow CE here so the slot is freed;
                 // structured-concurrency parent in cleanupScope is SupervisorJob
-                // so this does not propagate.
+                // so this does not propagate. It is NOT a successful close.
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} cleanup $label cancelled — socket not confirmed closed",
+                )
+                false
             } catch (t: Throwable) {
                 relayLog(
                     RelayLogLevel.WARN,
                     "${genTag()} cleanup $label threw: ${t::class.simpleName}: ${t.message}",
                 )
+                false
             } finally {
                 withContext(NonCancellable) {
                     cleanupCounterMutex.withLock { cleanupInflight-- }
@@ -683,9 +837,23 @@ class KtorRelayTransport(
      * regression test can saturate the cap without seeding real HttpClient
      * / WS-session refs. The action runs on [cleanupScope].
      */
-    internal suspend fun launchCleanupForTest(label: String, action: suspend () -> Unit) {
-        maybeLaunchCleanup(label, action)
+    /**
+     * Test seam: enqueue a pending close exactly as a teardown does when
+     * it detaches a session or client.
+     *
+     * Deliberately NOT a way to invoke a cleanup directly - that would
+     * exercise a helper beside the aggregator instead of the aggregator.
+     * What goes in here is dispatched, awaited, retained and retried by
+     * `disconnectAndConfirm` itself.
+     */
+    internal suspend fun enqueuePendingCloseForTest(label: String, action: suspend () -> Unit) {
+        rememberPendingClose(teardownIdentityValue, label, action)
     }
+
+    internal suspend fun launchCleanupForTest(
+        label: String,
+        action: suspend () -> Unit,
+    ): Deferred<Boolean>? = maybeLaunchCleanup(label, action)
 
     /**
      * Test seam (test-lifecycle requirement, 2026-06-22): deterministic
@@ -1268,6 +1436,7 @@ class KtorRelayTransport(
                     "${genTag()} connect: launching fresh reconnect loop (ownerGen=$ownerGen)",
                 )
                 val launched = transportScope.launch { runReconnectLoop(ownerGen) }
+                teardownIdentityValue += 1
                 reconnectJob = launched
                 launched
             }
@@ -2491,7 +2660,30 @@ class KtorRelayTransport(
      * strict-bound body.
      */
     override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean {
-        return teardownAndJoin(timeoutMs = timeoutMs, flushBeforeClose = false)
+        return teardownAndJoin(timeoutMs = timeoutMs, flushBeforeClose = false).loopJoined
+    }
+
+    /**
+     * R-N1.17 P1: the confirming variant. See [RelayTransport.disconnectAndConfirm].
+     */
+    override suspend fun disconnectAndConfirm(
+        timeoutMs: Long,
+        onlyIfIdentity: Long?,
+    ): TransportTeardownResult {
+        // The identity is compared INSIDE the lifecycle mutex, together
+        // with the capture of what is being torn down.
+        //
+        // R-N1.17 P1: checking it here and calling the teardown afterwards
+        // is check-then-act, and a reconnect landing in that gap is
+        // exactly the case the check exists for - the answer would be
+        // about a connection that no longer exists by the time anything
+        // is cancelled.
+        return teardownAndJoin(
+            timeoutMs = timeoutMs,
+            flushBeforeClose = false,
+            confirmCloses = true,
+            onlyIfIdentity = onlyIfIdentity,
+        )
     }
 
     /**
@@ -2505,8 +2697,27 @@ class KtorRelayTransport(
      * `cancel + join` bound. See [RelayTransport.disconnectAndJoin]
      * kdoc for the contract.
      */
-    private suspend fun teardownAndJoin(timeoutMs: Long, flushBeforeClose: Boolean): Boolean {
+    private suspend fun teardownAndJoin(
+        timeoutMs: Long,
+        flushBeforeClose: Boolean,
+        confirmCloses: Boolean = false,
+        onlyIfIdentity: Long? = null,
+    ): TransportTeardownResult {
         return connectionLifecycleMutex.withLock {
+            // Same critical section as the capture below.
+            val ownedNow = teardownIdentityValue
+            if (onlyIfIdentity != null && onlyIfIdentity != ownedNow) {
+                relayLog(
+                    RelayLogLevel.WARN,
+                    "${genTag()} teardown refused — asked for identity " +
+                        "$onlyIfIdentity, transport now owns $ownedNow",
+                )
+                return@withLock TransportTeardownResult(ownedNow, ran = false)
+            }
+            // ONE deadline over the whole confirmation: the loop join and
+            // the closes share it. A fresh full timeout for each would let
+            // a caller that asked for ten seconds wait twenty.
+            val deadline = TimeSource.Monotonic.markNow()
             relayLog(
                 RelayLogLevel.INFO,
                 "${genTag()} disconnectAndJoin() called timeoutMs=$timeoutMs",
@@ -2606,6 +2817,11 @@ class KtorRelayTransport(
             //   3. cancel the per-generation watchdog jobs + scope.
             //      `scope` is a separate SupervisorJob — cancelling
             //      `reconnectJob` alone does NOT cascade into it.
+            // R-N1.17 P1: the dispatched closes are TRACKED. Whether they
+            // finished is a different fact from whether the loop joined,
+            // and a caller that needs the socket gone needs the second one.
+            var closeDispatches = 0
+            val closeAttempts = mutableListOf<Pair<PendingClose, Deferred<Boolean>>>()
             withContext(NonCancellable) {
                 job?.cancel()
 
@@ -2613,14 +2829,74 @@ class KtorRelayTransport(
                 val clientRef = currentGenerationClient
                 session = null
                 currentGenerationClient = null
+
+                // Everything this teardown detaches, in one list.
+                val detached = mutableListOf<Detachable>()
                 if (clientRef != null) {
-                    maybeLaunchCleanup("generationClient.close") {
-                        clientRef.close()
-                    }
+                    detached += Detachable(
+                        label = "generationClient.close",
+                        close = { clientRef.close() },
+                        completion = { clientRef.coroutineContext[Job] },
+                    )
                 }
                 if (sessionRef != null) {
-                    maybeLaunchCleanup("session.close") {
-                        sessionRef.close()
+                    detached += Detachable(
+                        label = "session.close",
+                        close = { sessionRef.close() },
+                        completion = { sessionRef.coroutineContext[Job] },
+                    )
+                }
+                detached += pendingClosesMutex.withLock {
+                    val extras = extraDetachables.toList()
+                    extraDetachables.clear()
+                    extras
+                }
+
+                // Detaching is what made these unretryable: the transport
+                // no longer holds the reference, so nobody could close it
+                // again. They are REMEMBERED before they are dispatched,
+                // and this one loop is the only place that happens.
+                //
+                // The close and the WAIT for the resource to finish are
+                // composed here, once, so production and any other source
+                // of detachables get the same two steps. `close()` alone
+                // is a request; the join is the fact.
+                for (item in detached) {
+                    rememberPendingClose(ownedNow, item.label) {
+                        item.close()
+                        item.completion()?.join()
+                    }
+                }
+
+                // EVERY outstanding close that nobody is already working
+                // on. One that failed earlier is the whole reason a sweep
+                // exists, and this is the only place that can dispatch it -
+                // but one that is still RUNNING must not be started again
+                // beside itself.
+                val outstanding = claimIdlePendingCloses()
+                closeDispatches = outstanding.size
+                for (entry in outstanding) {
+                    val dispatched = maybeLaunchCleanup(entry.label) {
+                        try {
+                            entry.action()
+                            // Discharged only on success, and by the
+                            // cleanup itself, so it holds whether or not
+                            // anyone is waiting for the answer.
+                            forgetPendingClose(entry)
+                        } finally {
+                            // The claim goes back either way. A close that
+                            // failed is owed again; one that succeeded is
+                            // gone from the registry already.
+                            withContext(NonCancellable) { releasePendingClaim(entry) }
+                        }
+                    }
+                    if (dispatched == null) {
+                        // The cap refused it: nothing is running, so the
+                        // claim must not be left held or the entry would
+                        // never be attempted again.
+                        releasePendingClaim(entry)
+                    } else {
+                        closeAttempts += entry to dispatched
                     }
                 }
 
@@ -2628,6 +2904,8 @@ class KtorRelayTransport(
                 ackWatchdogJob?.cancel()
                 scope?.cancel()
             }
+            // A cleanup the cap refused is a close that will never run.
+            val allDispatched = closeAttempts.size == closeDispatches
             // ─── END CRITICAL TEARDOWN TRANSACTION ───────────────────────────
 
             // If caller was cancelled during the flush, propagate CE now —
@@ -2636,6 +2914,8 @@ class KtorRelayTransport(
             // re-await via disconnectAndJoin.
             val capturedCe = pendingCe
             if (capturedCe != null) {
+                @Suppress("UNUSED_EXPRESSION")
+                allDispatched
                 // Keep reconnectJob reference intact for the next caller.
                 if (job == null) reconnectJob = null
                 relayLog(
@@ -2667,12 +2947,12 @@ class KtorRelayTransport(
                 reconnectJob = null
             }
 
-            if (completed == true) {
+            val loopJoined = completed == true
+            if (loopJoined) {
                 relayLog(
                     RelayLogLevel.INFO,
-                    "${genTag()} disconnectAndJoin: completed cleanly within ${timeoutMs}ms (close calls handed off to cleanupScope)",
+                    "${genTag()} disconnectAndJoin: reconnect loop joined within ${timeoutMs}ms",
                 )
-                true
             } else {
                 relayLog(
                     RelayLogLevel.WARN,
@@ -2680,8 +2960,60 @@ class KtorRelayTransport(
                         "coordinator MUST revoke route change. reconnectJob retained: " +
                         "isCompleted=${job?.isCompleted} isCancelled=${job?.isCancelled}",
                 )
-                false
             }
+
+            // Only a caller that asked to CONFIRM waits for the closes.
+            // `disconnectAndJoin` keeps its documented strict bound over
+            // the join alone, and its documented silence about the rest.
+            var closesConfirmed = false
+            var remainingForCloses = -1L
+            if (confirmCloses) {
+                // What is left of the ONE deadline, shared with the join
+                // above and shared between the closes below.
+                remainingForCloses = timeoutMs - deadline.elapsedNow().inWholeMilliseconds
+                val remaining = remainingForCloses
+                val outcomes = if (remaining <= 0) {
+                    null
+                } else {
+                    withTimeoutOrNull(remaining) {
+                        // Every result, awaited, so the log below reports
+                        // what each close did rather than stopping at the
+                        // first failure.
+                        //
+                        // NOT what keeps an unfinished close from being
+                        // lost: the registry does that, because entries
+                        // leave it only on success and only from inside
+                        // the cleanup. Measured - `all { it.await() }` and
+                        // a genuine short-circuit are both passed by the
+                        // whole suite. This is accounting, and it is not
+                        // claimed to be more.
+                        //
+                        // Awaiting, not joining, IS load-bearing: the
+                        // cleanup swallows its exceptions, so its
+                        // coroutine ends cleanly whether the socket closed
+                        // or threw.
+                        closeAttempts.map { (entry, d) -> entry to d.await() }
+                    }
+                }
+                val stillOwed = pendingCloseCount()
+                closesConfirmed = allDispatched &&
+                    outcomes != null &&
+                    outcomes.all { it.second } &&
+                    stillOwed == 0
+                relayLog(
+                    if (closesConfirmed) RelayLogLevel.INFO else RelayLogLevel.WARN,
+                    "${genTag()} disconnectAndConfirm: dispatched=$closeDispatches " +
+                        "tracked=${closeAttempts.size} remainingMs=$remaining " +
+                        "stillOwed=$stillOwed confirmed=$closesConfirmed",
+                )
+            }
+            TransportTeardownResult(
+                identity = teardownIdentity,
+                ran = true,
+                loopJoined = loopJoined,
+                closesConfirmed = closesConfirmed,
+                closesBudgetMs = remainingForCloses,
+            )
         }
     }
 
@@ -2822,6 +3154,7 @@ class KtorRelayTransport(
             // and does NOT open a socket — that is how forceReconnect
             // honours quiescence without a special-case here.
             val ownerGen = gateProvider?.allocateConnectionGeneration() ?: 0L
+            teardownIdentityValue += 1
             reconnectJob = transportScope.launch {
                 runReconnectLoop(ownerGen)
             }
@@ -3054,6 +3387,7 @@ class KtorRelayTransport(
      * if it is left running after the assertions complete.
      */
     internal fun seedReconnectJobForTest(job: Job) {
+        teardownIdentityValue += 1
         reconnectJob = job
     }
 

@@ -30,6 +30,16 @@ class DiagnosticCommandReceiverContractTest {
             "dual_sim_report", "health", "clear",
             "checkpoint", "paired_count_report",
             "signed_prekey_readiness",
+            // WSS-3 §4.5: bounded additive extension. The receiver
+            // remains debug-only and DUMP-gated; the new subcommand
+            // accepts only `checkpoint_key_hex` (extras whitelist
+            // pinned by `DiagnosticNetworkProfileReporterExtrasWhitelistTest`).
+            "network_profile_report",
+            // WSS-3 audit ROUND-10 P0-1: state-only reporter path for
+            // the phone that NEVER accepts a checkpoint key (empty
+            // extras whitelist). Full run() with HMAC egress is
+            // host↔emulator only, per REDLINE-4 (phone excluded).
+            "network_profile_state_report",
         )
         assertEquals(expected, DiagnosticCommandReceiver.ALLOWED_SUBCOMMANDS)
     }

@@ -21,6 +21,27 @@ import kotlin.test.assertEquals
  */
 class RestInboundDeduplicatorTest {
 
+    @Test
+    fun parking_releases_both_claim_and_recent_completion_hint() = runTest {
+        val dedup = deduplicator()
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("held"))
+        dedup.park("held")
+        assertEquals(RestInboundDeduplicator.Snapshot(0, 0), dedup.snapshot())
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("held"))
+        assertEquals(RestInboundDeduplicator.Action.SkipNoAck, dedup.resolve("held"))
+    }
+
+    @Test
+    fun parking_is_idempotent_and_does_not_ack_other_envelopes() = runTest {
+        val dedup = deduplicator()
+        dedup.resolve("held")
+        dedup.resolve("busy")
+        dedup.park("held")
+        dedup.park("held")
+        assertEquals(RestInboundDeduplicator.Action.SkipNoAck, dedup.resolve("busy"))
+        assertEquals(RestInboundDeduplicator.Action.Emit, dedup.resolve("held"))
+    }
+
     private class FakeClock(var nowMs: Long = 0L) {
         fun advance(deltaMs: Long) { nowMs += deltaMs }
     }

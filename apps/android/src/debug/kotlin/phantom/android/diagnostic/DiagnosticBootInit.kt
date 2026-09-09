@@ -45,6 +45,8 @@ class DiagnosticBootInitProvider : ContentProvider() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onCreate(): Boolean {
+        try { context?.applicationContext?.let { BackgroundRecorder.start(it) } }
+        catch (_: Exception) { Log.w("BackgroundDiagnostic", "observer_start_failed") }
         // §PR-review-round-1 P0: activate WssDiag. `WssDiag.emit`
         // is release-inert-by-default; every call is a no-op until
         // this line runs. This provider is declared ONLY in the
@@ -125,9 +127,13 @@ internal object AndroidWssDiagBridge : WssDiagBridge {
         role: WssDiagBridge.Role,
         outcomeFlag: WssDiagBridge.OutcomeFlag,
         dedupGate: WssDiagBridge.DedupGate?,
+        deliverFailure: WssDiagBridge.DeliverFailure?,
+        deliverStage: WssDiagBridge.DeliverStage?,
+        attempt: Int?,
     ) {
         WssDiag.emit(
             event = event,
+            attempt = attempt,
             role = when (role) {
                 WssDiagBridge.Role.SENDER -> WssDiag.Role.SENDER
                 WssDiagBridge.Role.RECIPIENT -> WssDiag.Role.RECIPIENT
@@ -146,6 +152,23 @@ internal object AndroidWssDiagBridge : WssDiagBridge {
                     WssDiagBridge.DedupGate.DUPLICATE -> WssDiag.DedupGate.DUPLICATE
                     WssDiagBridge.DedupGate.REACK -> WssDiag.DedupGate.REACK
                     WssDiagBridge.DedupGate.UNKNOWN -> WssDiag.DedupGate.UNKNOWN
+                }
+            },
+            deliverFailure = deliverFailure?.let {
+                when (it) {
+                    WssDiagBridge.DeliverFailure.THREW -> WssDiag.DeliverFailure.THREW
+                    WssDiagBridge.DeliverFailure.HELD -> WssDiag.DeliverFailure.HELD
+                    WssDiagBridge.DeliverFailure.UNKNOWN_PROCESSING_FAILURE ->
+                        WssDiag.DeliverFailure.UNKNOWN_PROCESSING_FAILURE
+                }
+            },
+            deliverStage = deliverStage?.let {
+                when (it) {
+                    WssDiagBridge.DeliverStage.RECEIVED -> WssDiag.DeliverStage.RECEIVED
+                    WssDiagBridge.DeliverStage.DECRYPTED -> WssDiag.DeliverStage.DECRYPTED
+                    WssDiagBridge.DeliverStage.PERSISTED -> WssDiag.DeliverStage.PERSISTED
+                    WssDiagBridge.DeliverStage.LEDGER_MARKED -> WssDiag.DeliverStage.LEDGER_MARKED
+                    WssDiagBridge.DeliverStage.ACK_SENT -> WssDiag.DeliverStage.ACK_SENT
                 }
             },
         )

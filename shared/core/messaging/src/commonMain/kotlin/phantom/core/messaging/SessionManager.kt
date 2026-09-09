@@ -3,6 +3,7 @@
 
 package phantom.core.messaging
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.datetime.Clock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -22,6 +23,17 @@ import phantom.core.storage.NoOpOpkReservationRepository
 import phantom.core.storage.OpkReservationRepository
 import phantom.core.storage.RatchetStateRepository
 import phantom.core.storage.ReservationOutcome
+
+/** A local prekey read failed; this is not a verdict on an envelope's authenticity. */
+internal class PreKeyReadFailed(cause: Exception) : Exception("local prekey read failed", cause)
+
+private suspend fun <T> readLocalPrekey(read: suspend () -> T): T = try {
+    read()
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (failure: Exception) {
+    throw PreKeyReadFailed(failure)
+}
 
 /**
  * Manages per-conversation Double Ratchet state and the X3DH 4-DH
@@ -121,6 +133,21 @@ class SessionManager(
         localIdentityKeyPair: DhKeyPair,
         bundle: PreKeyBundle,
     ): InitiatorBootstrapResult {
+        val result = initiatorBootstrapInMemory(localIdentityKeyPair, bundle)
+        saveSession(conversationId, result.ratchetState)
+        return result
+    }
+
+    /**
+     * Derive and validate an outbound candidate without publishing it as active.
+     * DMS owns its commit after encryption; publishing the initial state here
+     * would overwrite the receive session and become a stale send fallback
+     * after the advanced pending candidate expires.
+     */
+    internal fun initiatorBootstrapInMemory(
+        localIdentityKeyPair: DhKeyPair,
+        bundle: PreKeyBundle,
+    ): InitiatorBootstrapResult {
         // Decode + structural validation of bundle bytes BEFORE running
         // any crypto. A malformed peer publish would otherwise surface
         // as an opaque libsodium error several layers down.
@@ -198,8 +225,6 @@ class SessionManager(
             "F15 invariant violated: sending ratchet private key equals identity private key."
         }
 
-        saveSession(conversationId, state)
-
         // The header that the caller must attach to the first outbound
         // WireFrame so the recipient can recompute the same root key.
         // ephemeralPubKeyHex is EK_a's public half (the X3DH ephemeral
@@ -261,7 +286,25 @@ class SessionManager(
             senderIdentityPublicKeyHex = senderIdentityPublicKeyHex,
             x3dhInit = x3dhInit,
         )
-        x3dhInit.opkKeyIdHex?.let { opkId ->
+        finishFirstContactBootstrap(conversationId, state, x3dhInit.opkKeyIdHex)
+        return state
+    }
+
+    /**
+     * The tail of the first-contact bootstrap: release the reservation,
+     * consume the one-time pre-key, save the session.
+     *
+     * Kept as a named step so a caller that derives with
+     * [recipientBootstrapInMemory] can complete the same way when it has
+     * no atomic commit available -- byte-for-byte the sequence this
+     * wrapper has always performed, and no more.
+     */
+    suspend fun finishFirstContactBootstrap(
+        conversationId: String,
+        state: RatchetState,
+        opkKeyIdHex: String?,
+    ) {
+        opkKeyIdHex?.let { opkId ->
             // The reservation just created by InMemory is released here
             // because the wrapper writes the active ratchet row directly
             // (no candidate-decrypt gate, no pending slot). The OPK is
@@ -271,7 +314,6 @@ class SessionManager(
             oneTimePreKeyRepository.deleteByKeyId(opkId)
         }
         saveSession(conversationId, state)
-        return state
     }
 
     /**
@@ -372,12 +414,35 @@ class SessionManager(
         localIdentityKeyPair: DhKeyPair,
         senderIdentityPublicKeyHex: String,
         x3dhInit: X3dhInitHeader,
+        /**
+         * Accept a reservation THIS conversation already holds for a
+         * different envelope instead of treating it as a collision.
+         *
+         * A retry that follows an attempt of ours which rolled back
+         * meets its own leftover reservation; refusing it would strand
+         * the envelope for good. The row is neither released nor taken
+         * over here -- it stays exactly as it was, so an attempt that
+         * then fails to authenticate leaves the earlier candidate's
+         * protection intact. A reservation belonging to a DIFFERENT
+         * conversation remains a hard collision.
+         */
+        adoptOwnConversationReservation: Boolean = false,
+        /**
+         * Called with true when the reservation was created by THIS call,
+         * false when one was already there.
+         *
+         * Ownership is what decides whether a caller may release the row
+         * on failure, and only the reserve outcome establishes it -- not a
+         * comparison of envelope ids, which says nothing after a retry
+         * under the SAME id.
+         */
+        onReservationCreated: (Boolean) -> Unit = {},
     ): RatchetState {
         // Resolve the SPK keypair locally. Either the current SPK or the
         // previous (retained for SPK_PREVIOUS_RETENTION_DAYS days after
         // rotation) must match the targeted keyId. Anything else is an
         // out-of-window message — the local store has rolled past it.
-        val storedSpk = signedPreKeyRepository.get()
+        val storedSpk = readLocalPrekey { signedPreKeyRepository.get() }
             ?: throw SessionBootstrapException.SpkNotFound(x3dhInit.spkKeyId)
         val (spkPub, spkPriv) = when (x3dhInit.spkKeyId) {
             storedSpk.keyId -> Pair(
@@ -424,7 +489,7 @@ class SessionManager(
         //   - calling [OpkReservationRepository.release] on
         //     candidate-decrypt failure (L4 phase 3 failure).
         val opkKeyPair: DhKeyPair? = x3dhInit.opkKeyIdHex?.let { opkId ->
-            val opk = oneTimePreKeyRepository.get(opkId)
+            val opk = readLocalPrekey { oneTimePreKeyRepository.get(opkId) }
                 ?: throw SessionBootstrapException.OpkNotFound(opkId)
             val outcome = opkReservationRepository.reserve(
                 opkKeyIdHex = opkId,
@@ -432,6 +497,7 @@ class SessionManager(
                 conversationId = conversationId,
                 nowMs = nowMsProvider(),
             )
+            onReservationCreated(outcome !is ReservationOutcome.AlreadyReserved)
             // PR #316 review P1-1 (2026-06-15): owner-check the
             // ReservationOutcome.AlreadyReserved branch. INSERT OR
             // IGNORE returns AlreadyReserved both for our own retry
@@ -451,8 +517,11 @@ class SessionManager(
             // reservation belongs to the other derivation.
             if (outcome is ReservationOutcome.AlreadyReserved) {
                 val existing = outcome.existing
-                if (existing.conversationId != conversationId ||
-                    existing.envelopeId != envelopeId
+                val ownConversationRetry = adoptOwnConversationReservation &&
+                    existing.conversationId == conversationId
+                if (!ownConversationRetry &&
+                    (existing.conversationId != conversationId ||
+                        existing.envelopeId != envelopeId)
                 ) {
                     throw SessionBootstrapException.OpkReservationConflict(
                         opkKeyIdHex = opkId,

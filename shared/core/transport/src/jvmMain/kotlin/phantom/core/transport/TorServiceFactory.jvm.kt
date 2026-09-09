@@ -30,9 +30,15 @@ internal class TorServiceJvm : TorService {
         // it has no effect because no tor instance is launched.
     }
 
-    override suspend fun stop() {
-        // Intentional no-op — see start().
-    }
+    override suspend fun stop(budget: TorBudget): TorStopResponse =
+        // Nothing is ever launched here, so there is nothing to confirm and
+        // nothing holding threads.
+        torStopNothingToStop()
+
+    override suspend fun awaitRelease(
+        attempt: TorStopAttempt,
+        budget: TorBudget,
+    ): TorStopResult = stop(budget).result
 }
 
 actual fun createTorService(config: TorServiceConfig, platformContext: Any?): TorService =

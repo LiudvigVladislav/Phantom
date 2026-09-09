@@ -56,6 +56,7 @@ interface DecryptFailedEnvelopeRepository {
         val wireFrameJson: String,
         val replayAttemptCount: Long,
         val lastReplayAtMs: Long?,
+        val lastReceiveVersion: String? = null,
     )
 
     /**
@@ -110,8 +111,24 @@ interface DecryptFailedEnvelopeRepository {
      */
     suspend fun recordReplayAttempt(envelopeId: String, nowMs: Long)
 
+    /** A crypto rejection waits for receive-state progress; a commit failure may retry in place. */
+    suspend fun recordFailure(envelopeId: String, errorType: String, receiveVersion: String, nowMs: Long) {
+        recordReplayAttempt(envelopeId, nowMs)
+    }
+
     /** TTL sweep — evicts held rows older than [olderThanMs] (epoch ms). */
     suspend fun deleteOlderThan(olderThanMs: Long)
+
+    /**
+     * Audit ROUND-30.16 — is this envelope held?
+     *
+     * Read by the delivery-handler boundary to tell a held envelope
+     * apart from an unexplained one. The default answers `false`, so an
+     * implementation that does not override it degrades to the
+     * fail-closed `UNKNOWN_PROCESSING_FAILURE` classification rather
+     * than silently claiming the envelope was not held.
+     */
+    suspend fun existsByEnvelopeId(envelopeId: String): Boolean = false
 
     /** Diagnostic — total held rows across the table. */
     suspend fun count(): Long

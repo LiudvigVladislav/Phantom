@@ -164,6 +164,14 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
      * from the release compilation unit (dead-code-eliminated by R8).
      */
     private val k8ConnectionCloseProvider: (() -> Boolean)? = null,
+    /**
+     * N1-F2 R-N1.3 — registry of abortable in-flight native calls. A
+     * privacy-mode revocation aborts every registered [okhttp3.Call];
+     * without this, `Call.execute()` below keeps running after the user
+     * leaves Standard because it is not cooperative with coroutine
+     * cancellation.
+     */
+    private val callRegistry: EgressCallRegistry? = null,
 ) : RestFallbackTransport {
 
     private val jsonCodec = Json {
@@ -272,7 +280,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         val retryAfterSeconds: Long? = null,
     )
 
-    private fun post(
+    private suspend fun post(
         url: String,
         token: String?,
         idempotencyKey: String?,
@@ -289,7 +297,7 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         return execute(client, builder.build())
     }
 
-    private fun get(
+    private suspend fun get(
         url: String,
         token: String,
         op: String,
@@ -311,9 +319,21 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         return execute(client, request)
     }
 
-    private fun execute(client: OkHttpClient, request: Request): RawResponse {
+    private suspend fun execute(client: OkHttpClient, request: Request): RawResponse {
         val startMs = System.currentTimeMillis()
-        client.newCall(request).execute().use { response: Response ->
+        // N1-F2 R-N1.3: the Call is created first and registered for the
+        // duration of the blocking execute, so a privacy-mode change can
+        // abort it. OkHttp's Call.cancel() is the only supported way to
+        // stop an in-flight call; thread interruption is not guaranteed
+        // to abort a blocking socket read.
+        val call = client.newCall(request)
+        return callRegistry.withRegisteredCall("rest_call", { call.cancel() }) {
+            executeCall(call, startMs)
+        }
+    }
+
+    private fun executeCall(call: okhttp3.Call, startMs: Long): RawResponse {
+        call.execute().use { response: Response ->
             val raw = response.body?.string() ?: ""
             val elapsedMs = System.currentTimeMillis() - startMs
             // Trek 2 Stage 2B-B (C5, L8) — parse `Retry-After` INSIDE
