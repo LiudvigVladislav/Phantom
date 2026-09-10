@@ -35,6 +35,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import phantom.android.navigation.Screen
 import phantom.android.navigation.ScreenSaver
 import phantom.android.navigation.resolveScreenAfterStartup
+import phantom.android.navigation.PendingNotificationChat
+import phantom.android.navigation.ApplyPendingNotificationChat
 import phantom.android.qr.QrScanScreen
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
@@ -80,6 +82,7 @@ class MainActivity : ComponentActivity() {
 
     // Mutable state hoisted to Activity level so onNewIntent can update Compose state.
     private val pendingInviteQr = androidx.compose.runtime.mutableStateOf<String?>(null)
+    private val pendingNotificationChat = PendingNotificationChat()
 
     // App Lock — hoisted to Activity so onResume can trigger re-lock after background timeout.
     // Initialised to false; set to true in onCreate when the pref is enabled.
@@ -133,6 +136,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        pendingNotificationChat.accept(intent)
         parseInviteIntent(intent)?.let { payload ->
             pendingInviteQr.value = payload
         }
@@ -140,6 +144,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingNotificationChat.restore(savedInstanceState)
         Log.d("PHANTOM_INIT", "MainActivity onCreate")
         // PR-RECV-DIAG1 v1.1 — mirror MainActivity lifecycle into the
         // PhantomMessaging tag so Test #84 can prove (a) MainActivity
@@ -180,7 +185,7 @@ class MainActivity : ComponentActivity() {
             )
         }
         val app = application as PhantomApplication
-        // Read notification extras once — intent is immutable after activity creation.
+        // Cold-start target; warm notification taps are queued separately by onNewIntent.
         val notifConversationId = intent.getStringExtra(PhantomNotificationManager.EXTRA_CONVERSATION_ID)
         val notifSenderName     = intent.getStringExtra(PhantomNotificationManager.EXTRA_THEIR_USERNAME)
         // Parse invite deep link from cold-start intent (warm-start handled by onNewIntent).
@@ -250,6 +255,7 @@ class MainActivity : ComponentActivity() {
                             notifConversationId    = notifConversationId,
                             notifSenderName        = notifSenderName,
                             pendingInviteQr        = pendingInviteQr,
+                            pendingNotificationChat = pendingNotificationChat,
                         )
 
                         initError != null -> Box(
@@ -271,6 +277,10 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingNotificationChat.save(outState)
+    }
 }
 
 @Composable
@@ -279,6 +289,7 @@ private fun PhantomApp(
     notifConversationId: String? = null,
     notifSenderName: String? = null,
     pendingInviteQr: androidx.compose.runtime.MutableState<String?> = androidx.compose.runtime.mutableStateOf(null),
+    pendingNotificationChat: PendingNotificationChat,
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     // C6-a round-8 REDLINE §P0/§P1 pin: separate presentation
@@ -302,6 +313,7 @@ private fun PhantomApp(
     // concurrent startup run. Toggled true when a run begins,
     // false when it completes.
     var startupInFlight by remember { mutableStateOf(false) }
+    var startupCompleted by remember { mutableStateOf(false) }
     val startupContext = androidx.compose.ui.platform.LocalContext.current
 
     // currentScreen starts as null so the first frame after readiness
@@ -363,6 +375,7 @@ private fun PhantomApp(
         //      = false in `finally` so Retry callbacks see the
         //      right state.
         startupInFlight = true
+        startupCompleted = false
         try {
             val decision = phantom.android.screens.onboarding.v2.decideStartupRoute(
                 markerRead = {
@@ -439,6 +452,7 @@ private fun PhantomApp(
             val destination = if (
                 resolved is Screen.ChatList &&
                 restoredOrCurrent == null &&
+                pendingNotificationChat.target == null &&
                 notifConversationId != null &&
                 notifSenderName != null
             ) {
@@ -448,10 +462,18 @@ private fun PhantomApp(
                 resolved
             }
             currentScreen = destination
+            startupCompleted = true
         } finally {
             startupInFlight = false
         }
     }
+
+    ApplyPendingNotificationChat(
+        pending = pendingNotificationChat,
+        startupReady = startupCompleted && !startupInFlight,
+        currentScreen = currentScreen,
+        navigate = { currentScreen = it },
+    )
 
     // Transport connect and startReceiving are now owned by PhantomMessagingService (foreground
     // service). Calling them here would create a second competing connection loop. The service

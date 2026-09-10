@@ -283,6 +283,60 @@ Sprint 2b-C ships a minimal in-memory counter wired into the recipient-side `rec
 
 The M-OPK-3 Wi-Fi field gate ships as an `androidInstrumentedTest` harness that requires a connected device or emulator + relay deploy + APK install + adb pairing. It is NOT executed by the local sweep; it is a manual acceptance gate per scope-doc L10. Source-only landing in 2b-C; the harness itself does not produce a deterministic PASS/FAIL until run against the device matrix.
 
+## Amendment 2026-09-08: preserve displaced receive sessions
+
+The single-active-slot model above loses a live chain when a held older bootstrap
+is replayed after a newer bootstrap committed. A real-crypto, real-SQLite REST
+composition reproduces the field sequence: the newer continuation fails with
+`OpkNotFound` after old replay. The missing OPK is the consequence of losing an
+already-established ratchet, not permission to reuse the consumed OPK.
+
+The owner approved a **24-hour receive-session retention window** on 2026-09-08.
+The implementation adds a separate encrypted `receive_session_archive`; migration
+24 creates it empty and does not infer or reconstruct already-lost chains.
+This amendment supersedes the single-slot replacement rule for the covered paths:
+
+- Authenticated replacement preserves the displaced active state in the same
+  transaction. Replacing a distinct outbound initiator pending bootstrap also
+  preserves its advanced state, since its delayed reply can still arrive.
+- A held bootstrap completes into an archive when active exists, without selecting
+  itself over that active session. When no active state exists it can become active.
+- Inbound first tries active, then bounded archived candidates, then pending and
+  bootstrap. Only a successful authenticated decrypt can authorize a state update;
+  header fields and message timestamps do not prove session order.
+- Local replay advances its archive without extending expiry. Fresh inbound on
+  an archived chain can atomically move that advanced chain to active and archive
+  the displaced active chain. There is no second pre-advance copy left behind.
+- Text commits include the selected state, message, completion ledger, held removal,
+  and any pending/OPK promotion in one transaction. Archive revisions, conversation
+  ownership and expiry are checked inside that transaction. ACK remains outside,
+  after commit. No confirmation is sent on refusal or rollback.
+- Each displacement gets an immutable 24-hour deadline. Expired archives cannot
+  authorize a commit; the existing owned replay pass physically removes them,
+  including when no envelopes are held. If the process is stopped, deletion occurs
+  on its next pass. This uses the existing wall-clock model, not trusted time across
+  clock changes or guaranteed deletion while the device is powered off.
+- The resource bound is 256 unexpired archives per conversation. Overflow refuses
+  replacement; it does not evict an unexpired chain or alter the existing active
+  state. The relay copy stays unacknowledged. This is a bounded recovery window,
+  not a promise of unlimited concurrent sessions or indefinite offline recovery.
+- Archive blobs use the existing authenticated Keystore codec/cipher. Legacy
+  plaintext rows are wrapped on archival. Conversation deletion, session reset,
+  and ratchet-state wipe also remove their archives. No OPK, skipped-message-key
+  cache, raw key log, or server protocol change is added.
+
+**Security and scope:** this deliberately retains displaced ratchet state longer
+than single-slot replacement, extending the exposure of those still-live chains
+if their at-rest protection is compromised. It does not preserve individual used
+message keys. Atomic archived delivery remains text-only: unsupported archived
+payloads are held without ACK rather than advanced through the legacy non-atomic
+path. Non-text completion as a whole, Android Keystore hardware validation, and
+mixed WSS/REST device acceptance are not established by host tests.
+
+Rejected shortcuts: suppress old replay (strands deliverable messages); save and
+restore active outside the transaction (crash-unsafe); accept the bootstrap header
+as proof of authenticity; retain old state forever; silently evict a live chain.
+
 ## References
 
 - `docs/tracks/sprint-2b-opk-pending-session-scope.md` — binding scope-doc (PR #314 squash `cfa765d2`).

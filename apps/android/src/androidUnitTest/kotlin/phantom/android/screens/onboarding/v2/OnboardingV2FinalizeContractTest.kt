@@ -14,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -25,6 +26,7 @@ import phantom.android.ui.designv2.formatShortKeyIdForDisplay
 import phantom.core.identity.PrivateKey
 import phantom.core.identity.PublicKey
 import phantom.core.transport.PrivacyMode
+import phantom.android.testing.ModelSnapshotRule
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
@@ -52,6 +54,9 @@ import kotlin.test.assertTrue
 @Config(sdk = [35], application = Application::class)
 @OptIn(ExperimentalCoroutinesApi::class)
 class OnboardingV2FinalizeContractTest {
+
+    @get:Rule
+    val snapshots = ModelSnapshotRule()
 
     private val fakeHex = "abcd" + "0123456789abcdef".repeat(3) + "abcd123456ef"
 

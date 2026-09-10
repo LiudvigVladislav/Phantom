@@ -1676,6 +1676,8 @@ class RestFallbackOrchestratorBreakerTest {
             },
         )
         val orch = RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
             baseUrl = "https://relay.test",
             identityHex = IDENTITY,
             signingPubkeyHex = "bb".repeat(32),
@@ -2916,6 +2918,8 @@ class RestFallbackOrchestratorBreakerTest {
         cursor: LongPollCursorRepository = NoopCursor(),
         logSink: (String) -> Unit = {},
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
         baseUrl = "https://relay.test",
         identityHex = IDENTITY,
         signingPubkeyHex = "bb".repeat(32),
@@ -3025,6 +3029,8 @@ class RestFallbackOrchestratorBreakerTest {
         scheduler: TestCoroutineScheduler,
         logSink: (String) -> Unit = {},
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
         baseUrl = "https://relay.test",
         identityHex = IDENTITY,
         signingPubkeyHex = "bb".repeat(32),

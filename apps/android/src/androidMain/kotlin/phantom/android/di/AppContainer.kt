@@ -9,6 +9,9 @@ import android.graphics.BitmapFactory
 import java.io.File
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -68,9 +71,6 @@ import phantom.core.transport.TransportManagerLog
 import phantom.core.transport.TransportPreferences
 import phantom.core.transport.TransportPreferencesAndroid
 import phantom.core.transport.createHttpClientFactory
-import io.ktor.client.request.get
-import io.ktor.client.statement.bodyAsText
-import io.ktor.http.isSuccess
 import phantom.core.transport.createPreKeyPublishHttpTransport
 import phantom.core.transport.createRestHttpClient
 import phantom.core.transport.createTorService
@@ -152,6 +152,96 @@ class AppContainer(private val context: Context) {
      */
     @Volatile private var restOrchestratorRef:
         phantom.core.transport.RestFallbackOrchestrator? = null
+
+    // N1-F2 R-N1.2: the shared revocable Direct-egress gate, captured so
+    // `setPrivacyMode` can revoke every in-flight REST/media lease.
+    @Volatile private var restEgressGateRef:
+        phantom.core.transport.RestEgressGate? = null
+
+    /**
+     * N1-F2 R-N1.3 — abortable in-flight native calls. Shared with the
+     * gate so `revokeAndJoin` can stop a blocking `Call.execute()`, and
+     * with [phantom.android.net.GatedAppHttp] so product HTTP is
+     * revocable too.
+     */
+    internal val egressCallRegistry = phantom.core.transport.EgressCallRegistry(
+        log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+    )
+
+    @Volatile
+    private var gatedAppHttpRef: phantom.android.net.GatedAppHttp? = null
+
+    /**
+     * Outcome of the most recent privacy-mode revocation, or `null` if
+     * none has run. Non-null with `joinedCleanly == false` means a
+     * transport did not honour its cancellation handle inside the join
+     * budget: the posture is still fail-closed, but Direct I/O may have
+     * briefly outlived the switch. Exposed so the condition is
+     * observable instead of silently swallowed.
+     */
+    @Volatile
+    var lastPrivacyModeRevocation:
+        phantom.core.transport.RestEgressGate.RevocationResult? = null
+        private set
+
+    /**
+     * Outcome of the most recent privacy-mode teardown transaction, or
+     * `null` if none has run. `clean == false` means at least one of
+     * revoke / disconnect / release did not complete normally: the
+     * posture is still fail-closed, but the old connection may have
+     * outlived the switch. Exposed so the condition is observable
+     * instead of silently swallowed.
+     */
+    @Volatile
+    internal var lastPrivacyModeTeardown: PrivacyTeardownOutcome? = null
+        private set
+
+    /**
+     * N1-F2 R-N1.3 — abuse report over the shared fail-closed authority.
+     * Previously a raw `HttpURLConnection` inside `ContactProfileScreen`,
+     * which sent both parties' public keys over Direct HTTP regardless
+     * of privacy mode.
+     */
+    suspend fun submitAbuseReport(
+        reporterKey: String,
+        reportedKey: String,
+        category: String,
+    ): phantom.android.net.GatedAppHttp.Outcome<Int> {
+        if (reporterKey.isEmpty() || reportedKey.isEmpty()) {
+            return phantom.android.net.GatedAppHttp.Outcome.Failed("missing_key")
+        }
+        val http = gatedAppHttpRef
+            ?: return phantom.android.net.GatedAppHttp.Outcome.Failed("not_initialised")
+        val httpBase = phantom.android.BuildConfig.RELAY_URL
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .removeSuffix("/ws")
+        // Keys come from local storage and the category is one of the
+        // predefined enum strings, so a hand-built body carries no
+        // interpolated user text.
+        val payload =
+            """{"reporter_key":"$reporterKey","reported_key":"$reportedKey",""" +
+                """"category":"$category"}"""
+        return http.postJson(url = "$httpBase/report", jsonBody = payload)
+    }
+
+    /**
+     * N1-F2 R-N1.3 — link-preview fetch, only ever on an explicit user
+     * tap (see `ChatScreen`), always through the shared gate, so
+     * Private/Ghost make no Direct request at all. The body is bounded:
+     * the target host is chosen by whoever sent the message.
+     */
+    suspend fun fetchLinkPreviewHtml(
+        url: String,
+    ): phantom.android.net.GatedAppHttp.Outcome<String> {
+        val http = gatedAppHttpRef
+            ?: return phantom.android.net.GatedAppHttp.Outcome.Failed("not_initialised")
+        return http.getText(
+            url = url,
+            maxChars = 32_768,
+            userAgent = "PHANTOM/1.0",
+        )
+    }
 
     /**
      * Trek 2 Stage 2B-B (C6 review-fix round 9 P1.evidence) — entry
@@ -398,6 +488,22 @@ class AppContainer(private val context: Context) {
     // relay's at-least-once delivery from MAC-failing the ratchet on
     // the second decrypt of a re-delivered envelope after a lost ack.
     val processedEnvelopeRepo = SqlDelightProcessedEnvelopeRepository(dbHolder.database)
+    /**
+     * N1-F1 R-N1.8 — settles an inbound message row and its ledger entry
+     * in one transaction. Same [PhantomDatabase] instance as every other
+     * repository here, which is what makes the single transaction
+     * possible.
+     */
+    val inboundCommitRepo = phantom.core.storage.SqlDelightInboundCommitRepository(
+        dbHolder.database,
+    )
+    /**
+     * N1-F1b R-N1.12 — settles a DB-backed control event and its ledger
+     * entry in one transaction. Same PhantomDatabase instance as every
+     * other repository here.
+     */
+    val controlEventCommitRepo =
+        phantom.core.storage.SqlDelightControlEventCommitRepository(dbHolder.database)
 
     /**
      * PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — durable hold
@@ -856,12 +962,15 @@ class AppContainer(private val context: Context) {
     // hybridTransport) flows the bare-wsTransport semantics correctly
     // through the derivation. After initMessaging assigns hybridTransport,
     // a forwarder coroutine inside initMessaging begins routing
-    // hybrid.stateMachine.state into this MutableStateFlow. Standard
+    // hybrid.stateMachine.snapshot into this MutableStateFlow. Mode and
+    // cause travel together; UI must not combine independently updated fields.
+    // Standard
     // "lazy upstream swap" pattern — combine reads this flow from
     // AppContainer construction without depending on hybridTransport
     // being non-null.
-    private val connectionRestMode =
-        MutableStateFlow(phantom.core.transport.RestMode.WsActive)
+    private val connectionRestSnapshot = MutableStateFlow(
+        phantom.core.transport.RestModeSnapshot(phantom.core.transport.RestMode.WsActive),
+    )
 
     /**
      * Presentation-only UI state combining raw WS [phantom.core.transport.TransportState]
@@ -871,7 +980,7 @@ class AppContainer(private val context: Context) {
      * `ConnectionBanner`.
      *
      * Always-present: combine reads `wsTransport.state` (always present
-     * from class construction) and [connectionRestMode] (initialised to
+     * from class construction) and [connectionRestSnapshot] (initialised to
      * `WsActive` at class init, updated post-`initMessaging` by the
      * forwarder coroutine). Consumers never see null.
      *
@@ -883,9 +992,9 @@ class AppContainer(private val context: Context) {
     val connectionUiState: StateFlow<phantom.android.transport.ConnectionUiState> =
         combine(
             wsTransport.state,
-            connectionRestMode,
-        ) { wsState, restMode ->
-            phantom.android.transport.deriveConnectionUiState(wsState, restMode)
+            connectionRestSnapshot,
+        ) { wsState, snapshot ->
+            phantom.android.transport.deriveConnectionUiState(wsState, snapshot)
         }.stateIn(
             scope = appScope,
             started = SharingStarted.Eagerly,
@@ -902,7 +1011,7 @@ class AppContainer(private val context: Context) {
             // derivation function literally here makes the semantics match.
             initialValue = phantom.android.transport.deriveConnectionUiState(
                 wsTransport.state.value,
-                connectionRestMode.value,
+                connectionRestSnapshot.value,
             ),
         )
 
@@ -1036,6 +1145,122 @@ class AppContainer(private val context: Context) {
      * [phantom.core.transport.ConnectedTransport]. PhantomMessagingService
      * delegates to this on every connect.
      */
+    /**
+     * R-N1.17: the single authority for privacy-mode state - the epoch,
+     * the requested and effective modes, the status and the register of
+     * live use permits.
+     *
+     * Process-wide, like the connect lease, because a recreated Service
+     * or screen must observe the same posture rather than a fresh one.
+     */
+    /**
+     * The startup read of BOTH storage keys, decided by one rule rather
+     * than by whichever getter runs first.
+     *
+     * R-N1.17 P1: the plain `privacyMode` getter collapses a malformed
+     * value to Standard - Direct-first - so a corrupted preference would
+     * silently authorise a Direct chain walk, and a legacy-only Ghost
+     * would become Standard at the moment the user upgraded. Both are
+     * silent downgrades arriving through storage rather than through a
+     * race.
+     */
+    private val startupPrivacyModeLoad: phantom.core.transport.PrivacyModeLoad by lazy {
+        val legacyPrefs = context.applicationContext.getSharedPreferences(
+            phantom.android.screens.onboarding.v2.LEGACY_PHANTOM_PREFS_NAME,
+            Context.MODE_PRIVATE,
+        )
+        phantom.core.transport.loadPrivacyModeAtStartup(
+            canonicalRaw = legacyPrefs.getString(
+                phantom.android.screens.onboarding.v2.CANONICAL_TRANSPORT_PRIVACY_MODE_KEY,
+                null,
+            ),
+            legacyRaw = legacyPrefs.getString(
+                phantom.android.screens.onboarding.v2.LEGACY_PRIVACY_MODE_KEY,
+                null,
+            ),
+        ).also { load ->
+            android.util.Log.i(
+                "PhantomHybrid",
+                "PRIVACY startup_load mode=${load.mode} reason=${load.reason} " +
+                    "migrate=${load.migrateLegacy}",
+            )
+        }
+    }
+
+    val privacyModeCoordinator: phantom.core.transport.PrivacyModeCoordinator by lazy {
+        phantom.core.transport.PrivacyModeCoordinator(
+            initialMode = startupPrivacyModeLoad.mode,
+            // R-N1.17: the ONE place production writes the privacy mode.
+            // Both storage surfaces are written here - the canonical
+            // TransportPreferences key and the legacy `privacy_mode`
+            // mirror - so no caller has a reason to reach past the
+            // authority, and none does. A write beside this one is a
+            // second owner of the same fact, which is the defect class
+            // this whole round removed.
+            persistRequested = { mode ->
+                // R-N1.17 P2: the dispatcher boundary lives here, at the
+                // one persistence contract, so no call site can reach a
+                // synchronous SharedPreferences.commit() from Main by
+                // forgetting to wrap itself. The detail screen launches
+                // from rememberCoroutineScope and did exactly that.
+                withContext(Dispatchers.IO) {
+                phantom.android.screens.onboarding.v2.applyPrivacyModeToFirstRunStores(
+                    context = context,
+                    transportPreferences = transportPreferences,
+                    mode = mode,
+                )
+                }
+            },
+            log = { line -> android.util.Log.i("PhantomHybrid", line) },
+            // This store reads synchronously, so passing the resolved
+            // value to the constructor IS the startup reconciliation: a
+            // fresh process has an empty register by construction, and
+            // requested and effective agree from the first snapshot.
+        )
+    }
+
+    /**
+     * The epoch a freshly constructed authority carries. A migration is
+     * only valid while nothing has been requested.
+     */
+    private val STARTUP_EPOCH = 0L
+
+    /** True once the legacy-only value has been copied to the canonical key. */
+    @Volatile
+    private var privacyModeMigrationDone = false
+
+    /**
+     * Copy a legacy-only privacy mode to the canonical key.
+     *
+     * R-N1.17 P2: this used to run inside the coordinator's lazy
+     * initializer, which meant a synchronous `SharedPreferences.commit()`
+     * on whichever thread first touched the container - Main, for a
+     * screen. The dispatcher boundary now belongs to this function, as it
+     * does to `persistRequested`.
+     *
+     * Correctness does not depend on when it runs: the authority already
+     * holds the migrated mode in memory from the startup read, so every
+     * decision is made under the right posture. Only the durability of
+     * the canonical key waits for this.
+     */
+    suspend fun migratePrivacyModeIfNeeded() {
+        if (privacyModeMigrationDone || !startupPrivacyModeLoad.migrateLegacy) return
+        // Serialised by the authority and refused once the epoch has
+        // moved. A migration parked behind a slow disk could otherwise
+        // land after the user picked something else and write the OLD
+        // mode into both keys - the running process would look right and
+        // the next start would come up under a posture nobody asked for.
+        val written = privacyModeCoordinator.migrateStoredMode(
+            mode = startupPrivacyModeLoad.mode,
+            expectedEpoch = STARTUP_EPOCH,
+        )
+        privacyModeMigrationDone = true
+        android.util.Log.i(
+            "PhantomHybrid",
+            "PRIVACY legacy_migration mode=${startupPrivacyModeLoad.mode} written=$written",
+        )
+    }
+
     val transportManager: TransportManager by lazy {
         val healthUrl = phantom.android.BuildConfig.RELAY_URL
             .replace("wss://", "https://")
@@ -1048,10 +1273,17 @@ class AppContainer(private val context: Context) {
             preferences = transportPreferences,
             probe = KtorTransportProbe(healthUrl = healthUrl),
             log = object : TransportManagerLog {
-                override fun info(msg: String) { android.util.Log.i("TransportManager", msg) }
-                override fun warn(msg: String) { android.util.Log.w("TransportManager", msg) }
+                override fun info(msg: String) {
+                    android.util.Log.i("TransportManager", msg)
+                    phantom.android.diagnostic.BackgroundTrace.observe("manager", msg)
+                }
+                override fun warn(msg: String) {
+                    android.util.Log.w("TransportManager", msg)
+                    phantom.android.diagnostic.BackgroundTrace.observe("manager", msg)
+                }
             },
             vpnDetector = ::isSystemVpnActive,
+            policy = privacyModeCoordinator,
         )
     }
 
@@ -1083,38 +1315,421 @@ class AppContainer(private val context: Context) {
     }.getOrDefault(false)
 
     /**
-     * ADR-020 Phase 3: Privacy Mode setter that handles graceful reconnect.
+     * ADR-020 Phase 3, as rebuilt by R-N1.17: the privacy switch.
      *
-     * Writes the new mode to the canonical [TransportPreferences.privacyMode]
-     * AND mirrors it into the legacy `privacy_mode` SharedPreferences key
-     * (the read-receipt suppression in `ChatScreen` still reads that key —
-     * keeping both in sync avoids a behaviour split mid-migration).
+     * The mode is NOT written here. `privacyModeCoordinator` is the single
+     * writer: it bumps the policy epoch, persists the canonical key and
+     * its legacy mirror in one atomic batch, and revokes every permit from
+     * the old policy. A second writer beside it is the defect this round
+     * removed, so this method asks and does not write.
      *
-     * Then forces a transport teardown so the next connect generation walks
-     * the chain implied by the new mode. The foreground service's
-     * `onStartCommand` will be re-invoked by the caller's
-     * `startForegroundService` Intent (see [SettingsScreen]); the resulting
-     * fresh [TransportManager.connect] call sees the new preference.
+     * `ChatScreen` no longer reads the legacy key either - read receipts
+     * ask the authority through `maySendReadReceipts`, which requires the
+     * requested AND the effective mode to allow them.
+     *
+     * The successor is started by this transaction, not by the caller.
+     * Leaving it to `SettingsScreen` meant a cancellation between the
+     * switch and the start left a persisted new mode with nothing running
+     * under it; and when the switch cannot finish, the successor is owed
+     * to a deferred settlement instead. See [concludePrivacySwitch].
      */
-    suspend fun setPrivacyMode(mode: PrivacyMode) {
-        transportPreferences.privacyMode = mode
+    /**
+     * The privacy mode the app may present as ACTIVE.
+     *
+     * R-N1.16 P1: distinct from `transportPreferences.privacyMode`, which
+     * is the REQUESTED mode and governs new chain walks immediately. This
+     * one only moves once the switch has actually closed everything from
+     * the previous policy - because showing Ghost while a Direct socket
+     * is still up is the silent downgrade, written into the UI.
+     */
+    val effectivePrivacyMode: PrivacyMode
+        get() = privacyModeCoordinator.state.value.effective
+
+    /** The outcome of the most recent switch, for whoever displays it. */
+    @Volatile
+    var lastPrivacyModeChange: phantom.core.transport.PrivacyModeChangeResult? = null
+        private set
+
+    /**
+     * Finish a switch whose sockets would not close at the time.
+     *
+     * R-N1.17 P1. `stillOpen` was read once: if it was positive the
+     * release was skipped, the switch stayed Blocked, and the successor
+     * had already been refused a permit. When the late sweep finally
+     * closed those sockets there was nothing left to run the rest - the
+     * app sat with the sockets shut, the lease free and no transport.
+     *
+     * Returns whether the transaction settled. Reporting true when it did
+     * not would strand it again, silently.
+     */
+    suspend fun finishDeferredPrivacySwitch(epoch: Long): Boolean =
+        // R-N1.17 P1: the same transition lock `setPrivacyMode` holds.
+        // Re-reading the epoch between steps does NOT close the window:
+        // this settlement suspends inside its teardown retry, and a new
+        // request could run its whole transaction and bring a transport
+        // up in that gap - which the late release would then stop. The
+        // later `complete()` reported Superseded correctly, but the
+        // damage had already happened.
+        privacyModeCoordinator.withTransition { settleDeferredSwitchLocked(epoch) }
+
+    private suspend fun settleDeferredSwitchLocked(epoch: Long): Boolean {
+        // R-N1.17 P1: the obligation is epoch-bound and lives in ONE
+        // place. A bare boolean here carried no identity, so a timer
+        // armed by switch A settled again over switch B - releasing a
+        // transport B was using and starting a second successor.
+        val outcome = phantom.core.transport.settleDeferredPrivacySwitch(
+            epoch = epoch,
+            coordinator = privacyModeCoordinator,
+            // R-N1.17 P1: the WHOLE teardown again, not just the
+            // subsystem release.
+            //
+            // Every phase here is idempotent - a second revocation on an
+            // already-revoked gate, a disconnect on a closed socket, a
+            // handover of a lease nobody holds, a release of stopped
+            // subsystems - so re-running them costs nothing and is the
+            // only way a phase that FAILED during the inline half ever
+            // gets another attempt. Retrying the release alone let a REST
+            // egress revocation that threw become an applied switch on
+            // the next tick, with old REST/media leases possibly still
+            // live under the new posture.
+            retryTeardown = {
+                val outcome = runPrivacyModeTeardown(
+                    revoke = {
+                        restEgressGateRef?.revokeAndJoin("deferred_privacy_settlement")
+                    },
+                    disconnectAndJoin = {
+                        transport.disconnectAndJoin(PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS)
+                    },
+                    handOverWalk = {
+                        phantom.android.service.PhantomMessagingService
+                            .handoffRecovery.handOverOrArm("deferred_privacy_settlement")
+                    },
+                    release = { transportManager.release() },
+                )
+                lastPrivacyModeTeardown = outcome
+                lastPrivacyModeRevocation = outcome.revocation
+                // Same rule as the inline half above.
+                outcome.release?.torIncomplete?.let {
+                    android.util.Log.w(
+                        "PhantomHybrid",
+                        "PRIVACY_SWITCH tor_teardown_incomplete path=deferred reason=$it",
+                    )
+                }
+                phantom.core.transport.TeardownAttempt(
+                    walkQuiesced = outcome.walkQuiesced,
+                    confirmed = outcome.confirmed,
+                )
+            },
+            // R-N1.17 P1: the lease stays shut from before the handover
+            // until the teardown is CONFIRMED done. A successful handover
+            // frees `owner` immediately, and an ordinary service start
+            // could otherwise claim it and have its fresh subsystems
+            // stopped by this transition's release. Raised on every
+            // attempt because the process may have restarted.
+            raiseClaimFence = {
+                connectOwnership.raiseClaimFence("deferred_settlement", epoch)
+            },
+            lowerClaimFence = {
+                connectOwnership.lowerClaimFence("deferred_settlement", epoch)
+            },
+            // R-N1.17 P1: an explicit stop must not schedule its own
+            // restart, and the check for one is inside the start rather
+            // than beside it - a `standDown` landing between a question
+            // and its answer would otherwise still restart the service.
+            startSuccessor = {
+                phantom.android.service.PhantomMessagingService.handoffRecovery
+                    .startSuccessorUnlessShutDown { startSuccessorService() }
+            },
+            log = { line -> android.util.Log.i("PhantomHybrid", line) },
+        )
+        return outcome.isDischarged
+    }
+
+    /**
+     * The connect lease. It lives in the service companion because it
+     * has to outlive any one service instance.
+     */
+    private val connectOwnership: phantom.core.transport.ConnectOwnership
+        get() = phantom.android.service.PhantomMessagingService.connectOwnership
+
+    /** Start exactly one successor. Returns whether it actually started. */
+    internal fun startSuccessorService(): Boolean = runCatching {
+        val intent = android.content.Intent(
+            context.applicationContext,
+            phantom.android.service.PhantomMessagingService::class.java,
+        )
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            context.applicationContext.startForegroundService(intent)
+        } else {
+            context.applicationContext.startService(intent)
+        }
+    }.onFailure {
+        android.util.Log.w(
+            "PhantomHybrid",
+            "PRIVACY_SWITCH successor_start_failed reason=${it::class.simpleName}",
+        )
+    }.isSuccess
+
+    suspend fun setPrivacyMode(mode: PrivacyMode): phantom.core.transport.PrivacyModeChangeResult {
+        // R-N1.17: the mode is written by the AUTHORITY, inside the
+        // critical section that also bumps the epoch. A direct write
+        // here as well would be a second owner of the same fact - the
+        // shape this round exists to remove - and could leave
+        // preferences saying Ghost while the authority still authorised
+        // Standard walks.
         // Drop the previous-mode "preferred transport" hint. Without this, a
         // Ghost → Standard switch reorders the new chain to put Tor first
         // because the last successful Ghost connect recorded Tor as the hint.
         transportPreferences.lastWorkingTransport = null
         transportPreferences.lastSuccessAt = null
-        // Legacy mirror so ChatScreen's read-receipt gate keeps working
-        // until everything is migrated to read from TransportPreferences.
-        context.applicationContext
-            .getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
-            .edit()
-            .putString("privacy_mode", mode.name)
-            .apply()
-        // Tear down the live socket — the service's connect coroutine exits
-        // its runReconnectLoop and the connectStarted flag flips back so a
-        // subsequent startForegroundService picks up the new mode cleanly.
-        runCatching { transport.disconnect() }
-        runCatching { transportManager.release() }
+        // R-N1.17: the legacy mirror is written by the authority's
+        // persistence adapter, in the SAME atomic batch as the canonical
+        // key. Writing it again here was a third writer of the same fact
+        // - and a non-atomic one, so a crash between the two edits could
+        // leave the keys disagreeing about the user's posture.
+        // N1-F2 R-N1.3 P2-4: leaving Standard must synchronously revoke
+        // every in-flight Direct REST/media lease so nothing already
+        // authorised dispatches or completes under the old posture. Runs
+        // BEFORE the socket teardown; new operations already fail closed
+        // on the live policy read.
+        //
+        // R-N1.2 wrapped this in a bare `runCatching`, which swallowed
+        // EVERY throwable including `CancellationException` — the exact
+        // anti-pattern `RestFallbackOrchestrator.authSessionOnce`
+        // already documents as breaking structured-concurrency teardown.
+        //
+        // R-N1.3 fixed the swallowing but re-asserted the caller's
+        // cancellation BETWEEN the REST revocation and the socket
+        // teardown. Leaving the screen mid-switch could therefore cancel
+        // the transition in that gap: the preference was already
+        // persisted and Settings already showed Private/Ghost, while the
+        // old Direct WSS connection was never disconnected and the new
+        // transport never started.
+        //
+        // R-N1.4: revoke, disconnect and release are ONE non-cancellable
+        // transaction. The caller's cancellation is re-asserted only
+        // after the whole teardown has run. See runPrivacyModeTeardown,
+        // which lives outside this container so the behaviour can be
+        // covered by a fixture that cancels the caller mid-transition.
+        // R-N1.16 P1: make the change visible to the policy gate BEFORE
+        // anything is torn down. From this point a walk that already
+        // passed its probe can no longer publish, and any result already
+        // in flight is stale.
+        // R-N1.17: the request goes to the single authority, which bumps
+        // the epoch, revokes every permit from the old policy and reports
+        // what is still open.
+        // R-N1.17 P1: the WHOLE transition is one non-cancellable
+        // transaction. `requestMode` re-raises the caller's cancellation
+        // as soon as its own sweep finishes, so a cancelled caller used
+        // to leave the new mode persisted while the REST revocation, the
+        // handover, the release and `complete()` never ran - a Direct
+        // REST lease surviving a switch to Ghost, which is the defect the
+        // comment above claims to have closed.
+        //
+        // Cancellation is re-asserted at the very end, once everything
+        // has settled and the successor has been started.
+        val result = withContext(NonCancellable) {
+        privacyModeCoordinator.withTransition {
+        val changeEpoch = privacyModeCoordinator.requestMode(mode)
+        connectOwnership.raiseClaimFence("privacy_mode_change", changeEpoch)
+        // Set by the conclusion when it records a deferred obligation.
+        // That obligation OWNS the fence from then on, so an abort must
+        // not lower it; without an obligation, nothing else ever would.
+        var settlementArmed = false
+        try {
+        val stillOpen = privacyModeCoordinator.state.value.stillOpen
+        if (stillOpen > 0) {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "NETWORK_TRACE privacy_switch_incomplete epoch=$changeEpoch " +
+                    "stillOpen=$stillOpen — handing the lease over anyway; " +
+                        "not releasing until those sockets close",
+            )
+        }
+        // Captured separately from the release decision: `complete()`
+        // needs to know whether the WALK stopped, which is not the same
+        // question as whether the release was allowed to run.
+        var walkHandedOver = false
+        val teardown = runPrivacyModeTeardown(
+            revoke = { restEgressGateRef?.revokeAndJoin("privacy_mode_change") },
+            // Tear down the live socket — the service's connect coroutine
+            // exits its runReconnectLoop and the connectStarted flag flips
+            // back so a subsequent startForegroundService picks up the new
+            // mode cleanly.
+            //
+            // R-N1.5: disconnectAndJoin, NOT disconnect. `disconnect()`
+            // routes to teardownAndJoin(flushBeforeClose = true), which
+            // spends up to three seconds pushing pendingOutbox and
+            // pendingAcks through the still-live socket before closing
+            // it. For logout that is right; for a privacy switch it means
+            // the user's queued payloads keep leaving over Direct AFTER
+            // they asked for Direct to stop. disconnectAndJoin does not
+            // flush, so the pending stores are carried to the new
+            // transport instead. It also returns whether the teardown
+            // actually joined, which `disconnect()` threw away.
+            disconnectAndJoin = {
+                transport.disconnectAndJoin(PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS)
+            },
+            // R-N1.16 P1: the outer walk owns the connect lease and is
+            // NOT stopped by disconnectAndJoin, which only tears down the
+            // socket. Hand the lease over first; on a failed join the
+            // teardown skips the release and recovery is armed, and the
+            // retry that follows re-reads the NEW privacy mode.
+            handOverWalk = {
+                // R-N1.17 P1: the handover is ALWAYS attempted, even when
+                // sockets are still open.
+                //
+                // Skipping it when `stillOpen > 0` left the lease in an
+                // ordinary owned state rather than handover-blocked, so
+                // after a successful socket recovery `recoverIfBlocked`
+                // reported NotBlocked, the recovery timer stood down
+                // without handing anything over, and nothing started a
+                // connect. Stopping the old walk is independent of the
+                // sockets and is never the wrong thing to do.
+                walkHandedOver = phantom.android.service.PhantomMessagingService
+                    .handoffRecovery.handOverOrArm("privacy_mode_change")
+                // The RELEASE, though, needs both: subsystems must not be
+                // torn down while a socket from the old policy is up.
+                walkHandedOver && stillOpen == 0
+            },
+            release = { transportManager.release() },
+        )
+        lastPrivacyModeRevocation = teardown.revocation
+        lastPrivacyModeTeardown = teardown
+        teardown.revokeFailure?.let {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "REST_EGRESS revoke_failed reason=${it::class.simpleName}",
+            )
+        }
+        teardown.disconnectFailure?.let {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH disconnect_failed reason=${it::class.simpleName}",
+            )
+        }
+        // A teardown that left tor unsettled is incomplete for the same
+        // reason a failed revocation is: something from the old posture may
+        // still be alive. `confirmed` already refuses the switch; this says
+        // WHICH of the two facts is unfinished, because a daemon nobody
+        // confirmed gone and a host still holding threads are not the same
+        // problem and do not clear the same way.
+        teardown.release?.torIncomplete?.let {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH tor_teardown_incomplete path=inline reason=$it",
+            )
+        }
+        if (teardown.disconnectJoinedCleanly == false) {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH disconnect_join_timeout budgetMs=" +
+                    "$PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS",
+            )
+        }
+        teardown.releaseFailure?.let {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH release_failed reason=${it::class.simpleName}",
+            )
+        }
+        teardown.release?.let { r ->
+            if (!r.clean) {
+                android.util.Log.w(
+                    "PhantomHybrid",
+                    "PRIVACY_SWITCH subsystem_stop_failed " +
+                        "xray=${r.xrayFailure?.let { it::class.simpleName } ?: "ok"} " +
+                        "tor=${r.torFailure?.let { it::class.simpleName } ?: "ok"}",
+                )
+            }
+        }
+        if (!teardown.clean) {
+            android.util.Log.w(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH teardown_not_clean mode=${mode.name} — posture is " +
+                    "fail-closed and late results are discarded, but Direct I/O " +
+                    "may briefly outlive the switch",
+            )
+        }
+
+        // R-N1.16 P1. The requested mode already governs new chain walks;
+        // the EFFECTIVE mode - the one the app may present as active -
+        // moves only when everything from the previous policy is
+        // confirmed closed. Showing Ghost over a live Direct socket is
+        // the silent downgrade written into the UI, so a switch that
+        // could not finish reports Blocked and leaves the effective mode
+        // where it was.
+        // The authority decides and commits. It compares the epoch this
+        // switch created with the one in force, so a late completion
+        // installs nothing.
+        //
+        // R-N1.17 P1: the completion AND the decision about who owes the
+        // successor are one shared rule, not three lines here. The
+        // container used to complete the switch and then start a
+        // successor unconditionally, which made the settlement's sole
+        // ownership nominal - and the rule could only be checked by
+        // reading source, never by running anything.
+        // R-N1.17 P1: a release that threw, that reported anything
+        // unclean, or that was skipped entirely is NOT a released
+        // subsystem. The deferred half already refused to call that a
+        // settled switch; the inline half used to log it and go on to
+        // Applied plus a successor - the same defect on the path that
+        // runs far more often.
+        // The WHOLE teardown, not just the subsystem release - see
+        // PrivacyTeardownOutcome.confirmed, where the rule lives and is
+        // covered by fixtures for each way a teardown can fall short.
+        val teardownConfirmed = teardown.confirmed
+        val conclusion = phantom.core.transport.concludePrivacySwitch(
+            epoch = changeEpoch,
+            coordinator = privacyModeCoordinator,
+            stillOpen = stillOpen,
+            walkQuiesced = walkHandedOver,
+            teardownConfirmed = teardownConfirmed,
+            armSettlement = { reason, epoch ->
+                // R-N1.16 P1: a driver that does not wait for the user to
+                // do something or for a network nudge a stable network
+                // never sends. R-N1.17 P1: it owes the whole deferred
+                // half - release, completion AND successor - not a sweep.
+                phantom.android.service.PhantomMessagingService
+                    .handoffRecovery.armDeferredSettlement(reason, epoch)
+                settlementArmed = true
+            },
+            lowerClaimFence = {
+                connectOwnership.lowerClaimFence("privacy_mode_change", changeEpoch)
+            },
+            startSuccessor = {
+                phantom.android.service.PhantomMessagingService.handoffRecovery
+                    .startSuccessorUnlessShutDown { startSuccessorService() }
+            },
+            armStartRetry = { reason, epoch ->
+                phantom.android.service.PhantomMessagingService
+                    .handoffRecovery.armStartRetry(reason, epoch)
+            },
+            noteSuccessorStarted = { epoch ->
+                phantom.android.service.PhantomMessagingService
+                    .handoffRecovery.noteSuccessorStarted(epoch)
+            },
+            log = { line -> android.util.Log.w("PhantomHybrid", line) },
+        )
+        val result = conclusion.result
+        lastPrivacyModeChange = result
+        result
+        } catch (t: Throwable) {
+            // A switch that blew up before recording an obligation leaves
+            // nothing to lower the fence, and a permanently shut lease is
+            // worse than the failure that caused it. When an obligation
+            // WAS recorded it owns the fence, and the settlement lowers it
+            // when it is genuinely safe.
+            if (!settlementArmed) {
+                connectOwnership.lowerClaimFence("privacy_mode_change:aborted", changeEpoch)
+            }
+            throw t
+        }
+        }
+        }
+        // Only now: the entire transition has settled.
+        currentCoroutineContext().ensureActive()
+        return result
     }
 
     /**
@@ -1144,10 +1759,17 @@ class AppContainer(private val context: Context) {
      */
     suspend fun applyPrivacyModeFromOnboarding(mode: PrivacyMode) {
         withContext(Dispatchers.IO) {
-            phantom.android.screens.onboarding.v2.applyPrivacyModeToFirstRunStores(
-                context = context,
-                transportPreferences = transportPreferences,
-                mode = mode,
+            // R-N1.17: an ordinary request through the authority, then an
+            // explicit completion. First run differs only in having
+            // nothing to tear down - no socket and no chain walk - so both
+            // conditions are genuinely true here and are stated rather
+            // than assumed. Without the completion the authority would sit
+            // in Blocked until the process restarted.
+            val epoch = privacyModeCoordinator.requestMode(mode)
+            privacyModeCoordinator.complete(
+                epoch = epoch,
+                policyChangeComplete = true,
+                walkQuiesced = true,
             )
         }
     }
@@ -1245,9 +1867,24 @@ class AppContainer(private val context: Context) {
         // GET /prekeys/status and GET /prekeys/bundle continue using the shared REST
         // client (small GETs; connection reuse fine for them).
         val restHttpClient = createRestHttpClient()
+        val sharedEgressGate = phantom.core.transport.RestEgressGate(
+            policy = phantom.core.transport.PrivacyModeRestEgressPolicy {
+                // N1-F2 R-N1.2: the egress read distinguishes missing
+                // (legacy Standard) from present-but-malformed (fail closed).
+                transportPreferences.privacyModeForEgress()
+            },
+            callRegistry = egressCallRegistry,
+            log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+        )
+        restEgressGateRef = sharedEgressGate
+        gatedAppHttpRef = phantom.android.net.GatedAppHttp(
+            egressGate = sharedEgressGate,
+            callRegistry = egressCallRegistry,
+        )
         val preKeyApi = phantom.core.transport.PreKeyApiClient(
             httpClient = restHttpClient,
             relayBaseUrl = relayHttpBase,
+            egressGate = sharedEgressGate,
             // T2 carrier-ceiling fix (2026-06-16, post Phase 1+2 field
             // evidence). The Android publish transport unconditionally
             // skips the response body read on 2xx and returns an empty
@@ -1258,7 +1895,9 @@ class AppContainer(private val context: Context) {
             // `storedOpks` count from the response is informational
             // only — server contract pin "201 == stored" is sufficient
             // for the publish-success branch.
-            publishTransport = createPreKeyPublishHttpTransport(),
+            publishTransport = createPreKeyPublishHttpTransport(
+                callRegistry = egressCallRegistry,
+            ),
             // T2 carrier-ceiling instrumentation client-side gate
             // (2026-06-16 Option A Item 3). `true` only when BOTH
             // `BuildConfig.DEBUG == true` AND
@@ -1429,35 +2068,34 @@ class AppContainer(private val context: Context) {
             }
 
             val restOrchestrator = phantom.core.transport.RestFallbackOrchestrator(
+                // N1-F2 (2026-08-29): the fail-closed egress authority.
+                // Reads the LIVE persisted privacy mode on every
+                // decision — never the diagnostic latched outer arm —
+                // so a runtime Standard -> Private/Ghost switch blocks
+                // the next REST request/poll iteration immediately and
+                // a session created under Standard stops being usable.
+                egressGate = sharedEgressGate,
                 baseUrl = relayHttpBase,
                 identityHex = identity.publicKeyHex,
                 signingPubkeyHex = signingPubHexForRest,
+                // N1-F2 R-N1.3: the challenge HTTP moved to
+                // phantom.android.net.RelayChallengeClient so this container
+                // imports no HTTP client type. The orchestrator wraps this
+                // lambda in egressGate.dispatch("auth_challenge"), which
+                // R-N1.2 failed to do — the identity-bearing challenge was
+                // reaching the network in Private/Ghost.
                 getChallenge = { identityHex ->
-                    // Re-use the long-lived Ktor REST client (HTTP/1.1 pinned by
-                    // PR-G4). The relay returns `{"nonce_hex":"<64 hex>"}` on
-                    // success. We throw on IOException or non-2xx so the
-                    // orchestrator's runCatching surfaces it as
-                    // `session_challenge_fail` and the next bootstrap attempt
-                    // tries again.
-                    val resp = restHttpClient.get(
-                        "$relayHttpBase/auth/challenge?identity=$identityHex"
-                    )
-                    val text = resp.bodyAsText()
-                    if (!resp.status.isSuccess()) {
-                        error(
-                            "auth/challenge non-2xx: ${resp.status.value} body=${text.take(120)}"
-                        )
-                    }
-                    val nonceMatch = Regex("\"nonce_hex\"\\s*:\\s*\"([a-fA-F0-9]+)\"")
-                        .find(text)
-                        ?: error("auth/challenge response missing nonce_hex: ${text.take(120)}")
-                    nonceMatch.groupValues[1]
+                    phantom.android.net.RelayChallengeClient(
+                        httpClient = restHttpClient,
+                        relayHttpBase = relayHttpBase,
+                    ).fetchNonceHex(identityHex)
                 },
                 signChallenge = { nonceBytes ->
                     identityManager.signRelayChallenge(nonceBytes)
                         ?: error("signing key not provisioned")
                 },
                 transport = phantom.core.transport.createRestFallbackTransport(
+                    callRegistry = egressCallRegistry,
                     // Round 12 step 2 — debug-only per-chunk body
                     // byte accounting on the /relay/poll path. Wired
                     // from BuildConfig.DEBUG so the release variant
@@ -1505,7 +2143,8 @@ class AppContainer(private val context: Context) {
                         phantom.android.BuildConfig.DEBUG &&
                             phantom.android.BuildConfig.POLL_SKIP_LP_AND_PP == "1" &&
                             phantom.android.BuildConfig.LONGPOLL_V2_ENABLED == "1" &&
-                            transportPreferences.privacyMode == phantom.core.transport.PrivacyMode.Standard
+                            privacyModeCoordinator.state.value.effective ==
+                            phantom.core.transport.PrivacyMode.Standard
                     },
                     // Round 13 — debug-only gate for the OkHttp
                     // HttpPhaseEventListener. The release variant has
@@ -1551,7 +2190,10 @@ class AppContainer(private val context: Context) {
                     // / auth OkHttp clients unaffected.
                     k8ConnectionCloseProvider = k8ConnectionCloseProvider,
                 ),
-                log = { msg -> android.util.Log.i("PhantomHybrid", msg) },
+                log = { msg ->
+                    android.util.Log.i("PhantomHybrid", msg)
+                    phantom.android.diagnostic.BackgroundTrace.observe("rest", msg)
+                },
                 onModeSwitched = { _, _, reason ->
                     // Mirror the REST_TRACE mode_switched reason into the
                     // WS_DEGRADED_TELEMETRY stream so calibration can
@@ -1775,6 +2417,7 @@ class AppContainer(private val context: Context) {
             // CAS facade — auth lives in the orchestrator, not here.
             val mediaCryptoLocal = phantom.core.crypto.MediaCrypto()
             val mediaUploadTransportLocal = phantom.core.transport.AndroidNativeOkHttpMediaUploadTransport(
+                callRegistry = egressCallRegistry,
                 relayBaseUrl = relayHttpBase,
                 log          = { msg -> android.util.Log.i("PhantomMedia", msg) },
                 // PR-M2f — relay advertises `media_capabilities.binary_v3=true`
@@ -1786,12 +2429,16 @@ class AppContainer(private val context: Context) {
                 // contradicts the announcement at runtime.
                 binaryV3Enabled = { restOrchestrator.capabilities.value.mediaBinaryV3 },
             )
+            val gatedMediaTransport = phantom.core.transport.GatedMediaUploadTransport(
+                delegate = mediaUploadTransportLocal,
+                egressGate = sharedEgressGate,
+            )
             val mediaAuthTokenProviderLocal = phantom.core.transport.RestMediaAuthTokenProvider(
                 orchestrator = restOrchestrator,
             )
             voiceV2SenderLocal = phantom.core.messaging.VoiceV2Sender(
                 mediaCrypto    = mediaCryptoLocal,
-                mediaTransport = mediaUploadTransportLocal,
+                mediaTransport = gatedMediaTransport,
                 tokenProvider  = mediaAuthTokenProviderLocal,
                 log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
                 // PR-M2f.1 — debug-only Settings selector binds to a
@@ -1812,7 +2459,7 @@ class AppContainer(private val context: Context) {
             voiceV2DownloadOrchestratorLocal = phantom.core.messaging.VoiceV2DownloadOrchestrator(
                 downloadRepo   = voiceV2DownloadRepo,
                 messageRepo    = messageRepo,
-                mediaTransport = mediaUploadTransportLocal,
+                mediaTransport = gatedMediaTransport,
                 tokenProvider  = mediaAuthTokenProviderLocal,
                 mediaCrypto    = mediaCryptoLocal,
                 fileStore      = phantom.core.messaging.VoiceFileStore(context),
@@ -1897,6 +2544,26 @@ class AppContainer(private val context: Context) {
                 scope = appScope,
                 transportPreferences = transportPreferences,
                 releaseTransport = { transportManager.release() },
+                // R-N1.16 P1-2: hand the connect lease over BEFORE the
+                // transport is released. The walk that owns it may be
+                // inside TransportManager.connect() starting or probing
+                // the subsystems the next step stops, and release() is
+                // deliberately not serialised against connect().
+                //
+                // Returns false when quiescence could not be confirmed,
+                // which aborts the rewalk rather than tearing subsystems
+                // down under a walk we failed to stop. The service keeps
+                // the lease fail-closed and drives its own recovery.
+                // R-N1.16 P1: handOverOrArm, not handOver. A failed
+                // handover abandons the rewalk - no release, no service
+                // restart - so the arming that used to live in the
+                // service's restart branch was unreachable from the one
+                // situation that needs it. Pairing them here puts the
+                // arming in the path that actually runs.
+                handOverConnectOwnership = { reason ->
+                    phantom.android.service.PhantomMessagingService
+                        .handoffRecovery.handOverOrArm(reason)
+                },
                 hybridTransportProvider = { hybridTransport },
                 // RC-RECONNECT-QUIESCENCE1 commit 2c (2026-06-22): wire
                 // the [RestStateMachine] instance owned by
@@ -1982,17 +2649,17 @@ class AppContainer(private val context: Context) {
 
             // PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30): forwarder
             // coroutine for connectionUiState. The class-level
-            // `connectionRestMode` source starts at WsActive so the
+            // `connectionRestSnapshot` source starts at WsActive so the
             // pre-init window flows bare-wsTransport semantics through
             // the derivation. Now that `hybridTransport = hybrid` is
-            // assigned above (~30 lines back), route real RestMode
-            // emissions into connectionRestMode so the combine output
+            // assigned above (~30 lines back), route atomic mode/cause
+            // snapshots into connectionRestSnapshot so the combine output
             // updates accordingly. Standard "lazy upstream swap" pattern
             // — combine itself was constructed at AppContainer init and
             // never sees a null hybrid; only this collector starts late.
             appScope.launch {
-                hybrid.stateMachine.state.collect { mode ->
-                    connectionRestMode.value = mode
+                hybrid.stateMachine.snapshot.collect { snapshot ->
+                    connectionRestSnapshot.value = snapshot
                 }
             }
         }
@@ -2005,7 +2672,7 @@ class AppContainer(private val context: Context) {
         // transportManager.release() and then a new foreground service start
         // re-calls initMessaging — at that point privacyMode == Ghost and the
         // coroutine is started.
-        if (transportPreferences.privacyMode == PrivacyMode.Ghost) {
+        if (privacyModeCoordinator.state.value.requested == PrivacyMode.Ghost) {
             _torStarted = true
             appScope.launch {
                 torService.state.collect { torState ->
@@ -2111,6 +2778,8 @@ class AppContainer(private val context: Context) {
             messageRepository = messageRepo,
             conversationRepository = conversationRepo,
             processedEnvelopeRepository = processedEnvelopeRepo,
+            inboundCommitRepository = inboundCommitRepo,
+            controlEventCommitRepository = controlEventCommitRepo,
             scope = appScope,
             json = json,
             reactionRepository = reactionRepo,

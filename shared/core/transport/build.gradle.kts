@@ -43,6 +43,14 @@ kotlin {
         jvmMain.dependencies {
             implementation(libs.ktor.client.okhttp)
         }
+        // Host tests for the Android-only library boundary
+        // (`AndroidTorProcessHandle`). It talks to Briar's `TorWrapper`
+        // interface, which is plain Java, so these run on the JVM without a
+        // device or Robolectric — the fixture substitutes that interface.
+        androidUnitTest.dependencies {
+            implementation(kotlin("test"))
+            implementation(libs.kotlinx.coroutines.test)
+        }
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)

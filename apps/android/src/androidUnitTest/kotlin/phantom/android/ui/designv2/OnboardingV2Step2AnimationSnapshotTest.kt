@@ -30,6 +30,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseOnboardingIdentityKeyPreview
  * Pixel-5 viewport (411 dp × 891 dp, fontScale 1.0) — matches
  * every other OnboardingV2 golden.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class OnboardingV2Step2AnimationSnapshotTest {
 
     @get:Rule

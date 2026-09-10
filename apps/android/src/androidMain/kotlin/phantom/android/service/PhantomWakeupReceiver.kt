@@ -139,12 +139,28 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             return
         }
         if (managerState is phantom.core.transport.ManagerState.AllFailed) {
+            // N1-F3. This branch used to return here, on the grounds that
+            // "the foreground service owns the retry cadence". The service
+            // had no such cadence: it caught NoTransportReachableException,
+            // logged it, released its CAS and returned. The receiver
+            // deferred to the service, the service deferred to nobody, and
+            // a chain exhausted while the network stayed up left the app
+            // dark until something restarted the service. That is the
+            // observed `direct_unavailable`.
+            //
+            // forceReconnect() is still wrong here - it tears down the
+            // OkHttp engine an in-flight attempt is using, which is why
+            // the skip existed. So the receiver does not reconnect and
+            // does not call connect(). It sends a NUDGE and stops. The
+            // service checks due time, epoch and single-flight and
+            // decides; duplicate nudges collapse into at most one attempt.
             Log.i(
                 TAG,
                 "TransportManager AllFailed (chain exhausted, " +
-                    "${managerState.attempts.size} attempts) — skipping " +
-                    "keepalive forceReconnect; the foreground service owns the retry cadence",
+                    "${managerState.attempts.size} attempts) - sending retry nudge " +
+                    "to the service, which owns the cadence",
             )
+            sendRetryNudge(appContext, source = "alarm_all_failed")
             return
         }
 
@@ -222,6 +238,27 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             android.os.Handler(appContext.mainLooper).postDelayed({
                 runCatching { cm.unregisterNetworkCallback(callback) }
             }, CONNECTIVITY_POKE_BUDGET_MS)
+        }
+    }
+
+    /**
+     * N1-F3 - tell the service a retry may be due. Deliberately NOT a
+     * connect: the receiver has no generation, no CAS and no view of
+     * whether a chain walk is already running, so it is not allowed to
+     * decide. It only delivers the signal.
+     */
+    private fun sendRetryNudge(appContext: Context, source: String) {
+        runCatching {
+            val intent = Intent(appContext, PhantomMessagingService::class.java)
+                .putExtra(PhantomMessagingService.EXTRA_RETRY_NUDGE, true)
+                .putExtra(PhantomMessagingService.EXTRA_RETRY_NUDGE_SOURCE, source)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appContext.startForegroundService(intent)
+            } else {
+                appContext.startService(intent)
+            }
+        }.onFailure {
+            Log.e(TAG, "could not send retry nudge: ${it.message}", it)
         }
     }
 

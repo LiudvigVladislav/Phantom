@@ -145,7 +145,23 @@ private fun IntroPager(container: AppContainer, onComplete: () -> Unit) {
                                 // ADR-020 Phase 3: persist the chosen Privacy Mode so
                                 // TransportManager picks the matching strategy on the
                                 // first connect after onboarding.
-                                container.transportPreferences.privacyMode = privacyMode
+                                // R-N1.17: through the authority, which is
+                                // the only writer of the privacy mode. A
+                                // direct preferences write beside it would
+                                // leave the coordinator authorising walks
+                                // under the mode the process started with
+                                // while storage said something else.
+                                //
+                                // R-N1.17 P2: and through the SAME helper
+                                // the v2 flow uses, rather than a second
+                                // copy of its body here. This one ran the
+                                // request and the completion on the
+                                // composition scope - the main thread -
+                                // where the persistence write inside
+                                // `requestMode` does disk I/O. The helper
+                                // hops to `Dispatchers.IO` itself, and one
+                                // implementation cannot drift from itself.
+                                container.applyPrivacyModeFromOnboarding(privacyMode)
                                 runOnboarding(container, username, finalize) {
                                     error = it; loading = false
                                 }

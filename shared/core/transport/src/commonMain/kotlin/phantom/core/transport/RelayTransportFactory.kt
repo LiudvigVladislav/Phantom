@@ -106,7 +106,16 @@ expect fun createPreKeyPublishHttpClient(): HttpClient
  * Non-Android actuals (iOS, JVM) throw [NotImplementedError] because the
  * streaming bug is Android-only and iOS/desktop are not production paths.
  */
-expect fun createPreKeyPublishHttpTransport(): PreKeyPublishHttpTransport
+expect fun createPreKeyPublishHttpTransport(
+    /**
+     * N1-F2 R-N1.3 — registry of abortable in-flight native calls.
+     * Revocation aborts every registered call, which is the only
+     * supported way to stop an in-flight OkHttp request; coroutine
+     * cancellation alone does not interrupt a blocking `execute()`.
+     * Defaults to `null` so existing call sites keep their behaviour.
+     */
+    callRegistry: EgressCallRegistry? = null,
+): PreKeyPublishHttpTransport
 
 /**
  * Returns a [RestFallbackTransport] for the new REST short-poll fallback
@@ -250,6 +259,14 @@ expect fun createRestFallbackTransport(
      * existing call site.
      */
     k8ConnectionCloseProvider: (() -> Boolean)? = null,
+    /**
+     * N1-F2 R-N1.3 — registry of abortable in-flight native calls.
+     * Revocation aborts every registered call, which is the only
+     * supported way to stop an in-flight OkHttp request; coroutine
+     * cancellation alone does not interrupt a blocking `execute()`.
+     * Defaults to `null` so existing call sites keep their behaviour.
+     */
+    callRegistry: EgressCallRegistry? = null,
 ): RestFallbackTransport
 
 /**

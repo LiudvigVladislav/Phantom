@@ -22,6 +22,16 @@ package phantom.core.storage
  */
 interface SessionTransactionRepository {
 
+    suspend fun listReceiveArchives(conversationId: String, nowMs: Long): List<ReceiveSessionArchive> = emptyList()
+
+    suspend fun listReceiveArchiveVersions(conversationId: String, nowMs: Long): List<ReceiveSessionArchiveVersion> = emptyList()
+
+    suspend fun deleteExpiredReceiveArchives(nowMs: Long) {}
+
+    /** Legacy non-text replacement still preserves the displaced receive state. */
+    suspend fun replaceActiveSession(conversationId: String, stateBlob: String, nowMs: Long): Unit =
+        throw UnsupportedOperationException("replaceActiveSession is not implemented")
+
     /**
      * L4 phase 3 success — commit the candidate bootstrap into the
      * pending slot.
@@ -273,4 +283,109 @@ interface SessionTransactionRepository {
         bootstrapArtifactsBlob: String,
         nowMs: Long,
     )
+
+    /**
+     * The single durable moment of an inbound message.
+     *
+     * Commits, in ONE transaction:
+     *
+     *  - the message row;
+     *  - the advanced receive-chain state for the conversation --
+     *    either [advancedStateBlob] written to `ratchet_state`, or, when
+     *    [promotePending] is true, the pending row promoted to active
+     *    with its one-time pre-key consumed and its reservation released;
+     *  - the completion-ledger entry for the envelope.
+     *
+     * Why one transaction. These three facts all mean "this envelope is
+     * finished with", and until this method existed they were three
+     * separate writes in that order: chain first, ledger second, message
+     * last and outside the per-conversation lock. A failure of the
+     * message write therefore left a chain position spent and a ledger
+     * entry claiming the envelope was processed, so the next redelivery
+     * was recognised as a duplicate and acknowledged -- and the relay
+     * dropped the only remaining copy. A compensating rollback cannot fix
+     * that, because a process death between the writes leaves no one to
+     * run it.
+     *
+     * The relay ack is deliberately NOT part of this transaction. It is
+     * an external effect that FOLLOWS a commit, must be idempotent, and
+     * must be re-issuable from the committed record alone. A ledger entry
+     * without an ack is recoverable; an ack without a ledger entry is
+     * not.
+     *
+     * @param advancedStateBlob plaintext JSON of the advanced state, or
+     *   null when [promotePending] supplies the new active state instead.
+     * @return [InboundCommitOutcome.Committed], or
+     *   [InboundCommitOutcome.PendingMissing] when a promotion was asked
+     *   for and no pending row was there -- in which case NOTHING is
+     *   written, so the caller may still hold or retry the envelope.
+     */
+    suspend fun commitInboundMessage(
+        conversationId: String,
+        envelopeId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+        message: MessageEntity,
+        advancedStateBlob: String?,
+        promotePending: Boolean = false,
+        /**
+         * The one-time pre-key the candidate for THIS envelope was derived
+         * with, or null when the derivation used no one-time key at all
+         * (a 3-DH bundle, or a path that consumes nothing).
+         *
+         * When non-null the transaction verifies, BEFORE it writes
+         * anything, that a reservation for exactly this key exists and
+         * belongs to this conversation; it then consumes that key and
+         * releases that reservation. A mismatch is
+         * [InboundCommitOutcome.ReservationMissing] and writes nothing.
+         *
+         * Binding matters in both directions. Looking the reservation up
+         * by conversation alone would let a first contact that used NO
+         * one-time key consume some older reservation of the same
+         * conversation, and would let a commit whose reservation had
+         * disappeared finish anyway, storing the message and the session
+         * while the key it depended on was never spent.
+         *
+         * For promotion, the stored pending binding is authoritative:
+         * this parameter is only a cross-check when present. In particular
+         * a headerless frame still consumes the pending candidate's key.
+         * Without promotion, null means no local key was used and leaves
+         * every reservation untouched.
+         */
+        expectedOpkKeyIdHex: String? = null,
+        /** Archive targets are revision-checked; activation moves, never duplicates, their state. */
+        stateTarget: InboundStateTarget = InboundStateTarget.Active,
+    ): InboundCommitOutcome =
+        throw UnsupportedOperationException(
+            "commitInboundMessage is not implemented by ${this::class.simpleName}; " +
+                "a receive path must be wired to a repository that commits atomically",
+        )
+}
+
+/** Result of [SessionTransactionRepository.commitInboundMessage]. */
+enum class InboundCommitOutcome {
+    /** Selected archive disappeared, expired, or advanced since decryption. No writes. */
+    ArchiveUnavailable,
+    /** Every record named in the contract is durable. */
+    Committed,
+
+    /**
+     * A promotion was requested and the pending row was gone. Nothing was
+     * written: no message, no chain advance, no ledger entry.
+     */
+    PendingMissing,
+
+    /**
+     * A one-time pre-key was named as the candidate's, and no reservation
+     * for it belongs to this conversation any more. Nothing was written:
+     * the envelope is not finished with, and must not be acknowledged.
+     */
+    ReservationMissing,
+
+    /** The pending row has no established local-key provenance. No writes. */
+    PendingBindingUnknown,
+
+    /** The caller's expected key disagrees with the pending row. No writes. */
+    PendingBindingMismatch,
 }

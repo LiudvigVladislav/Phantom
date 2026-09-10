@@ -12,6 +12,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseFilterChipMatrix
 /**
  * PhantomFilterChip matrix golden — unselected / selected + a typical row.
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomFilterChipSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

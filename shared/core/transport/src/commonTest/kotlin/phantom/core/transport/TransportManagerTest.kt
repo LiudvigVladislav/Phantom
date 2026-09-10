@@ -50,6 +50,7 @@ class TransportManagerTest {
             preferences = prefs,
             probe = TransportProbe { kind, _ -> kind == TransportKind.Direct }, // direct works
             nowMs = { 1_000L },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val connected = mgr.connect()
         assertEquals(TransportKind.Direct, connected.kind)
@@ -68,6 +69,7 @@ class TransportManagerTest {
             preferences = prefs,
             probe = TransportProbe { kind, _ -> kind == TransportKind.Tor }, // only tor works
             nowMs = { 5_000L },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val connected = mgr.connect()
         assertEquals(TransportKind.Tor, connected.kind)
@@ -89,6 +91,7 @@ class TransportManagerTest {
             preferences = prefs,
             probe = TransportProbe { _, _ -> false },
             nowMs = { 0L },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val ex = assertFailsWith<NoTransportReachableException> { mgr.connect() }
         assertEquals(1, ex.attempts.size)
@@ -110,6 +113,7 @@ class TransportManagerTest {
                 kind == TransportKind.Direct || kind == TransportKind.Reality
             },
             nowMs = { 0L },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val ex = assertFailsWith<NoTransportReachableException> { mgr.connect() }
         assertEquals(listOf(TransportKind.Tor), ex.attempts.map { it.kind })
@@ -143,6 +147,7 @@ class TransportManagerTest {
                 kind == TransportKind.Direct
             },
             nowMs = { TransportPreferences.LAST_SUCCESS_TTL_MS / 2 }, // hint is fresh
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val connected = mgr.connect()
         assertEquals(TransportKind.Direct, connected.kind)
@@ -175,6 +180,7 @@ class TransportManagerTest {
                 kind == TransportKind.Direct
             },
             nowMs = { TransportPreferences.LAST_SUCCESS_TTL_MS / 2 },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         val connected = mgr.connect()
         assertEquals(TransportKind.Direct, connected.kind)
@@ -199,6 +205,7 @@ class TransportManagerTest {
                 kind == TransportKind.Direct
             },
             nowMs = { TransportPreferences.LAST_SUCCESS_TTL_MS + 1 }, // hint is stale
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         mgr.connect()
         // Stale hint was cleared inside reorderChain so the walk started
@@ -220,6 +227,7 @@ class TransportManagerTest {
             preferences = prefs,
             probe = TransportProbe { kind, _ -> kind == TransportKind.Direct },
             nowMs = { 0L },
+            policy = PrivacyModeCoordinator(prefs.privacyMode),
         )
         mgr.connect()
         assertEquals(0, prefs.transportFailureCount)
@@ -250,6 +258,7 @@ class TransportManagerTest {
             preferences = InMemoryTransportPreferences(PrivacyMode.Private),
             probe = TransportProbe { kind, _ -> kind == TransportKind.Reality },
             nowMs = { 0L },
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Private).privacyMode),
         )
         val connected = mgr.connect()
         assertEquals(TransportKind.Reality, connected.kind)
@@ -264,6 +273,7 @@ class TransportManagerTest {
             preferences = InMemoryTransportPreferences(PrivacyMode.Standard),
             probe = TransportProbe { _, _ -> true },
             nowMs = { 0L },
+            policy = PrivacyModeCoordinator(InMemoryTransportPreferences(PrivacyMode.Standard).privacyMode),
         )
         mgr.connect()
         val state = mgr.state.value
@@ -277,7 +287,15 @@ class TransportManagerTest {
         private val flow = MutableStateFlow<TorState>(TorState.Ready(socksPort = 9050))
         override val state: StateFlow<TorState> = flow.asStateFlow()
         override suspend fun start(bridgeProfile: BridgeProfile) { /* already Ready */ }
-        override suspend fun stop() { flow.value = TorState.Off }
+        override suspend fun stop(budget: TorBudget): TorStopResponse {
+            flow.value = TorState.Off
+            return freeStopResponse()
+        }
+
+        override suspend fun awaitRelease(
+            attempt: TorStopAttempt,
+            budget: TorBudget,
+        ): TorStopResult = freeStopResponse().result
     }
 
     private fun fakeXray(): XrayService = object : XrayService {

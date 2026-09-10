@@ -77,14 +77,15 @@ fun SettingsScreen(
     }
     var readReceipts by remember { mutableStateOf(prefs.getBoolean("read_receipts", true)) }
     var screenshotProtection by remember { mutableStateOf(prefs.getBoolean("screenshot_protection", false)) }
-    var messageAlerts by remember { mutableStateOf(prefs.getBoolean("message_alerts", true)) }
     var callAlerts by remember { mutableStateOf(prefs.getBoolean("call_alerts", true)) }
 
     // Privacy Mode value displayed in the row (no inline picker — that's a
     // separate detail screen now per ADR-020 Phase 3 spec).
-    val privacyModeLabel = remember(identity) {
-        container.transportPreferences.privacyMode.name
-    }
+    // R-N1.17: the EFFECTIVE mode, not the stored one. Showing the
+    // requested mode here would announce Ghost while a Direct socket
+    // from the previous posture was still up.
+    val privacyModeLabel = container.privacyModeCoordinator
+        .state.collectAsState().value.effective.name
 
     // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
     var cacheSize by remember { mutableStateOf<String?>(null) }
@@ -244,15 +245,11 @@ fun SettingsScreen(
             item { SettingsGroupHeader("Notifications") }
             item {
                 SettingsGroupCard {
-                    SettingsToggleRow(
-                        icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
-                        label = "Message Alerts",
-                        checked = messageAlerts,
-                        onCheckedChange = {
-                            messageAlerts = it
-                            prefs.edit().putBoolean("message_alerts", it).apply()
-                        },
-                    )
+                    MessageAlertsSetting(onError = {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Could not update notification settings")
+                        }
+                    })
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsToggleRow(
                         icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },

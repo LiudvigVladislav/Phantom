@@ -123,6 +123,8 @@ class RestFallbackOrchestratorTest {
         clockMs: () -> Long = { 0L },
         longPollEnabled: Boolean = false,
     ): RestFallbackOrchestrator = RestFallbackOrchestrator(
+        // N1-F2: tests exercise Standard/Direct semantics explicitly.
+        egressGate = RestEgressGate(RestEgressPolicy { RestEgressDecision.DirectAllowed }),
         baseUrl = "https://relay.test",
         identityHex = "aa".repeat(32),
         signingPubkeyHex = "bb".repeat(32),

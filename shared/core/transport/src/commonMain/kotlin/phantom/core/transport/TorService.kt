@@ -42,12 +42,31 @@ interface TorService {
     suspend fun start(bridgeProfile: BridgeProfile = BridgeProfile.Mixed)
 
     /**
-     * Stop the embedded tor daemon and tear down all circuits. Idempotent.
-     * Returns when the daemon has fully exited; [state] becomes
-     * [TorState.Off]. The persisted DataDirectory is preserved across stops
-     * so guard caching survives the next [start].
+     * Stop the embedded tor daemon, bounded by [budget].
+     *
+     * Returns the attempt and what is known about it. The budget bounds how
+     * long the CALLER waits, never the work: an expired budget answers with
+     * an intermediate result and leaves the attempt running and owned. Ask
+     * again through [awaitRelease] with the same budget to spend what is
+     * left of it on the same attempt.
+     *
+     * Only [TorStopResult.Free] says nothing is left of the daemon or its
+     * host, and even that is not a standing permission to start: the owner
+     * checks again, atomically, when a successor is actually started.
+     *
+     * The persisted DataDirectory is preserved across stops so guard
+     * caching survives the next [start].
      */
-    suspend fun stop()
+    suspend fun stop(budget: TorBudget): TorStopResponse
+
+    /**
+     * Keep waiting on [attempt] — the same one, never a new teardown — for
+     * whatever remains of [budget].
+     *
+     * Waiting has no side effects: it does not complete the attempt, does
+     * not cancel it, and does not consult whichever generation is live now.
+     */
+    suspend fun awaitRelease(attempt: TorStopAttempt, budget: TorBudget): TorStopResult
 }
 
 /**

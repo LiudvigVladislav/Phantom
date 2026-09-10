@@ -15,6 +15,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseSegmentedMatrix
  *   3 segments, index=1 (All/Incoming/Missed)
  *   3 segments, index=2 (Standard/Private/Ghost)
  */
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomSegmentedControlSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

@@ -53,6 +53,9 @@ class PhantomApplication : Application() {
             try {
                 Log.d("PHANTOM_INIT", "Initializing libsodium…")
                 LibsodiumInitializer.initialize()
+                // Database construction decrypts its passphrase. A locked cold start
+                // waits here rather than permanently failing the readiness deferred.
+                phantom.android.security.DeviceUnlockGate(this@PhantomApplication).awaitUnlocked()
                 Log.d("PHANTOM_INIT", "libsodium OK — creating AppContainer…")
                 container = AppContainer(this@PhantomApplication)
                 // Round-5 REDLINE §P0 (round-6 fail-loud upgrade) —

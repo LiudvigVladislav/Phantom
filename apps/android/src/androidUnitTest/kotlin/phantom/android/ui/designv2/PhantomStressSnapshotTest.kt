@@ -30,6 +30,7 @@ import phantom.android.ui.designv2.showcase.ShowcaseStressB
  *   - Chip / segmented cramped layout under 2x font scale.
  */
 @androidx.compose.foundation.layout.ExperimentalLayoutApi
+@org.junit.experimental.categories.Category(phantom.android.testing.PaparazziTestEngine::class)
 class PhantomStressSnapshotTest {
     @get:Rule
     val paparazzi = Paparazzi(deviceConfig = DeviceConfig.PIXEL_5)

@@ -128,6 +128,17 @@ class PreKeyApiClient(
      */
     private val publishTransport: PreKeyPublishHttpTransport? = null,
     /**
+     * N1-F2 R-N1.2 — the revocable Direct-egress authority. Pre-key
+     * publish/fetch/status are a Direct REST boundary the R-N1.1
+     * orchestrator authority did not cover. When non-null, every
+     * actual HTTP dispatch here runs inside [RestEgressGate.dispatch]:
+     * in Private/Ghost no pre-key HTTP leaves, and an in-flight fetch
+     * suspended at the network boundary is cancelled/joined on a
+     * Standard -> Private/Ghost switch. Null (test default) keeps the
+     * legacy unguarded behaviour.
+     */
+    private val egressGate: RestEgressGate? = null,
+    /**
      * T2 carrier-ceiling instrumentation client-side gate (2026-06-16
      * Option A Item 3 scope-lock). When `true`, `publishWithRetry`
      * emits an additional `T2_DIAG_PUBLISH_TRACE` log line per attempt
@@ -294,6 +305,20 @@ class PreKeyApiClient(
         }
     }
 
+    /**
+     * N1-F2 R-N1.2 — route one pre-key HTTP dispatch through the
+     * revocable [egressGate] when wired; pass through unguarded when
+     * null (legacy test default). A refusal throws
+     * [RestEgressBlockedException], which the existing
+     * `catch (t: Throwable)` handlers around each dispatch treat as a
+     * transport failure — the WAITING placeholder / retry state is
+     * preserved.
+     */
+    private suspend fun <T> egressDispatch(operation: String, block: suspend () -> T): T {
+        val gate = egressGate ?: return block()
+        return gate.dispatch(operation, block)
+    }
+
     private suspend fun publishWithRetry(
         requestProvider: suspend () -> PublishRequest,
     ): PublishResult {
@@ -387,11 +412,13 @@ class PreKeyApiClient(
                 // disables phase trace emission inside the impl —
                 // production release builds AND any test that didn't
                 // opt into T2 diag trace will pass `""` here.
-                transport.publish(
-                    url = url,
-                    bodyBytes = bodyBytes,
-                    requestId = t2DiagRequestId,
-                )
+                egressDispatch("prekey_publish") {
+                    transport.publish(
+                        url = url,
+                        bodyBytes = bodyBytes,
+                        requestId = t2DiagRequestId,
+                    )
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -607,7 +634,7 @@ class PreKeyApiClient(
         )
         val startMs = Clock.System.now().toEpochMilliseconds()
         val response: HttpResponse = try {
-            httpClient.get(url)
+            egressDispatch("prekey_fetch_bundle") { httpClient.get(url) }
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
@@ -678,7 +705,7 @@ class PreKeyApiClient(
 
             val received: ResponseAndBody? = try {
                 withTimeoutOrNull(FETCH_STATUS_ATTEMPT_DEADLINE_MS) {
-                    val response = httpClient.get(url)
+                    val response = egressDispatch("prekey_fetch_status") { httpClient.get(url) }
                     ResponseAndBody(response, response.bodyAsText())
                 }
             } catch (ce: CancellationException) {

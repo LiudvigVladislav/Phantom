@@ -7,6 +7,40 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
+/**
+ * What one teardown actually achieved.
+ *
+ * Three separate facts, because they used to be collapsed into one
+ * boolean and the collapse was where a live socket got lost.
+ */
+data class TransportTeardownResult(
+    /** The identity that was current when this ran. */
+    val identity: Long,
+    /** False when a newer connection owns the transport: nothing was done. */
+    val ran: Boolean,
+    /** The reconnect loop was confirmed stopped. */
+    val loopJoined: Boolean = false,
+    /** Every close this teardown dispatched actually completed. */
+    val closesConfirmed: Boolean = false,
+    /**
+     * What was left of the caller's budget when the closes were awaited,
+     * or -1 when they were not awaited at all.
+     *
+     * R-N1.17 P1: reported because the alternative was a wall-clock
+     * assertion, and a wall-clock assertion inside a parallel suite is not
+     * evidence - it measures the machine as much as the code. The join and
+     * the closes share ONE deadline, and this is that fact, stated rather
+     * than timed.
+     */
+    val closesBudgetMs: Long = -1,
+) {
+    /** The socket is gone, and this teardown is the reason. */
+    val confirmed: Boolean get() = ran && loopJoined && closesConfirmed
+
+    /** Nothing was torn down: the connection had already been replaced. */
+    val supersededIdentity: Boolean get() = !ran
+}
+
 interface RelayTransport {
     val state: StateFlow<TransportState>
     val incoming: Flow<RelayMessage.Deliver>
@@ -150,6 +184,51 @@ interface RelayTransport {
      */
     suspend fun disconnectAndJoin(timeoutMs: Long = 10_000L): Boolean
 
+    /**
+     * Identity of the connection this transport currently owns.
+     *
+     * Advances every time a reconnect generation is launched. A caller
+     * that captured it earlier can tell whether the connection it meant
+     * to tear down is still the one here.
+     */
+    val teardownIdentity: Long get() = 0L
+
+    /**
+     * Tear the current connection down and CONFIRM it.
+     *
+     * R-N1.17 P1. [disconnectAndJoin] confirms one thing only: that the
+     * reconnect loop ended. The session and HTTP-client closes are handed
+     * to a cleanup scope and may finish afterwards - or be refused
+     * outright when that scope's budget is exhausted. Treating its `true`
+     * as "the socket is closed" is a claim the method never made, and a
+     * permit released on it can leave a live WSS in no register at all.
+     *
+     * [onlyIfIdentity], when non-null, makes this a no-op unless the
+     * transport still owns that identity. A teardown scheduled by a
+     * service instance that has since been replaced must not stop its
+     * successor's transport - it would be cancelling a connection it has
+     * never seen.
+     */
+    suspend fun disconnectAndConfirm(
+        timeoutMs: Long = 10_000L,
+        onlyIfIdentity: Long? = null,
+    ): TransportTeardownResult {
+        // Default for implementations whose closes happen inside the join
+        // - the loop ending IS the socket closing. KtorRelayTransport,
+        // whose closes are dispatched elsewhere, overrides this.
+        val identity = teardownIdentity
+        if (onlyIfIdentity != null && onlyIfIdentity != identity) {
+            return TransportTeardownResult(identity, ran = false)
+        }
+        val joined = disconnectAndJoin(timeoutMs)
+        return TransportTeardownResult(
+            identity = identity,
+            ran = true,
+            loopJoined = joined,
+            closesConfirmed = joined,
+        )
+    }
+
     suspend fun send(message: RelayMessage.Send): Boolean
 
     /**
@@ -158,6 +237,9 @@ interface RelayTransport {
      * if the WS is not connected the call is enqueued and retried on reconnect.
      */
     suspend fun sendDeliveryAck(messageId: String): Boolean
+
+    /** Release an inbound processing claim WITHOUT acknowledging the envelope. */
+    suspend fun parkInbound(messageId: String) {}
 
     /**
      * Sends an ephemeral typing notification to [toPubKeyHex].

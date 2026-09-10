@@ -17,6 +17,7 @@ import phantom.core.transport.ProbeIssueResult
 import phantom.core.transport.RelayTransportConfig
 import phantom.core.transport.RewalkCoordinatorGateProvider
 import phantom.core.transport.RouteChangeOutcome
+import phantom.core.transport.TransportManager
 import phantom.core.transport.TransportPreferences
 
 /**
@@ -88,7 +89,43 @@ internal class TransportRewalkCoordinator(
      * [phantom.core.transport.TransportManager.release]; tests inject a
      * controllable suspend lambda.
      */
-    private val releaseTransport: suspend () -> Unit,
+    /**
+     * Releases the transport subsystems and REPORTS how that went. A
+     * teardown that did not come back clean is not an error to be caught:
+     * it is an answer, and a rewalk that ignored it would restart on top
+     * of a daemon nobody confirmed gone.
+     */
+    private val releaseTransport: suspend () -> TransportManager.ReleaseOutcome,
+    /**
+     * Stop the chain walk that currently owns the connect lease and wait
+     * for it to finish. Returns true only when quiescence is confirmed.
+     *
+     * R-N1.16 P1-2. This exists because the ordering between components
+     * was wrong, and no test inside the service could see it: the
+     * coordinator released the transport at step 5 and only asked the
+     * service to restart at step 7, so the service's handover ran AFTER
+     * Tor and Xray had already been stopped. A walk still inside
+     * `TransportManager.connect()` was therefore having its subsystems
+     * torn down underneath it while it was starting or probing them, and
+     * `TransportManager.release()` is deliberately not serialised
+     * against `connect()` so nothing prevented the overlap.
+     *
+     * Handing over first makes the documented order the real one:
+     * cancel, confirmed join, release, restart.
+     *
+     * Required, with no default. R-N1.16: it used to default to
+     * `{ true }`, which is fail-OPEN - any construction site that forgot
+     * to wire it would silently claim quiescence it had never checked,
+     * and the release would go ahead under a live walk. A required
+     * parameter turns that into a compile error.
+     *
+     * Returning false means the previous walk could not be confirmed
+     * stopped. The rewalk then does NOT release and does NOT restart -
+     * tearing down subsystems under a walk we failed to stop is the
+     * defect, not the recovery. The service keeps the lease fail-closed
+     * and drives its own recovery from there.
+     */
+    private val handOverConnectOwnership: suspend (reason: String) -> Boolean,
     private val hybridTransportProvider: () -> RewalkHybridFacade?,
     private val requestServiceRestart: (reason: NetworkChangeReason) -> Unit,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
@@ -354,10 +391,41 @@ internal class TransportRewalkCoordinator(
                 return@withLock
             }
 
+            // Step 4b — hand the connect lease over BEFORE anything is
+            // released. R-N1.16 P1-2: the walk that owns the lease may be
+            // inside TransportManager.connect() right now, starting or
+            // probing the very subsystems the next step stops.
+            val quiesced: Boolean = try {
+                handOverConnectOwnership("rewalk_${reason.name}")
+            } catch (ce: CancellationException) {
+                withContext(NonCancellable) {
+                    coordinator.revokeRouteChange(routeEpoch, reason = "handover_cancelled")
+                }
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "NETWORK_TRACE rewalk_substep_error step=handOverConnectOwnership " +
+                        "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
+                )
+                coordinator.revokeRouteChange(routeEpoch, reason = "handover_failed")
+                return@withLock
+            }
+            if (!quiesced) {
+                Log.w(
+                    TAG,
+                    "NETWORK_TRACE rewalk_abandoned reason=handoff_timeout " +
+                        "route_epoch=$routeEpoch — not releasing transport under a walk " +
+                        "we could not stop",
+                )
+                coordinator.revokeRouteChange(routeEpoch, reason = "handoff_timeout")
+                return@withLock
+            }
+
             // Step 5 — release cached probe/select state. CE propagates;
             // other throws revoke the route change WITHOUT issuing a
             // probe.
-            try {
+            val released: TransportManager.ReleaseOutcome = try {
                 releaseTransport()
             } catch (ce: CancellationException) {
                 withContext(NonCancellable) {
@@ -371,6 +439,21 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "release_failed")
+                return@withLock
+            }
+            // A release that threw nothing but did not come back clean stops
+            // the rewalk just as surely. The gate is the WHOLE outcome: an
+            // unreleased tor host and a xray that refused to stop are both
+            // reasons not to build a new route on top of the old one.
+            if (!released.clean) {
+                Log.w(
+                    TAG,
+                    "NETWORK_TRACE rewalk_abandoned reason=release_not_clean " +
+                        "route_epoch=$routeEpoch " +
+                        "xray=${released.xrayFailure?.let { it::class.simpleName }} " +
+                        "tor=${released.torIncomplete}",
+                )
+                coordinator.revokeRouteChange(routeEpoch, reason = "release_not_clean")
                 return@withLock
             }
 
@@ -502,7 +585,28 @@ internal class TransportRewalkCoordinator(
                 "NETWORK_TRACE rewalk_substep_skip step=hybrid reason=hybrid_not_initialized",
             )
         }
-        runCatching { releaseTransport() }
+        // R-N1.16 P1-2: the legacy path needs the same ordering as the
+        // typed one. Stopping subsystems under a walk that is still
+        // starting or probing them is the defect regardless of which
+        // path got us here.
+        val quiesced = runCatching { handOverConnectOwnership("rewalk_legacy_${reason.name}") }
+            .getOrElse { e ->
+                Log.w(
+                    TAG,
+                    "NETWORK_TRACE rewalk_substep_error step=handOverConnectOwnership " +
+                        "errorClass=${e::class.simpleName} message=${e.message?.take(120)}",
+                )
+                false
+            }
+        if (!quiesced) {
+            Log.w(
+                TAG,
+                "NETWORK_TRACE rewalk_abandoned reason=handoff_timeout path=legacy — " +
+                    "not releasing transport under a walk we could not stop",
+            )
+            return
+        }
+        val released = runCatching { releaseTransport() }
             .onFailure { e ->
                 Log.w(
                     TAG,
@@ -510,6 +614,19 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${e::class.simpleName} message=${e.message?.take(120)}",
                 )
             }
+            .getOrNull()
+        // Same rule as the typed path: a release that is not clean does not
+        // earn a restart. A release that threw did not report at all, which
+        // is no better than reporting trouble.
+        if (released?.clean != true) {
+            Log.w(
+                TAG,
+                "NETWORK_TRACE rewalk_abandoned reason=release_not_clean path=legacy " +
+                    "xray=${released?.xrayFailure?.let { it::class.simpleName }} " +
+                    "tor=${released?.torIncomplete}",
+            )
+            return
+        }
         runCatching { requestServiceRestart(reason) }
             .onFailure { e ->
                 Log.w(
