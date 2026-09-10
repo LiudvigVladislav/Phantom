@@ -131,6 +131,17 @@ class SessionOrderFullStackTest {
     private val trace: MutableList<String> =
         Collections.synchronizedList(mutableListOf<String>())
 
+    /**
+     * A consistent copy of the orchestrator trace. The list is synchronized
+     * per operation, which makes `add` safe from the orchestrator's threads
+     * but does NOT make iteration safe: `any`, `takeLast` and `joinToString`
+     * walk the list while those threads keep appending, and that raced into a
+     * `ConcurrentModificationException` once in a 708-test batch. Every read
+     * below goes through this snapshot; the assertions themselves are
+     * unchanged.
+     */
+    private fun traceSnapshot(): List<String> = synchronized(trace) { trace.toList() }
+
     // Torn down in reverse order of construction. The orchestrator owns a
     // SupervisorJob that is NOT part of the rig's scope, so it has to be
     // closed explicitly, and everything has to be quiet before the
@@ -955,12 +966,34 @@ class SessionOrderFullStackTest {
             if (predicate()) return
             delay(50L)
         }
-        val dump = trace.joinToString(separator = " ~ ").take(3000)
+        val dump = traceSnapshot().joinToString(separator = " ~ ").take(3000)
         throw AssertionError(
             "timed out after " + timeoutMs + "ms waiting for: " + what +
-                " | orchestrator trace: " + dump,
+                " | orchestrator trace: " + dump +
+                " | receiver log tail: " + receiverLogTail(),
         )
     }
+
+    /**
+     * Diagnostic only, read at the point of failure. The orchestrator trace
+     * above stops at the transport's poll loop; everything after it -- the
+     * Hybrid dedup decision, the receive collector, decrypt, commit and the
+     * ACK request -- is written through Android `Log`, which Robolectric
+     * keeps in `ShadowLog` and never copies into the JUnit XML. Without this
+     * tail a timeout cannot say where the envelope stopped.
+     */
+    private fun receiverLogTail(limit: Int = 80): String =
+        ShadowLog.getLogs()
+            .filter { item ->
+                item.tag == "PhantomHybrid" || item.tag == "PhantomMessaging" ||
+                    (item.msg?.let { m ->
+                        m.contains("REST_TRACE") || m.contains("DECRYPT_TRACE") ||
+                            m.contains("RECV_DIAG") || m.contains("CONTROL_SETTLE")
+                    } ?: false)
+            }
+            .takeLast(limit)
+            .joinToString(separator = " ~ ") { item -> item.tag + ": " + (item.msg ?: "") }
+            .take(6000)
 
     /** Let the poll loop run for at least [polls] more rounds. */
     private suspend fun letPollsElapse(rig: Rig, polls: Int) {
@@ -1895,7 +1928,7 @@ class SessionOrderFullStackTest {
         // the authority refuses the poll loop as well, so the receiver goes
         // quiet in both directions. The refusal itself is the signal.
         awaitTrue("the authority actually refuses REST traffic") {
-            trace.any { it.startsWith("REST_EGRESS blocked") }
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked") }
         }
         delay(1_000L)
 
@@ -1904,8 +1937,8 @@ class SessionOrderFullStackTest {
             "a request crossed a revoked authority: durable local completion is not egress permission",
         )
         assertTrue(
-            trace.any { it.startsWith("REST_EGRESS blocked") },
-            "the authority never actually refused anything: " + trace.takeLast(6),
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked") },
+            "the authority never actually refused anything: " + traceSnapshot().takeLast(6),
         )
         assertEquals(listOf(TEXT_S), rig.texts(), "and nothing was rolled back to compensate")
         assertEquals(
@@ -1933,7 +1966,7 @@ class SessionOrderFullStackTest {
         assertTrue(
             rig.transport.sendDeliveryAck("env-S"),
             "the acknowledgement was still refused after the authority returned: " +
-                trace.takeLast(8),
+                traceSnapshot().takeLast(8),
         )
         assertTrue("env-S" in rig.relay.acked, "and it reached the relay")
         assertEquals(listOf(TEXT_S), rig.texts(), "exactly one row, not a second copy")
@@ -1985,7 +2018,7 @@ class SessionOrderFullStackTest {
         rig.egressAllowed.set(false)
         rig.relay.dropAcks.set(false)
         awaitTrue("the authority actually refuses REST traffic") {
-            trace.any { it.startsWith("REST_EGRESS blocked") }
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked") }
         }
         delay(1_000L)
 
@@ -1999,8 +2032,8 @@ class SessionOrderFullStackTest {
             assertFalse(id in rig.relay.acked, id + " was acknowledged across a revoked authority")
         }
         assertTrue(
-            trace.any { it.startsWith("REST_EGRESS blocked") },
-            "the authority never actually refused anything: " + trace.takeLast(6),
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked") },
+            "the authority never actually refused anything: " + traceSnapshot().takeLast(6),
         )
 
         // Control: the same drained envelopes acknowledge as soon as the
@@ -2011,7 +2044,7 @@ class SessionOrderFullStackTest {
         for (id in listOf("env-A", "env-B", "env-C")) {
             assertTrue(
                 rig.transport.sendDeliveryAck(id),
-                id + " was still refused after the authority returned: " + trace.takeLast(8),
+                id + " was still refused after the authority returned: " + traceSnapshot().takeLast(8),
             )
         }
         assertTrue(
@@ -2271,7 +2304,7 @@ class SessionOrderFullStackTest {
         // Give the post-commit acknowledgement attempt time to be refused;
         // the refusal itself is the signal, so this is not an ordering proof.
         awaitTrue("the authority refused the replay's acknowledgement") {
-            trace.any { it.startsWith("REST_EGRESS blocked operation=ack") }
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked operation=ack") }
         }
 
         assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(), "exactly one row per message, in order")
@@ -2294,7 +2327,7 @@ class SessionOrderFullStackTest {
         rig.egressAllowed.set(true)
         assertTrue(
             rig.transport.sendDeliveryAck("env-B"),
-            "the acknowledgement was still refused after the authority returned: " + trace.takeLast(8),
+            "the acknowledgement was still refused after the authority returned: " + traceSnapshot().takeLast(8),
         )
         assertTrue("env-B" in rig.relay.acked, "and it reached the relay")
         assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(), "still exactly one row per message")
@@ -2357,7 +2390,7 @@ class SessionOrderFullStackTest {
         barrier.release.complete(Unit)
         awaitTrue("the replayed message still completes durably") { rig.processed.exists("env-B") }
         awaitTrue("the authority refused its acknowledgement") {
-            trace.any { it.startsWith("REST_EGRESS blocked operation=ack") }
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked operation=ack") }
         }
         assertFalse("env-B" in rig.relay.acked, "nothing crossed the revoked authority")
         assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(), "exactly one row per message")
@@ -2417,7 +2450,7 @@ class SessionOrderFullStackTest {
         assertTrue(checkNotNull(walks.successorJob).isActive, "and is still running")
         assertEquals(successor, walks.ownership.currentOwner())
         assertFalse(
-            trace.any { it.startsWith("REST_EGRESS blocked operation=ack") },
+            traceSnapshot().any { it.startsWith("REST_EGRESS blocked operation=ack") },
             "nothing was refused: the silence in the revoked case is the authority, not the rig",
         )
         } finally {

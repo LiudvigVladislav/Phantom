@@ -54,6 +54,25 @@
 # Change policy: do NOT enable global `forkEvery = 1L` (masks leaks,
 # doubles wall-clock). Do NOT invoke `recordPaparazziDebug` in this
 # workflow. Do NOT upgrade Paparazzi/AGP/Gradle in the CI-repair round.
+#
+# 2026-09-10: the classification guard now also reads the three run lists
+#   out of this file and requires manifest == jvm-state + compose-ui +
+#   paparazzi, pairwise disjoint, with every manifest entry backed by a
+#   source file. A class that is declared but never executed, or executed
+#   but never declared, fails the guard. The 40 classes of the N1
+#   consolidation were added to the shards they actually need (38 JVM/
+#   Robolectric, 2 Compose UI, 0 Paparazzi). The guard classifies DECLARED
+#   runnable classes -- top-level classes whose body carries @Test -- not
+#   file names and not a naming convention: a `--tests` filter selects a
+#   class, so a file whose class is named differently
+#   (AppContainerLastSeenSeqReaderWiringTest.kt declares
+#   AppContainerCursorRepositoryWiringTest) or a file with a second test
+#   class (OnboardingV2NextLaunchQuarantineTest,
+#   OnboardingV2RepairRequiredIntegrationTest) had never actually run, and
+#   HybridRelayTransportIntegrationTest20 (file and class both end in
+#   `Test20`, one real @Test) must not be dropped by a `*Test` filter.
+#   `scripts/tests/test_android_test_classification.py` pins the guard's
+#   negative controls.
 
 name: Android CI
 
@@ -134,14 +153,39 @@ jobs:
         # NOT use `composeTestRule.setContent` and is NOT a Paparazzi test.
         # Includes pre-existing WSS PR #399 diagnostic tests + transport
         # wiring + release-config pins + manifest-contract tests + all L1..L4
-        # additions in the JVM/state category. Verified by
-        # android-test-classification-guard.
+        # additions in the JVM/state category, and (2026-09-10) the 38
+        # JVM/Robolectric classes of the N1 consolidation: privacy/egress,
+        # teardown ownership, delivery full-stack rig, diagnostic journal and
+        # network-profile reporter tests. Robolectric-runner classes stay in
+        # this batch: they stub Android APIs, they do not call setContent.
+        # Kept sorted; verified by android-test-classification-guard, which
+        # reads this list back out of the file.
         run: |
           ./gradlew :apps:android:testDebugUnitTest \
             --tests "phantom.android.calls.CallManagerGuardTest" \
+            --tests "phantom.android.di.AppContainerCommitWiringTest" \
             --tests "phantom.android.di.PreKeySelfHealHookTest" \
+            --tests "phantom.android.di.PrivacyModeTeardownOwnershipTest" \
+            --tests "phantom.android.diagnostic.BackgroundEventFilterTest" \
+            --tests "phantom.android.diagnostic.BackgroundJournalTest" \
+            --tests "phantom.android.diagnostic.DeliverFailedSchemaTest" \
             --tests "phantom.android.diagnostic.DiagnosticCommandReceiverContractTest" \
+            --tests "phantom.android.diagnostic.DiagnosticDebugManifestContainsAccessWifiStateTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterCanonicalShapeTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterDenylistedFieldAbsenceTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterDualSimActiveDataSubTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterEgressNon200Test" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterEgressTimeoutTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterExtrasWhitelistTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterFixedOutputPathTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterHmacDeterminismTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterNoActiveNetworkStateTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterSecurityExceptionFailsClosedTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterSourceSetBoundaryTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterVpnActiveStateTest" \
+            --tests "phantom.android.diagnostic.DiagnosticNetworkProfileReporterWifiMobileDataTest" \
             --tests "phantom.android.diagnostic.DiagnosticOuterArmObservationTest" \
+            --tests "phantom.android.diagnostic.DiagnosticProductionManifestOmitsAccessWifiStateTest" \
             --tests "phantom.android.diagnostic.DiagnosticSendCoordinatorTest" \
             --tests "phantom.android.diagnostic.DiagnosticSourceSetBoundaryTest" \
             --tests "phantom.android.diagnostic.DiagnosticTransportGuardOuterArmMappingTest" \
@@ -151,6 +195,12 @@ jobs:
             --tests "phantom.android.diagnostic.WssDiagBridgeAdapterTest" \
             --tests "phantom.android.diagnostic.WssDiagInertByDefaultTest" \
             --tests "phantom.android.diagnostics.K8HoldOverrideResolverTest" \
+            --tests "phantom.android.messaging.InboundCommitBindingTest" \
+            --tests "phantom.android.messaging.OutboundContinuityTest" \
+            --tests "phantom.android.messaging.PendingExpiryReceiveTest" \
+            --tests "phantom.android.messaging.ReceiveSessionArchiveTest" \
+            --tests "phantom.android.messaging.SessionOrderDbSpikeTest" \
+            --tests "phantom.android.messaging.SessionOrderFullStackTest" \
             --tests "phantom.android.navigation.ScreenSaverTest" \
             --tests "phantom.android.navigation.StartupRouteResolverTest" \
             --tests "phantom.android.notifications.NotificationsOptInMigrationTest" \
@@ -164,17 +214,24 @@ jobs:
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StateTest" \
+            --tests "phantom.android.service.ConnectRetryWiringTest" \
+            --tests "phantom.android.service.ServiceStartupTest" \
             --tests "phantom.android.service.TransportNameForOverlayTest" \
+            --tests "phantom.android.testing.ModelSnapshotRuleTest" \
+            --tests "phantom.android.transport.AppContainerCursorRepositoryWiringTest" \
             --tests "phantom.android.transport.AppContainerDebugForceMode2WiringTest" \
             --tests "phantom.android.transport.AppContainerK8WiringTest" \
-            --tests "phantom.android.transport.AppContainerLastSeenSeqReaderWiringTest" \
             --tests "phantom.android.transport.AppContainerPollSkipLpAndPpGateTest" \
             --tests "phantom.android.transport.AppContainerS6DebugTriggerWiringTest" \
             --tests "phantom.android.transport.ConnectionUiStateTest" \
             --tests "phantom.android.transport.DebugForceMode2ActivityManifestContractTest" \
             --tests "phantom.android.transport.DebugK11_5cTokenLogEnabledReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.EgressAuthorizationLinearizabilityTest" \
+            --tests "phantom.android.transport.GatedAppHttpFailClosedTest" \
             --tests "phantom.android.transport.HybridRelayTransportIntegrationTest20" \
             --tests "phantom.android.transport.HybridRelayTransportMapperTest" \
+            --tests "phantom.android.transport.IdleRecoveryCollectorTest" \
+            --tests "phantom.android.transport.IdleRecoveryPresentationTest" \
             --tests "phantom.android.transport.KtorRelayTransportProguardNarrowingPinTest" \
             --tests "phantom.android.transport.LongPollOptInOrchestratorSeamTest" \
             --tests "phantom.android.transport.LongPollOptInWireRequestTest" \
@@ -183,11 +240,16 @@ jobs:
             --tests "phantom.android.transport.Mode2FastPathReleaseBuildConfigPinTest" \
             --tests "phantom.android.transport.Mode2StickyReleaseBuildConfigPinTest" \
             --tests "phantom.android.transport.PollSkipLpAndPpReleaseBuildConfigPinTest" \
+            --tests "phantom.android.transport.PreviewUrlPolicySsrfTest" \
+            --tests "phantom.android.transport.PrivacyModeTeardownTransactionTest" \
+            --tests "phantom.android.transport.ProductHttpSinkInventoryTest" \
+            --tests "phantom.android.transport.RealOkHttpRevocationTest" \
             --tests "phantom.android.transport.ReconnectQuiescenceReleaseBuildConfigPinTest" \
             --tests "phantom.android.transport.S6ActivityManifestContractTest" \
             --tests "phantom.android.transport.S6BreakerTriggerActivityContractTest" \
             --tests "phantom.android.transport.S6DocsHygieneNegativeGrepTest" \
             --tests "phantom.android.transport.Tele2RunbookPermissionLiteralContractTest" \
+            --tests "phantom.android.transport.TransportPreferencesMalformedModeTest" \
             --tests "phantom.android.transport.TransportRewalkCoordinatorTransactionTest" \
             --tests "phantom.android.transport.WsDegradationCollectorBindingsTest" \
             --tests "phantom.android.transport.WsLifecycleCollectorSideEffectsTest" \
@@ -233,6 +295,16 @@ jobs:
           - phantom.android.screens.onboarding.v2.OnboardingFlowV2TransitionTest
           - phantom.android.screens.profile.ProfileQrKeyCardSimplifiedTest
           - phantom.android.navigation.StartupRouteLateWriteIntegrationTest
+          # N1 consolidation (2026-09-10): both call createComposeRule +
+          # setContent under Robolectric, so they belong to the isolated
+          # per-class matrix, not to the shared JVM batch.
+          - phantom.android.navigation.NotificationChatNavigationTest
+          - phantom.android.screens.settings.MessageAlertsSettingTest
+          # 2026-09-10: second test class declared in an already-listed
+          # file. A `--tests` filter selects a CLASS, so a file's second
+          # class never ran until it was listed by its own name.
+          - phantom.android.screens.onboarding.v2.OnboardingV2NextLaunchQuarantineTest
+          - phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredIntegrationTest
     steps:
       - uses: actions/checkout@v4
       - name: Set up JDK 21
@@ -295,9 +367,18 @@ jobs:
 
   # =================================================================
   # 5. Test classification guard. Enumerates every androidUnitTest *Test.kt
-  #    file and asserts each is present in the union of the three bucket
-  #    lists below. New test class → must also be added to the matching
-  #    shard AND this manifest. Missing classification = fail-red.
+  #    file, collects every RUNNABLE top-level class it DECLARES -- a class
+  #    whose body carries @Test, whatever the file or class is called; a
+  #    `--tests` filter selects a class, not a file -- reads the three shard
+  #    run lists back out of THIS workflow file, and
+  #    requires all of the following, or fails red:
+  #      - every declared test class is in the manifest below;
+  #      - every manifest entry is a declared class (no stale names);
+  #      - manifest == jvm-state + compose-ui + paparazzi -- a class that is
+  #        declared but not executed, or executed but not declared, fails;
+  #      - the three run lists are pairwise disjoint.
+  #    New test class -> add it to the shard it needs AND to this manifest.
+  #    Declaring a class here does not run it; the run lists are what run.
   # =================================================================
   android-test-classification-guard:
     name: Test classification guard
@@ -305,21 +386,48 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Verify every androidUnitTest test class is classified
+      - name: Verify every androidUnitTest test class is classified and executed
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          WORKFLOW = os.environ.get("PHANTOM_ANDROID_WORKFLOW", ".github/workflows/android.yml")
+          TEST_ROOT = os.environ.get("PHANTOM_ANDROID_UNIT_TEST_ROOT", "apps/android/src/androidUnitTest/kotlin")
 
           # Explicit classification manifest. Must stay in sync with the
-          # jobs above:
-          #   • JVM/STATE  -> android-jvm-state.steps
-          #   • COMPOSE_UI -> android-compose-ui.strategy.matrix.test-class
-          #   • PAPARAZZI  -> android-paparazzi.steps
-          CLASSIFIED=$(cat <<'EOF'
+          # jobs above; the checks below enforce that mechanically:
+          #   - JVM/STATE  -> android-jvm-state.steps (--tests list)
+          #   - COMPOSE_UI -> android-compose-ui.strategy.matrix.test-class
+          #   - PAPARAZZI  -> android-paparazzi.steps (--tests list)
+          MANIFEST = """
           phantom.android.calls.CallManagerGuardTest
+          phantom.android.di.AppContainerCommitWiringTest
           phantom.android.di.PreKeySelfHealHookTest
+          phantom.android.di.PrivacyModeTeardownOwnershipTest
+          phantom.android.diagnostic.BackgroundEventFilterTest
+          phantom.android.diagnostic.BackgroundJournalTest
+          phantom.android.diagnostic.DeliverFailedSchemaTest
           phantom.android.diagnostic.DiagnosticCommandReceiverContractTest
+          phantom.android.diagnostic.DiagnosticDebugManifestContainsAccessWifiStateTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterCanonicalShapeTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterDenylistedFieldAbsenceTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterDualSimActiveDataSubTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterEgressNon200Test
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterEgressTimeoutTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterExtrasWhitelistTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterFixedOutputPathTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterHmacDeterminismTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterNoActiveNetworkStateTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterSecurityExceptionFailsClosedTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterSourceSetBoundaryTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterVpnActiveStateTest
+          phantom.android.diagnostic.DiagnosticNetworkProfileReporterWifiMobileDataTest
           phantom.android.diagnostic.DiagnosticOuterArmObservationTest
+          phantom.android.diagnostic.DiagnosticProductionManifestOmitsAccessWifiStateTest
           phantom.android.diagnostic.DiagnosticSendCoordinatorTest
           phantom.android.diagnostic.DiagnosticSourceSetBoundaryTest
           phantom.android.diagnostic.DiagnosticTransportGuardOuterArmMappingTest
@@ -329,17 +437,63 @@ jobs:
           phantom.android.diagnostic.WssDiagBridgeAdapterTest
           phantom.android.diagnostic.WssDiagInertByDefaultTest
           phantom.android.diagnostics.K8HoldOverrideResolverTest
-          phantom.android.transport.TransportRewalkCoordinatorTransactionTest
-          phantom.android.transport.HybridRelayTransportIntegrationTest20
+          phantom.android.messaging.InboundCommitBindingTest
+          phantom.android.messaging.OutboundContinuityTest
+          phantom.android.messaging.PendingExpiryReceiveTest
+          phantom.android.messaging.ReceiveSessionArchiveTest
+          phantom.android.messaging.SessionOrderDbSpikeTest
+          phantom.android.messaging.SessionOrderFullStackTest
+          phantom.android.navigation.NotificationChatNavigationTest
+          phantom.android.navigation.ScreenSaverTest
+          phantom.android.navigation.StartupRouteLateWriteIntegrationTest
+          phantom.android.navigation.StartupRouteResolverTest
+          phantom.android.notifications.NotificationsOptInMigrationTest
+          phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
+          phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
+          phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest
+          phantom.android.screens.onboarding.v2.OnboardingFlowV2TransitionTest
+          phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest
+          phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest
+          phantom.android.screens.onboarding.v2.OnboardingPrivacyModePersistenceTest
+          phantom.android.screens.onboarding.v2.OnboardingScreenV2GateTest
+          phantom.android.screens.onboarding.v2.OnboardingV2EdgeGestureTest
+          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeContractTest
+          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeOutcomeContractTest
+          phantom.android.screens.onboarding.v2.OnboardingV2IdentityRepairMarkerTest
+          phantom.android.screens.onboarding.v2.OnboardingV2NextLaunchQuarantineTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PermissionsSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PricingSheetSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyDialSemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyFinalizeOrderingTest
+          phantom.android.screens.onboarding.v2.OnboardingV2ProductionWrapperQuarantineTest
+          phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredIntegrationTest
+          phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredScreenTest
+          phantom.android.screens.onboarding.v2.OnboardingV2ScrollableCtaReachabilityTest
+          phantom.android.screens.onboarding.v2.OnboardingV2SemanticsTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupErrorScreenTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest
+          phantom.android.screens.onboarding.v2.OnboardingV2StateTest
+          phantom.android.screens.profile.ProfileQrKeyCardSimplifiedTest
+          phantom.android.screens.settings.MessageAlertsSettingTest
+          phantom.android.service.ConnectRetryWiringTest
+          phantom.android.service.ServiceStartupTest
+          phantom.android.service.TransportNameForOverlayTest
+          phantom.android.testing.ModelSnapshotRuleTest
+          phantom.android.transport.AppContainerCursorRepositoryWiringTest
           phantom.android.transport.AppContainerDebugForceMode2WiringTest
           phantom.android.transport.AppContainerK8WiringTest
-          phantom.android.transport.AppContainerLastSeenSeqReaderWiringTest
           phantom.android.transport.AppContainerPollSkipLpAndPpGateTest
           phantom.android.transport.AppContainerS6DebugTriggerWiringTest
           phantom.android.transport.ConnectionUiStateTest
           phantom.android.transport.DebugForceMode2ActivityManifestContractTest
           phantom.android.transport.DebugK11_5cTokenLogEnabledReleaseBuildConfigPinTest
+          phantom.android.transport.EgressAuthorizationLinearizabilityTest
+          phantom.android.transport.GatedAppHttpFailClosedTest
+          phantom.android.transport.HybridRelayTransportIntegrationTest20
           phantom.android.transport.HybridRelayTransportMapperTest
+          phantom.android.transport.IdleRecoveryCollectorTest
+          phantom.android.transport.IdleRecoveryPresentationTest
           phantom.android.transport.KtorRelayTransportProguardNarrowingPinTest
           phantom.android.transport.LongPollOptInOrchestratorSeamTest
           phantom.android.transport.LongPollOptInWireRequestTest
@@ -348,52 +502,31 @@ jobs:
           phantom.android.transport.Mode2FastPathReleaseBuildConfigPinTest
           phantom.android.transport.Mode2StickyReleaseBuildConfigPinTest
           phantom.android.transport.PollSkipLpAndPpReleaseBuildConfigPinTest
+          phantom.android.transport.PreviewUrlPolicySsrfTest
+          phantom.android.transport.PrivacyModeTeardownTransactionTest
+          phantom.android.transport.ProductHttpSinkInventoryTest
+          phantom.android.transport.RealOkHttpRevocationTest
           phantom.android.transport.ReconnectQuiescenceReleaseBuildConfigPinTest
           phantom.android.transport.S6ActivityManifestContractTest
           phantom.android.transport.S6BreakerTriggerActivityContractTest
           phantom.android.transport.S6DocsHygieneNegativeGrepTest
           phantom.android.transport.Tele2RunbookPermissionLiteralContractTest
+          phantom.android.transport.TransportPreferencesMalformedModeTest
+          phantom.android.transport.TransportRewalkCoordinatorTransactionTest
           phantom.android.transport.WsDegradationCollectorBindingsTest
           phantom.android.transport.WsLifecycleCollectorSideEffectsTest
           phantom.android.transport.WsLifecycleDispatchBehaviourTest
           phantom.android.transport.WsSessionLifecycleContractTest
           phantom.android.transport.WsSessionLifecycleDispatcherSequentialOrderTest
-          phantom.android.notifications.NotificationsOptInMigrationTest
-          phantom.android.navigation.ScreenSaverTest
-          phantom.android.navigation.StartupRouteResolverTest
-          phantom.android.navigation.StartupRouteLateWriteIntegrationTest
-          phantom.android.service.TransportNameForOverlayTest
-          phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest
-          phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest
-          phantom.android.screens.onboarding.v2.OnboardingPrivacyModePersistenceTest
-          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeContractTest
-          phantom.android.screens.onboarding.v2.OnboardingV2FinalizeOutcomeContractTest
-          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyFinalizeOrderingTest
-          phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest
-          phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest
-          phantom.android.screens.onboarding.v2.OnboardingV2StateTest
-          phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest
-          phantom.android.ui.designv2.PhantomComponentsSemanticsTest
-          phantom.android.ui.designv2.components.PhantomSegmentedControlTouchTargetBoundsTest
-          phantom.android.screens.onboarding.v2.OnboardingScreenV2GateTest
-          phantom.android.screens.onboarding.v2.OnboardingV2EdgeGestureTest
-          phantom.android.screens.onboarding.v2.OnboardingV2PermissionsSemanticsTest
-          phantom.android.screens.onboarding.v2.OnboardingV2PricingSheetSemanticsTest
-          phantom.android.screens.onboarding.v2.OnboardingV2PrivacyDialSemanticsTest
-          phantom.android.screens.onboarding.v2.OnboardingV2ScrollableCtaReachabilityTest
-          phantom.android.screens.onboarding.v2.OnboardingV2SemanticsTest
-          phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
-          phantom.android.screens.onboarding.v2.OnboardingV2IdentityRepairMarkerTest
-          phantom.android.screens.onboarding.v2.OnboardingV2ProductionWrapperQuarantineTest
-          phantom.android.screens.onboarding.v2.OnboardingV2RepairRequiredScreenTest
-          phantom.android.screens.onboarding.v2.OnboardingV2StartupErrorScreenTest
-          phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
-          phantom.android.screens.onboarding.v2.OnboardingFlowV2TransitionTest
-          phantom.android.screens.profile.ProfileQrKeyCardSimplifiedTest
           phantom.android.ui.ConnectionBannerErrorLabelTest
+          phantom.android.ui.designv2.OnboardingV2RecoverySnapshotTest
+          phantom.android.ui.designv2.OnboardingV2ResponsiveMatrixTest
+          phantom.android.ui.designv2.OnboardingV2SnapshotTest
+          phantom.android.ui.designv2.OnboardingV2Step2AnimationSnapshotTest
           phantom.android.ui.designv2.PhantomAvatarSnapshotTest
           phantom.android.ui.designv2.PhantomBadgeSnapshotTest
           phantom.android.ui.designv2.PhantomButtonSnapshotTest
+          phantom.android.ui.designv2.PhantomComponentsSemanticsTest
           phantom.android.ui.designv2.PhantomFilterChipSnapshotTest
           phantom.android.ui.designv2.PhantomIconAuditSnapshotTest
           phantom.android.ui.designv2.PhantomIconContactSheetSnapshotTest
@@ -401,37 +534,88 @@ jobs:
           phantom.android.ui.designv2.PhantomSegmentedControlSnapshotTest
           phantom.android.ui.designv2.PhantomStressSnapshotTest
           phantom.android.ui.designv2.PhantomToggleSnapshotTest
-          phantom.android.ui.designv2.OnboardingV2ResponsiveMatrixTest
-          phantom.android.ui.designv2.OnboardingV2SnapshotTest
-          phantom.android.ui.designv2.OnboardingV2RecoverySnapshotTest
-          phantom.android.ui.designv2.OnboardingV2Step2AnimationSnapshotTest
           phantom.android.ui.designv2.ProfileQrKeyCardSnapshotTest
-          EOF
-          )
+          phantom.android.ui.designv2.components.PhantomSegmentedControlTouchTargetBoundsTest
+          """
+          classified = set(l.strip() for l in MANIFEST.splitlines() if l.strip())
 
-          UNCLASSIFIED=()
-          while IFS= read -r path; do
-            fqn="${path#*/androidUnitTest/kotlin/}"
-            fqn="${fqn%.kt}"
-            fqn="${fqn//\//.}"
-            if ! echo "$CLASSIFIED" | grep -qx "$fqn"; then
-              UNCLASSIFIED+=("$fqn")
-            fi
-          done < <(find apps/android/src/androidUnitTest -type f -name "*Test.kt" | sort)
+          text = open(WORKFLOW, encoding="utf-8").read()
 
-          # OnboardingV2SemanticsMatchers is a helper, not a *Test class.
-          # It intentionally ends with "Matchers" not "Test", so `find`
-          # above already skips it.
+          def section(start, end):
+              i = text.index(start)
+              j = text.index(end, i)
+              return text[i:j]
 
-          if [ ${#UNCLASSIFIED[@]} -eq 0 ]; then
-            echo "OK — every androidUnitTest *Test.kt is classified in the CI matrix."
-          else
-            echo "FAIL — the following test classes are unclassified. They must be"
-            echo "added to one of the shards (android-jvm-state / android-compose-ui /"
-            echo "android-paparazzi) AND to the CLASSIFIED manifest in this guard:"
-            printf '  %s\n' "${UNCLASSIFIED[@]}"
-            exit 1
-          fi
+          jvm = set(re.findall(r'--tests "([^"]+)"', section("\n  android-jvm-state:", "\n  android-compose-ui:")))
+          compose = set(re.findall(r"^\s*- (phantom\.[\w.]+)$", section("\n  android-compose-ui:", "\n  android-paparazzi:"), re.M))
+          paparazzi = set(re.findall(r'--tests "([^"]+)"', section("\n  android-paparazzi:", "\n  android-test-classification-guard:")))
+          for name, lst in (("jvm-state", jvm), ("compose-ui", compose), ("paparazzi", paparazzi)):
+              if not lst:
+                  print("FAIL -- could not read the %s run list out of %s" % (name, WORKFLOW))
+                  sys.exit(1)
+
+          # Units are RUNNABLE declared classes, not file names and not a naming
+          # convention: every .kt file under the test root is read, each
+          # top-level class is taken with the text up to the next top-level
+          # class, and it counts if that text carries a @Test annotation.
+          # Gradle's --tests filter selects a class, so a file whose class has
+          # another name, a file declaring two test classes, or a class called
+          # ...Test20 would otherwise leave a test that is never executed while
+          # the inventory looks complete.
+          DECL = re.compile(r"^(?:(?:internal|public|private|open|abstract|final)\s+)*(?:data\s+)?class\s+(\w+)", re.M)
+          on_disk = set()
+          test_named_without_runnable = []
+          for d, _, files in os.walk(TEST_ROOT):
+              for f in files:
+                  if not f.endswith(".kt"):
+                      continue
+                  path = os.path.join(d, f)
+                  text = open(path, encoding="utf-8", errors="replace").read()
+                  pkg = re.search(r"^package\s+([\w.]+)", text, re.M)
+                  decls = list(DECL.finditer(text))
+                  runnable = []
+                  for k, dm in enumerate(decls):
+                      body = text[dm.start():decls[k + 1].start() if k + 1 < len(decls) else len(text)]
+                      if "abstract" in dm.group(0).split("class")[0]:
+                          continue
+                      if re.search(r"^\s*@(?:org\.junit\.)?Test\b", body, re.M):
+                          runnable.append(dm.group(1))
+                  if runnable and not pkg:
+                      test_named_without_runnable.append(os.path.relpath(path, TEST_ROOT).replace(os.sep, "/") + " (no package line)")
+                      continue
+                  if not runnable and re.search(r"Test\d*\.kt$", f):
+                      test_named_without_runnable.append(os.path.relpath(path, TEST_ROOT).replace(os.sep, "/"))
+                      continue
+                  for n in runnable:
+                      on_disk.add(pkg.group(1) + "." + n)
+          # OnboardingV2SemanticsMatchers is a helper with no @Test; it is
+          # therefore not a unit, whatever it is called.
+
+          executed = jvm | compose | paparazzi
+          problems = []
+          def report(title, items):
+              if items:
+                  problems.append((title, sorted(items)))
+          report("files named *Test.kt (or *Test<n>.kt) that declare no runnable class, or lack a package line", set(test_named_without_runnable))
+          report("unclassified -- runnable declared test classes missing from the manifest", on_disk - classified)
+          report("stale -- manifest entries that no source file declares as a runnable class", classified - on_disk)
+          report("declared but never executed -- in the manifest, in no shard run list", classified - executed)
+          report("executed but never declared -- in a shard run list, not in the manifest", executed - classified)
+          report("in more than one shard", (jvm & compose) | (jvm & paparazzi) | (compose & paparazzi))
+
+          if not problems:
+              print("OK -- %d runnable androidUnitTest classes: %d jvm-state, %d compose-ui, %d paparazzi; manifest == executed." % (
+                  len(on_disk), len(jvm), len(compose), len(paparazzi)))
+              sys.exit(0)
+          print("FAIL -- test classification is inconsistent. A class must be in exactly one")
+          print("shard run list (android-jvm-state / android-compose-ui / android-paparazzi)")
+          print("AND in the manifest of this guard; declaring it does not run it.")
+          for title, items in problems:
+              print("  %s:" % title)
+              for it in items:
+                  print("    %s" % it)
+          sys.exit(1)
+          PY
 
   # =================================================================
   # 6. assembleDebug + APK artifact. Runs after all test shards succeed.
