@@ -199,6 +199,7 @@ jobs:
             --tests "phantom.android.messaging.OutboundContinuityTest" \
             --tests "phantom.android.messaging.PendingExpiryReceiveTest" \
             --tests "phantom.android.messaging.ReceiveSessionArchiveTest" \
+            --tests "phantom.android.messaging.SessionContinuityRegressionTest" \
             --tests "phantom.android.messaging.SessionOrderDbSpikeTest" \
             --tests "phantom.android.messaging.SessionOrderFullStackTest" \
             --tests "phantom.android.navigation.ScreenSaverTest" \
@@ -441,6 +442,7 @@ jobs:
           phantom.android.messaging.OutboundContinuityTest
           phantom.android.messaging.PendingExpiryReceiveTest
           phantom.android.messaging.ReceiveSessionArchiveTest
+          phantom.android.messaging.SessionContinuityRegressionTest
           phantom.android.messaging.SessionOrderDbSpikeTest
           phantom.android.messaging.SessionOrderFullStackTest
           phantom.android.navigation.NotificationChatNavigationTest

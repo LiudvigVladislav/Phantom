@@ -238,8 +238,30 @@ interface RelayTransport {
      */
     suspend fun sendDeliveryAck(messageId: String): Boolean
 
-    /** Release an inbound processing claim WITHOUT acknowledging the envelope. */
+    /**
+     * Release an inbound processing claim WITHOUT acknowledging the
+     * envelope. Nothing durable happened on the recipient: the relay's
+     * copy is the only copy, and the relay must offer it again.
+     */
     suspend fun parkInbound(messageId: String) {}
+
+    /**
+     * The envelope's encrypted frame is now durably held on the
+     * recipient (the held-registry write was confirmed) and the envelope
+     * is still NOT acknowledged. The relay keeps its copy. Because a
+     * durable local copy exists, the transport may stop asking the relay
+     * for this sequence for the rest of this process; local replay owns
+     * its completion, and the relay's copy remains the durable fallback
+     * that a later process re-establishes from (it is offered once more
+     * after a restart and recognised through the held registry).
+     *
+     * This is a different operation from [parkInbound] and is kept as a
+     * separate method on purpose: the caller must state which of the two
+     * facts it has, and a failed hold write must call [parkInbound], not
+     * this. The default treats it as a plain release so implementations
+     * without a poll cursor keep their existing behaviour.
+     */
+    suspend fun deferInboundHeld(messageId: String) { parkInbound(messageId) }
 
     /**
      * Sends an ephemeral typing notification to [toPubKeyHex].

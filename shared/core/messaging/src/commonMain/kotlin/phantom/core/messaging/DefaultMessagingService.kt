@@ -374,6 +374,22 @@ class DefaultMessagingService(
     private val processingLock = Mutex()
     private val activeProcessing = mutableSetOf<String>()
 
+    /**
+     * Queue-progress fix (2026-09-12). Envelope ids whose encrypted frame
+     * is CONFIRMED present in the durable held registry during the
+     * current delivery attempt: a successful [holdForRetry] write, or a
+     * redelivery recognised as already held at the same receive version.
+     * Consumed by the delivery `finally`, which then tells the transport
+     * [RelayTransport.deferInboundHeld] instead of [RelayTransport.parkInbound].
+     * A failed hold write never adds to this set, so the transport keeps
+     * asking the relay for that envelope. Guarded by [processingLock].
+     */
+    private val durablyHeld = mutableSetOf<String>()
+
+    private suspend fun noteDurablyHeld(envelopeId: String) {
+        processingLock.withLock { durablyHeld.add(envelopeId) }
+    }
+
     // Audit ROUND-30.18: the ordinal range is ONE contract, named on
     // both sides. R30.17 left the producer unbounded while the verifier
     // rejected anything above a limit it had invented for itself, so the
@@ -719,72 +735,51 @@ class DefaultMessagingService(
 
             val existingState = sessionManager.tryLoadSession(conversationId)
             // ═════════════════════════════════════════════════════════
-            // RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15) — outbound
-            // role guard.
+            // Existing-session admission.
             //
-            // The existing-session branch must run ONLY when the loaded
-            // session is the INITIATOR side of the X3DH handshake (i.e.,
-            // its sending chain is the one the remote peer's receiving
-            // chain expects). A RESPONDER-bootstrapped session — created
-            // by `recipientBootstrap` / `recipientBootstrapInMemory` in
-            // response to an inbound `x3dhInit` from the peer — has its
-            // sending chain oriented opposite: the remote peer's
-            // INITIATOR ratchet is keyed to expect messages from the
-            // INITIATOR's sending chain, not the RESPONDER's. Encrypting
-            // an outbound message under a RESPONDER session produces a
-            // ciphertext the remote peer cannot decrypt (`fail_mac` with
-            // `sessionExists=true, x3dhInitPresent=false` on the receive
-            // side — the recurring asymmetric-pair lacuna documented in
-            // three field tests: 2026-05-30 sealed read receipts,
-            // 2026-06-14 WiFi, 2026-06-14 Tele2 LTE).
+            // A loaded active session is used for sending whichever side
+            // opened it. RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15)
+            // added a guard that sent a RESPONDER-tagged session back
+            // through a fresh X3DH bootstrap on every change of direction;
+            // that guard was written before the pending/active machine and
+            // the sender-side DH step existed in their current form, and it
+            // made every reply re-key the peer and read the peer's private
+            // prekeys -- on Android, through the Keystore key that requires
+            // an unlocked device. Measured on two real services with real
+            // storage (2026-09-10): with the guard, five alternating
+            // messages, first contact included, were five bootstraps;
+            // without it, the four after first contact continue on one
+            // session with no prekey read on either side, and a
+            // conversation continues while the prekey key is unreadable.
             //
-            // The guard routes a RESPONDER-tagged session into the
-            // bootstrap branch below. That branch runs a fresh X3DH 4-DH
-            // exchange in the local→peer direction, attaches the
-            // resulting `x3dhInit` header to the outbound WireFrame, and
-            // saves a new INITIATOR-tagged session record. The remote
-            // peer processes the `x3dhInit` via PR #249's inbound repair
-            // path and re-keys their own ratchet to match.
+            // What decides the ratchet's fitness to send is the ratchet, not
+            // the tag: `LibsodiumDoubleRatchet.encrypt` performs the
+            // sender-side DH step from the peer's last ratchet public key
+            // when the sending chain is not yet keyed. The `role` field
+            // stays as a record of which side opened the session and for
+            // diagnostics; it is no longer a routing condition.
             //
-            // Backwards-compat: untagged legacy `rs1:` blobs deserialize
-            // with default `SessionRole.INITIATOR` (Sprint 1) so the
-            // guard is a no-op for any session row written before the
-            // tag existed. A legacy RESPONDER session persisted before
-            // Sprint 1 therefore satisfies `role == INITIATOR &&
-            // !sessionSuspect` and continues to encrypt under its
-            // (actually RESPONDER) sending chain — Sprint 2a does NOT
-            // auto-heal these pairs. Recovery requires user-driven
-            // reset or re-pair of the affected conversation. Accepted
-            // Option A trade-off from synthesis-track-A-amended-2: no
-            // migration risk / no OPK storm at upgrade time, at the
-            // cost of manual remediation for pre-Sprint-1 broken pairs.
-            // New sessions created after Sprint 1 carry an explicit
-            // role and are fully covered by the guard below.
+            // Recovery after a held MAC failure is unchanged: `sessionSuspect`
+            // is set by the receive path and forces one bootstrap on the next
+            // send, cleared only by that bootstrap's commit. Measured on the
+            // same rig with one envelope lost in transit: the peer's next
+            // reply bootstraps once and the conversation continues; without
+            // the flag the direction stayed held. The pending barrier below is
+            // also unchanged.
             //
-            // Known limitation (race window, Sprint 2b scope): the
-            // bootstrap path's `saveSession` REPLACES the RESPONDER
-            // session row with the new INITIATOR session row in the same
-            // storage slot — there is no pending/active separation in
-            // this iteration. If the remote peer sends another message
-            // under their old INITIATOR ratchet AFTER our local
-            // RESPONDER row was replaced but BEFORE the remote peer has
-            // processed our `x3dhInit` and rebuilt their own ratchet,
-            // that message arrives at us encrypted under a chain our
-            // new INITIATOR session does not know about and fails MAC.
-            // The window is bounded by the peer's bootstrap-processing
-            // latency (seconds to minutes on Tele2 LTE) and the user
-            // retry path. Sprint 2b's pending/active state machine
-            // eliminates the window by keeping the RESPONDER session in
-            // a primary slot for inbound decryption while the new
-            // INITIATOR session sits in a pending slot until the first
-            // successful reply.
+            // Backwards-compat: untagged legacy `rs1:` blobs deserialize with
+            // default `SessionRole.INITIATOR` and were always admitted;
+            // RESPONDER-tagged rows are now admitted too. A peer still
+            // running the older guard decides its own sends by its own
+            // rule; its bootstraps arrive through the inbound bootstrap
+            // path, which this change does not touch. Mixed pairs are
+            // covered by SessionContinuityRegressionTest.
             // ═════════════════════════════════════════════════════════
             // Reuse was already attempted above. An outbound pending candidate
             // that is expired or unusable does not attest that the active slot
             // still matches the peer, including rows from older app versions.
             val hasOutboundPending = pendingEntity?.bootstrapArtifactsBlob != null
             val canTakeExistingSessionPath = !hasOutboundPending && existingState != null &&
-                existingState.role == SessionRole.INITIATOR &&
                 !sessionSuspect
             if (canTakeExistingSessionPath) {
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE session_existing conv=$convTag")
@@ -800,13 +795,12 @@ class DefaultMessagingService(
                 messagingLog(MessagingLogLevel.INFO, "SEND_TRACE save_session_ok conv=$convTag")
                 wireFrame
             } else {
-                // Bootstrap path: peer has no usable initiator session here.
-                // Fetch their bundle, run 4-DH, ship the bootstrap
-                // header with the first message.
+                // Bootstrap path: no usable session for this send. Fetch
+                // their bundle, run 4-DH, ship the bootstrap header with
+                // the first message.
                 val bootstrapReason = when {
                     hasOutboundPending -> "outbound_pending_not_reusable"
                     existingState == null -> "no_session_row"
-                    existingState.role == SessionRole.RESPONDER -> "responder_role_redirected"
                     sessionSuspect -> "session_suspect"
                     else -> "unknown"
                 }
@@ -3087,7 +3081,15 @@ class DefaultMessagingService(
                     transport.sendDeliveryAck(deliver.messageId)
                     return@withLock null
                 }
-                if (!heldRetryIsDue(conversationId, deliver.messageId)) return@withLock null
+                if (!heldRetryIsDue(conversationId, deliver.messageId)) {
+                    // Already durably held at this receive version (the
+                    // registry row was found). No decrypt, no ACK; the
+                    // transport may stop asking the relay for it -- this
+                    // is how a restarted process re-establishes its scan
+                    // position from the durable registry.
+                    noteDurablyHeld(deliver.messageId)
+                    return@withLock null
+                }
                 val state = sessionManager.tryLoadSession(conversationId)
                 val hasReceiveArchives = state == null && sessionTransactionRepository?.listReceiveArchiveVersions(
                     conversationId, Clock.System.now().toEpochMilliseconds()).orEmpty().isNotEmpty()
@@ -5141,7 +5143,7 @@ class DefaultMessagingService(
                 )
             } finally {
                 withContext(NonCancellable) {
-                processingLock.withLock {
+                val durablyDeferred = processingLock.withLock {
                     activeProcessing.remove(deliver.messageId)
                     // Audit ROUND-30.18: a settled envelope's chain is
                     // over, so its counter goes with the claim. Done
@@ -5153,8 +5155,19 @@ class DefaultMessagingService(
                     } else if (r3017OverflowAnnounced) {
                         overflowAnnounced.add(deliver.messageId)
                     }
+                    // Queue-progress fix (2026-09-12): the attempt's hold
+                    // result, read and cleared under the same lock.
+                    durablyHeld.remove(deliver.messageId)
                 }
-                if (!r3016AckSent) transport.parkInbound(deliver.messageId)
+                if (!r3016AckSent) {
+                    // Two different facts for the transport. A confirmed
+                    // durable hold lets it stop asking the relay for this
+                    // sequence; anything else (no hold, hold write failed,
+                    // unknown failure) only releases the claim and the
+                    // relay must offer the envelope again.
+                    if (durablyDeferred) transport.deferInboundHeld(deliver.messageId)
+                    else transport.parkInbound(deliver.messageId)
+                }
                 }
             }
         }
@@ -5468,6 +5481,7 @@ class DefaultMessagingService(
             )
             messagingLog(MessagingLogLevel.INFO,
                 "DECRYPT_TRACE hold_recorded msgId=${deliver.messageId.take(8)} errorType=$reason")
+            noteDurablyHeld(deliver.messageId)
             return true
         } catch (cancelled: CancellationException) {
             throw cancelled
