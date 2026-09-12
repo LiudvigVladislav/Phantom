@@ -162,6 +162,23 @@ class RestFallbackOrchestrator(
      * in Stage 2B-B (OQ-6 LOCK).
      */
     private val cursorRepository: LongPollCursorRepository? = null,
+    /**
+     * Queue-progress fix, round 2 (2026-09-12) -- "is this envelope's
+     * encrypted frame still in the durable held registry?" The scan
+     * position past a held envelope ([_heldScanSeqById]) is valid ONLY
+     * while that durable copy exists; held rows are evicted by TTL (and
+     * removed by other paths) without any notification to this class.
+     * So before every poll each tracked id is re-checked through this
+     * seam and an id whose row is gone is dropped from the scan map: the
+     * relay copy, still retained because nothing was ever ACKed, becomes
+     * visible to the poll again. Storage I/O, so it is called outside
+     * [_inboundStateMutex].
+     *
+     * `null` = no registry wired (legacy fixtures): the scan map is then
+     * trusted as reported, which is correct only while nothing deletes
+     * held rows. Production wires the SQLDelight held registry.
+     */
+    private val heldEnvelopeExists: (suspend (envelopeId: String) -> Boolean)? = null,
     dispatcher: CoroutineContext = Dispatchers.Default,
     /**
      * Trek 2 Stage 2B-B (C6, L10, M15) — single CSPRNG source for
@@ -468,6 +485,49 @@ class RestFallbackOrchestrator(
      * [_pendingSeqForAck] kdoc.
      */
     private var _emitGenerationCounter: Long = 0L
+
+    /**
+     * Queue-progress fix (2026-09-12) -- process-local scan position.
+     *
+     * The relay is strict head-of-line: `POLL_MAX_ENVELOPES = 1` and
+     * every poll returns the FIRST retained envelope with
+     * `seq > since_seq`. An envelope the recipient holds without
+     * acknowledging (MAC failure, out-of-order position, locked prekey,
+     * failed commit) therefore blocks every later envelope for as long
+     * as `since_seq` stays below it -- and the persisted cursor must
+     * stay below it, because the cursor is the durable completion
+     * boundary and the envelope is not complete.
+     *
+     * This map is the second, separate notion: `envelope_id -> seq` of
+     * every REST envelope whose ENCRYPTED frame has been confirmed
+     * written to the durable held registry ([deferInboundHeld]). The
+     * poll loops ask the relay from `max(persisted cursor, max(this))`,
+     * so a durably held barrier no longer starves the queue while the
+     * relay keeps its copy. Nothing here is persisted: after a restart
+     * the map is empty, the relay offers the earliest barrier once more,
+     * and the durable held registry re-establishes the entry without an
+     * ACK (see `DefaultMessagingService`'s held-recognition path).
+     *
+     * Validity rule (round 2): an entry is only as good as the durable
+     * row behind it. Held rows are evicted by TTL without telling this
+     * class, so every entry is re-checked against the registry through
+     * [heldEnvelopeExists] before each poll and dropped when the row is
+     * gone ([revokeScanForMissingHeldRows]); the relay copy then
+     * reappears in the next poll and is held again.
+     *
+     * Accessed only under [_inboundStateMutex]. Survives `stop()` /
+     * `start()` re-arms within one process, like [_pendingSeqForAck].
+     */
+    private val _heldScanSeqById: MutableMap<String, Long> = LinkedHashMap()
+
+    /**
+     * Highest sequence the relay has confirmed removed (2xx ACK) in this
+     * process. Lets the persisted cursor catch up to already-acknowledged
+     * sequences once an earlier barrier is resolved, instead of lagging at
+     * the barrier's own seq. Process-local; monotonic; accessed only under
+     * [_inboundStateMutex].
+     */
+    private var _highestAckedSeq: Long = 0L
 
     /**
      * Trek 2 Stage 2B-B (C4, L2) — verify-key state machine value.
@@ -1438,6 +1498,130 @@ class RestFallbackOrchestrator(
         _pendingSeqForAck.containsKey(envelopeId)
     }
 
+    /**
+     * Queue-progress fix (2026-09-12) -- the recipient reports that
+     * [envelopeId]'s encrypted frame is durably held locally and still
+     * unacknowledged. See [_heldScanSeqById] for what that buys.
+     *
+     * Only an envelope this orchestrator emitted (present in
+     * [_pendingSeqForAck]) can move the scan position, because only such
+     * an envelope has a relay sequence to move past; anything else
+     * (a WebSocket delivery, a local replay of an old row) is reported as
+     * [HeldDeferralOutcome.NotRestOrigin] and changes nothing. The
+     * pending-seq entry is deliberately KEPT: the eventual ACK after a
+     * successful local replay must still find the seq, and the entry
+     * keeps clamping later cursor writes below this barrier.
+     *
+     * Idempotent: a second report for the same id re-records the same
+     * seq. Never sends anything to the relay.
+     */
+    suspend fun deferInboundHeld(envelopeId: String): HeldDeferralOutcome {
+        // Logged BEFORE the scan map is touched: a caller that must
+        // keep its own claim until the deferral is recorded (the
+        // Hybrid transport's dedup claim) is observable at exactly the
+        // point where releasing early would reopen the redelivery
+        // window.
+        log("REST_TRACE inbound_held_deferral_begin id=${envelopeId.take(8)}")
+        val outcome = _inboundStateMutex.withLock {
+            val entry = _pendingSeqForAck[envelopeId] ?: return@withLock HeldDeferralOutcome.NotRestOrigin
+            _heldScanSeqById[envelopeId] = entry.seq
+            HeldDeferralOutcome.ScanAdvanced(seq = entry.seq, scanSinceSeq = scanBoundLocked() ?: entry.seq)
+        }
+        when (outcome) {
+            is HeldDeferralOutcome.ScanAdvanced -> log(
+                "REST_TRACE inbound_held_deferred id=${envelopeId.take(8)} seq=${outcome.seq} " +
+                    "scan_since_seq=${outcome.scanSinceSeq}",
+            )
+            HeldDeferralOutcome.NotRestOrigin -> log(
+                "REST_TRACE inbound_held_deferred id=${envelopeId.take(8)} outcome=not_rest_origin",
+            )
+        }
+        return outcome
+    }
+
+    /** Caller holds [_inboundStateMutex]. Highest durably held seq, or null when none. */
+    private fun scanSinceSeqLocked(): Long? = _heldScanSeqById.values.maxOrNull()
+
+    /**
+     * Queue-progress fix, round 3 (2026-09-12). Caller holds
+     * [_inboundStateMutex]. The highest sequence a poll may skip, or null
+     * when nothing is durably held.
+     *
+     * The plain maximum of the scan map is not enough: the relay returns
+     * only `seq > since_seq`, so every REST envelope tracked in
+     * [_pendingSeqForAck] that is NOT shielded by a valid scan entry --
+     * a barrier whose held row was revoked, or a claim released without a
+     * durable copy -- must stay below `since_seq` or the relay can never
+     * offer its retained copy again. Held B(2) and C(3) with B's row gone
+     * and C's kept therefore yields 1, not 3; C's own recovery may depend
+     * on B. The bound is `min(max(scan), earliestUnshielded - 1)`.
+     */
+    private fun scanBoundLocked(): Long? {
+        val scan = scanSinceSeqLocked() ?: return null
+        val earliestUnshielded = _pendingSeqForAck.entries
+            .filter { it.key !in _heldScanSeqById }
+            .minOfOrNull { it.value.seq }
+        return if (earliestUnshielded != null && earliestUnshielded <= scan) earliestUnshielded - 1 else scan
+    }
+
+    /**
+     * The `since_seq` a poll actually sends: the persisted completion
+     * cursor, raised to the process-local scan bound when a durably held
+     * barrier sits above it -- see [scanBoundLocked] for why the bound is
+     * not simply the highest held seq. The persisted value itself is never
+     * written here.
+     */
+    private suspend fun effectiveSinceSeq(durableSinceSeq: Long?): Long? {
+        revokeScanForMissingHeldRows()
+        val bound = _inboundStateMutex.withLock { scanBoundLocked() } ?: return durableSinceSeq
+        return maxOf(durableSinceSeq ?: 0L, bound)
+    }
+
+    /**
+     * Queue-progress fix, round 2 (2026-09-12). Drops every scan entry
+     * whose durable held copy no longer exists (see [heldEnvelopeExists]).
+     * Runs at the start of every poll iteration, so a held row evicted by
+     * TTL -- or removed by any other path that did not go through a
+     * successful commit and ACK -- stops shielding its relay copy at the
+     * very next poll. Nothing here writes the persisted cursor, sends an
+     * ACK, or touches [_pendingSeqForAck] (the seq stays tracked: the
+     * envelope is unresolved and back on the relay, so it keeps bounding
+     * later cursor writes).
+     *
+     * A check that throws is treated as "not held": the safe direction is
+     * toward the relay's copy, which is retained until an ACK regardless.
+     * A [CancellationException] propagates untouched -- no poll is sent
+     * in that iteration, the entry is kept, and the next iteration
+     * re-checks. So a cancellation can never leave a scan entry standing
+     * on a row that was verified missing.
+     */
+    private suspend fun revokeScanForMissingHeldRows() {
+        val check = heldEnvelopeExists ?: return
+        val tracked: List<Pair<String, Long>> = _inboundStateMutex.withLock {
+            _heldScanSeqById.entries.map { it.key to it.value }
+        }
+        if (tracked.isEmpty()) return
+        val gone = ArrayList<Triple<String, Long, String>>()
+        for ((id, seq) in tracked) {
+            val stillHeld = try {
+                check(id)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                gone += Triple(id, seq, "check_failed_${t::class.simpleName}")
+                continue
+            }
+            if (!stillHeld) gone += Triple(id, seq, "held_row_gone")
+        }
+        if (gone.isEmpty()) return
+        _inboundStateMutex.withLock {
+            for ((id, _, _) in gone) _heldScanSeqById.remove(id)
+        }
+        for ((id, seq, reason) in gone) {
+            log("REST_TRACE scan_revoked id=${id.take(8)} seq=$seq reason=$reason")
+        }
+    }
+
     suspend fun ackInboundAndAdvanceCursor(envelopeId: String): AckOutcome {
         // N1-F2: same refusal shape as [ackInbound].
         egressBlocked("ack_advance")?.let { decision ->
@@ -1471,15 +1655,48 @@ class RestFallbackOrchestrator(
         // point on, `finally` guarantees cleanup. (M-B29 sub-cell (d)
         // verifies the absence of a suspension point structurally.)
         var pendingSeq: Long? = null
+        var persistSeq: Long? = null
         var upsertOk = false
         var wasCancelled = false
         try {
             // Phase 1 — mutex held (cancellable, first suspension point):
             // snapshot the pending seq from the (seq, generation)
-            // entry. Read-only; the remove happens in the Phase 3
-            // cleanup under the same mutex.
-            pendingSeq = _inboundStateMutex.withLock {
-                _pendingSeqForAck[envelopeId]?.seq
+            // entry. The remove happens in the Phase 3 cleanup under
+            // the same mutex.
+            //
+            // Queue-progress fix (2026-09-12): the relay has removed
+            // its copy, so this envelope is no longer a barrier; drop
+            // it from the scan map. Then decide what the persisted
+            // cursor may become. It is the durable completion
+            // boundary: it may never pass an EARLIER envelope that is
+            // still unresolved here (held barrier, or a REST envelope
+            // whose claim was released without a durable copy), so it
+            // is clamped to `earliest unresolved seq - 1`. Within that
+            // bound it catches up to the highest sequence the relay
+            // has confirmed removed, so resolving a barrier does not
+            // leave the cursor lagging behind acknowledged sequences.
+            val snapshot: Pair<Long, Long>? = _inboundStateMutex.withLock {
+                val seq = _pendingSeqForAck[envelopeId]?.seq ?: return@withLock null
+                _heldScanSeqById.remove(envelopeId)
+                if (seq > _highestAckedSeq) _highestAckedSeq = seq
+                val earliestUnresolved = _pendingSeqForAck.entries
+                    .filter { it.key != envelopeId }
+                    .minOfOrNull { it.value.seq }
+                val target = _highestAckedSeq
+                val bounded = if (earliestUnresolved != null && earliestUnresolved < target) {
+                    earliestUnresolved - 1
+                } else {
+                    target
+                }
+                Pair(seq, bounded)
+            }
+            pendingSeq = snapshot?.first
+            persistSeq = snapshot?.second
+            if (pendingSeq != null && persistSeq != pendingSeq) {
+                log(
+                    "REST_TRACE cursor_bounded id=${envelopeId.take(8)} acked_seq=$pendingSeq " +
+                        "persist_seq=$persistSeq",
+                )
             }
             if (pendingSeq == null) {
                 // The relay ack succeeded but the orchestrator never
@@ -1504,10 +1721,23 @@ class RestFallbackOrchestrator(
                         upsertOk = true
                         break
                     }
+                    if (persistSeq!! < 1L) {
+                        // An earlier barrier sits at the very front of
+                        // the queue: there is no cursor value below it
+                        // worth persisting. The relay copy of the
+                        // acked envelope is gone regardless; nothing
+                        // is lost by leaving the cursor where it is.
+                        log(
+                            "REST_TRACE cursor_write_skipped_barrier id=${envelopeId.take(8)} " +
+                                "acked_seq=$pendingSeq",
+                        )
+                        upsertOk = true
+                        break
+                    }
                     try {
                         val outcome = cursorRepository.upsertLastSeenSeq(
                             identityHex = identityHex,
-                            seq = pendingSeq!!,
+                            seq = persistSeq!!,
                             nowMs = now(),
                         )
                         upsertOk = true
@@ -1531,7 +1761,7 @@ class RestFallbackOrchestrator(
                             )
                             is CursorUpsertOutcome.NoChange -> log(
                                 "REST_TRACE cursor_noop existing_seq=${outcome.existingSeq} " +
-                                    "rejected_seq=$pendingSeq id=${envelopeId.take(8)} " +
+                                    "rejected_seq=$persistSeq acked_seq=$pendingSeq id=${envelopeId.take(8)} " +
                                     "attempt=${attemptIdx + 1}",
                             )
                         }
@@ -1550,7 +1780,7 @@ class RestFallbackOrchestrator(
                         // diagnostic triage.
                         log(
                             "REST_TRACE poll_cursor_write_attempt_fail " +
-                                "id=${envelopeId.take(8)} seq=$pendingSeq " +
+                                "id=${envelopeId.take(8)} seq=$persistSeq acked_seq=$pendingSeq " +
                                 "attempt=${attemptIdx + 1} of=$CURSOR_WRITE_MAX_ATTEMPTS " +
                                 "reason=${t::class.simpleName}",
                         )
@@ -1760,6 +1990,14 @@ class RestFallbackOrchestrator(
                 // flag distinguishes the HalfOpen single-probe
                 // iteration from regular ones — S6 pass criterion
                 // 4 needs to greppably identify the probe.
+                //
+                // Queue-progress fix (2026-09-12): the wire value is
+                // the persisted cursor raised to the process-local scan
+                // position; both are logged so a trace can tell a
+                // durable advance from a temporary bypass.
+                val durableSince: Long? = lastSeenSeq
+                val effectiveSince: Long? = effectiveSinceSeq(lastSeenSeq)
+                val scanSince: Long? = _inboundStateMutex.withLock { scanBoundLocked() }
                 val lpHeaderValue = if (longPollEnabled) "1" else "absent"
                 val ppHeaderValue = if (longPollEnabled) "1" else "absent"
                 // Round 12 step 2 — emit the server-advertised
@@ -1771,10 +2009,11 @@ class RestFallbackOrchestrator(
                 // run to be invalidated post-hoc.
                 val holdSecsField = _capabilities.value.pollHoldSecs
                 log(
-                    "REST_TRACE poll_call since_seq=${lastSeenSeq ?: -1L} mode=$pollMode " +
+                    "REST_TRACE poll_call since_seq=${effectiveSince ?: -1L} mode=$pollMode " +
                         "probe=$isProbe " +
                         "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue " +
-                        "hold_secs=$holdSecsField",
+                        "hold_secs=$holdSecsField " +
+                        "durable_since_seq=${durableSince ?: -1L} scan_since_seq=${scanSince ?: -1L}",
                 )
                 val startMs = now()
                 val outcome = runCatching {
@@ -1800,7 +2039,7 @@ class RestFallbackOrchestrator(
                         transport.poll(
                             url = "$baseUrl/relay/poll",
                             token = token,
-                            sinceSeq = lastSeenSeq,
+                            sinceSeq = effectiveSince,
                             longPollOptIn = longPollEnabled,
                             readTimeoutMs = computeLongPollReadTimeoutMs(
                                 longPollEnabled = longPollEnabled,
@@ -2113,6 +2352,13 @@ class RestFallbackOrchestrator(
                 // loop only spawns when the flag is on, so the
                 // literal is constant here) so back-compat parsers
                 // see no shape change; the new fields are appended.
+                //
+                // Queue-progress fix (2026-09-12): same as the legacy
+                // loop -- the wire value is the persisted cursor raised
+                // to the process-local scan position.
+                val durableSince: Long? = sinceSeq
+                val effectiveSince: Long? = effectiveSinceSeq(sinceSeq)
+                val scanSince: Long? = _inboundStateMutex.withLock { scanBoundLocked() }
                 val lpHeaderValue = if (longPollEnabled) "1" else "absent"
                 val ppHeaderValue = if (longPollEnabled) "1" else "absent"
                 // Round 12 step 2 — emit `hold_secs` on the parallel
@@ -2120,11 +2366,12 @@ class RestFallbackOrchestrator(
                 // field so a single grep covers both.
                 val holdSecsField = _capabilities.value.pollHoldSecs
                 log(
-                    "REST_TRACE ws_active_poll_call since_seq=${sinceSeq ?: -1L} " +
+                    "REST_TRACE ws_active_poll_call since_seq=${effectiveSince ?: -1L} " +
                         "long_poll_enabled=true " +
                         "probe=$isProbe " +
                         "X-Phantom-Long-Poll=$lpHeaderValue X-Phantom-Padded-Poll=$ppHeaderValue " +
-                        "hold_secs=$holdSecsField",
+                        "hold_secs=$holdSecsField " +
+                        "durable_since_seq=${durableSince ?: -1L} scan_since_seq=${scanSince ?: -1L}",
                 )
                 val startMs = now()
                 val outcome = runCatching {
@@ -2135,7 +2382,7 @@ class RestFallbackOrchestrator(
                         transport.poll(
                             url = "$baseUrl/relay/poll",
                             token = token,
-                            sinceSeq = sinceSeq,
+                            sinceSeq = effectiveSince,
                             longPollOptIn = longPollEnabled,
                             readTimeoutMs = computeLongPollReadTimeoutMs(
                                 longPollEnabled = longPollEnabled,
@@ -3441,6 +3688,14 @@ class RestFallbackOrchestrator(
             _pendingSeqForAck[envelopeId]?.seq
         }
 
+    /** Queue-progress fix (2026-09-12) -- the process-local scan position, or null when no barrier is held. */
+    internal suspend fun peekScanSinceSeqForTest(): Long? =
+        _inboundStateMutex.withLock { scanSinceSeqLocked() }
+
+    /** Queue-progress fix (2026-09-12) -- the `since_seq` a poll would send for a given persisted cursor. */
+    internal suspend fun effectiveSinceSeqForTest(durableSinceSeq: Long?): Long? =
+        effectiveSinceSeq(durableSinceSeq)
+
     /**
      * Trek 2 Stage 2B-B (C3 review-fix round 3) — test-only seam
      * that drives the cancel-safe emit pattern directly. Production
@@ -4268,4 +4523,17 @@ sealed class AckOutcome {
     object Acked : AckOutcome()
     object DisabledByCapability : AckOutcome()
     data class Failed(val statusCode: Int?, val reason: String) : AckOutcome()
+}
+
+/**
+ * Queue-progress fix (2026-09-12) -- result of
+ * [RestFallbackOrchestrator.deferInboundHeld]. Distinct from
+ * [AckOutcome] on purpose: a deferral never talks to the relay and never
+ * moves the persisted cursor.
+ */
+sealed class HeldDeferralOutcome {
+    /** The envelope was a REST poll envelope; the scan position now covers its [seq]. */
+    data class ScanAdvanced(val seq: Long, val scanSinceSeq: Long) : HeldDeferralOutcome()
+    /** Not an envelope this orchestrator emitted (WebSocket delivery or local replay); nothing changed. */
+    object NotRestOrigin : HeldDeferralOutcome()
 }

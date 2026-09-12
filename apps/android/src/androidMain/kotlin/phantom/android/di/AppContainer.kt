@@ -2276,6 +2276,14 @@ class AppContainer(private val context: Context) {
                         }
                     }
                 },
+                // Queue-progress fix, round 2 (2026-09-12): the scan
+                // position past a held envelope is valid only while its
+                // encrypted frame is still in the durable held registry
+                // (rows are evicted by TTL). The orchestrator re-checks
+                // every tracked id through this seam before each poll.
+                heldEnvelopeExists = { envelopeId ->
+                    decryptFailedEnvelopeRepo.existsByEnvelopeId(envelopeId)
+                },
                 s6DebugTriggerEnabled = s6DebugEnabled,
                 // 3.6 Fast REST degradation (2026-06-18). Gate reads
                 // BuildConfig.MODE_2_FAST_PATH_ENABLED directly — NO

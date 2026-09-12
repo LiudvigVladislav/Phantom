@@ -884,6 +884,21 @@ class AckInboundAndAdvanceCursorTest {
         //     never "called and committed" with a value lower than
         //     the persisted state.
         //
+        // Queue-progress fix (2026-09-12): the value handed to the
+        // storage seam is no longer the acked envelope's own seq. Each
+        // successful ACK persists a SAFE BOUND -- the highest acked seq
+        // so far, clamped just below the earliest REST envelope that is
+        // still tracked as unresolved at that moment (a barrier, or an
+        // envelope whose ACK has not landed yet). Under this
+        // interleaving that means an attempt may carry a value below
+        // its own seq (bounded by a still-pending lower seq), may
+        // repeat an earlier value, and a later attempt may catch up
+        // past several seqs at once. So the SET of attempted values is
+        // not pinned any more; what is pinned is that every attempt is
+        // positive and never above the highest acked seq, that the
+        // highest attempt and the final persisted value are 6, and that
+        // accepted writes stay strictly increasing.
+        //
         // The concurrency here exercises the orchestrator's
         // `_inboundStateMutex` discipline AND the storage layer's
         // monotonicity AND their interaction. A regression that
@@ -920,11 +935,18 @@ class AckInboundAndAdvanceCursorTest {
         // All four envelopes acked at the relay.
         assertEquals(4, transport.ackCalls.size, "all four envelopes must ack")
 
-        // All four upsert attempts forwarded to the storage seam
-        // (the orchestrator does NOT pre-filter; the storage layer
-        // enforces monotonicity).
-        assertEquals(4, cursor.attempts.size, "orchestrator forwards every (id, seq) to upsert")
-        assertEquals(setOf(3L, 4L, 5L, 6L), cursor.attempts.toSet())
+        // All four ACKs produced an upsert attempt at the storage seam
+        // (the orchestrator does NOT pre-filter monotonicity; the
+        // storage layer enforces it). The attempted VALUES are the
+        // bounded / catch-up cursor described above, not the acked
+        // seqs themselves: positive, never above the highest acked
+        // seq, and reaching 6 once every lower seq has resolved.
+        assertEquals(4, cursor.attempts.size, "every successful ACK attempts one cursor write")
+        assertTrue(
+            cursor.attempts.all { it in 1L..6L },
+            "every attempted bound is positive and never above the highest acked seq; saw ${cursor.attempts}",
+        )
+        assertEquals(6L, cursor.attempts.max(), "once every lower seq resolved, the bound catches up to 6")
 
         // Monotonic non-decreasing accepted writes — the load-bearing
         // M12 property. A regression that accidentally let a lower

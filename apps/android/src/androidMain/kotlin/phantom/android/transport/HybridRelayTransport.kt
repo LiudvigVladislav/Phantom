@@ -1409,6 +1409,37 @@ class HybridRelayTransport(
         restDedup.park(messageId)
     }
 
+    /**
+     * Queue-progress fix (2026-09-12). The recipient confirmed a durable
+     * held-registry write for [messageId] and did NOT acknowledge it.
+     * The processing claim is released exactly as in [parkInbound]; in
+     * addition the orchestrator is told, so its poll loops stop asking
+     * the strict head-of-line relay for this sequence while the process
+     * lives. The relay keeps its copy; the persisted cursor is not
+     * touched; no ACK is sent. A hold write that FAILED must not reach
+     * this method -- the service calls [parkInbound] for that case.
+     */
+    override suspend fun deferInboundHeld(messageId: String) {
+        // Order matters (review round 2). While the dedup claim is held,
+        // a redelivery of this id is `SkipNoAck`; once released it is a
+        // fresh `Emit`. The scan position must therefore be recorded
+        // BEFORE the claim is released -- releasing first would leave a
+        // window in which the relay, still asked from the old
+        // `since_seq`, re-offers the envelope and it is processed a
+        // second time. The release runs in `finally` so a deferral that
+        // throws, and a `NotRestOrigin` outcome, still free the claim.
+        val outcome = try {
+            orchestrator.deferInboundHeld(messageId)
+        } finally {
+            restDedup.park(messageId)
+        }
+        Log.i(
+            TAG,
+            "REST_TRACE inbound_deferred_held id=${messageId.take(8)} " +
+                "outcome=${outcome::class.simpleName}",
+        )
+    }
+
     override suspend fun sendDeliveryAck(messageId: String): Boolean {
         // In-memory bookkeeping is not evidence that the recipient committed.
         if (processedEnvelopeRepository != null &&

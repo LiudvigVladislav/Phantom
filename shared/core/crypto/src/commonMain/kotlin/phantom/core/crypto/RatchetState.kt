@@ -90,23 +90,15 @@ data class RatchetState(
      * at bootstrap time. See [SessionRole] KDoc for the protocol
      * background.
      *
-     * Introduced as the Sprint 1 state-model foundation and consumed
-     * by the Sprint 2a outbound role guard in
-     * `DefaultMessagingService.encryptUnderLock` — the existing-
-     * session branch fires only when the loaded state's role is
-     * [SessionRole.INITIATOR] and `sessionSuspect` is false. A
-     * [SessionRole.RESPONDER]-tagged session is redirected into the
-     * bootstrap branch (fresh X3DH 4-DH + outbound `x3dhInit`) so
-     * the peer's inbound X3DH repair path can re-key their ratchet
-     * to match. A future Sprint 2b pending/active state machine
-     * will likely also read this field to decide which slot a
-     * loaded record belongs in. Legacy `rs1:` blobs without the
-     * role field deserialize as [SessionRole.INITIATOR] by the
-     * default below, so the guard is a no-op for any session row
-     * written before the tag existed — pre-Sprint-1 broken
-     * RESPONDER pairs are NOT auto-healed and require user-driven
-     * reset / re-pair / manual repair (or a future migration that
-     * is explicitly out of scope for Sprint 2a).
+     * Introduced as the Sprint 1 state-model foundation. The Sprint 2a
+     * outbound role guard that redirected a [SessionRole.RESPONDER]
+     * session into a fresh bootstrap on every send was removed
+     * (2026-09-10): a session is used for sending whichever side opened
+     * it, and the ratchet performs its own sender-side DH step. The
+     * field remains a record of how the session was opened, for
+     * diagnostics and for the pending/active machine. Legacy `rs1:`
+     * blobs without the role field deserialize as [SessionRole.INITIATOR]
+     * by the default below.
      */
     val role: SessionRole = SessionRole.INITIATOR,
 ) {

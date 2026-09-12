@@ -2192,20 +2192,23 @@ class DefaultMessagingServiceTest {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15)
+    // RC-CRYPTO-PAIR-X3DH-INIT Sprint 2a (2026-06-15), revised 2026-09-10
     //
-    // Outbound role guard at DefaultMessagingService.kt:434. The
-    // existing-session path now requires `existingState.role ==
-    // SessionRole.INITIATOR` in addition to the prior `existingState !=
-    // null && !sessionSuspect` checks. A RESPONDER-tagged session
-    // (created by recipientBootstrap or recipientBootstrapInMemory in
-    // response to an inbound x3dhInit from the peer) is routed into the
-    // bootstrap branch, which produces a fresh x3dhInit attached to the
-    // outbound WireFrame.
+    // Existing-session admission in `DefaultMessagingService.encryptUnderLock`.
+    // Sprint 2a added `existingState.role == SessionRole.INITIATOR` to the
+    // `existingState != null && !sessionSuspect` checks, sending every
+    // RESPONDER-tagged session (created by recipientBootstrap or
+    // recipientBootstrapInMemory in response to an inbound x3dhInit) back
+    // through a fresh X3DH bootstrap on each change of direction. That
+    // role condition was removed on 2026-09-10: a loaded session is used
+    // for sending whichever side opened it, and the ratchet performs its
+    // own sender-side DH step. The `sessionSuspect` override and the
+    // outbound-pending barrier are unchanged.
     //
     // Coverage:
-    //   U1 — RESPONDER-tagged existing session => bootstrap path =>
-    //        x3dhInit on the wire (the new behaviour Sprint 2a adds)
+    //   U1 — RESPONDER-tagged existing session => existing-session path
+    //        => no x3dhInit on the wire, no prekey bundle requested, the
+    //        RESPONDER row kept (the 2026-09-10 contract)
     //   U2 — INITIATOR-tagged existing session => existing-session path
     //        => no x3dhInit on the wire (regression — Sprint 1's
     //        default-INITIATOR fallback keeps legacy blobs working)
@@ -2213,18 +2216,6 @@ class DefaultMessagingServiceTest {
     //        bootstrap path => x3dhInit on the wire (regression —
     //        PR-CRYPTO-SESSION-REPAIR1 commit 4 suspect override still
     //        fires regardless of role)
-    //
-    // Sprint 2a explicitly accepts a known race window: the bootstrap
-    // branch's saveSession REPLACES the RESPONDER row with a new
-    // INITIATOR row in the same storage slot (single-slot
-    // RatchetStateRepository). If the remote peer sends a message
-    // under their old INITIATOR ratchet after our RESPONDER row was
-    // replaced but before they have processed our x3dhInit and
-    // rebuilt their own ratchet, that message arrives at us
-    // encrypted under a chain our new INITIATOR session does not know
-    // about and fails MAC. The window is closed by Sprint 2b's
-    // pending/active state machine; it is not covered by tests in
-    // this iteration.
     // ═══════════════════════════════════════════════════════════════════
 
     private fun seedRatchetStateJson(role: phantom.core.crypto.SessionRole): String {
@@ -2261,55 +2252,34 @@ class DefaultMessagingServiceTest {
     }
 
     /**
-     * U1 — RESPONDER-tagged existing session must NOT take the existing-
-     * session path. The role guard routes it into the bootstrap branch,
-     * which attaches `x3dhInit` to the outbound WireFrame. This is the
-     * load-bearing behaviour change introduced by Sprint 2a — without
-     * it, the asymmetric-pair lacuna (peer→Tecno fail_mac after a fresh
-     * QR pair when peer's session is RESPONDER-bootstrapped) recurs as
-     * confirmed across three field tests.
+     * U1 — a RESPONDER-tagged existing session takes the existing-session
+     * path (contract of 2026-09-10): the reply is encrypted on the session
+     * the peer opened, no `x3dhInit` is attached, no prekey bundle is
+     * requested, and the RESPONDER row is kept. The peer's prekeys are
+     * therefore never read for a reply -- on Android that read goes
+     * through the Keystore key that requires an unlocked device.
+     *
+     * Not weakened here: `sessionSuspect=true` still forces the bootstrap
+     * path regardless of role (U3), and an outbound pending row is still
+     * decided before the active row is consulted (Sprint 2b-C tests).
      */
     @Test
-    fun sendMessage_responderRoleSession_takesBootstrapPath_andEmitsX3dhInit() = runTest {
+    fun sendMessage_responderRoleSession_takesExistingSessionPath_noX3dhInit_noPrekeyFetch() = runTest {
         LibsodiumInitializer.initialize()
         val transport = FakeRelayTransport()
         val msgRepo = FakeMessageRepository()
         val convRepo = FakeConversationRepository()
 
         // Pre-seed the conversation's ratchet row with a RESPONDER-tagged
-        // session. tryLoadSession returns non-null, but the role guard
-        // forces the bootstrap path.
+        // session and nothing else: no conversation row (so
+        // sessionSuspect is false) and no pending row.
         val ratchetRepo = SingleEntryRatchetRepo(
             conversationId = "responder-conv",
             seedJson = seedRatchetStateJson(phantom.core.crypto.SessionRole.RESPONDER),
         )
 
-        // Build a real-signed bundle so initiatorBootstrap's signature
-        // verification path runs (same shape as the canonical bootstrap
-        // test above).
-        val bobX25519 = phantom.core.crypto.LibsodiumX3DH().generateDhKeyPair()
-        val bobSpk = phantom.core.crypto.LibsodiumX3DH().generateDhKeyPair()
-        val bobSigning = com.ionspin.kotlin.crypto.signature.Signature.keypair()
-        val bobSpkSig = phantom.core.crypto.SignedPreKeySigner.sign(
-            spkPublic = bobSpk.publicKey,
-            createdAtMs = 1_000L,
-            identityEd25519SecretKey = bobSigning.secretKey.toByteArray(),
-        )
-        val bobBundle = phantom.core.transport.PreKeyBundle(
-            identity_pubkey_hex = bobX25519.publicKey.bytes.toHexStringLower(),
-            signing_pubkey_hex = bobSigning.publicKey.toByteArray().toHexStringLower(),
-            signed_pre_key = phantom.core.transport.WireSignedPreKey(
-                key_id = 7L,
-                public_key_hex = bobSpk.publicKey.bytes.toHexStringLower(),
-                created_at_ms = 1_000L,
-                signature_hex = bobSpkSig.toHexStringLower(),
-            ),
-            one_time_pre_key = null,
-        )
-
-        val real = phantom.core.crypto.LibsodiumX3DH()
         val sessionManager = SessionManager(
-            x3dh = real,
+            x3dh = phantom.core.crypto.LibsodiumX3DH(),
             ratchetStateRepository = ratchetRepo,
             signedPreKeyRepository = FakeLocalSignedPreKeyRepository(),
             oneTimePreKeyRepository = FakeLocalOneTimePreKeyRepository(),
@@ -2323,6 +2293,8 @@ class DefaultMessagingServiceTest {
             privateKey = phantom.core.identity.SigningPrivateKey(ourSigningKp.secretKey.toByteArray()),
         )
 
+        // ThrowingPreKeyApi: any prekey bundle request fails the send, so a
+        // successful send proves that none was made.
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
@@ -2333,19 +2305,24 @@ class DefaultMessagingServiceTest {
             conversationRepository = convRepo,
             scope = this,
             json = json,
-            preKeyApi = StubPreKeyApi(bundle = bobBundle),
+            preKeyApi = ThrowingPreKeyApi,
             signingKeyProvider = { ourSigning },
         )
 
-        service.sendMessage(
+        val result = service.sendMessage(
             OutgoingMessage(
-                id = "msg-responder-guard-1",
+                id = "msg-responder-existing-1",
                 conversationId = "responder-conv",
-                recipientPublicKeyHex = bobX25519.publicKey.bytes.toHexStringLower(),
+                recipientPublicKeyHex = "ccdd",
                 text = "first reply",
             ),
         )
 
+        assertTrue(
+            result.isSuccess,
+            "a reply on a RESPONDER-tagged session must not request a prekey bundle: " +
+                result.exceptionOrNull(),
+        )
         assertEquals(1, transport.sent.size, "WireFrame must reach transport")
         val payload = transport.sent[0].payload
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
@@ -2353,16 +2330,20 @@ class DefaultMessagingServiceTest {
         val unpadded = phantom.core.crypto.MessagePadding.unpad(padded)
         val wireFrame = json.decodeFromString<WireFrame>(unpadded.decodeToString())
 
-        assertNotNull(
+        assertNull(
             wireFrame.x3dhInit,
-            "Sprint 2a role guard: a RESPONDER-tagged existing session MUST route the " +
-                "outbound through the bootstrap branch and attach x3dhInit. Without this, " +
-                "the remote peer's INITIATOR ratchet cannot decrypt and fail_mac recurs.",
+            "a RESPONDER-tagged existing session takes the existing-session path: " +
+                "no x3dhInit on the wire, no fresh X3DH bootstrap for a reply.",
         )
+        assertNull(
+            wireFrame.senderSigningPublicKeyHex,
+            "the existing-session WireFrame carries the encrypted message only.",
+        )
+        val rowAfter = assertNotNull(ratchetRepo.snapshot(), "the session row is kept")
         assertEquals(
-            7L,
-            wireFrame.x3dhInit!!.spkKeyId,
-            "Attached x3dhInit must reference Bob's published SPK from the stubbed bundle.",
+            phantom.core.crypto.SessionRole.RESPONDER,
+            json.decodeFromString<phantom.core.crypto.RatchetState>(rowAfter).role,
+            "the row keeps its RESPONDER tag: it records which side opened the session.",
         )
     }
 

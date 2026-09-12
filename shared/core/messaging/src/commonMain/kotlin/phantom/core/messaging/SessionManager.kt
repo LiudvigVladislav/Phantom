@@ -563,18 +563,12 @@ class SessionManager(
         )
 
         // RC-CRYPTO-PAIR-X3DH-INIT Sprint 1 (2026-06-15) — tag this
-        // session record with [SessionRole.RESPONDER]. This is the
-        // load-bearing tag for the asymmetric-pair lacuna: an inbound
-        // X3DH bootstrap produces a session whose sending chain
-        // corresponds to the initiator's receiving chain, NOT a
-        // generic bidirectional session. Without the tag, a later
-        // outbound send call would find this record via
-        // [tryLoadSession] and use it as if it were a normal existing
-        // session — encrypting on the RESPONDER's sending chain while
-        // the remote peer's INITIATOR ratchet expects messages from
-        // the INITIATOR's sending chain. The diagnostic tag here is a
-        // prerequisite for the outbound guard added in a subsequent
-        // iteration; this iteration adds the tag only.
+        // session record with [SessionRole.RESPONDER]: it records that
+        // this side opened the session by accepting the peer's X3DH
+        // header. The tag is diagnostic and feeds the pending/active
+        // machine; since 2026-09-10 it no longer decides whether the
+        // session may send -- the ratchet's sender-side DH step covers
+        // a responder's first send.
         val state = rawState.copy(role = SessionRole.RESPONDER)
 
         // F15 invariant — for the recipient side the ratchet seed is the

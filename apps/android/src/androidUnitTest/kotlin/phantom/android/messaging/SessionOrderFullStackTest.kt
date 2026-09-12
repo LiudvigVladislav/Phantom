@@ -47,6 +47,7 @@ import phantom.core.storage.SqlDelightConversationRepository
 import phantom.core.storage.SqlDelightDecryptFailedEnvelopeRepository
 import phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository
 import phantom.core.storage.SqlDelightLocalSignedPreKeyRepository
+import phantom.core.storage.SqlDelightLastSeenSeqRepository
 import phantom.core.storage.SqlDelightMessageRepository
 import phantom.core.storage.SqlDelightOpkReservationRepository
 import phantom.core.storage.SqlDelightPendingRatchetStateRepository
@@ -62,6 +63,8 @@ import phantom.core.transport.ConnectOwnership
 import phantom.core.transport.ConnectWalkHandle
 import phantom.core.transport.Handover
 import phantom.core.transport.KtorRelayTransport
+import phantom.core.transport.CursorUpsertOutcome
+import phantom.core.transport.LongPollCursorRepository
 import phantom.core.transport.PollEnvelope
 import phantom.core.transport.PollResponse
 import phantom.core.transport.PreKeyApi
@@ -150,6 +153,8 @@ class SessionOrderFullStackTest {
     private val orchestrators = mutableListOf<RestFallbackOrchestrator>()
     private val scopes = mutableListOf<CoroutineScope>()
     private val drivers = mutableListOf<JdbcSqliteDriver>()
+    /** The relay's sequence counter: one per test, shared by every rig and relay instance within it. */
+    private val relaySeq = java.util.concurrent.atomic.AtomicLong(0L)
 
     /**
      * Owns the close ATTEMPTS. They are issued here rather than run
@@ -262,24 +267,36 @@ class SessionOrderFullStackTest {
     // ── A relay that behaves like the real one about redelivery ─────────
 
     /**
-     * Holds envelopes until they are acked and keeps offering the unacked
-     * ones, round-robin, one per poll -- the documented server contract
-     * ("the server retains the envelope until the client sends
-     * ackDeliver; subsequent poll calls keep returning the same envelope
-     * until acked").
+     * The production relay's queue contract, as measured in
+     * `services/relay/src/rest_fallback.rs` and `m4_adapters.rs`
+     * (2026-09-12): envelopes are kept in sequence order, a poll returns
+     * the FIRST retained envelope with `seq > since_seq` and never more
+     * than one (`POLL_MAX_ENVELOPES = 1`), and an envelope stays retained
+     * until `/relay/ack-deliver` succeeds. This is strict head-of-line:
+     * an unacknowledged sequence is offered again on every poll with the
+     * same `since_seq`, and every later sequence is hidden behind it.
      *
-     * Round-robin rather than strict head-of-line so a later envelope can
-     * arrive while an earlier one is outstanding, which is what the field
-     * run showed.
+     * An earlier version of this fake rotated unacknowledged envelopes
+     * round-robin and ignored `sinceSeq` so that a later envelope could
+     * arrive while an earlier one was outstanding. That is not what the
+     * relay does, and it masked the head-of-line deadlock seen on the
+     * phone (durable cursor 147, held envelope at sequence 156, every poll
+     * returning 156). Only the client's own scan position can move a poll
+     * past a retained sequence now, which is exactly what the tests below
+     * measure.
+     *
+     * [withheld] models an envelope that has not (yet) reached the relay:
+     * it is simply not offered, whatever its sequence.
      *
      * [onAck] runs INSIDE `ackDeliver`, so the rig can observe what was
      * already durable at the instant the ack left the client. That is the
      * only place where ACK-after-persistence can be measured: asserting
      * "the row appeared" and then "the ack appeared" passes even when the
-     * ack came first.
+     * ack came first. It is a `var` so a restarted rig over the same
+     * relay can point it at its own repositories.
      */
     private class FakeRelay(
-        private val onAck: suspend (String) -> Unit = {},
+        @Volatile var onAck: suspend (String) -> Unit = {},
     ) : RestFallbackTransport {
         private val queued = Collections.synchronizedList(mutableListOf<PollEnvelope>())
         val acked: MutableList<String> = Collections.synchronizedList(mutableListOf<String>())
@@ -287,19 +304,28 @@ class SessionOrderFullStackTest {
         val dropAcks = java.util.concurrent.atomic.AtomicBoolean(false)
         val polls = AtomicInteger(0)
         val withheld = Collections.synchronizedSet(mutableSetOf<String>())
-        private var cursor = 0
+        /** Every poll, in order: the `since_seq` asked for and the envelope id offered (null = none). */
+        val offered: MutableList<Pair<Long?, String?>> = Collections.synchronizedList(mutableListOf())
+
+        // Iterating a synchronizedList outside its monitor races the
+        // writer (the earlier `trace` fault). Every multi-element read
+        // goes through a snapshot taken under the list's own monitor;
+        // `x in acked` is a single synchronized call and stays as is.
+        fun offeredSnapshot(): List<Pair<Long?, String?>> = synchronized(offered) { offered.toList() }
+        fun ackedSnapshot(): List<String> = synchronized(acked) { acked.toList() }
 
         fun enqueue(env: PollEnvelope) {
-            synchronized(queued) { queued.add(env) }
+            synchronized(queued) {
+                queued.add(env)
+                queued.sortBy { it.seq }
+            }
         }
 
         fun outstanding(): List<String> = synchronized(queued) { queued.map { it.id } }
 
-        private fun nextEnvelope(): PollEnvelope? = synchronized(queued) {
-            val available = queued.filter { it.id !in withheld }
-            if (available.isEmpty()) return null
-            if (cursor >= available.size) cursor = 0
-            available[cursor++]
+        private fun nextEnvelope(sinceSeq: Long?): PollEnvelope? = synchronized(queued) {
+            val since = sinceSeq ?: 0L
+            queued.firstOrNull { it.id !in withheld && it.seq > since }
         }
 
         override suspend fun authSession(
@@ -334,7 +360,8 @@ class SessionOrderFullStackTest {
             readTimeoutMs: Long?,
         ): RestFallbackResponse<PollResponse> {
             polls.incrementAndGet()
-            val env = nextEnvelope()
+            val env = nextEnvelope(sinceSeq)
+            offered.add(sinceSeq to env?.id)
             return RestFallbackResponse(
                 statusCode = 200,
                 bodyParsed = PollResponse(envelopes = listOfNotNull(env), more = false),
@@ -360,7 +387,6 @@ class SessionOrderFullStackTest {
             acked.add(body.id)
             synchronized(queued) {
                 queued.removeAll { it.id == body.id }
-                cursor = 0
             }
             return RestFallbackResponse(
                 statusCode = 200,
@@ -520,10 +546,30 @@ class SessionOrderFullStackTest {
         val failHeldStorage: (Boolean) -> Unit,
         val transport: phantom.core.transport.RelayTransport,
         val deliver: (which: String, messageId: String) -> Unit,
+        /** The persisted REST poll cursor (`transport_seq_state`), the durable completion boundary. */
+        val lastSeen: SqlDelightLastSeenSeqRepository,
+        /** Every genuine forward write of that cursor, in order. */
+        val cursorWrites: MutableList<Long>,
+        val identityHex: String,
     ) {
         suspend fun texts(): List<String?> =
             messages.getMessages(convId).map { it.plaintextCache }
+
+        suspend fun persistedCursor(): Long? = lastSeen.getLastSeenSeq(identityHex)
+
+        /** Snapshot under the list's monitor; see [FakeRelay.offeredSnapshot]. */
+        fun cursorWritesSnapshot(): List<Long> = synchronized(cursorWrites) { cursorWrites.toList() }
+        fun ackObservationsSnapshot(): List<Pair<String, Boolean>> =
+            synchronized(ackObservations) { ackObservations.toList() }
     }
+
+    /**
+     * Test hook on the orchestrator's trace line. Set by a case that must
+     * hold a specific point (it runs on the orchestrator's calling
+     * thread, so it may block that caller and only that caller); null
+     * otherwise. Cleared by the case that set it.
+     */
+    private val deferralHook = java.util.concurrent.atomic.AtomicReference<((String) -> Unit)?>(null)
 
     @OptIn(ExperimentalEncodingApi::class)
     private suspend fun buildRig(
@@ -537,6 +583,8 @@ class SessionOrderFullStackTest {
         dbFile: java.io.File? = null,
         /** Non-null = reopen an existing database as the same receiver. */
         reuse: RigSeed? = null,
+        /** Non-null = keep polling the SAME relay (its retained copies and sequence numbers) after a restart. */
+        existingRelay: FakeRelay? = null,
     ): Rig {
         com.ionspin.kotlin.crypto.LibsodiumInitializer.initialize()
         ShadowLog.clear()
@@ -838,12 +886,26 @@ class SessionOrderFullStackTest {
             },
             log = { line -> trace.add(line) },
         )
-        val relay = FakeRelay(
-            onAck = { id ->
-                // The durable state read at the instant of the ack.
-                ackObservations.add(id to (realMessages.getMessageById(id) != null))
-            },
-        )
+        val relay = existingRelay ?: FakeRelay()
+        relay.onAck = { id ->
+            // The durable state read at the instant of the ack.
+            ackObservations.add(id to (realMessages.getMessageById(id) != null))
+        }
+        // The persisted poll cursor, wired the way AppContainer wires it:
+        // the SQLDelight repository behind the orchestrator's cursor seam.
+        // Without it the orchestrator polls with `since_seq = null`, and a
+        // strict relay could never be told apart from a lenient one.
+        val lastSeen = SqlDelightLastSeenSeqRepository(db)
+        val cursorWrites: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+        val cursor = object : LongPollCursorRepository {
+            override suspend fun getLastSeenSeq(identityHex: String): Long? =
+                lastSeen.getLastSeenSeq(identityHex)
+            override suspend fun upsertLastSeenSeq(identityHex: String, seq: Long, nowMs: Long): CursorUpsertOutcome =
+                when (val existing = lastSeen.upsertLastSeenSeq(identityHex, seq, nowMs)) {
+                    null -> { cursorWrites.add(seq); CursorUpsertOutcome.Advanced(seq) }
+                    else -> CursorUpsertOutcome.NoChange(existing)
+                }
+        }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also { scopes += it }
         val ws = KtorRelayTransport(
             httpClientFactory = { error("the rig must never open a websocket") },
@@ -856,7 +918,7 @@ class SessionOrderFullStackTest {
             signChallenge = { ByteArray(64) { 0xDD.toByte() } },
             transport = relay,
             now = { 0L },
-            log = { line -> trace.add(line) },
+            log = { line -> trace.add(line); deferralHook.get()?.invoke(line) },
             // Same flags the existing hybrid integration test uses.
             // Without them the Mode-2 signature is only observed and the
             // poll loop stays stopped with `reason=ws_active`.
@@ -865,6 +927,9 @@ class SessionOrderFullStackTest {
             reconnectQuiescenceEnabled = true,
             currentKindProvider = { TransportKind.Direct },
             egressGate = egressGate,
+            cursorRepository = cursor,
+            // The real held registry: a scan entry is valid only while its row exists.
+            heldEnvelopeExists = { envelopeId -> held.existsByEnvelopeId(envelopeId) },
         ).also { orchestrators += it }
         val hybrid = HybridRelayTransport(
             wsTransport = ws,
@@ -910,7 +975,6 @@ class SessionOrderFullStackTest {
             ),
         )
 
-        var seq = 1L
         return Rig(
             seed = seed,
             relay = relay,
@@ -939,6 +1003,7 @@ class SessionOrderFullStackTest {
                 else "DROP TRIGGER IF EXISTS refuse_held", 0)
             },
             deliver = { which, messageId ->
+                val seq = relaySeq.incrementAndGet()
                 relay.enqueue(
                     PollEnvelope(
                         id = messageId,
@@ -946,11 +1011,14 @@ class SessionOrderFullStackTest {
                         sealedSenderBase64 = sealedSender,
                         payloadBase64 = payloads.getValue(which),
                         sequenceTs = 1_000L + seq,
-                        seq = seq++,
+                        seq = seq,
                         seqMac = "",
                     ),
                 )
             },
+            lastSeen = lastSeen,
+            cursorWrites = cursorWrites,
+            identityHex = bobIdentity.publicKeyHex,
         )
     }
 
@@ -2939,6 +3007,411 @@ class SessionOrderFullStackTest {
             "a control consumer never finished; the database is left open deliberately",
         )
     }
+
+    // ── 5. Queue progress past a durably held barrier (2026-09-12) ──────
+    //
+    // The relay is strict head-of-line (see [FakeRelay]). A held,
+    // unacknowledged envelope must not stop later envelopes from being
+    // fetched, and the durable ACK cursor must never pass it. The cases
+    // below read three things the rig now exposes: what `since_seq` each
+    // poll asked for and what it got (`relay.offered`), the persisted
+    // cursor (`persistedCursor()`), and every genuine cursor write
+    // (`cursorWrites`).
+
+    /** The relay model itself: strict order, `seq > sinceSeq`, one envelope, retained until ACK. */
+    @Test
+    fun strict_relay_repeats_an_unacknowledged_sequence_and_hides_later_ones() = runBlocking {
+        val relay = FakeRelay()
+        fun env(seq: Long) = PollEnvelope(
+            id = "env-$seq", fromHex = "", sealedSenderBase64 = "", payloadBase64 = "",
+            sequenceTs = seq, seq = seq, seqMac = "",
+        )
+        relay.enqueue(env(2L)); relay.enqueue(env(1L)) // arrival order is not queue order
+        suspend fun poll(since: Long?): List<String> =
+            relay.poll("u", "t", since, false, null).bodyParsed!!.envelopes.map { it.id }
+        assertEquals(listOf("env-1"), poll(null))
+        assertEquals(listOf("env-1"), poll(null), "unacknowledged: offered again, and only it")
+        assertEquals(listOf("env-1"), poll(0L))
+        assertEquals(listOf("env-2"), poll(1L), "only a higher since_seq reveals the next sequence")
+        assertEquals(emptyList(), poll(2L))
+        relay.ackDeliver("u", "t", AckDeliverRequest(id = "env-1"))
+        assertEquals(listOf("env-2"), poll(null), "after the ACK the next retained envelope is first")
+        relay.withheld.add("env-2")
+        assertEquals(emptyList(), poll(null), "a withheld envelope is not offered")
+        assertEquals(listOf(null, null, 0L, 1L, 2L, null, null), relay.offeredSnapshot().map { it.first })
+        assertEquals(listOf("env-2"), relay.outstanding())
+    }
+
+    /** A durable hold moves the temporary scan position only; the barrier is never ACKed. */
+    @Test
+    fun full_stack_a_durable_hold_moves_only_the_scan_position_and_sends_no_ack() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        awaitTrue("durable cursor at S") { rig.persistedCursor() == 1L }
+        rig.deliver("B", "env-B")
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("the poll moves past the held B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        assertEquals(1L, rig.persistedCursor(), "the durable cursor stays before the barrier")
+        assertEquals(listOf(1L), rig.cursorWritesSnapshot())
+        assertFalse("env-B" in rig.relay.acked)
+        assertTrue("env-B" in rig.relay.outstanding(), "the relay keeps its copy")
+        assertFalse(rig.ackObservationsSnapshot().any { it.first == "env-B" }, "no ACK request was ever made for the barrier")
+        assertTrue(logLines("inbound_deferred_held").any { "id=env-B" in it && "ScanAdvanced" in it })
+    }
+
+    /** A later envelope commits and is ACKed; the durable cursor still stops before the unresolved barrier. */
+    @Test
+    fun full_stack_a_later_commit_is_acked_while_the_durable_cursor_stays_before_an_unresolved_barrier() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("A_FORGED", "env-forged") // seq 2: held, never resolvable
+        awaitTrue("forgery held") { rig.held.existsByEnvelopeId("env-forged") }
+        awaitTrue("scan past the forgery") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        rig.deliver("A", "env-A") // seq 3: genuine, commits
+        awaitTrue("A ACK") { "env-A" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A), rig.texts())
+        letPollsElapse(rig, 2)
+        assertEquals(1L, rig.persistedCursor(), "the durable cursor may not pass the unresolved barrier")
+        assertTrue(rig.cursorWritesSnapshot().all { it <= 1L }, "no cursor write ever passed the barrier: " + rig.cursorWritesSnapshot())
+        assertTrue(traceSnapshot().any { "cursor_bounded" in it && "acked_seq=3" in it && "persist_seq=1" in it })
+        assertTrue(rig.held.existsByEnvelopeId("env-forged"))
+        assertFalse("env-forged" in rig.relay.acked)
+        assertTrue("env-forged" in rig.relay.outstanding())
+    }
+
+    /** A refused held-row write advances nothing; the relay offers the same envelope again. */
+    @Test
+    fun full_stack_a_failed_held_row_write_moves_neither_position_and_the_relay_offers_the_same_envelope_again() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        val offeredBefore = rig.relay.offeredSnapshot().size
+        rig.failHeldStorage(true)
+        rig.deliver("A_FORGED", "env-forged") // seq 2: MAC failure, hold write refused
+        letPollsElapse(rig, 4)
+        val since = rig.relay.offeredSnapshot().drop(offeredBefore)
+        assertTrue(since.size >= 4)
+        assertTrue(
+            since.all { it.first == 1L && it.second == "env-forged" },
+            "every poll asks from the durable cursor and is given the same envelope: " + since,
+        )
+        assertEquals(0, rig.held.count(), "nothing was durably held")
+        assertEquals(1L, rig.persistedCursor())
+        assertFalse("env-forged" in rig.relay.acked)
+        assertTrue("env-forged" in rig.relay.outstanding())
+        assertTrue(logLines("hold_storage_error").isNotEmpty())
+        assertFalse(logLines("inbound_deferred_held").any { "id=env-forg" in it }, "a failed hold never reports a durable deferral")
+        rig.failHeldStorage(false)
+        awaitTrue("the surviving relay copy is held once storage returns") { rig.held.existsByEnvelopeId("env-forged") }
+        awaitTrue("and only then does the scan move") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        assertEquals(1L, rig.persistedCursor())
+    }
+
+    /**
+     * Restart over a file database. The scan position is process-local,
+     * so the new process polls from the durable cursor, the relay offers
+     * the barrier once more, the durable held registry recognises it
+     * without decrypting or ACKing, and the scan position is
+     * re-established. Local replay still finishes it when its
+     * predecessor arrives.
+     */
+    @Test
+    fun restart_re_establishes_the_scan_position_from_the_held_registry_without_an_ack() = runBlocking {
+        val dbFile = java.io.File.createTempFile("held-barrier-restart", ".db")
+        dbFile.delete()
+        try {
+            val first = buildRig(dbFile = dbFile)
+            first.deliver("S", "env-S")
+            awaitTrue("S ACK") { "env-S" in first.relay.acked }
+            awaitTrue("cursor at S") { first.persistedCursor() == 1L }
+            first.deliver("B", "env-B")
+            awaitTrue("B held") { first.held.existsByEnvelopeId("env-B") }
+            awaitTrue("scan past B") { first.relay.offeredSnapshot().any { it.first == 2L } }
+            assertEquals(1L, first.persistedCursor())
+            val problems = releaseResources(
+                closeActions = orchestrators.map { o -> suspend { o.close() } },
+                scopes = scopes.toList(), drivers = drivers.toList(),
+            )
+            orchestrators.clear(); scopes.clear(); drivers.clear()
+            assertEquals(emptyList(), problems)
+            val offeredAtRestart = first.relay.offeredSnapshot().size
+            // Same relay, same retained copy of B; a fresh process over the same file.
+            val second = buildRig(reuse = first.seed, existingRelay = first.relay)
+            awaitTrue("the relay offers the barrier again, from the durable cursor") {
+                second.relay.offeredSnapshot().drop(offeredAtRestart).any { it.first == 1L && it.second == "env-B" }
+            }
+            awaitTrue("the durable registry re-establishes the scan position") {
+                second.relay.offeredSnapshot().drop(offeredAtRestart).any { it.first == 2L }
+            }
+            val afterRestart = second.relay.offeredSnapshot().drop(offeredAtRestart)
+            val scanIndex = afterRestart.indexOfFirst { it.first == 2L }
+            assertTrue(afterRestart.take(scanIndex).all { it.first == 1L && it.second == "env-B" })
+            assertTrue(afterRestart.drop(scanIndex).none { it.second == "env-B" }, "once re-established, B is not offered again")
+            assertTrue(second.held.existsByEnvelopeId("env-B"))
+            assertFalse("env-B" in second.relay.acked)
+            assertEquals(1L, second.persistedCursor())
+            assertTrue(logLines("DECRYPT_TRACE attempt").none { "msgId=env-B" in it }, "recognised as held: not decrypted again")
+            assertTrue(logLines("inbound_deferred_held").any { "id=env-B" in it && "ScanAdvanced" in it })
+            second.deliver("A", "env-A")
+            awaitTrue("the gap drains and B completes") { "env-B" in second.relay.acked }
+            assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), second.texts())
+            awaitTrue("the durable cursor advances past the resolved barrier") { second.persistedCursor() == 3L }
+            assertEquals(emptyList(), second.relay.outstanding())
+        } finally {
+            // @After confirms resource completion before cleaning up files.
+            dbFile.deleteOnExit()
+        }
+    }
+
+    /** Two barriers: later envelopes still arrive, and the durable cursor never leaps over the first unresolved one. */
+    @Test
+    fun full_stack_multiple_held_barriers_do_not_block_later_envelopes_or_let_the_cursor_leap() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B") // seq 2, held (needs A)
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        rig.deliver("C", "env-C") // seq 3, held (needs A and B)
+        awaitTrue("C held") { rig.held.existsByEnvelopeId("env-C") }
+        awaitTrue("scan past C") { rig.relay.offeredSnapshot().any { it.first == 3L } }
+        assertEquals(1L, rig.persistedCursor(), "two barriers: the durable cursor is still before the first")
+        assertEquals(listOf(TEXT_S), rig.texts())
+        rig.deliver("A", "env-A") // seq 4: commits and drains the gap
+        awaitTrue("B ACK") { "env-B" in rig.relay.acked }
+        awaitTrue("C ACK") { "env-C" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B, TEXT_C), rig.texts())
+        assertEquals(0, rig.held.count())
+        awaitTrue("the cursor reaches the last acknowledged sequence") { rig.persistedCursor() == 4L }
+        // A's ACK (seq 4) could not be persisted while B and C were unresolved;
+        // B's ACK persisted C-1 = 2; C's ACK caught up to the highest acked seq.
+        assertEquals(listOf(1L, 2L, 4L), rig.cursorWritesSnapshot())
+        assertEquals(emptyList(), rig.relay.outstanding())
+    }
+
+    /** A replayed barrier commits once, its ACK leaves after the durable row, and the cursor moves only then. */
+    @Test
+    fun full_stack_a_replayed_barrier_completes_once_and_the_durable_cursor_moves_after_its_ack() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B")
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        rig.deliver("A", "env-A")
+        awaitTrue("B ACK") { "env-B" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts(), "each message exactly once")
+        assertEquals(1, rig.relay.ackedSnapshot().count { it == "env-B" })
+        assertTrue(rig.processed.exists("env-B"))
+        assertFalse(rig.held.existsByEnvelopeId("env-B"))
+        assertTrue(rig.ackObservationsSnapshot().filter { it.first == "env-B" }.all { it.second }, "the ACK left after the row was durable")
+        awaitTrue("the durable cursor covers both") { rig.persistedCursor() == 3L }
+        assertEquals(listOf(1L, 3L), rig.cursorWritesSnapshot())
+        assertEquals(emptyList(), rig.relay.outstanding())
+    }
+
+    /** Authenticity is untouched: a forgery stays held past the scan, the ratchet does not move, the genuine position lands. */
+    @Test
+    fun full_stack_a_forgery_stays_held_past_the_scan_and_the_genuine_position_still_lands() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        val state = rig.ratchetStates.getRatchetState(rig.convId)
+        rig.deliver("A_FORGED", "env-forged")
+        awaitTrue("forgery held") { rig.held.existsByEnvelopeId("env-forged") }
+        awaitTrue("scan past the forgery") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        assertEquals(state, rig.ratchetStates.getRatchetState(rig.convId), "the ratchet did not advance on a forgery")
+        assertFalse("env-forged" in rig.relay.acked)
+        assertFalse(rig.processed.exists("env-forged"))
+        assertTrue("env-forged" in rig.relay.outstanding())
+        rig.deliver("A", "env-A")
+        awaitTrue("genuine A lands") { "env-A" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A), rig.texts())
+        assertTrue(rig.held.existsByEnvelopeId("env-forged"), "still held")
+        assertFalse("env-forged" in rig.relay.acked)
+        assertEquals(1L, rig.persistedCursor(), "the forgery is an unresolved barrier: the cursor stays before it")
+    }
+
+
+    // ── 6. The scan position is only as good as the durable held row ────
+
+    /**
+     * The 24-hour sweep removes the held row (the same repository call the
+     * sweep makes, without waiting a day). With no durable copy left, the
+     * scan entry is revoked at the next poll, the relay copy is offered
+     * again from the durable cursor, and it is held again. No ACK at any
+     * point; the durable cursor never moved.
+     */
+    @Test
+    fun full_stack_evicting_the_held_row_revokes_the_scan_and_the_relay_copy_is_offered_again() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B")
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        val beforeEviction = rig.relay.offeredSnapshot().size
+        rig.held.deleteOlderThan(Long.MAX_VALUE) // what the TTL sweep does, today
+        assertEquals(0L, rig.held.count())
+        awaitTrue("the relay copy is offered again from the durable cursor") {
+            rig.relay.offeredSnapshot().drop(beforeEviction).any { it.first == 1L && it.second == "env-B" }
+        }
+        assertTrue(traceSnapshot().any { it.startsWith("REST_TRACE scan_revoked id=env-B seq=2 reason=held_row_gone") })
+        awaitTrue("held again") { rig.held.existsByEnvelopeId("env-B") }
+        // Index of the re-offer; a poll that computed since_seq=2 before the
+        // eviction may still be recorded after `beforeEviction`, so the
+        // re-established scan is looked for strictly after the re-offer.
+        val reOffer = beforeEviction + rig.relay.offeredSnapshot().drop(beforeEviction)
+            .indexOfFirst { it.first == 1L && it.second == "env-B" }
+        awaitTrue("scan re-established") { rig.relay.offeredSnapshot().drop(reOffer + 1).any { it.first == 2L } }
+        assertFalse("env-B" in rig.relay.acked, "never acknowledged")
+        assertFalse(rig.ackObservationsSnapshot().any { it.first == "env-B" })
+        assertEquals(1L, rig.persistedCursor())
+        assertTrue("env-B" in rig.relay.outstanding())
+        rig.deliver("A", "env-A")
+        awaitTrue("the gap drains and B completes") { "env-B" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B), rig.texts())
+        awaitTrue("cursor covers both") { rig.persistedCursor() == 3L }
+    }
+
+    /** Two barriers, one row removed: only that entry is revoked; the other keeps shielding its sequence. */
+    @Test
+    fun full_stack_removing_one_of_two_held_rows_revokes_only_its_scan_entry() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B") // seq 2
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        rig.deliver("C", "env-C") // seq 3
+        awaitTrue("C held") { rig.held.existsByEnvelopeId("env-C") }
+        awaitTrue("scan past C") { rig.relay.offeredSnapshot().any { it.first == 3L } }
+        val before = rig.relay.offeredSnapshot().size
+        rig.held.deleteByEnvelopeId("env-C")
+        awaitTrue("C is offered again, from B's scan position") {
+            rig.relay.offeredSnapshot().drop(before).any { it.first == 2L && it.second == "env-C" }
+        }
+        assertTrue(rig.relay.offeredSnapshot().drop(before).none { it.second == "env-B" }, "B's entry was not revoked")
+        assertTrue(traceSnapshot().any { it.startsWith("REST_TRACE scan_revoked id=env-C seq=3") })
+        assertTrue(traceSnapshot().none { it.startsWith("REST_TRACE scan_revoked id=env-B") })
+        awaitTrue("C held again") { rig.held.existsByEnvelopeId("env-C") }
+        val reOffer = before + rig.relay.offeredSnapshot().drop(before)
+            .indexOfFirst { it.first == 2L && it.second == "env-C" }
+        awaitTrue("scan past C again") { rig.relay.offeredSnapshot().drop(reOffer + 1).any { it.first == 3L } }
+        assertEquals(1L, rig.persistedCursor())
+        assertFalse("env-B" in rig.relay.acked); assertFalse("env-C" in rig.relay.acked)
+        rig.deliver("A", "env-A")
+        awaitTrue("everything drains") { "env-C" in rig.relay.acked && "env-B" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B, TEXT_C), rig.texts())
+        assertEquals(0L, rig.held.count())
+    }
+
+    /**
+     * Round 3 (review R2 P1): two barriers, and it is the EARLIER row that
+     * disappears. C's entry alone must not carry the poll past B's
+     * sequence -- the relay only returns `seq > since_seq`, and C's own
+     * recovery may depend on B. B is offered again from the durable cursor,
+     * held again, and only then does the poll resume past C.
+     */
+    @Test
+    fun full_stack_removing_the_earlier_of_two_held_rows_brings_its_relay_copy_back() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B") // seq 2
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        rig.deliver("C", "env-C") // seq 3
+        awaitTrue("C held") { rig.held.existsByEnvelopeId("env-C") }
+        awaitTrue("scan past C") { rig.relay.offeredSnapshot().any { it.first == 3L } }
+        val before = rig.relay.offeredSnapshot().size
+        rig.held.deleteByEnvelopeId("env-B")
+        awaitTrue("B is offered again, from the durable cursor") {
+            rig.relay.offeredSnapshot().drop(before).any { it.first == 1L && it.second == "env-B" }
+        }
+        assertTrue(traceSnapshot().any { it.startsWith("REST_TRACE scan_revoked id=env-B seq=2") })
+        assertTrue(traceSnapshot().none { it.startsWith("REST_TRACE scan_revoked id=env-C") })
+        assertFalse("env-B" in rig.relay.acked); assertFalse("env-C" in rig.relay.acked)
+        assertEquals(1L, rig.persistedCursor())
+        awaitTrue("B held again") { rig.held.existsByEnvelopeId("env-B") }
+        val reOffer = before + rig.relay.offeredSnapshot().drop(before)
+            .indexOfFirst { it.first == 1L && it.second == "env-B" }
+        awaitTrue("the poll resumes past C") { rig.relay.offeredSnapshot().drop(reOffer + 1).any { it.first == 3L } }
+        assertTrue(rig.relay.offeredSnapshot().drop(before).none { it.second == "env-C" }, "C stayed shielded throughout")
+        assertTrue(rig.held.existsByEnvelopeId("env-C"))
+        assertEquals(1L, rig.persistedCursor())
+        assertFalse(rig.ackObservationsSnapshot().any { it.first == "env-B" || it.first == "env-C" })
+        rig.deliver("A", "env-A") // seq 4
+        awaitTrue("B and C drain after A") { "env-B" in rig.relay.acked && "env-C" in rig.relay.acked }
+        assertEquals(listOf(TEXT_S, TEXT_A, TEXT_B, TEXT_C), rig.texts())
+        assertEquals(0L, rig.held.count())
+        awaitTrue("cursor covers everything") { rig.persistedCursor() == 4L }
+        assertEquals(emptyList(), rig.relay.outstanding())
+    }
+
+    /** With the held row in place the scan position holds across polls: the re-check revokes nothing. */
+    @Test
+    fun full_stack_the_scan_position_holds_while_the_held_row_exists() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        rig.deliver("B", "env-B")
+        awaitTrue("B held") { rig.held.existsByEnvelopeId("env-B") }
+        awaitTrue("scan past B") { rig.relay.offeredSnapshot().any { it.first == 2L } }
+        val from = rig.relay.offeredSnapshot().indexOfFirst { it.first == 2L }
+        letPollsElapse(rig, 4)
+        val later = rig.relay.offeredSnapshot().drop(from)
+        assertTrue(later.size >= 4)
+        assertTrue(later.all { it.first == 2L && it.second == null }, "every later poll asks past B and gets nothing: " + later)
+        assertTrue(traceSnapshot().none { it.startsWith("REST_TRACE scan_revoked") })
+        assertTrue(rig.held.existsByEnvelopeId("env-B"))
+        assertFalse("env-B" in rig.relay.acked)
+        assertEquals(1L, rig.persistedCursor())
+    }
+
+    /**
+     * Order inside `HybridRelayTransport.deferInboundHeld`: the scan
+     * position is recorded BEFORE the dedup claim is released. The hook
+     * holds the deferral at the orchestrator's entry point (before the
+     * scan map is written, so the relay still re-offers B) for two more
+     * polls. Because the claim is still held, every re-offer is
+     * `inbound_skip_pending`; B is delivered to the service exactly once.
+     * With the claim released first, the re-offers would be fresh
+     * `inbound_deliver`s and B would be processed again.
+     */
+    @Test
+    fun full_stack_a_deferral_records_the_scan_before_releasing_the_dedup_claim() = runBlocking {
+        val rig = buildRig()
+        rig.deliver("S", "env-S")
+        awaitTrue("S ACK") { "env-S" in rig.relay.acked }
+        val windowStart = java.util.concurrent.atomic.AtomicInteger(-1)
+        val windowEnd = java.util.concurrent.atomic.AtomicInteger(-1)
+        deferralHook.set { line ->
+            if (line.startsWith("REST_TRACE inbound_held_deferral_begin id=env-B") && windowStart.get() < 0) {
+                windowStart.set(rig.relay.offeredSnapshot().size)
+                val target = rig.relay.polls.get() + 2
+                val deadline = System.currentTimeMillis() + 10_000L
+                while (rig.relay.polls.get() < target && System.currentTimeMillis() < deadline) Thread.sleep(25L)
+                windowEnd.set(rig.relay.offeredSnapshot().size)
+            }
+        }
+        rig.deliver("B", "env-B")
+        awaitTrue("the deferral window closed") { windowEnd.get() >= 0 }
+        deferralHook.set(null)
+        awaitTrue("scan past B after the window") { rig.relay.offeredSnapshot().drop(windowEnd.get()).any { it.first == 2L } }
+        val window = rig.relay.offeredSnapshot().subList(windowStart.get(), windowEnd.get())
+        assertTrue(window.size >= 2, "the relay was polled during the window: " + window)
+        assertTrue(window.all { it.first == 1L && it.second == "env-B" }, "the scan was not yet set, so B was re-offered: " + window)
+        assertEquals(1, logLines("inbound_deliver id=env-B").size, "B reached the service exactly once")
+        assertTrue(logLines("inbound_skip_pending id=env-B").size >= 2, "the claim was still held during the window")
+        assertTrue(rig.relay.offeredSnapshot().drop(windowEnd.get()).none { it.second == "env-B" }, "not re-offered once the scan is set")
+        assertFalse("env-B" in rig.relay.acked)
+        assertEquals(1L, rig.persistedCursor())
+        assertTrue(rig.held.existsByEnvelopeId("env-B"))
+    }
+
 
     private companion object {
         const val TEXT_S = "S: the message that established the session"

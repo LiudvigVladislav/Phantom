@@ -111,6 +111,12 @@ class PendingExpiryReceiveTest {
                     return true
                 }
                 override suspend fun parkInbound(messageId: String) { parked.add(messageId) }
+                // Interface delegation forwards every member NOT overridden here to the
+                // Ktor delegate, including the interface's default `deferInboundHeld`, which
+                // would then call the DELEGATE's `parkInbound` and never reach the `parked`
+                // queue above. A durable hold must signal completion the same way a plain
+                // park does, so the override is explicit.
+                override suspend fun deferInboundHeld(messageId: String) { parkInbound(messageId) }
             }
             val api = object : PreKeyApi {
                 override suspend fun fetchBundle(identityPubkeyHex: String, requesterPubkeyHex: String?): phantom.core.transport.PreKeyBundle {
@@ -205,21 +211,45 @@ class PendingExpiryReceiveTest {
         }
     }
 
+    /**
+     * First contact: a's bootstrap is delivered, so b holds the session a
+     * opened and a holds its own outbound INITIATOR pending -- the one real
+     * outbound pending a sender has, until the peer's reply promotes it.
+     * The returned frame carries that pending's `x3dhInit`.
+     *
+     * Until 2026-09-10 this setup went on to exchange a reply and a third
+     * message, relying on each change of direction re-bootstrapping (the
+     * former role guard) so that a ended up with a fresh pending. Replies
+     * now continue on the existing session, so a reply would promote a's
+     * pending and leave nothing to expire; the setup therefore stops at the
+     * point where the genuine pending exists and checks it is there.
+     */
     private suspend fun establish(a: Peer, b: Peer): WireFrame {
         val first = a.send("first")
+        val outbound = assertNotNull(a.pending.get(a.conversation), "a holds its outbound pending after the first send")
+        assertNotNull(outbound.bootstrapArtifactsBlob, "a's pending is its own INITIATOR pending, with bootstrap artifacts")
         b.deliver(first, "first"); b.assertDelivered("first")
         assertNull(b.opks.get(requireNotNull(first.x3dhInit?.opkKeyIdHex)))
-        val reply = b.send("reply")
-        a.deliver(reply, "reply"); a.assertDelivered("reply")
-        val next = a.send("next")
-        b.deliver(next, "next"); b.assertDelivered("next")
-        return next
+        assertNotNull(b.active.getRatchetState(b.conversation), "b holds the session a opened")
+        assertNotNull(a.pending.get(a.conversation), "a's outbound pending is still present: nothing has promoted it")
+        return first
+    }
+
+    /**
+     * Models the expiry of a's outbound pending: checks that the pending is
+     * there, then moves a's clock to exactly PENDING_TTL_MS after the
+     * pending's reservation, the first instant at which the service no
+     * longer reuses it.
+     */
+    private suspend fun expireOutboundPending(a: Peer) {
+        val outbound = assertNotNull(a.pending.get(a.conversation), "an outbound pending must exist before it can expire")
+        a.now = outbound.reservedAtMs + DefaultMessagingService.PENDING_TTL_MS
     }
 
     @Test fun expiry_with_available_prekeys_delivers_and_consumes_a_new_key_once() = runBlocking {
         peers { a, b ->
             val before = establish(a, b)
-            a.now += DefaultMessagingService.PENDING_TTL_MS
+            expireOutboundPending(a)
             val after = a.send("after-expiry")
             assertNotEquals(before.x3dhInit, after.x3dhInit)
             val opk = requireNotNull(after.x3dhInit?.opkKeyIdHex)
@@ -247,7 +277,7 @@ class PendingExpiryReceiveTest {
     @Test fun a_locked_bootstrap_recovers_without_new_inbound_when_prekey_access_returns() = runBlocking {
         peers { a, b ->
             establish(a, b)
-            a.now += DefaultMessagingService.PENDING_TTL_MS
+            expireOutboundPending(a)
             val frame = a.send("locked-bootstrap")
             val opk = requireNotNull(frame.x3dhInit?.opkKeyIdHex)
             val activeBefore = b.active.getRatchetState(b.conversation)
@@ -297,7 +327,7 @@ class PendingExpiryReceiveTest {
     @Test fun a_legacy_mac_classification_gets_one_compatibility_recheck() = runBlocking {
         peers { a, b ->
             establish(a, b)
-            a.now += DefaultMessagingService.PENDING_TTL_MS
+            expireOutboundPending(a)
             val frame = a.send("legacy-held")
             b.access.locked = true
             b.deliver(frame, "legacy-held")
@@ -314,7 +344,7 @@ class PendingExpiryReceiveTest {
     @Test fun restored_prekey_access_does_not_make_a_forgery_authentic() = runBlocking {
         peers { a, b ->
             establish(a, b)
-            a.now += DefaultMessagingService.PENDING_TTL_MS
+            expireOutboundPending(a)
             val real = a.send("genuine")
             val forged = real.copy(encryptedMessage = real.encryptedMessage.copy(
                 ciphertext = real.encryptedMessage.ciphertext.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }))
