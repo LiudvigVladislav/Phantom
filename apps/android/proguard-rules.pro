@@ -57,6 +57,65 @@
 
 
 # --------------------------------------------------------------------------
+# gomobile binding for the vendored Xray runtime (go.**, libXray.**)
+# --------------------------------------------------------------------------
+# Release-only SIGABRT, found on a TECNO BF7 during Stage 2 physical
+# acceptance (2026-09-14). Losing the network drove the transport lifecycle
+# into the vendored Xray runtime and the process aborted three times with:
+#
+#   Fatal signal 6 (SIGABRT) in DefaultDispatch
+#   Abort message: 'failed to find method Seq.getRef'
+#   libgojni.so (Java_go_Seq_init+504)
+#
+# Why the catch-all above is NOT enough, and this is the part that is easy
+# to get wrong:
+#
+#   `-keepclasseswithmembernames` preserves NAMES. It does not prevent
+#   SHRINKING. The gomobile binding classes are never referenced from Java
+#   -- Go reaches them through JNI by name -- so R8 saw them as unused.
+#   `go.Seq` survived only because `Seq.init()` is native and reachable
+#   from its own `<clinit>`, and it survived as a shell: a static
+#   initialiser plus the private native `init()`, with every pure-Java
+#   member stripped. `go.Seq$Ref` and the whole `libXray` binding were
+#   removed outright.
+#
+# `Java_go_Seq_init` then resolves this surface by name and aborts the
+# process on the first miss. The names and descriptors the arm64
+# `libgojni.so` in the failing APK looks up are:
+#
+#   Seq.incRefnum       (I)V
+#   Seq.incRef          (Ljava/lang/Object;)I
+#   Seq.decRef          (I)V
+#   Seq.incGoObjectRef  (Lgo/Seq$GoObject;)I
+#   Seq.getRef          (I)Lgo/Seq$Ref;
+#   Seq.Ref             class go/Seq$Ref
+#   Seq.Ref.obj         field on that class
+#
+# The same library additionally resolves these classes with FindClass, so
+# they must keep their ORIGINAL names as well as their members:
+#
+#   go/Universe$proxyerror
+#   libXray/CountGeoDataRequest
+#   libXray/DialerController
+#   libXray/LibXray$proxyDialerController
+#   libXray/RunXrayFromJSONRequest
+#   libXray/RunXrayRequest
+#
+# `-keep` (not `-keepnames` / `-keepclasseswithmembernames`) is therefore
+# required: it is the only form that suppresses both shrinking and
+# obfuscation.
+#
+# Scope. This is narrow BY CONSTRUCTION, not by wildcard discipline: the
+# two packages are exactly the vendored
+# `shared/core/xray/src/androidMain/libs/libXray.jar`, which contains 18
+# classes and nothing else. No application package is kept here, and no
+# app-wide keep is introduced. If the jar is ever re-vendored, the pin
+# test and the DEX verifier below are what catch a surface change.
+-keep class go.** { *; }
+-keep class libXray.** { *; }
+
+
+# --------------------------------------------------------------------------
 # kotlinx.serialization
 # --------------------------------------------------------------------------
 # @Serializable classes are resolved at runtime via companion object

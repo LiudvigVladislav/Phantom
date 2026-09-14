@@ -1,4 +1,6 @@
+import java.io.File
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.android.application)
@@ -1405,6 +1407,469 @@ val verifyR8StripsTestSeams = tasks.register("verifyR8StripsTestSeams") {
     }
 }
 
+// --------------------------------------------------------------------------
+// verifyR8KeepsGomobileJniSurface — POSITIVE release verification
+// --------------------------------------------------------------------------
+// The companion of `verifyR8StripsTestSeams`. That task proves forbidden
+// surfaces are ABSENT; this one proves a required surface is PRESENT.
+// Stage 2 physical acceptance (2026-09-14) failed on exactly the gap
+// between those two statements: seam stripping was green while the
+// vendored gomobile runtime had been shrunk away, and the release process
+// aborted with `failed to find method Seq.getRef` out of
+// `Java_go_Seq_init` in `libgojni.so`.
+//
+// Why this reads the DEX and not `mapping.txt` or `proguard-rules.pro`:
+//
+//   - a grep of the rules file proves a rule was WRITTEN, not that it took
+//     effect, and the failing build had a rule (`-keepclasseswithmembernames`)
+//     that looked like it covered this and did not;
+//   - `mapping.txt` describes renaming. A class R8 removed outright is
+//     simply absent from it, so "not mentioned" is ambiguous between kept
+//     and deleted.
+//
+// Why it reads DEFINITIONS and not the id tables. The first version of this
+// check asked whether each required descriptor appeared in `type_ids`,
+// `method_ids` and `field_ids`. That was unsound, and an independent review
+// measured it: those tables are the DEX symbol REFERENCE pool, so a class
+// that some other class merely calls into is listed there even when its own
+// definition has been removed. A one-class probe that referenced all
+// thirteen entries and defined none of them passed the first version.
+//
+// So the check reads `class_defs` and each target's `class_data_item`:
+//
+//   - a class counts only when it has its own `class_def`;
+//   - a method or field counts only when it is an `encoded_method` /
+//     `encoded_field` of that class with the required name AND descriptor —
+//     a `getRef` that survived with the wrong signature would still abort
+//     the process;
+//   - the JNI shape is checked from `access_flags`: gomobile invokes the
+//     five `go.Seq` entry points through `CallStatic*Method`, and reads
+//     `go.Seq$Ref.obj` through `GetObjectField` on an instance, so a member
+//     that flipped between static and instance is a failure even though its
+//     name and descriptor are intact.
+//
+// The id tables are still parsed, but only to separate the two failure
+// modes in the report — "gone entirely" versus "referenced but not
+// defined" — which is precisely the distinction the first version missed.
+//
+// Self-test. Before reporting a pass this task rebuilds the artifact's DEX
+// images with every contract owner's `class_def` removed and nothing else
+// touched, then requires its own verdict to flip to a rejection of all
+// thirteen entries, each for the "referenced but not defined" reason. A
+// verifier that still passes that image is unsound and fails the build
+// rather than certifying it.
+//
+// Negative control. Point it at the known-broken artifact and it must fail:
+//
+//   ./gradlew :apps:android:verifyR8KeepsGomobileJniSurface \
+//       -PgomobileVerifyApk=/path/to/android-release-34a89021.apk
+
+/** `access_flags` bit for a static member, per the Dalvik executable format. */
+val ACC_STATIC = 0x8
+
+/** One entry of the JNI contract the vendored `libgojni.so` resolves by name. */
+data class GomobileJniEntry(
+    val kind: String,
+    val owner: String,
+    val name: String,
+    val descriptor: String,
+    /**
+     * Required JNI shape for member entries: `true` when the member must be
+     * static, `false` when it must be an instance member. Always null for a
+     * `class` entry.
+     */
+    val requiredStatic: Boolean? = null,
+) {
+    override fun toString(): String = when (kind) {
+        "class" -> owner
+        "field" -> owner + "->" + name + ":" + descriptor
+        else -> owner + "->" + name + descriptor
+    }
+}
+
+/**
+ * The surface this APK's arm64 `libgojni.so` looks up by name.
+ *
+ * Every method and field entry corresponds to a `failed to find ...`
+ * diagnostic compiled into that library; every class entry corresponds to a
+ * `FindClass` name string in it. The list is evidence-derived, not a guess:
+ * see the block comment on the keep rule in `proguard-rules.pro`.
+ *
+ * The static/instance column is taken from the vendored jar itself
+ * (`javap -private -s` on `go.Seq` and `go.Seq$Ref`), not assumed.
+ */
+val gomobileJniContract: List<GomobileJniEntry> = listOf(
+    GomobileJniEntry("method", "Lgo/Seq;", "incRefnum", "(I)V", requiredStatic = true),
+    GomobileJniEntry("method", "Lgo/Seq;", "incRef", "(Ljava/lang/Object;)I", requiredStatic = true),
+    GomobileJniEntry("method", "Lgo/Seq;", "decRef", "(I)V", requiredStatic = true),
+    GomobileJniEntry("method", "Lgo/Seq;", "incGoObjectRef", "(Lgo/Seq\$GoObject;)I", requiredStatic = true),
+    GomobileJniEntry("method", "Lgo/Seq;", "getRef", "(I)Lgo/Seq\$Ref;", requiredStatic = true),
+    GomobileJniEntry("class", "Lgo/Seq\$Ref;", "", ""),
+    GomobileJniEntry("field", "Lgo/Seq\$Ref;", "obj", "Ljava/lang/Object;", requiredStatic = false),
+    GomobileJniEntry("class", "Lgo/Universe\$proxyerror;", "", ""),
+    GomobileJniEntry("class", "LlibXray/CountGeoDataRequest;", "", ""),
+    GomobileJniEntry("class", "LlibXray/DialerController;", "", ""),
+    GomobileJniEntry("class", "LlibXray/LibXray\$proxyDialerController;", "", ""),
+    GomobileJniEntry("class", "LlibXray/RunXrayFromJSONRequest;", "", ""),
+    GomobileJniEntry("class", "LlibXray/RunXrayRequest;", "", ""),
+)
+
+/**
+ * What a DEX image contains, split into the two things an R8 verification
+ * must never confuse.
+ *
+ * `referenced*` comes from the global id tables — every symbol the image
+ * MENTIONS, including calls into classes defined elsewhere or nowhere.
+ * `defined*` comes from `class_defs` and `class_data_item` — what this image
+ * actually CARRIES. Only the second kind can keep a JNI lookup alive; the
+ * first is kept for diagnostics.
+ */
+class DexSurface {
+    val referencedTypes = HashSet<String>()
+    val referencedMethods = HashSet<String>()
+    val referencedFields = HashSet<String>()
+    val definedTypes = HashSet<String>()
+
+    /** Member key to `access_flags` of the `encoded_method` / `encoded_field`. */
+    val definedMethods = HashMap<String, Int>()
+    val definedFields = HashMap<String, Int>()
+
+    fun mergeFrom(other: DexSurface) {
+        referencedTypes += other.referencedTypes
+        referencedMethods += other.referencedMethods
+        referencedFields += other.referencedFields
+        definedTypes += other.definedTypes
+        definedMethods += other.definedMethods
+        definedFields += other.definedFields
+    }
+}
+
+/**
+ * Parse one `classes*.dex` image into its referenced and defined surfaces.
+ *
+ * Offsets are the fixed `header_item` fields of the Dalvik executable
+ * format; member keys are `owner->name(params)ret` for methods and
+ * `owner->name:type` for fields.
+ */
+fun readDexSurface(dex: ByteArray): DexSurface {
+    fun u1(o: Int) = dex[o].toInt() and 0xFF
+    fun u2(o: Int) = u1(o) or (u1(o + 1) shl 8)
+    fun u4(o: Int) = u2(o) or (u2(o + 2) shl 16)
+
+    fun uleb128(start: Int): Pair<Int, Int> {
+        var result = 0
+        var shift = 0
+        var o = start
+        while (true) {
+            val b = u1(o); o++
+            result = result or ((b and 0x7F) shl shift)
+            if (b and 0x80 == 0) break
+            shift += 7
+        }
+        return result to o
+    }
+
+    val stringIdsSize = u4(0x38); val stringIdsOff = u4(0x3C)
+    val typeIdsSize = u4(0x40); val typeIdsOff = u4(0x44)
+    val protoIdsSize = u4(0x48); val protoIdsOff = u4(0x4C)
+    val fieldIdsSize = u4(0x50); val fieldIdsOff = u4(0x54)
+    val methodIdsSize = u4(0x58); val methodIdsOff = u4(0x5C)
+    val classDefsSize = u4(0x60); val classDefsOff = u4(0x64)
+
+    val strings = Array(stringIdsSize) { i ->
+        val dataOff = u4(stringIdsOff + i * 4)
+        // `string_data_item` is a ULEB128 UTF-16 length followed by MUTF-8
+        // bytes terminated by NUL. Only the bytes are needed here.
+        val after = uleb128(dataOff).second
+        var end = after
+        while (dex[end].toInt() != 0) end++
+        String(dex, after, end - after, Charsets.UTF_8)
+    }
+    val types = Array(typeIdsSize) { i -> strings[u4(typeIdsOff + i * 4)] }
+
+    val protos = Array(protoIdsSize) { i ->
+        val base = protoIdsOff + i * 12
+        val ret = types[u4(base + 4)]
+        val paramsOff = u4(base + 8)
+        val params = if (paramsOff == 0) {
+            ""
+        } else {
+            val n = u4(paramsOff)
+            (0 until n).joinToString("") { k -> types[u2(paramsOff + 4 + k * 2)] }
+        }
+        "(" + params + ")" + ret
+    }
+
+    // Keys are built once per id so `class_data_item` can look them up by
+    // index without re-reading the tables.
+    val methodKeys = Array(methodIdsSize) { i ->
+        val base = methodIdsOff + i * 8
+        types[u2(base)] + "->" + strings[u4(base + 4)] + protos[u2(base + 2)]
+    }
+    val fieldKeys = Array(fieldIdsSize) { i ->
+        val base = fieldIdsOff + i * 8
+        types[u2(base)] + "->" + strings[u4(base + 4)] + ":" + types[u2(base + 2)]
+    }
+
+    val surface = DexSurface()
+    surface.referencedTypes.addAll(types)
+    surface.referencedMethods.addAll(methodKeys)
+    surface.referencedFields.addAll(fieldKeys)
+
+    for (i in 0 until classDefsSize) {
+        val base = classDefsOff + i * 32
+        val descriptor = types[u4(base)]
+        surface.definedTypes += descriptor
+        val classDataOff = u4(base + 24)
+        // An interface or marker class with no members has no class_data_item.
+        if (classDataOff == 0) continue
+
+        var o = classDataOff
+        val staticFieldsSize = uleb128(o).also { o = it.second }.first
+        val instanceFieldsSize = uleb128(o).also { o = it.second }.first
+        val directMethodsSize = uleb128(o).also { o = it.second }.first
+        val virtualMethodsSize = uleb128(o).also { o = it.second }.first
+
+        // Each of the four lists carries its own index, accumulated from
+        // per-entry deltas and reset between lists.
+        for (list in 0 until 2) {
+            var fieldIdx = 0
+            val count = if (list == 0) staticFieldsSize else instanceFieldsSize
+            repeat(count) {
+                fieldIdx += uleb128(o).also { r -> o = r.second }.first
+                val flags = uleb128(o).also { r -> o = r.second }.first
+                val key = fieldKeys[fieldIdx]
+                check(key.startsWith(descriptor + "->")) {
+                    "Malformed DEX: class_data_item of $descriptor encodes field $key"
+                }
+                surface.definedFields[key] = flags
+            }
+        }
+        for (list in 0 until 2) {
+            var methodIdx = 0
+            val count = if (list == 0) directMethodsSize else virtualMethodsSize
+            repeat(count) {
+                methodIdx += uleb128(o).also { r -> o = r.second }.first
+                val flags = uleb128(o).also { r -> o = r.second }.first
+                uleb128(o).also { r -> o = r.second } // code_off, unused
+                val key = methodKeys[methodIdx]
+                check(key.startsWith(descriptor + "->")) {
+                    "Malformed DEX: class_data_item of $descriptor encodes method $key"
+                }
+                surface.definedMethods[key] = flags
+            }
+        }
+    }
+    return surface
+}
+
+/**
+ * Return a parser-input copy of `dex` with every `class_def` whose descriptor
+ * is in `targets` removed, and the count removed.
+ *
+ * The id tables are deliberately left untouched, so the result still MENTIONS
+ * every symbol it used to define. That is the shape of the probe that defeated
+ * the first version of this check, which is why the task builds one from the
+ * artifact under test and requires itself to reject it. The result is a
+ * fixture for this parser, not a loadable DEX: `map_list` and the checksum
+ * are not repaired.
+ */
+fun stripClassDefs(dex: ByteArray, targets: Set<String>): Pair<ByteArray, Int> {
+    fun u1(b: ByteArray, o: Int) = b[o].toInt() and 0xFF
+    fun u2(b: ByteArray, o: Int) = u1(b, o) or (u1(b, o + 1) shl 8)
+    fun u4(b: ByteArray, o: Int) = u2(b, o) or (u2(b, o + 2) shl 16)
+
+    val out = dex.copyOf()
+    val stringIdsOff = u4(out, 0x3C)
+    val typeIdsOff = u4(out, 0x44)
+    val classDefsSize = u4(out, 0x60)
+    val classDefsOff = u4(out, 0x64)
+
+    fun descriptorOf(typeIdx: Int): String {
+        val dataOff = u4(out, stringIdsOff + u4(out, typeIdsOff + typeIdx * 4) * 4)
+        var o = dataOff
+        while (u1(out, o) and 0x80 != 0) o++ // skip the ULEB128 length
+        o++
+        var end = o
+        while (out[end].toInt() != 0) end++
+        return String(out, o, end - o, Charsets.UTF_8)
+    }
+
+    var kept = 0
+    var removed = 0
+    for (i in 0 until classDefsSize) {
+        val base = classDefsOff + i * 32
+        if (descriptorOf(u4(out, base)) in targets) {
+            removed++
+            continue
+        }
+        val dest = classDefsOff + kept * 32
+        if (dest != base) System.arraycopy(out, base, out, dest, 32)
+        kept++
+    }
+    // `class_defs_size` is authoritative, so the trailing slots are simply
+    // no longer addressed.
+    for (b in 0 until 4) out[0x60 + b] = ((kept shr (b * 8)) and 0xFF).toByte()
+    return out to removed
+}
+
+/** Why one contract entry was not satisfied. */
+data class GomobileMiss(val entry: GomobileJniEntry, val reason: String, val detail: String)
+
+/**
+ * Decide the contract against DEFINITIONS only. `referenced*` is consulted
+ * purely to label the failure.
+ */
+fun evaluateGomobileContract(
+    surface: DexSurface,
+    contract: List<GomobileJniEntry>,
+): List<GomobileMiss> = contract.mapNotNull { entry ->
+    val key = entry.toString()
+    when (entry.kind) {
+        "class" -> when {
+            entry.owner in surface.definedTypes -> null
+            entry.owner in surface.referencedTypes ->
+                GomobileMiss(entry, "REFERENCED-ONLY", "in type_ids but has no class_def")
+            else -> GomobileMiss(entry, "ABSENT", "no class_def and not referenced")
+        }
+        else -> {
+            val isField = entry.kind == "field"
+            val defined = if (isField) surface.definedFields else surface.definedMethods
+            val referenced = if (isField) surface.referencedFields else surface.referencedMethods
+            val flags = defined[key]
+            val requiredStatic = entry.requiredStatic
+            if (flags == null) {
+                if (key in referenced) {
+                    GomobileMiss(
+                        entry,
+                        "REFERENCED-ONLY",
+                        "in the id tables but not encoded in the class_data_item of " + entry.owner,
+                    )
+                } else {
+                    GomobileMiss(entry, "ABSENT", "not defined and not referenced")
+                }
+            } else if (requiredStatic != null && (flags and ACC_STATIC != 0) != requiredStatic) {
+                GomobileMiss(
+                    entry,
+                    "WRONG-SHAPE",
+                    "defined, but access_flags=0x" + Integer.toHexString(flags) + " makes it " +
+                        (if (flags and ACC_STATIC != 0) "static" else "an instance member") +
+                        " while the native call site requires " +
+                        (if (requiredStatic) "static" else "an instance member"),
+                )
+            } else {
+                null
+            }
+        }
+    }
+}
+
+val verifyR8KeepsGomobileJniSurface = tasks.register("verifyR8KeepsGomobileJniSurface") {
+    group = "verification"
+    description =
+        "Verifies the minified release DEX still DEFINES every `go.Seq` / gomobile member the vendored `libgojni.so` resolves by name."
+
+    val defaultApk = layout.buildDirectory.file("outputs/apk/release/android-release.apk")
+    val apkOverride = providers.gradleProperty("gomobileVerifyApk")
+    val contract = gomobileJniContract
+    // A release gate must never be skipped as up-to-date.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        val apk = apkOverride.map { File(it) }.orNull ?: defaultApk.get().asFile
+        check(apk.exists()) {
+            "Expected a release APK at ${apk.absolutePath} but it does not exist. " +
+                "Assemble the release build first, or pass -PgomobileVerifyApk=<path>."
+        }
+
+        val dexImages = ArrayList<ByteArray>()
+        ZipFile(apk).use { zip ->
+            for (entry in zip.entries()) {
+                val n = entry.name
+                if (!n.startsWith("classes") || !n.endsWith(".dex") || n.contains('/')) continue
+                dexImages += zip.getInputStream(entry).use { it.readBytes() }
+            }
+        }
+        check(dexImages.isNotEmpty()) {
+            "No classes*.dex found in ${apk.absolutePath} — is this an APK?"
+        }
+
+        val surface = DexSurface()
+        dexImages.forEach { surface.mergeFrom(readDexSurface(it)) }
+
+        val missing = evaluateGomobileContract(surface, contract)
+        if (missing.isNotEmpty()) {
+            throw GradleException(
+                buildString {
+                    appendLine(
+                        "verifyR8KeepsGomobileJniSurface FAILED — ${missing.size} of ${contract.size} " +
+                            "required gomobile JNI entries are not defined in the minified DEX of " +
+                            "${apk.absolutePath} (${dexImages.size} dex file(s)):",
+                    )
+                    missing.forEach { appendLine("  ${it.reason}  ${it.entry.kind}  ${it.entry} — ${it.detail}") }
+                    appendLine()
+                    appendLine(
+                        "The vendored `libgojni.so` resolves these by name from `Java_go_Seq_init` " +
+                            "and aborts the process on the first miss — this is the release-only " +
+                            "SIGABRT `failed to find method Seq.getRef` seen in Stage 2 physical " +
+                            "acceptance. Restore the `-keep class go.** { *; }` / " +
+                            "`-keep class libXray.** { *; }` rules in apps/android/proguard-rules.pro. " +
+                            "`-keepnames` and `-keepclasseswithmembernames` are NOT sufficient: they " +
+                            "stop renaming but still allow R8 to shrink the classes away.",
+                    )
+                },
+            )
+        }
+
+        // Self-test: the same verdict must flip to a rejection once the
+        // definitions are gone but the references remain. See the block
+        // comment above — this is the probe shape that defeated the first
+        // version of this check.
+        val owners = contract.map { it.owner }.toSet()
+        var removedDefs = 0
+        val stripped = DexSurface()
+        dexImages.forEach {
+            val (image, removed) = stripClassDefs(it, owners)
+            removedDefs += removed
+            stripped.mergeFrom(readDexSurface(image))
+        }
+        check(removedDefs >= owners.size) {
+            "verifyR8KeepsGomobileJniSurface self-test is vacuous: expected to strip at least " +
+                "${owners.size} class_def entries but stripped $removedDefs."
+        }
+        val strippedMisses = evaluateGomobileContract(stripped, contract)
+        val referencedOnly = strippedMisses.count { it.reason == "REFERENCED-ONLY" }
+        if (strippedMisses.size != contract.size || referencedOnly != contract.size) {
+            throw GradleException(
+                buildString {
+                    appendLine(
+                        "verifyR8KeepsGomobileJniSurface SELF-TEST FAILED — this check cannot be " +
+                            "trusted and is refusing to certify the build.",
+                    )
+                    appendLine(
+                        "With all ${owners.size} contract owners' class_def entries removed and the id " +
+                            "tables left intact, it should have rejected all ${contract.size} entries as " +
+                            "REFERENCED-ONLY; it rejected ${strippedMisses.size} " +
+                            "($referencedOnly as REFERENCED-ONLY).",
+                    )
+                    appendLine(
+                        "That is the defect an independent review found in the first version of this " +
+                            "task: id tables list symbols a DEX merely mentions, so they cannot prove a " +
+                            "class survived R8.",
+                    )
+                },
+            )
+        }
+
+        logger.lifecycle(
+            "verifyR8KeepsGomobileJniSurface PASS — all ${contract.size} gomobile JNI entries are " +
+                "defined with the required descriptors and static/instance shape in " +
+                "${dexImages.size} dex file(s); self-test rejected the definition-stripped image " +
+                "${strippedMisses.size}/${contract.size}.",
+        )
+    }
+}
+
 tasks.matching { it.name == "assembleRelease" }.configureEach {
-    finalizedBy(verifyR8StripsTestSeams)
+    finalizedBy(verifyR8StripsTestSeams, verifyR8KeepsGomobileJniSurface)
 }
