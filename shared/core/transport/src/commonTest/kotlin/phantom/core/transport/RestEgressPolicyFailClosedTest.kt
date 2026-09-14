@@ -228,16 +228,9 @@ class RestEgressPolicyFailClosedTest {
         assertEquals(1, h.transport.authSessionCalls)
 
         // Drive the machine out of WsActive so the poll loops spawn.
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1_000L,
-                    inboundFrames = 0,
-                    pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActiveNow()
         assertEquals(RestMode.RestActive, orch.stateMachine.state.value)
         orch.start()
         runCurrent()

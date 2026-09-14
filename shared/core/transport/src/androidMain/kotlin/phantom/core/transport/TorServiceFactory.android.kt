@@ -127,6 +127,9 @@ internal class TorServiceAndroid(
         return result
     }
 
+    /** Delegates to the owner, which answers inside its own monitor. */
+    override fun settlementFor(generation: Long): TorSettlement = owner.settlementFor(generation)
+
     /**
      * A teardown result moves the state away from stopped only when the
      * DAEMON is unconfirmed. A host that has not let go of its threads does

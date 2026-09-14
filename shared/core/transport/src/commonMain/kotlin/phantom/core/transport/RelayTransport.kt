@@ -185,6 +185,16 @@ interface RelayTransport {
     suspend fun disconnectAndJoin(timeoutMs: Long = 10_000L): Boolean
 
     /**
+     * Stage 2 (2026-09-13): the same bounded teardown, with a [reason]
+     * the transport carries into the session-invalidation signal it
+     * enqueues before the socket is closed (B11: a privacy teardown is
+     * distinguishable from a rewalk in the trace). Implementations that
+     * do not record a reason inherit this delegation.
+     */
+    suspend fun disconnectAndJoin(timeoutMs: Long, reason: String): Boolean =
+        disconnectAndJoin(timeoutMs)
+
+    /**
      * Identity of the connection this transport currently owns.
      *
      * Advances every time a reconnect generation is launched. A caller
@@ -228,6 +238,17 @@ interface RelayTransport {
             closesConfirmed = joined,
         )
     }
+
+    /**
+     * Stage 2 (2026-09-13): the confirming teardown with a [reason] for
+     * the session-invalidation signal. See [disconnectAndJoin] with a
+     * reason; implementations without a reason inherit this delegation.
+     */
+    suspend fun disconnectAndConfirm(
+        timeoutMs: Long,
+        onlyIfIdentity: Long?,
+        reason: String,
+    ): TransportTeardownResult = disconnectAndConfirm(timeoutMs, onlyIfIdentity)
 
     suspend fun send(message: RelayMessage.Send): Boolean
 

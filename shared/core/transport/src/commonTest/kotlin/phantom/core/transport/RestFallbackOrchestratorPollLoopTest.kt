@@ -267,22 +267,34 @@ class RestFallbackOrchestratorPollLoopTest {
      * Drive the orchestrator's state machine out of `WsActive` so
      * the legacy `pollLoop` spawns alongside the parallel
      * `wsActivePollLoop`. The threshold-based transition takes
-     * `ACTIVE_FAIL_THRESHOLD = 2` `WsSessionEnded` events with zero
+     * one live session `WsSessionEnded` with zero
      * inbound frames + positive pending acks.
      */
     private fun driveStateToRestActive(orch: RestFallbackOrchestrator) {
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEventNow(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L,
-                    inboundFrames = 0,
-                    pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActiveNow()
         check(orch.stateMachine.state.value == RestMode.RestActive) {
             "expected RestActive after threshold flips; was ${orch.stateMachine.state.value}"
+        }
+    }
+
+    /**
+     * The other direction: put the machine INTO `WsActive`, which is what
+     * keeps the legacy `pollLoop` from spawning so a case can observe the
+     * parallel `wsActivePollLoop` on its own.
+     *
+     * Review round 7 (2026-09-13): this isolation used to be free, because
+     * the machine STARTED in `WsActive`. It no longer does — a handshake is
+     * not proof — so a case that wants one loop has to establish the mode
+     * by the proof the contract names: a live session plus an ACK
+     * round-trip on that same session (B3).
+     */
+    private fun driveStateToWsActive(orch: RestFallbackOrchestrator) {
+        orch.submitEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        orch.submitEventNow(RestStateMachine.Event.WsOutboundAckReceived(sessionEpoch = 1L))
+        check(orch.stateMachine.state.value == RestMode.WsActive) {
+            "expected WsActive after a proven session; was ${orch.stateMachine.state.value}"
         }
     }
 
@@ -568,9 +580,14 @@ class RestFallbackOrchestratorPollLoopTest {
             }
         }
         val logLines = mutableListOf<String>()
-        // longPollEnabled = true, no driveStateToRestActive() →
-        // only the parallel wsActivePollLoop runs (state stays
-        // WsActive so the legacy pollLoop does NOT spawn).
+        // longPollEnabled = true and the machine driven INTO WsActive:
+        // only the parallel wsActivePollLoop runs, because the legacy
+        // pollLoop does not spawn in that mode. Review round 7: the mode
+        // has to be established now that `RestActive` is where the machine
+        // starts — without it BOTH loops would read the cursor, the
+        // single scripted read failure would land on whichever got there
+        // first, and the `pollEnterCount == 0` assertion below would be
+        // measuring the other loop.
         val orch = buildOrchestrator(
             transport,
             cursor,
@@ -580,6 +597,7 @@ class RestFallbackOrchestratorPollLoopTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
+        driveStateToWsActive(orch)
 
         val received = mutableListOf<PollEnvelope>()
         val collectorJob = launch {

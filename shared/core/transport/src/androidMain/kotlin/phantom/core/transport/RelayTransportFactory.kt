@@ -78,7 +78,7 @@ actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { s
         // PR-RECV-DIAG1 v1.6 (2026-05-27) — REVERTED back to 15s.
         // v1.3 disabled this to 0L as a diagnostic A/B. Test #84.4 proved
         // disabling ping made things WORSE: with no ping, WS never dies
-        // → WsSessionEnded events never fire → ACTIVE_FAIL_THRESHOLD
+        // → WsSessionEnded events never fire → the degradation rule
         // counter never increments → automatic REST fallback never
         // activates. The "31s ping/pong cycle" we saw was actually a
         // useful failover signal that we accidentally suppressed.

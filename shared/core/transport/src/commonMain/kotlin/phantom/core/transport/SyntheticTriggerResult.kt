@@ -15,7 +15,7 @@ package phantom.core.transport
  * Six members:
  *
  *   - [Fired]                          — synthetic event constructed +
- *                                        `_wsSessionLifecycle.trySend(...)` succeeded.
+ *                                        the session-signal enqueue succeeded.
  *                                        Trigger CANNOT fire again for the same
  *                                        `wsSessionEpoch`. A new
  *                                        [WsSessionLifecycleEvent.Connected] event
@@ -63,7 +63,7 @@ package phantom.core.transport
 public sealed class SyntheticTriggerResult {
     /**
      * Synthetic event constructed and successfully enqueued into
-     * `_wsSessionLifecycle`. Both Consumer A (state-machine actuation)
+     * the single session-signal channel. Both Consumer A (state-machine actuation)
      * and Consumer B (telemetry detector) downstream code will run.
      */
     public object Fired : SyntheticTriggerResult() {

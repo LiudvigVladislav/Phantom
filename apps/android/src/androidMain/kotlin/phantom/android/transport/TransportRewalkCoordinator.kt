@@ -76,7 +76,13 @@ import phantom.core.transport.TransportPreferences
  * locked transaction sequence with a deterministic fake.
  */
 internal interface RewalkHybridFacade {
-    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean)
+    /**
+     * Stage 2 B5: [networkGeneration] is the observer's monotonic counter
+     * for the change being applied; it invalidates REST health and tags
+     * the state-machine event so a poll issued on the old network cannot
+     * re-prove health on the new one.
+     */
+    suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean, networkGeneration: Long)
     suspend fun disconnect()
     suspend fun disconnectAndJoin(timeoutMs: Long): Boolean
 }
@@ -128,6 +134,20 @@ internal class TransportRewalkCoordinator(
     private val handOverConnectOwnership: suspend (reason: String) -> Boolean,
     private val hybridTransportProvider: () -> RewalkHybridFacade?,
     private val requestServiceRestart: (reason: NetworkChangeReason) -> Unit,
+    /**
+     * Stage 2 B5/B7b: an aborted rewalk left recovery to nobody. Before
+     * Stage 2 the pending retry was invalidated on the restart branch
+     * (`cancelPendingRetry`) while every abort branch returned silently,
+     * so a rewalk that gave up after `beginRouteChange` -- a failed
+     * teardown, an unclean release, a refused probe -- ended with no walk,
+     * no timer and no trigger. Each abort now nudges the service's single
+     * recovery coordinator, which decides whether anything is owed. It is
+     * a nudge, never a connect: this coordinator has no lease.
+     *
+     * Default no-op so fixtures that do not exercise recovery stay
+     * source-compatible.
+     */
+    private val onRewalkAborted: suspend (reason: String) -> Unit = {},
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     /**
      * RC-RECONNECT-QUIESCENCE1 commit 2c (2026-06-22). When non-null
@@ -187,9 +207,13 @@ internal class TransportRewalkCoordinator(
      * absorbs the duplicates). Non-blocking — schedules the rewalk on
      * [scope] and returns.
      */
-    fun onMeaningfulChange(reason: NetworkChangeReason, snapshot: NetworkSnapshot) {
+    fun onMeaningfulChange(
+        reason: NetworkChangeReason,
+        snapshot: NetworkSnapshot,
+        networkGeneration: Long,
+    ) {
         currentRewalkJob = scope.launch {
-            performRewalk(reason, snapshot)
+            performRewalk(reason, snapshot, networkGeneration)
         }
     }
 
@@ -220,7 +244,32 @@ internal class TransportRewalkCoordinator(
         )
     }
 
-    private suspend fun performRewalk(reason: NetworkChangeReason, snapshot: NetworkSnapshot) {
+    /**
+     * Stage 2 B5: report one aborted rewalk to the recovery coordinator.
+     * Failures here are swallowed on purpose -- a nudge that could not be
+     * delivered must not turn an abort into a crash, and the alarm
+     * heartbeat is the backstop.
+     */
+    private suspend fun abortRewalk(step: String) {
+        Log.i(TAG, "NETWORK_TRACE rewalk_aborted step=$step — nudging the recovery coordinator")
+        try {
+            onRewalkAborted("rewalk_aborted_$step")
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "NETWORK_TRACE rewalk_abort_nudge_failed step=$step " +
+                    "errorClass=${t::class.simpleName}",
+            )
+        }
+    }
+
+    private suspend fun performRewalk(
+        reason: NetworkChangeReason,
+        snapshot: NetworkSnapshot,
+        networkGeneration: Long,
+    ) {
         rewalkMutex.withLock {
             val now = nowMs()
 
@@ -268,7 +317,7 @@ internal class TransportRewalkCoordinator(
             // hybrid.disconnect, release, restart).
             val coordinator = gateCoordinator
             if (coordinator == null) {
-                runLegacyRewalk(reason, snapshot, startMs)
+                runLegacyRewalk(reason, snapshot, startMs, networkGeneration)
                 lastRewalkAtMs = startMs
                 return@withLock
             }
@@ -291,6 +340,7 @@ internal class TransportRewalkCoordinator(
                     "NETWORK_TRACE rewalk_substep_error step=beginRouteChange " +
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
+                abortRewalk("begin_route_change_failed")
                 return@withLock
             }
             val routeEpoch = outcome.routeEpoch
@@ -331,6 +381,7 @@ internal class TransportRewalkCoordinator(
                     TAG,
                     "NETWORK_TRACE rewalk_substep_skip step=hybrid reason=hybrid_not_initialized",
                 )
+                abortRewalk("hybrid_not_initialized")
                 return@withLock
             }
 
@@ -339,7 +390,10 @@ internal class TransportRewalkCoordinator(
             // (when applicable). CE propagates; other throws revoke the
             // route change.
             try {
-                hybrid.submitNetworkChangedEvent(clearsMode2Sticky = reason.clearsMode2Sticky)
+                hybrid.submitNetworkChangedEvent(
+                    clearsMode2Sticky = reason.clearsMode2Sticky,
+                    networkGeneration = networkGeneration,
+                )
             } catch (ce: CancellationException) {
                 // P1 (2026-06-22): NonCancellable so the revoke is
                 // guaranteed to complete even when the parent
@@ -358,6 +412,7 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "submitNetworkChangedEvent_failed")
+                abortRewalk("submit_network_changed_failed")
                 return@withLock
             }
 
@@ -380,6 +435,7 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "disconnect_failed")
+                abortRewalk("disconnect_failed")
                 return@withLock
             }
             if (!joined) {
@@ -388,6 +444,7 @@ internal class TransportRewalkCoordinator(
                     "NETWORK_TRACE disconnect_join_timeout route_epoch=$routeEpoch",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "disconnect_join_timeout")
+                abortRewalk("disconnect_join_timeout")
                 return@withLock
             }
 
@@ -409,6 +466,7 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "handover_failed")
+                abortRewalk("handover_failed")
                 return@withLock
             }
             if (!quiesced) {
@@ -419,6 +477,7 @@ internal class TransportRewalkCoordinator(
                         "we could not stop",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "handoff_timeout")
+                abortRewalk("handoff_timeout")
                 return@withLock
             }
 
@@ -439,6 +498,7 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "release_failed")
+                abortRewalk("release_failed")
                 return@withLock
             }
             // A release that threw nothing but did not come back clean stops
@@ -454,6 +514,7 @@ internal class TransportRewalkCoordinator(
                         "tor=${released.torIncomplete}",
                 )
                 coordinator.revokeRouteChange(routeEpoch, reason = "release_not_clean")
+                abortRewalk("release_not_clean")
                 return@withLock
             }
 
@@ -478,6 +539,7 @@ internal class TransportRewalkCoordinator(
                                 "errorClass=${t::class.simpleName} message=${t.message?.take(120)}",
                         )
                         coordinator.revokeRouteChange(routeEpoch, reason = "issueProbe_failed")
+                        abortRewalk("issue_probe_failed")
                         return@withLock
                     }
                     when (probeResult) {
@@ -498,6 +560,7 @@ internal class TransportRewalkCoordinator(
                                 TAG,
                                 "NETWORK_TRACE rewalk_probe_rejected route_epoch=$routeEpoch reason=$rejectReason",
                             )
+                            abortRewalk("probe_rejected")
                             return@withLock
                         }
                     }
@@ -535,6 +598,7 @@ internal class TransportRewalkCoordinator(
                 } else {
                     coordinator.revokeRouteChange(routeEpoch, reason = "service_restart_failed")
                 }
+                abortRewalk("service_restart_failed")
                 return@withLock
             }
 
@@ -558,12 +622,18 @@ internal class TransportRewalkCoordinator(
         reason: NetworkChangeReason,
         snapshot: NetworkSnapshot,
         @Suppress("UNUSED_PARAMETER") startMs: Long,
+        networkGeneration: Long,
     ) {
         transportPreferences.lastWorkingTransport = null
         transportPreferences.lastSuccessAt = null
         val hybrid = hybridTransportProvider()
         if (hybrid != null) {
-            runCatching { hybrid.submitNetworkChangedEvent(clearsMode2Sticky = reason.clearsMode2Sticky) }
+            runCatching {
+                hybrid.submitNetworkChangedEvent(
+                    clearsMode2Sticky = reason.clearsMode2Sticky,
+                    networkGeneration = networkGeneration,
+                )
+            }
                 .onFailure { e ->
                     Log.w(
                         TAG,
@@ -604,6 +674,7 @@ internal class TransportRewalkCoordinator(
                 "NETWORK_TRACE rewalk_abandoned reason=handoff_timeout path=legacy — " +
                     "not releasing transport under a walk we could not stop",
             )
+            abortRewalk("legacy_handoff_timeout")
             return
         }
         val released = runCatching { releaseTransport() }
@@ -625,9 +696,10 @@ internal class TransportRewalkCoordinator(
                     "xray=${released?.xrayFailure?.let { it::class.simpleName }} " +
                     "tor=${released?.torIncomplete}",
             )
+            abortRewalk("legacy_release_not_clean")
             return
         }
-        runCatching { requestServiceRestart(reason) }
+        val restarted = runCatching { requestServiceRestart(reason) }
             .onFailure { e ->
                 Log.w(
                     TAG,
@@ -635,6 +707,11 @@ internal class TransportRewalkCoordinator(
                         "errorClass=${e::class.simpleName} message=${e.message?.take(120)}",
                 )
             }
+            .isSuccess
+        if (!restarted) {
+            abortRewalk("legacy_service_restart_failed")
+            return
+        }
         Log.i(TAG, "NETWORK_TRACE rewalk_done reason=$reason (legacy)")
     }
 

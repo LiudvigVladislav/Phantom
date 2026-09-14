@@ -10,7 +10,7 @@ import phantom.core.transport.WsSessionLifecycleEvent
 
 /**
  * R3.6 lifecycle dispatcher — single ordered consumer of the
- * [phantom.core.transport.KtorRelayTransport.wsSessionLifecycle] flow.
+ * lifecycle half of the transport's single session-signal channel.
  *
  * Extracted from [HybridRelayTransport] so unit tests drive the exact
  * production code path with mock callbacks, instead of re-implementing the

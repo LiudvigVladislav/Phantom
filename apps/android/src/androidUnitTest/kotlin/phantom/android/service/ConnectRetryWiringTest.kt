@@ -55,6 +55,24 @@ class ConnectRetryWiringTest {
             "apps/android/src/androidMain/kotlin/phantom/android/service/PhantomWakeupReceiver.kt",
         )
 
+    /**
+     * Review round 8 (2026-09-13): the recovery coordinator moved out of
+     * the service into `TransportRecoveryCoordinator`, precisely so its
+     * contract could be exercised rather than only read. The assertions
+     * that follow it are re-pointed here.
+     *
+     * They are now belt-and-braces: `TransportRecoveryCoordinatorTest`
+     * drives the same rules behaviourally, with barriers and virtual
+     * time. What these keep is the STRUCTURAL half a behavioural test
+     * cannot see -- that the shape which makes the behaviour possible is
+     * still written that way.
+     */
+    private val coordinatorSource: String
+        get() = source(
+            "shared/core/transport/src/commonMain/kotlin/phantom/core/transport/" +
+                "TransportRecoveryCoordinator.kt",
+        )
+
     // ── the service is the retry owner ───────────────────────────────
 
     @Test
@@ -266,17 +284,53 @@ class ConnectRetryWiringTest {
         )
         assertTrue(nudge != null, "the nudge handler is gone or was renamed")
         val recoverAt = nudge!!.indexOf("handoffRecovery.onSignal")
-        val schedulerAt = nudge.indexOf("retryScheduler.claim(")
+        // Stage 2 B7b, restated in review round 7 (2026-09-13). The nudge
+        // no longer calls `retryScheduler.claim(` itself: there is now ONE
+        // coordinator, `ensureRecoveryProgress`, and the scheduler is
+        // consulted inside its locked decision. The property this cell
+        // exists for is unchanged and is asserted against the new name --
+        // the blocked lease gets its chance BEFORE anything that consults
+        // the scheduler runs. Two things keep that from being a weaker
+        // claim than the old one: the handler may not reach past the
+        // coordinator to the scheduler, and the coordinator must still be
+        // the thing that decides.
+        val coordinatorAt = nudge.indexOf("ensureRecoveryProgress(")
         assertTrue(
             recoverAt >= 0,
             "a nudge that arrives while the lease is blocked must be able to lift it",
         )
-        assertTrue(schedulerAt >= 0, "the ordinary nudge path is gone")
+        assertTrue(coordinatorAt >= 0, "the ordinary nudge path is gone")
         assertTrue(
-            recoverAt < schedulerAt,
+            recoverAt < coordinatorAt,
             "recovery must be attempted BEFORE the scheduler is consulted: after a " +
                 "rewalk the retry slot is invalidated, so a nudge that asks the " +
                 "scheduler first is refused and the blocked lease is never lifted",
+        )
+        assertTrue(
+            "retryScheduler." !in nudge,
+            "and the nudge must not reach around the coordinator to the scheduler: " +
+                "two callers of the same slot is the overlap B7b removed; " +
+                "nudge was: $nudge",
+        )
+        val coordinator = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "suspend fun ensureRecoveryProgress",
+        )
+        assertTrue(coordinator != null, "the recovery coordinator is gone or was renamed")
+        assertTrue(
+            "decideRecoveryLocked" in coordinator!!,
+            "the coordinator must be the thing that decides; if the decision moved " +
+                "out of it, this fixture is asserting an empty hop",
+        )
+        val decision = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private suspend fun decideRecoveryLocked",
+        )
+        assertTrue(decision != null, "the locked decision is gone or was renamed")
+        assertTrue(
+            "retryScheduler.claim(" in decision!!,
+            "and the scheduler must be consulted there, or the nudge's ordering " +
+                "against it means nothing",
         )
     }
 
@@ -568,14 +622,28 @@ class ConnectRetryWiringTest {
             "is Handover.TimedOut ->",
         )
         assertTrue(branch != null, "the handover-timeout branch is gone or was renamed")
+        // Review round 7 (2026-09-13): the handover moved out of the
+        // `serviceScope.launch` in `onStartCommand` and into the extracted
+        // `runStartAttempt`, so the fail-closed exit is a plain `return`
+        // from that function rather than a `return@launch`. Same property,
+        // same strength: this branch LEAVES, and what it leaves behind is
+        // the claim -- which the last assertion here pins rather than
+        // assumes.
         assertTrue(
-            "return@launch" in branch!!,
+            Regex("\\breturn\\b").containsMatchIn(branch!!),
             "a handover that could not confirm quiescence must NOT fall through to " +
-                "the claim below it",
+                "the claim below it; branch was: $branch",
         )
         assertTrue(
             "claim" !in branch,
             "and it certainly must not claim the lease itself",
+        )
+        val handOverAt = serviceSource.indexOf("connectOwnership.handOver(")
+        val claimAt = serviceSource.indexOf("connectOwnership.claim(")
+        assertTrue(
+            handOverAt in 0 until claimAt,
+            "the claim this branch refuses to reach must actually sit below the " +
+                "handover, or the exit proves nothing",
         )
 
         val rawService = File(
@@ -591,28 +659,30 @@ class ConnectRetryWiringTest {
     // ── the receiver only delegates ──────────────────────────────────
 
     @Test
-    fun the_receiver_delegates_and_does_not_reconnect_on_all_failed() {
-        val branch = RetryWiringSourceScanner.blockAfter(
-            receiverSource,
-            "managerState is phantom.core.transport.ManagerState.AllFailed",
-        )
-        assertTrue(branch != null, "the receiver's AllFailed branch is gone or was renamed")
-
+    fun the_receiver_delegates_and_decides_nothing() {
+        // Stage 2 B7b: the receiver stopped reading `ManagerState` as its
+        // oracle. Every reading it used to act on could be wrong --
+        // `Probing` survives a policy-changed abort, `Connected` survives a
+        // WSS drop, and `AllFailed` was the only state that produced a
+        // nudge while the 19:07 vacuum was none of them. It now delivers
+        // the trigger unconditionally and the coordinator decides.
+        val code = receiverSource
         assertTrue(
-            "sendRetryNudge" in branch!!,
-            "the receiver must deliver a nudge. Returning silently here is the " +
-                "original defect: it deferred to a service cadence that did not exist.",
+            "sendRetryNudge" in code,
+            "the receiver must deliver a nudge. Returning silently is the original " +
+                "defect: it deferred to a service cadence that did not exist.",
         )
-        assertTrue(
-            "forceReconnect" !in branch,
-            "and it must NOT force a reconnect -- that tears down the OkHttp engine " +
-                "an in-flight attempt is using, which is why the skip existed at all",
-        )
-        assertTrue(
-            "transportManager.connect" !in branch,
-            "nor may it start a chain walk itself: it has no generation, no CAS and " +
-                "no view of whether a walk is already running",
-        )
+        for (forbidden in listOf(
+            "ManagerState.AllFailed",
+            "ManagerState.Probing",
+            "forceReconnect",
+            "transportManager.connect",
+        )) {
+            assertTrue(
+                forbidden !in code,
+                "the receiver must not decide: found `$forbidden`",
+            )
+        }
     }
 
     @Test
@@ -622,7 +692,7 @@ class ConnectRetryWiringTest {
         assertTrue(branch != null, "the service does not accept a retry nudge")
         assertTrue(
             "onExternalRetryNudge" in branch!!,
-            "a nudge must go through the scheduler's claim, not straight to a connect",
+            "a nudge must go through the single coordinator, not straight to a connect",
         )
         assertTrue(
             "transportManager.connect" !in branch,
@@ -694,29 +764,37 @@ class ConnectRetryWiringTest {
         // a mutation introduces the defect, so the absence of a cache is
         // the reason to write one, not a reason to skip it. This fixture
         // pins the structure; the mutation proves the behaviour.
-        val branch = RetryWiringSourceScanner.blockAfter(serviceSource, "fun startSelfForRetry")
-        assertTrue(branch != null, "startSelfForRetry is gone or was renamed")
-
-        // Review P1-1. The first version of this fixture asserted the
-        // OPPOSITE: it required EXTRA_REWALK_RESTART in the retry path,
-        // and so pinned the defect in place. That extra clears the CAS
-        // unconditionally, which is safe only after the rewalk
-        // coordinator has disconnected and released. A retry has not, so
-        // force-opening the CAS could start a second concurrent
-        // TransportManager.connect().
+        // Stage 2 (2026-09-13): a granted retry no longer crosses an
+        // Intent. `startSelfForRetry` is gone; the coordinator starts the
+        // attempt in this process, through the same `prepareStart` -> claim
+        // path an external start uses, and keeps the handle.
+        val branch = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private fun startGrantedAttemptLocked",
+        )
+        assertTrue(branch != null, "the in-process granted start is gone or was renamed")
         assertTrue(
-            "EXTRA_REWALK_RESTART" !in branch!!,
-            "a retry must NOT borrow the rewalk restart extra: that clears the CAS " +
-                "without any quiesce and can start a second concurrent chain walk",
+            "startSelfForRetry" !in serviceSource && "startSelfForRetry" !in coordinatorSource,
+            "the Intent-carried retry is the defect Stage 2 removed: the grant crossed a " +
+                "process boundary with no token, and between Granted and the next " +
+                "onStartCommand there was neither an owner nor a pending slot",
         )
         assertTrue(
-            "EXTRA_RETRY_ATTEMPT" in branch,
-            "the retry needs its own intent so it goes through the CAS like any " +
-                "other start and is refused while a walk is running",
+            "runStartAttempt" in branch!!,
+            "the granted attempt must run the SAME start path as an external start",
         )
         assertTrue(
-            "startForegroundService" in branch || "startService" in branch,
-            "the retry must go through a service start, not an inline connect",
+            "startForegroundService" !in branch && "startService" !in branch,
+            "a granted retry must not leave the process at all",
+        )
+        assertTrue(
+            "android." !in coordinatorSource && "import phantom.android" !in coordinatorSource,
+            "and the coordinator must stay free of Android APIs: that is what makes " +
+                "its behaviour testable, which is what review round 8 was about",
+        )
+        assertTrue(
+            "inFlightGrant" in branch,
+            "the grant must be retained, or a start that never claims cannot be restored",
         )
 
         val code = serviceSource
@@ -762,7 +840,7 @@ class ConnectRetryWiringTest {
             "a refused retry must never take the slot from the walk that holds it",
         )
         assertTrue(
-            "startSelfForRetry" !in branch,
+            "startGrantedAttemptLocked" !in branch,
             "nor may it start a walk beside the one already running",
         )
         assertTrue(
@@ -834,14 +912,155 @@ class ConnectRetryWiringTest {
     }
 
     @Test
-    fun a_failed_service_start_restores_the_retry() {
-        // Review P2-4.
-        val branch = RetryWiringSourceScanner.blockAfter(serviceSource, "fun startSelfForRetry")
-        assertTrue(branch != null)
+    fun a_start_that_never_claimed_restores_the_retry_after_it_is_joined() {
+        // Review P2-4, restated for Stage 2. `claim()` clears the pending
+        // slot, so a start that ends without taking the lease must put the
+        // grant back or every later trigger sees `NotPending`. What Stage 2
+        // adds is WHEN: only after that start job has ended, and only if it
+        // never claimed ownership -- restoring under a live job would put a
+        // second attempt on top of one that is still admitting.
+        val branch = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private suspend fun onStartJobCompleted",
+        )
+        assertTrue(branch != null, "the start-job completion handler is gone or was renamed")
         assertTrue(
             "restoreAfterFailedStart" in branch!!,
-            "claim() already cleared the slot; a start that throws must put it back " +
-                "or every later nudge sees NotPending",
+            "a grant whose start ended without a claim must go back to the scheduler",
+        )
+        assertTrue(
+            "startJobClaimedOwnership" in branch,
+            "and it must not go back when the start DID claim: that grant became a walk",
+        )
+    }
+
+    @Test
+    fun an_external_start_never_runs_unregistered() {
+        // Review round 8, finding 2, structural half. The behavioural half
+        // -- two concurrent external starts producing exactly one attempt
+        // -- is `TransportRecoveryCoordinatorTest`.
+        //
+        // What source can still show, and what the old shape got wrong: an
+        // external start had ONE admission path that registered when the
+        // slot was free and fell through to the work when it was not. The
+        // admission must be total, so the only call to the injected start
+        // sits on the branch that registered.
+        val branch = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "suspend fun runExternalStart",
+        )
+        assertTrue(branch != null, "the external start entry is gone or was renamed")
+        assertTrue(
+            "ExternalAdmission.Joins" in branch!! && "ExternalAdmission.Registered" in branch,
+            "the admission must be a total decision, not a nullable stamp that the " +
+                "work ignores; block was: $branch",
+        )
+        assertEquals(
+            1,
+            Regex(Regex.escape("runStartAttempt(")).findAll(branch).count(),
+            "exactly one call to the start, on the branch that registered",
+        )
+        val joinsAt = branch.indexOf("is ExternalAdmission.Joins")
+        val runAt = branch.indexOf("runStartAttempt(")
+        assertTrue(joinsAt >= 0 && runAt >= 0)
+        assertTrue(
+            joinsAt < runAt,
+            "the joining branch must be handled before the running one, so a reader " +
+                "cannot miss that one of them starts nothing",
+        )
+
+        // And the launcher must not leave a window in which the platform
+        // has asked for a start and the coordinator cannot see one.
+        val onStart = RetryWiringSourceScanner.blockAfter(serviceSource, "EXTRA_RETRY_NUDGE, false")
+        assertTrue(onStart != null)
+        assertTrue(
+            "CoroutineStart.UNDISPATCHED" in serviceSource &&
+                "recoveryCoordinator.runExternalStart" in serviceSource,
+            "onStartCommand must hand the start to the coordinator UNDISPATCHED, so the " +
+                "registration completes before it returns",
+        )
+    }
+
+    @Test
+    fun the_coordinator_never_joins_a_start_job_while_holding_its_own_lock() {
+        // The completion handler takes `recoveryMutex`; joining the job
+        // under that same mutex would deadlock the coordinator against the
+        // job it is retiring. The cancel-and-join must sit OUTSIDE the
+        // locked decision, between two locked phases.
+        val decide = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private suspend fun decideRecoveryLocked",
+        )
+        assertTrue(decide != null, "the locked decision is gone or was renamed")
+        assertTrue(
+            "cancelAndJoin" !in decide!!,
+            "cancelAndJoin under the coordinator mutex is the deadlock this shape avoids",
+        )
+        val ensure = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "suspend fun ensureRecoveryProgress",
+        )
+        assertTrue(ensure != null, "the coordinator entry point is gone or was renamed")
+        assertTrue(
+            "cancelAndJoin" in ensure!!,
+            "the join belongs to the unlocked phase between the two locked ones",
+        )
+    }
+
+    @Test
+    fun the_recovery_decision_never_reads_the_direct_rest_egress_gate() {
+        // B7a. `RestEgressGate` answers "may a DIRECT REST request leave",
+        // and it refuses in Private and Ghost -- whose chain walks are
+        // Reality and Tor, exactly the recovery those modes need. A
+        // predicate keyed on it would forbid the recovery of the two most
+        // exposed modes.
+        val decide = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private suspend fun decideRecoveryLocked",
+        )
+        assertTrue(decide != null)
+        for (forbidden in listOf("RestEgressGate", "egressGate", "DirectAllowed")) {
+            assertTrue(
+                forbidden !in decide!!,
+                "the vacuum predicate must not consult direct-REST authority; found `$forbidden`",
+            )
+        }
+        val allowed = RetryWiringSourceScanner.blockAfter(
+            coordinatorSource,
+            "private suspend fun blockedReasonLocked",
+        )
+        assertTrue(allowed != null, "the recovery authority is gone or was renamed")
+        for (forbidden in listOf("RestEgressGate", "egressGate", "DirectAllowed")) {
+            assertTrue(
+                forbidden !in allowed!!,
+                "nor may the authority itself; found `$forbidden`",
+            )
+        }
+    }
+
+    @Test
+    fun a_tor_obligation_is_cleared_only_by_an_authoritative_settlement() {
+        // B7c. `status` is a notification: it carries whichever generation
+        // is live and says nothing about whether the host of the generation
+        // in question let go. Clearing on it would walk straight back into
+        // a start the owner refuses, leaving one more unreleased host each
+        // time.
+        val branch = RetryWiringSourceScanner.blockAfter(
+            serviceSource,
+            "private suspend fun torObligationBlocks",
+        )
+        assertTrue(branch != null, "the obligation check is gone or was renamed")
+        assertTrue(
+            "settlementFor" in branch!!,
+            "only the authoritative per-generation query may clear the obligation",
+        )
+        assertTrue(
+            "recordPendingTorSettlement" in branch,
+            "and a switch off a Tor-first strategy must HAND IT OVER, not drop it",
+        )
+        assertTrue(
+            ".status" !in branch,
+            "the notification flow must not be the thing that lifts the obligation",
         )
     }
 

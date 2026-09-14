@@ -930,6 +930,11 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
+        // Review round 7 (2026-09-13): the machine starts in `RestActive`
+        // now, so the legacy `pollLoop` would drain the same script beside
+        // the parallel loop this case is about. `WsActive` suppresses it,
+        // and the mode is established through the B3 proof.
+        orch.driveToWsActiveNow()
         orch.start()
         runCurrent()
         // Advance virtual time enough for 5 short-cycle polls to
@@ -1137,16 +1142,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         val caps = orch.bootstrap()
         check(caps.restFallback)
         // Flip state to RestActive so the legacy pollLoop also spawns.
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L,
-                    inboundFrames = 0,
-                    pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         check(orch.stateMachine.state.value == RestMode.RestActive)
 
         orch.start()
@@ -1299,14 +1297,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         check(orch.stateMachine.state.value == RestMode.RestActive)
 
         // First start: spawns observer + wsActivePollJob; observer's
@@ -1416,14 +1409,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         check(orch.stateMachine.state.value == RestMode.RestActive)
 
         orch.start()
@@ -1505,14 +1493,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         orch.start()
         runCurrent()
         repeat(5) {
@@ -1633,14 +1616,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         orch.start()
         runCurrent()
         repeat(5) {
@@ -1764,14 +1742,9 @@ class RestFallbackOrchestratorVerifyAndPostureTest {
         )
         val caps = orch.bootstrap()
         check(caps.restFallback)
-        repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-            orch.submitEvent(
-                RestStateMachine.Event.WsSessionEnded(
-                    durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                    sessionEpoch = 0L,
-                ),
-            )
-        }
+        // Stage 2: one live session end degrades, and a close of a session
+        // the machine never saw connect is stale. The helper does both.
+        orch.driveToRestActive()
         orch.start()
         runCurrent()
         repeat(5) {

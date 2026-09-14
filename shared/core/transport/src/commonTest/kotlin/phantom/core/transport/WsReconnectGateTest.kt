@@ -42,6 +42,10 @@ class WsReconnectGateTest {
 
     /** Drive the SM from Open → Quiesced via the mode-2-fast-path sticky-arm. */
     private suspend fun armSticky(sm: RestStateMachine) {
+        // Stage 2: the session has to be live before its close means
+        // anything -- a close of a session the machine never saw connect
+        // is stale and is ignored by freshness (B2).
+        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
         sm.onEvent(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 31_000,
@@ -229,9 +233,11 @@ class WsReconnectGateTest {
                 connectionGeneration = 1L,
             )
         )
-        // 60s tick.
+        // 60s tick. Stage 2 B10: the sticky proof additionally requires
+        // the B3 proof -- one inbound frame of THIS session plus the dwell.
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived(sessionEpoch = 11L))
         t = 60_001L
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 11L))
         assertEquals(WsReconnectGate.Open, sm.gate.value)
     }
 
@@ -370,8 +376,9 @@ class WsReconnectGateTest {
                 connectionGeneration = ownerB,
             )
         )
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived(sessionEpoch = 99L))
         t = 60_001L
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 99L))
         assertEquals(WsReconnectGate.Open, sm.gate.value, "gate is Open again post-recovery")
 
         // Loop A finishes auth and tries to validate its stale OpenPermit.
@@ -810,9 +817,11 @@ class WsReconnectGateTest {
         // Clear any prior mode-switched callbacks captured during setup.
         modeSwitchedCapture.clear()
 
-        // Now the stale 60-s probation tick arrives.
+        // Now the stale 60-s probation tick arrives, with the frame the
+        // proof would need, so the ONLY thing that can reject it is the gate.
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived(sessionEpoch = 7L))
         t = 60_001L
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 7L))
 
         // (a) gate stays Quiesced.
         assertTrue(
@@ -866,8 +875,9 @@ class WsReconnectGateTest {
         assertTrue(sm.gate.value is WsReconnectGate.CandidateProving)
         modeSwitched.clear()
 
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived(sessionEpoch = 7L))
         t = 60_001L
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 7L))
 
         assertEquals(WsReconnectGate.Open, sm.gate.value, "proof commits: gate → Open")
         assertEquals(RestMode.WsActive, sm.state.value, "proof commits: RestMode → WsActive")
@@ -924,7 +934,20 @@ class WsReconnectGateTest {
             currentKindProvider = { TransportKind.Direct },
             tokenSource = { 0xDEAD_BEEFL },
         )
-        // Step 1: Mode 2 silent-drop session — fast-path armed, gate Quiesced.
+        // Step 1: a live session, then a Mode 2 silent drop — fast-path
+        // armed, gate Quiesced.
+        //
+        // Stage 2 freshness (B2): a close is handled only if it names the
+        // session the machine holds, so an `Ended(1)` with no preceding
+        // `Connected(1)` is stale and changes nothing. The session is made
+        // live first, and the intermediate mode is pinned: a handshake
+        // makes a session live, not proven.
+        sm.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        assertEquals(
+            RestMode.WsCandidate, sm.state.value,
+            "a connect is a candidate; the Mode-2 signature is evaluated for any mode " +
+                "that is not already RestActive, so the drop below still takes the fast path",
+        )
         sm.onEvent(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 31_000,
@@ -977,8 +1000,9 @@ class WsReconnectGateTest {
         assertEquals(42L, candidateSessionEpoch)
 
         // Step 6: 60-second probation tick ⇒ ws_alive_60s ⇒ Open + sticky cleared.
+        sm.onEvent(RestStateMachine.Event.WsFrameTextReceived(sessionEpoch = 42L))
         t = 11_000L + 60_001L
-        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEvent(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 42L))
         assertEquals(WsReconnectGate.Open, sm.gate.value, "after 60s probation ⇒ gate Open")
         assertEquals(RestMode.WsActive, sm.state.value, "after probation ⇒ RestMode WsActive")
 

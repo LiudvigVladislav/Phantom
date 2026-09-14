@@ -780,6 +780,93 @@ class GenerationHandoverPublicationTest {
         assertTrue(carries(failed.releaseFailure, release), "release cause lost")
         assertTrue(carries(failed.quiesceFailure, quiesce), "quiesce cause lost")
     }
+
+    // ── Stage 2 B7c: settlement of ONE generation, authoritatively ──────────
+    //
+    // A walk that ends `TorLifecycleUnsettled(N)` registers an obligation,
+    // and the recovery coordinator may only lift it on an authoritative
+    // answer about N. `status` cannot give that answer: it carries whichever
+    // generation is live and says nothing about whether the host of N let
+    // go. Each case below is a way a `status` observer would have lifted the
+    // obligation wrongly.
+
+    @Test
+    fun a_settled_generation_with_a_released_host_is_settled() = runTest {
+        val handle = FakeTorProcessHandle()
+        val owner = TorLifecycleOwner({ handle }, backgroundScope)
+        assertEquals(StartResult.Started(1L), owner.start(listOf("bridge")))
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.PhaseNotSettled),
+            owner.settlementFor(1L),
+            "a running generation owes a stop",
+        )
+        owner.stop(TorBudget(1_000))
+        assertEquals(
+            TorSettlement.Settled, owner.settlementFor(1L),
+            "confirmed stop plus an observed release is the only Settled",
+        )
+    }
+
+    @Test
+    fun a_settlement_of_another_generation_says_nothing_about_this_one() = runTest {
+        val handle = FakeTorProcessHandle()
+        val owner = TorLifecycleOwner({ handle }, backgroundScope)
+        owner.start(listOf("bridge"))
+        owner.stop(TorBudget(1_000))
+        assertEquals(StartResult.Started(2L), owner.start(bridges = null))
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.OtherGeneration),
+            owner.settlementFor(1L),
+            "an obligation for generation 1 must not be lifted by generation 2",
+        )
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.PhaseNotSettled),
+            owner.settlementFor(2L),
+        )
+    }
+
+    @Test
+    fun a_host_that_never_let_go_is_not_settled() = runTest {
+        val handle = FakeTorProcessHandle()
+        handle.releaseResult = ReleaseResult.NotReleased(IllegalStateException("threads held"))
+        val owner = TorLifecycleOwner({ handle }, backgroundScope)
+        owner.start(listOf("bridge"))
+        owner.stop(TorBudget(1_000))
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.HostNotReleased),
+            owner.settlementFor(1L),
+            "the daemon is gone but its host still holds resources; a successor is refused",
+        )
+        // And the owner itself refuses, which is the property the settlement
+        // answer exists to mirror.
+        assertIs<StartResult.RefusedHostNotReleased>(owner.start(bridges = null))
+    }
+
+    @Test
+    fun an_unconfirmed_stop_is_not_settled() = runTest {
+        val handle = FakeTorProcessHandle()
+        handle.terminateFailure = IllegalStateException("stop threw")
+        val owner = TorLifecycleOwner({ handle }, backgroundScope)
+        owner.start(listOf("bridge"))
+        owner.stop(TorBudget(1_000))
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.OutcomeInadmissible),
+            owner.settlementFor(1L),
+            "an outcome without positive evidence about the daemon may not lift an obligation",
+        )
+        assertIs<StartResult.RefusedUnsettled>(owner.start(bridges = null))
+    }
+
+    @Test
+    fun a_generation_that_never_existed_is_not_settled() = runTest {
+        val handle = FakeTorProcessHandle()
+        val owner = TorLifecycleOwner({ handle }, backgroundScope)
+        assertEquals(
+            TorSettlement.NotSettled(TorSettlementGap.OtherGeneration),
+            owner.settlementFor(7L),
+            "fail closed: an owner that knows nothing about a generation lifts nothing",
+        )
+    }
 }
 
 private class FakeTorProcessHandle : TorProcessHandle {

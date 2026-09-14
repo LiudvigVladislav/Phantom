@@ -156,7 +156,31 @@ class ServiceStartupTest {
         assertEquals(1, work.await())
     }
 
-    @Test fun actual_service_observers_and_start_stop_on_failed_readiness() = runTest {
+    /**
+     * A start that cannot reach a ready container stops the service and
+     * hands recovery to the coordinator, which schedules ONE bounded
+     * wake-up rather than trying again immediately.
+     *
+     * Review round 8 pass 5. This case asserted that a failed start left
+     * the coroutine count exactly where `onCreate` had it -- "no coroutine
+     * of its own" -- and that was wrong twice over. It described planned
+     * recovery as a leak, and it asserted a number that production had
+     * already stopped producing.
+     *
+     * What production actually does, and what this case now pins:
+     *
+     *   runStartAttempt fails readiness
+     *     -> onStartJobCompleted(stamp)
+     *     -> ensureRecoveryProgress("start_job_completed")
+     *     -> no owner, no live session, and a start attempt one instant old
+     *     -> START_BUDGET_MS spacing defers, arming one `spacingWakeJob`
+     *
+     * That wake-up is the mechanism that stops a failed start from waiting
+     * on the alarm heartbeat, so its absence would be the defect, not its
+     * presence. It is bounded, there is at most one, and it dies with the
+     * instance -- all three of which are asserted below.
+     */
+    @Test fun a_failed_readiness_stops_the_service_and_arms_one_bounded_recovery_wake() = runTest {
         val app = PhantomApplication() // Deliberately no native Application.onCreate.
         app.ready.completeExceptionally(IllegalStateException("test initialization failed"))
         val controller = Robolectric.buildService(PhantomMessagingService::class.java)
@@ -166,16 +190,71 @@ class ServiceStartupTest {
         ReflectionHelpers.setField(service, "serviceScope", CoroutineScope(job + StandardTestDispatcher(testScheduler)))
         try {
             controller.create()
+            runCurrent()
+            // `onCreate` launches the long-lived collectors, including the
+            // one that mirrors the recovery coordinator's start-job state
+            // into presentation. They are SUPPOSED to run until
+            // `onDestroy`, so the baseline is measured rather than written
+            // down: a future lifecycle coroutine must not silently become
+            // an accepted leak, and a fixture that stops measuring must
+            // fail rather than pass.
+            val lifecycleJobs = job.children.count { it.isActive }
+            assertTrue(
+                lifecycleJobs > 0,
+                "onCreate is expected to leave lifecycle coroutines running; a zero here " +
+                    "means this case has stopped measuring anything",
+            )
+
+            // Deliberately NOT ShadowLog.clear() here: the
+            // `UninitializedPropertyAccessException` assertion below is
+            // meant to cover everything this instance has logged, and
+            // clearing would quietly narrow it to the start alone. The
+            // trace assertion does not need a clear -- `recovery_deferred`
+            // is only ever emitted by a decision, and no decision runs
+            // before the start.
             service.onStartCommand(null, 0, 1)
             runCurrent()
             assertTrue(shadowOf(service).isStoppedBySelf)
-            assertTrue(job.children.none { it.isActive })
+
+            // Exactly ONE coroutine survives the failed start, and it is the
+            // coordinator's bounded start-spacing wake. The count alone
+            // would accept any stray job, so the coordinator's own trace is
+            // the discriminator: it names both the trigger that produced the
+            // wake and the reason it was deferred.
+            assertTrue(
+                ShadowLog.getLogsForTag("PhantomHybrid").any {
+                    "recovery_deferred" in it.msg &&
+                        "trigger=start_job_completed" in it.msg &&
+                        "reason=start_spacing" in it.msg
+                },
+                "the failed start must hand recovery to the coordinator, which defers on " +
+                    "START_BUDGET_MS spacing and arms one wake-up. Without this line the " +
+                    "extra coroutine below is unattributed. Logs: " +
+                    ShadowLog.getLogsForTag("PhantomHybrid").map { it.msg },
+            )
+            assertEquals(
+                lifecycleJobs + 1, job.children.count { it.isActive },
+                "the failed start leaves exactly one coroutine behind: the bounded " +
+                    "`spacingWakeJob`. It is planned recovery, not a leak -- without it a " +
+                    "restored-but-deferred start would wait for the alarm heartbeat, whose " +
+                    "delivery Doze can defer without bound",
+            )
             assertFalse(ShadowLog.getLogsForTag("PhantomMessaging").any {
                 "UninitializedPropertyAccessException" in it.msg
             })
             // app.container was never assigned; an access would throw the physical crash.
-        } finally {
+
+            // And none of it outlives the instance: the collectors' licence
+            // to outlive a start, and the spacing wake's licence to fire
+            // later, both expire at onDestroy.
             controller.destroy()
+            runCurrent()
+            assertTrue(
+                job.children.none { it.isActive },
+                "onDestroy must take the lifecycle collectors AND the bounded recovery " +
+                    "wake with it",
+            )
+        } finally {
             job.cancelAndJoin()
         }
     }
@@ -231,10 +310,32 @@ class ServiceStartupTest {
         ReflectionHelpers.setField(service, "serviceScope", CoroutineScope(job + StandardTestDispatcher(testScheduler)))
         try {
             controller.create()
+            runCurrent()
+            val lifecycleJobs = job.children.count { it.isActive }
+            assertTrue(
+                lifecycleJobs > 0,
+                "onCreate is expected to leave lifecycle coroutines running; a zero here " +
+                    "means this case has stopped measuring anything",
+            )
+
             service.onStartCommand(null, 0, 1)
             service.onStartCommand(null, 0, 2)
             runCurrent()
-            assertEquals(3, job.children.count { it.isActive }, "two observers and one startup waiter")
+            // Each `onStartCommand` launches exactly ONE coroutine on the
+            // service scope. Stage 2 does not make the second one a second
+            // ATTEMPT -- the coordinator admits one start and the other
+            // joins it -- but it is still a coroutine and it is still
+            // waiting, which is what this case needs it to be.
+            //
+            // This asserted a bare `3` until review round 8 pass 4. That
+            // literal folded the lifecycle coroutines and the start
+            // coroutines into one number, so adding a lifecycle collector
+            // broke it for a reason it could not name. The baseline is now
+            // measured and only the delta is asserted.
+            assertEquals(
+                lifecycleJobs + 2, job.children.count { it.isActive },
+                "one coroutine per onStartCommand, on top of the onCreate lifecycle set",
+            )
         } finally {
             controller.destroy()
             job.cancelAndJoin()

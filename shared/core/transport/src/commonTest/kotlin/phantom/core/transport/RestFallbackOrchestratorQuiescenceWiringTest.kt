@@ -95,6 +95,20 @@ class RestFallbackOrchestratorQuiescenceWiringTest {
             kindProvider = { TransportKind.Direct },
             tokens = { 0L },
         )
+        // Stage 2 freshness (B2): a close is handled only if it names the
+        // session the machine currently holds. Sending `Ended(1)` to a
+        // machine that never saw `Connected(1)` is a STALE signal and is
+        // ignored, so the fast path this case is about would never run.
+        // The session is made live first, and the intermediate mode is
+        // pinned so a future change to what a handshake means cannot pass
+        // silently through this fixture.
+        orch.stateMachine.onEvent(
+            RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L),
+        )
+        assertEquals(
+            RestMode.WsCandidate, orch.stateMachine.state.value,
+            "a handshake makes the session live, not proven",
+        )
         // Drive the Mode-2 fast-path event into the state machine.
         orch.stateMachine.onEvent(
             RestStateMachine.Event.WsSessionEnded(
@@ -126,6 +140,20 @@ class RestFallbackOrchestratorQuiescenceWiringTest {
             kindProvider = { null },
             tokens = { 0L },
         )
+        // Stage 2 freshness (B2): a close is handled only if it names the
+        // session the machine currently holds. Sending `Ended(1)` to a
+        // machine that never saw `Connected(1)` is a STALE signal and is
+        // ignored, so the fast path this case is about would never run.
+        // The session is made live first, and the intermediate mode is
+        // pinned so a future change to what a handshake means cannot pass
+        // silently through this fixture.
+        orch.stateMachine.onEvent(
+            RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L),
+        )
+        assertEquals(
+            RestMode.WsCandidate, orch.stateMachine.state.value,
+            "a handshake makes the session live, not proven",
+        )
         orch.stateMachine.onEvent(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 31_000,
@@ -138,6 +166,13 @@ class RestFallbackOrchestratorQuiescenceWiringTest {
         assertEquals(
             WsReconnectGate.Open, orch.stateMachine.gate.value,
             "currentKindProvider=null ⇒ gate stays Open even though sticky armed",
+        )
+        assertEquals(
+            RestMode.RestActive, orch.stateMachine.state.value,
+            "and the fast path DID run: before the session was made live above, this " +
+                "case passed for the wrong reason — the stale close was ignored, so " +
+                "nothing armed and the gate stayed Open by default rather than by the " +
+                "Direct fence",
         )
     }
 
@@ -154,6 +189,20 @@ class RestFallbackOrchestratorQuiescenceWiringTest {
         val orch = newOrchestrator(
             kindProvider = { TransportKind.Direct },
             tokens = { expectedToken },
+        )
+        // Stage 2 freshness (B2): a close is handled only if it names the
+        // session the machine currently holds. Sending `Ended(1)` to a
+        // machine that never saw `Connected(1)` is a STALE signal and is
+        // ignored, so the fast path this case is about would never run.
+        // The session is made live first, and the intermediate mode is
+        // pinned so a future change to what a handshake means cannot pass
+        // silently through this fixture.
+        orch.stateMachine.onEvent(
+            RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L),
+        )
+        assertEquals(
+            RestMode.WsCandidate, orch.stateMachine.state.value,
+            "a handshake makes the session live, not proven",
         )
         // Sticky-arm and then run the begin → issue cycle directly.
         orch.stateMachine.onEvent(

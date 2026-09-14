@@ -31,7 +31,7 @@ import kotlin.test.fail
  *   2. The `-keepclassmembers class phantom.core.transport.KtorRelayTransport {`
  *      block MUST be present. Without it, R8 would strip the five
  *      concrete-type-accessed members the wildcard previously preserved
- *      (`wsSessionLifecycle`, `outboundAckDeadlineExpired`, `inboundStalled`,
+ *      (`attachSessionSignalConsumer`, `hasSessionSignalConsumer`,
  *      `snapshotPendingOutbound`, `markPendingOutboundAcceptedByFallback`),
  *      breaking `HybridRelayTransport`'s WS-side wiring.
  *
@@ -79,9 +79,13 @@ class KtorRelayTransportProguardNarrowingPinTest {
      * step 2 contract.
      */
     private val requiredMemberNames: List<String> = listOf(
-        "wsSessionLifecycle",
-        "outboundAckDeadlineExpired",
-        "inboundStalled",
+        // Stage 2 (2026-09-13): the three separate flows this list used to
+        // name (`wsSessionLifecycle`, `outboundAckDeadlineExpired`,
+        // `inboundStalled`) are one channel reached through one entry
+        // point, so the keep list shrank with the surface rather than
+        // being loosened.
+        "attachSessionSignalConsumer",
+        "hasSessionSignalConsumer",
         "snapshotPendingOutbound",
         "markPendingOutboundAcceptedByFallback",
     )
@@ -157,8 +161,8 @@ class KtorRelayTransportProguardNarrowingPinTest {
             source.contains(narrowedKeepBlockHeader),
             "`apps/android/proguard-rules.pro` MUST carry the narrowed keep block\n" +
                 "  $narrowedKeepBlockHeader\n" +
-                "Without it, R8 strips `wsSessionLifecycle`, `outboundAckDeadlineExpired`, " +
-                "`inboundStalled`, `snapshotPendingOutbound`, and " +
+                "Without it, R8 strips `attachSessionSignalConsumer`, " +
+                "`hasSessionSignalConsumer`, `snapshotPendingOutbound`, and " +
                 "`markPendingOutboundAcceptedByFallback` — all of which are accessed " +
                 "by name from `HybridRelayTransport` via the concrete `KtorRelayTransport` " +
                 "type (not via the `RelayTransport` interface). The result would be a " +

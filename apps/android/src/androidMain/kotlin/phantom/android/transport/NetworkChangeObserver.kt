@@ -13,7 +13,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicLong
 import phantom.core.transport.RelayTransportConfig
+
+private fun atomicLongOf(initial: Long): AtomicLong = AtomicLong(initial)
 
 /**
  * PR-LTE-NETCHANGE1 (2026-05-28) — Android observer for meaningful
@@ -106,6 +109,22 @@ internal class NetworkChangeObserver(
 
     /** Last snapshot that was sent to the coordinator. `null` until first run. */
     @Volatile private var lastAcceptedSnapshot: NetworkSnapshot? = null
+
+    /**
+     * Stage 2 B5 (2026-09-13): monotonic counter of ACCEPTED meaningful
+     * changes. Before Stage 2 nothing on this path carried an identity, so
+     * a REST poll issued on the old network could answer after the change
+     * and re-prove health for a link that no longer existed. The value
+     * travels with every `onMeaningfulChange` into the rewalk paths, the
+     * orchestrator's health and the state-machine event, and a result
+     * captured under an older generation is discarded.
+     *
+     * The initial snapshot does NOT bump it: that is a read, not a change.
+     */
+    private val networkGeneration = atomicLongOf(0L)
+
+    /** The generation currently in force. Diagnostic and test surface. */
+    internal val currentNetworkGeneration: Long get() = networkGeneration.get()
 
     private val callback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
@@ -231,7 +250,9 @@ internal class NetworkChangeObserver(
         )
 
         lastAcceptedSnapshot = current
-        coordinator.onMeaningfulChange(reason, current)
+        val generation = networkGeneration.incrementAndGet()
+        Log.i(TAG, "NETWORK_TRACE network_generation generation=$generation reason=$reason")
+        coordinator.onMeaningfulChange(reason, current, generation)
     }
 
     /**

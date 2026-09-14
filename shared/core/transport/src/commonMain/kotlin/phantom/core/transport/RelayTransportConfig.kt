@@ -93,7 +93,7 @@ object RelayTransportConfig {
     /**
      * PR-RECV-DIAG1 v1.6 — inbound-stall threshold. If the WS read loop
      * has not seen any Frame.Text for this duration, the idle watchdog
-     * emits an `InboundStalledEvent` and the state machine transitions
+     * emits a `WsSessionSignal.Stalled` and the state machine transitions
      * WsActive → RestActive. 60 s is the same threshold the idle
      * watchdog already uses for its diagnostic log, so this is just
      * promoting that log into an actionable signal.
@@ -221,14 +221,14 @@ object RelayTransportConfig {
     const val WS_DEGRADED_PING_WEIGHT = 2.0
 
     /**
-     * Weak-medium signal (`OutboundAckDeadlineExpiredEvent`). Adjacent to
+     * Weak-medium signal (`WsSessionSignal.AckDeadlineExpired`). Adjacent to
      * ping-timeout but can also trigger on bursty outbound load that is
      * not actually degradation.
      */
     const val WS_DEGRADED_ACK_WEIGHT = 1.0
 
     /**
-     * Weakest signal (`InboundStalledEvent`). Equivalent to "WS handshake
+     * Weakest signal (`WsSessionSignal.Stalled`). Equivalent to "WS handshake
      * succeeded but no inbound traffic for [INBOUND_STALL_THRESHOLD_MS]".
      * Useful as a counter input but, per design note rev2 Q5, never
      * triggers a rewalk on its own — R0.4b spirit.

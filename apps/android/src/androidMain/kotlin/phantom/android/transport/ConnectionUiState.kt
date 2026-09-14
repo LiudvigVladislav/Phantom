@@ -3,6 +3,7 @@
 
 package phantom.android.transport
 
+import phantom.core.transport.RestHealth
 import phantom.core.transport.RestMode
 import phantom.core.transport.RestModeSnapshot
 import phantom.core.transport.RestRecoveryCause
@@ -11,68 +12,55 @@ import phantom.core.transport.TransportState
 /**
  * Presentation-only UI state for the Android transport banner / status row
  * / notification overlay. Derived from the raw [TransportState] of the
- * underlying WebSocket transport plus the [RestMode] of
- * [HybridRelayTransport.stateMachine].
+ * underlying WebSocket transport, the [RestModeSnapshot] of
+ * [HybridRelayTransport.stateMachine], the orchestrator's [RestHealth],
+ * the transport's connected session epoch and the recovery coordinator's
+ * activity (Stage 2 B9, 2026-09-13).
  *
  * NOT a substitute for the common-side [TransportState] source of truth.
  * `TransportState` is consumed by transport-internal logic (prekey retry,
- * keepalive guards, alarm-driven reconnect cues) and MUST stay on raw
- * WS semantics. This type is read by the three Android UI surfaces:
+ * keepalive guards) and MUST stay on raw WS semantics. This type is read
+ * by the three Android UI surfaces:
  * [phantom.android.screens.chatlist.ChatListScreen],
  * [phantom.android.screens.chat.ChatScreen], and
  * [phantom.android.ui.ConnectionBanner].
- *
- * PR-WS-HEALTH-STATE1 Commit 3.1 (2026-05-30). Design note locked in
- * `docs/tracks/ws-health-state.md` § Commit 3.1 design note. The
- * derivation table prioritises [RestMode] over raw [TransportState] so
- * that a transient `Connected` WS during `RestActive` / `WsCandidate`
- * still presents as `LimitedRealtime` / `Recovering` — matching the
- * existing notification shade overlay precedence at
- * `PhantomMessagingService.kt:246+`.
  */
 sealed class ConnectionUiState {
-    /** RestMode.WsActive + WS Connected — fully healthy, no fallback in flight. */
+    /** A proven live WS session in `WsActive`, the socket `Connected`, epochs matching. */
     object Online : ConnectionUiState()
 
-    /** RestMode.RestActive — REST fallback is delivering envelopes. */
+    /** REST fallback is delivering envelopes. */
     object LimitedRealtime : ConnectionUiState()
 
-    /** WS probation following a failure, route change, or unknown cause. */
+    /** WS probation following a failure, route change, or unknown cause; REST usable or a socket alive. */
     object Recovering : ConnectionUiState()
 
-    /** RestMode.WsActive + WS Connecting — cold-start / first connect. */
+    /** First WS attempt in flight, nothing proven yet and no usable REST. */
     object Connecting : ConnectionUiState()
 
-    /** RestMode.WsActive + WS Reconnecting — in-process recovery. */
+    /** No usable REST and the socket is between attempts, or a start is being prepared. */
     object Reconnecting : ConnectionUiState()
 
-    /** RestMode.WsActive + WS Disconnected — no transport. */
+    /** No live session, no usable REST, no start in flight: messages queue (L1 holds). */
     object Offline : ConnectionUiState()
 
-    /** RestMode.WsActive + WS Error — terminal failure without fallback. */
+    /** No usable REST and the last WS attempt failed with a cause. */
     data class Error(val cause: Throwable) : ConnectionUiState()
 }
 
 /**
- * Pure derivation function. Internal visibility so unit tests can target
- * it without going through `combine` / `StateFlow` plumbing.
- *
- * Pattern-match order matters in Kotlin `when` (first match wins). This
- * table is intentionally written with `restMode` as the outer dispatch
- * so that `RestActive` / `WsCandidate` ALWAYS supersede raw `wsState`,
- * even when raw WS is `Connected`. Per `RestStateMachine.kt:34-:45`,
- * `WsCandidate` keeps REST polling continuing until either 60 s of WS
- * uptime OR an outbound ACK round-trip lands — so raw WS `Connected`
- * during `WsCandidate` does NOT mean "fully online", and UI must reflect
- * the `Recovering` state in that window.
- *
- * Gate 7 of the Commit 3.1 acceptance gates: this function MUST be
- * unit-tested exhaustively over the 7 priority rows. Architect-flagged
- * ambiguous cases to verify explicitly:
- *   - (Connected, RestActive)    -> LimitedRealtime
- *   - (Connected, WsCandidate)   -> Recovering
- *   - (Reconnecting, RestActive) -> LimitedRealtime
- *   - (Error(t), RestActive)     -> LimitedRealtime
+ * Stage 2 B7d/B9: what the recovery coordinator is doing, for
+ * presentation. `StartJobPending` is L1 state (e): a start job is alive
+ * and has not claimed ownership yet -- waiting for the container, for the
+ * device unlock, or inside `prepareStart`. Never `Offline` in that state
+ * (I5).
+ */
+enum class RecoveryActivity { Idle, StartJobPending }
+
+/**
+ * Legacy two-input derivation kept for callers and fixtures that predate
+ * Stage 2: no REST health (unusable), no transport epoch, no recovery
+ * activity. Equivalent to the full derivation with those defaults.
  */
 internal fun deriveConnectionUiState(
     wsState: TransportState,
@@ -80,24 +68,64 @@ internal fun deriveConnectionUiState(
 ): ConnectionUiState = deriveConnectionUiState(wsState, RestModeSnapshot(restMode))
 
 /**
- * Silence alone is not a diagnosed connection failure. Keep the limited-realtime
- * indication while its probation runs, never promote it to Online here. Missing
- * evidence and a raw WS failure retain the conservative Recovering indication.
+ * Pure derivation, Stage 2 B9. Internal visibility so unit tests can
+ * target it without going through `combine` / `StateFlow` plumbing.
+ *
+ * Invariants asserted by the fixtures:
+ *  - I4: `Online` implies a proven live session, `WsActive`,
+ *    `TransportState.Connected` and a matching transport epoch.
+ *  - I5: `Offline` implies no live session, REST unusable and no start
+ *    job in flight.
+ *  - `Error(cause)` only when REST is unusable and the last WS attempt
+ *    failed with a cause.
+ *
+ * `Connecting` is kept for exactly one row the B9 table does not name:
+ * the very first WS attempt (`wsState == Connecting`, no session was
+ * ever live) with no usable REST. Every other `WsActive` case without a
+ * proven, connected, matching session is `Recovering` (REST usable) or
+ * `Reconnecting` (REST unusable), never `Online`.
  */
 internal fun deriveConnectionUiState(
     wsState: TransportState,
     snapshot: RestModeSnapshot,
-): ConnectionUiState = when (snapshot.mode) {
-    RestMode.RestActive  -> ConnectionUiState.LimitedRealtime   // priority 1
-    RestMode.WsCandidate -> if (
-        snapshot.recoveryCause == RestRecoveryCause.InboundSilence &&
-        wsState == TransportState.Connected
-    ) ConnectionUiState.LimitedRealtime else ConnectionUiState.Recovering
-    RestMode.WsActive    -> when (wsState) {                    // priority 3+
-        TransportState.Connected    -> ConnectionUiState.Online
-        TransportState.Connecting   -> ConnectionUiState.Connecting
-        TransportState.Reconnecting -> ConnectionUiState.Reconnecting
-        TransportState.Disconnected -> ConnectionUiState.Offline
-        is TransportState.Error     -> ConnectionUiState.Error(wsState.cause)
+    restHealth: RestHealth = RestHealth.UNKNOWN,
+    transportSessionEpoch: Long? = null,
+    recovery: RecoveryActivity = RecoveryActivity.Idle,
+): ConnectionUiState {
+    val restUsable = restHealth.usable
+    val live = snapshot.liveSessionEpoch
+    val silence = snapshot.recoveryCause == RestRecoveryCause.InboundSilence
+    val startPending = recovery == RecoveryActivity.StartJobPending
+    return when (snapshot.mode) {
+        RestMode.WsActive -> {
+            val proven = live != null && snapshot.provenSessionEpoch == live
+            when {
+                proven && wsState == TransportState.Connected && transportSessionEpoch == live ->
+                    ConnectionUiState.Online
+                startPending -> if (restUsable) ConnectionUiState.Recovering else ConnectionUiState.Reconnecting
+                restUsable -> ConnectionUiState.Recovering
+                wsState is TransportState.Error -> ConnectionUiState.Error(wsState.cause)
+                wsState == TransportState.Connecting && live == null -> ConnectionUiState.Connecting
+                else -> ConnectionUiState.Reconnecting
+            }
+        }
+        RestMode.WsCandidate ->
+            if (restUsable && silence) ConnectionUiState.LimitedRealtime else ConnectionUiState.Recovering
+        RestMode.RestActive -> when {
+            // A silent live socket: the transport's watchdogs own it; L1 is not required.
+            live != null -> if (restUsable) ConnectionUiState.LimitedRealtime else ConnectionUiState.Recovering
+            restUsable -> if (silence) ConnectionUiState.LimitedRealtime else ConnectionUiState.Recovering
+            startPending -> ConnectionUiState.Reconnecting
+            wsState is TransportState.Error -> ConnectionUiState.Error(wsState.cause)
+            // Review round 7: the machine now starts in `RestActive` with no
+            // session, because a handshake is no longer taken as proof. A
+            // socket that is being established is not "nothing works": the
+            // first attempt reads `Connecting`, a later one `Reconnecting`,
+            // and `Offline` is left for the state where no attempt is in
+            // flight at all.
+            wsState == TransportState.Connecting -> ConnectionUiState.Connecting
+            wsState == TransportState.Reconnecting -> ConnectionUiState.Reconnecting
+            else -> ConnectionUiState.Offline
+        }
     }
 }

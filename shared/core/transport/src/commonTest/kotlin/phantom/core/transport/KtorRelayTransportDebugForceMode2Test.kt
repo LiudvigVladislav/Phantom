@@ -226,12 +226,21 @@ class KtorRelayTransportDebugForceMode2Test {
             mode2FastPathEnabled = true,
             mode2StickyEnabled = true,
         )
-        // Establish a Connected session at epoch 1.
+        // Establish a LIVE session at epoch 1.
+        //
+        // Stage 2 (2026-09-13): a handshake makes the session live, not
+        // proven, so this lands in `WsCandidate`. The Mode-2 signature is
+        // evaluated for any mode that is not already `RestActive`, which
+        // is why the close below still takes the fast path from here.
         machine.onEventNow(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
-        assertEquals(RestMode.WsActive, machine.current)
+        assertEquals(
+            RestMode.WsCandidate, machine.current,
+            "a connect is a candidate: nothing has arrived on the socket yet",
+        )
         // First `Ended` for epoch 1 — matches the Mode 2 signature and
         // drives the state machine through transitionToRest +
-        // armSticky.
+        // armSticky. It also CLEARS the live session, which is what makes
+        // the duplicate below stale.
         clock += 30_000L
         machine.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
@@ -256,10 +265,13 @@ class KtorRelayTransportDebugForceMode2Test {
             "First Ended MUST emit exactly one `sticky_armed gen=` log line.",
         )
         // Second `Ended` for the SAME epoch 1 — the synthetic+real
-        // race outcome. The state machine is now `RestActive`; the
-        // `RestActive` arm of `onWsSessionEnded` silently absorbs the
-        // duplicate. State stays `RestActive`; no second `armSticky`
-        // fires; no `mode_2_signature_matched` line repeats.
+        // race outcome. Under Stage 2 the first close cleared the live
+        // session, so this one names a session the machine no longer
+        // holds and freshness (B2) absorbs it. The D-1 dedup verdict is
+        // unchanged in what it guarantees; what enforces it is now the
+        // session identity rather than the mode arm. State stays
+        // `RestActive`; no second `armSticky` fires; no
+        // `mode_2_signature_matched` line repeats.
         val logSizeBeforeSecond = logs.size
         machine.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
@@ -338,13 +350,15 @@ class KtorRelayTransportDebugForceMode2Test {
         // waiting via withTimeoutOrNull (round-3 fix: round 2 used
         // .take(1).toList() which would silently pass if a second
         // event were also enqueued).
-        val ended = assertIs<WsSessionLifecycleEvent.Ended>(
-            transport.wsSessionLifecycle.first(),
-        )
+        // Stage 2: one channel, one consumer. The subscription is taken
+        // once and read twice, because handing it out twice is exactly
+        // what the transport now refuses.
+        val signals = transport.attachSessionSignalConsumer().signals
+        val ended = assertIs<WsSessionLifecycleEvent.Ended>(signals.first())
         assertEquals(13L, ended.sessionEpoch)
         assertEquals("synthetic", ended.closeOrigin)
         val second = withTimeoutOrNull(timeMillis = 200L) {
-            transport.wsSessionLifecycle.first()
+            signals.first()
         }
         assertNull(
             second,
@@ -414,7 +428,7 @@ class KtorRelayTransportDebugForceMode2Test {
         // okhttpPingTimeoutDetected=true + inboundFrames=0 — plus
         // the closeOrigin="synthetic" telemetry tell that
         // distinguishes synthetic from real local/remote/error/unknown.
-        val event = transport.wsSessionLifecycle.first()
+        val event = transport.attachSessionSignalConsumer().signals.first()
         val ended = assertIs<WsSessionLifecycleEvent.Ended>(event)
         assertEquals(45_000L, ended.durationMs)
         assertEquals(0, ended.inboundFrames)

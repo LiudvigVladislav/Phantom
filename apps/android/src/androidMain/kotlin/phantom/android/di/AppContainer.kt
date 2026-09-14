@@ -973,6 +973,17 @@ class AppContainer(private val context: Context) {
     )
 
     /**
+     * Stage 2 B8: the orchestrator's REST health, always present so the
+     * presentation combine can read it from class construction. Unusable
+     * until the orchestrator exists and an authenticated poll answers.
+     * A forwarder inside the init stages routes the real flow here.
+     */
+    private val connectionRestHealth = MutableStateFlow(phantom.core.transport.RestHealth.UNKNOWN)
+
+    /** Whether REST is a usable path right now. Presentation and the recovery coordinator. */
+    val restHealth: StateFlow<phantom.core.transport.RestHealth> = connectionRestHealth.asStateFlow()
+
+    /**
      * Presentation-only UI state combining raw WS [phantom.core.transport.TransportState]
      * with [phantom.core.transport.RestMode], derived per the table in
      * [phantom.android.transport.deriveConnectionUiState]. Consumed by the
@@ -993,8 +1004,20 @@ class AppContainer(private val context: Context) {
         combine(
             wsTransport.state,
             connectionRestSnapshot,
-        ) { wsState, snapshot ->
-            phantom.android.transport.deriveConnectionUiState(wsState, snapshot)
+            connectionRestHealth,
+            phantom.android.service.PhantomMessagingService.recoveryActivityState,
+        ) { wsState, snapshot, health, recovery ->
+            // Stage 2 B9: the epoch is read here rather than collected —
+            // it can only change together with `wsTransport.state`, which
+            // is an input of this very combine, so a re-derivation always
+            // sees the pair that belong together.
+            phantom.android.transport.deriveConnectionUiState(
+                wsState = wsState,
+                snapshot = snapshot,
+                restHealth = health,
+                transportSessionEpoch = wsTransport.currentSessionEpoch,
+                recovery = recovery,
+            )
         }.stateIn(
             scope = appScope,
             started = SharingStarted.Eagerly,
@@ -1010,8 +1033,11 @@ class AppContainer(private val context: Context) {
             // (wsTransport.state, RestMode.WsActive) derivation; using the
             // derivation function literally here makes the semantics match.
             initialValue = phantom.android.transport.deriveConnectionUiState(
-                wsTransport.state.value,
-                connectionRestSnapshot.value,
+                wsState = wsTransport.state.value,
+                snapshot = connectionRestSnapshot.value,
+                restHealth = connectionRestHealth.value,
+                transportSessionEpoch = wsTransport.currentSessionEpoch,
+                recovery = phantom.android.service.PhantomMessagingService.recoveryActivityState.value,
             ),
         )
 
@@ -1398,7 +1424,10 @@ class AppContainer(private val context: Context) {
                         restEgressGateRef?.revokeAndJoin("deferred_privacy_settlement")
                     },
                     disconnectAndJoin = {
-                        transport.disconnectAndJoin(PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS)
+                        transport.disconnectAndJoin(
+                            PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS,
+                            reason = "privacy_mode_changed",
+                        )
                     },
                     handOverWalk = {
                         phantom.android.service.PhantomMessagingService
@@ -1415,9 +1444,14 @@ class AppContainer(private val context: Context) {
                         "PRIVACY_SWITCH tor_teardown_incomplete path=deferred reason=$it",
                     )
                 }
+                // Stage 2 B7c: a handed-over Tor obligation is part of
+                // this teardown. Reporting `confirmed` while it stands
+                // would declare a switch settled over a daemon nobody
+                // confirmed gone -- the obligation would then be dropped
+                // rather than discharged.
                 phantom.core.transport.TeardownAttempt(
                     walkQuiesced = outcome.walkQuiesced,
-                    confirmed = outcome.confirmed,
+                    confirmed = outcome.confirmed && !torSettlementOutstanding(),
                 )
             },
             // R-N1.17 P1: the lease stays shut from before the handover
@@ -1568,7 +1602,13 @@ class AppContainer(private val context: Context) {
             // transport instead. It also returns whether the teardown
             // actually joined, which `disconnect()` threw away.
             disconnectAndJoin = {
-                transport.disconnectAndJoin(PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS)
+                // Stage 2 B11: the teardown's session invalidation carries
+                // this reason, so a privacy switch is distinguishable from
+                // a rewalk in the state machine's trace.
+                transport.disconnectAndJoin(
+                    PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS,
+                    reason = "privacy_mode_changed",
+                )
             },
             // R-N1.16 P1: the outer walk owns the connect lease and is
             // NOT stopped by disconnectAndJoin, which only tears down the
@@ -1779,6 +1819,69 @@ class AppContainer(private val context: Context) {
     var messagingService: MessagingService? = null
         private set
 
+    /**
+     * Stage 2 B1 (2026-09-13): where the messaging stack is in its life.
+     *
+     * Before Stage 2 the only init state was `messagingService != null`,
+     * and there was no cleanup on a failure midway: an exception after the
+     * orchestrator ref was published left an orchestrator and possibly a
+     * Hybrid alive with `messagingService == null`, which is exactly the
+     * condition the storage wrapper reads as "not initialised" -- so the
+     * next attempt built a SECOND set against the same transport while the
+     * first kept consuming its flows.
+     */
+    sealed interface MessagingInit {
+        data object Uninitialized : MessagingInit
+        data object Initializing : MessagingInit
+        data object Ready : MessagingInit
+        data class Failed(val cause: Throwable) : MessagingInit
+    }
+
+    @Volatile
+    var messagingInit: MessagingInit = MessagingInit.Uninitialized
+        private set
+
+    /**
+     * Stage 2 B7c: a Tor generation whose settlement this container owes
+     * on behalf of the recovery coordinator, after a privacy switch moved
+     * the walk off a Tor-first strategy. The deferred settlement refuses
+     * to call itself settled while it stands.
+     */
+    @Volatile
+    private var pendingTorSettlement: Long? = null
+
+    /** Record an obligation handed over by the recovery coordinator (B7c). */
+    fun recordPendingTorSettlement(generation: Long) {
+        pendingTorSettlement = generation
+        android.util.Log.i(
+            "PhantomHybrid",
+            "PRIVACY_SWITCH pending_tor_settlement_recorded generation=$generation",
+        )
+    }
+
+    /**
+     * Whether a handed-over Tor obligation is still outstanding. Cleared
+     * only by the same authoritative check the coordinator uses, never by
+     * a notification.
+     */
+    internal fun torSettlementOutstanding(): Boolean {
+        val generation = pendingTorSettlement ?: return false
+        val settlement = runCatching { torService.settlementFor(generation) }.getOrNull()
+        if (settlement is phantom.core.transport.TorSettlement.Settled) {
+            pendingTorSettlement = null
+            android.util.Log.i(
+                "PhantomHybrid",
+                "PRIVACY_SWITCH pending_tor_settlement_cleared generation=$generation",
+            )
+            return false
+        }
+        android.util.Log.w(
+            "PhantomHybrid",
+            "PRIVACY_SWITCH pending_tor_settlement_outstanding generation=$generation",
+        )
+        return true
+    }
+
     // PR-M2d.1b — live chunk-progress bus for voice_v2 upload / download.
     // Lifetime tied to the AppContainer (process). UI reads `flow` and
     // looks up live N/M counters by message row id.
@@ -1793,7 +1896,112 @@ class AppContainer(private val context: Context) {
     var callManager: CallManager? = null
         private set
 
-    fun initMessaging(
+    /**
+     * Stage 2 B1: the guarded entry. Every caller that does not already
+     * hold [initMessagingMutex] comes through here; [initMessagingFromStorage]
+     * holds it and calls [initMessagingLocked] directly, so the
+     * non-reentrant mutex is never taken twice on one path.
+     */
+    suspend fun initMessaging(
+        identity: phantom.core.identity.IdentityRecord,
+        localKeyPair: phantom.core.crypto.DhKeyPair,
+    ) {
+        initMessagingMutex.withLock { initMessagingLocked(identity, localKeyPair) }
+    }
+
+    /**
+     * Caller holds [initMessagingMutex].
+     *
+     * Returns early only when the stack is [MessagingInit.Ready]. A
+     * previous [MessagingInit.Failed] rebuilds -- its objects were closed
+     * and its refs cleared, so there is nothing to inherit. Observing
+     * [MessagingInit.Initializing] here would mean the mutex was re-entered,
+     * which is a defect, not a state to tolerate.
+     */
+    private suspend fun initMessagingLocked(
+        identity: phantom.core.identity.IdentityRecord,
+        localKeyPair: phantom.core.crypto.DhKeyPair,
+    ) {
+        when (val state = messagingInit) {
+            is MessagingInit.Ready -> {
+                android.util.Log.i("PhantomMessaging", "RECV_DIAG init_messaging_already_ready")
+                return
+            }
+            is MessagingInit.Initializing ->
+                error("initMessagingLocked re-entered while initialising")
+            is MessagingInit.Failed ->
+                android.util.Log.i(
+                    "PhantomMessaging",
+                    "RECV_DIAG init_messaging_retry_after=${state.cause::class.simpleName}",
+                )
+            is MessagingInit.Uninitialized -> Unit
+        }
+        messagingInit = MessagingInit.Initializing
+        try {
+            buildMessagingStack(identity, localKeyPair)
+        } catch (t: Throwable) {
+            closePartialMessagingStack(t)
+            messagingInit = MessagingInit.Failed(t)
+            throw t
+        }
+        messagingInit = MessagingInit.Ready
+    }
+
+    /**
+     * Stage 2 B1: close what the aborted attempt built, in reverse order,
+     * and leave nothing of it alive or visible.
+     *
+     * Runs under [kotlinx.coroutines.NonCancellable] so a cancelled caller
+     * cannot skip it -- a half-built stack that keeps consuming the
+     * transport's signals is exactly what this exists to prevent. The
+     * Hybrid is closed BEFORE the orchestrator: it collects the
+     * orchestrator's inbound flow and holds the transport's signal
+     * subscription, so closing the orchestrator first would leave a
+     * collector waiting on a dead producer and the subscription attached.
+     */
+    private suspend fun closePartialMessagingStack(cause: Throwable) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+            android.util.Log.w(
+                "PhantomMessaging",
+                "RECV_DIAG init_messaging_failed_cleanup cause=${cause::class.simpleName}",
+            )
+            // Stage 3 first: the service owns no coroutine until
+            // `startReceiving`, which happens later in `prepareStart`.
+            messagingService = null
+            groupMessagingService = null
+            callManager = null
+            // Stage 2: the Hybrid owns its collectors AND the transport's
+            // single signal subscription.
+            val hybrid = hybridTransport
+            hybridTransport = null
+            if (hybrid != null) {
+                runCatching { hybrid.closeAndJoin() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PhantomMessaging",
+                            "RECV_DIAG init_cleanup_hybrid_close_failed=${it::class.simpleName}",
+                        )
+                    }
+            }
+            // Stage 1: the orchestrator cancels and joins its own jobs.
+            val orchestrator = restOrchestratorRef
+            restOrchestratorRef = null
+            if (orchestrator != null) {
+                runCatching { orchestrator.close() }
+                    .onFailure {
+                        android.util.Log.w(
+                            "PhantomMessaging",
+                            "RECV_DIAG init_cleanup_orchestrator_close_failed=${it::class.simpleName}",
+                        )
+                    }
+            }
+            connectionRestHealth.value = phantom.core.transport.RestHealth.UNKNOWN
+            connectionRestSnapshot.value =
+                phantom.core.transport.RestModeSnapshot(phantom.core.transport.RestMode.WsActive)
+        }
+    }
+
+    private suspend fun buildMessagingStack(
         identity: phantom.core.identity.IdentityRecord,
         localKeyPair: phantom.core.crypto.DhKeyPair,
     ) {
@@ -2524,6 +2732,15 @@ class AppContainer(private val context: Context) {
                 degradationCurrentKindProvider = sharedCurrentKindProvider,
             )
             hybridTransport = hybrid
+            // Stage 2 B1: attach the transport's single signal subscription
+            // and start the consumer HERE, synchronously, so this stage
+            // either completed or is cleaned up. Doing it inside the async
+            // bootstrap below would leave the attach outside the
+            // transaction: a failure between the two stages would find
+            // nothing attached, and the attach would then land on an
+            // abandoned Hybrid. A second attach throws, which is what
+            // makes "one consumer per process" checkable.
+            hybrid.startWsPassthroughCollectors()
             // Async REST bootstrap — never blocks AppContainer init. On failure
             // (relay unreachable at app start, network down, etc.) the hybrid
             // stays in passthrough mode and the WS path continues to function.
@@ -2600,6 +2817,9 @@ class AppContainer(private val context: Context) {
                 } else {
                     null
                 },
+                onRewalkAborted = { reason ->
+                    phantom.android.service.PhantomMessagingService.nudgeRecovery(reason)
+                },
                 requestServiceRestart = { reason ->
                     val intent = android.content.Intent(
                         context.applicationContext,
@@ -2668,6 +2888,12 @@ class AppContainer(private val context: Context) {
             appScope.launch {
                 hybrid.stateMachine.snapshot.collect { snapshot ->
                     connectionRestSnapshot.value = snapshot
+                }
+            }
+            // Stage 2 B8: the same lazy-upstream-swap for REST health.
+            appScope.launch {
+                restOrchestrator.restHealth.collect { health ->
+                    connectionRestHealth.value = health
                 }
             }
         }
@@ -3126,7 +3352,7 @@ class AppContainer(private val context: Context) {
 
     suspend fun initMessagingFromStorage() {
         initMessagingMutex.withLock {
-            if (messagingService != null) {
+            if (messagingInit is MessagingInit.Ready) {
                 android.util.Log.i(
                     "PhantomMessaging",
                     "RECV_DIAG initMessagingFromStorage_already_initialized",
@@ -3176,7 +3402,7 @@ class AppContainer(private val context: Context) {
                     "RECV_DIAG opk_reservation_startup_sweep_fail: ${it.message}",
                 )
             }
-            initMessaging(record, dhKeyPair)
+            initMessagingLocked(record, dhKeyPair)
             android.util.Log.i(
                 "PhantomMessaging",
                 "RECV_DIAG initMessagingFromStorage_done",

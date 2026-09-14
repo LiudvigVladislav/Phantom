@@ -19,12 +19,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -35,6 +39,7 @@ import phantom.android.BuildConfig
 import phantom.android.PhantomApplication
 import phantom.android.di.AppContainer
 import phantom.android.security.DeviceUnlockGate
+import phantom.android.transport.RecoveryActivity
 import phantom.core.identity.IdentitySigningKeyPair
 import phantom.core.transport.ConnectOwnership
 import phantom.core.transport.ConnectRetryScheduler
@@ -44,7 +49,11 @@ import phantom.core.transport.Handover
 import phantom.core.transport.ManagerState
 import phantom.core.transport.NoTransportReachableException
 import phantom.core.transport.SessionNotStoppedException
+import phantom.core.transport.PrivacyMode
 import phantom.core.transport.TorLifecycleUnsettled
+import phantom.core.transport.TorSettlement
+import phantom.core.transport.TransportRecoveryCoordinator
+import phantom.core.transport.TransportStrategy
 import phantom.core.transport.label
 import phantom.core.transport.TransportActivation
 import phantom.core.transport.TransportSession
@@ -186,6 +195,12 @@ class PhantomMessagingService : Service() {
         // Recovery lives in the companion and can outlive this
         // instance, so it needs a context that does too.
         appContext = applicationContext
+        collectRecoveryActivity()
+        // Stage 2 B7b: triggers that live outside a service instance --
+        // the alarm receiver, the rewalk coordinator -- reach the single
+        // coordinator through the companion, which needs to know which
+        // instance is live.
+        liveInstance = this
         super.onCreate()
         Log.d(TAG, "onCreate")
         // R-N1.17 P1: an instance is up, so successors are wanted again.
@@ -467,708 +482,764 @@ class PhantomMessagingService : Service() {
             return START_STICKY
         }
 
-        serviceScope.launch {
-            // Startup admission, identity and receive wiring all live in
-            // prepareStart(): it refuses duplicate concurrent starts, waits
-            // for readiness and reads identity only through the unlock gate.
-            val prepared = prepareStart() ?: return@launch
-            val container = prepared.container
-            val myPubKey = prepared.publicKeyHex
-            val signingPair = prepared.signingPair
-            // ADR-020 Phase 2: outer transport is now selected at runtime by
-            // TransportManager. It walks the strategy chain implied by the
-            // user's PrivacyMode (Standard → DIRECT_FIRST, Private →
-            // REALITY_FIRST, Ghost → TOR_FIRST), starts the matching
-            // subsystem, probes /health through it, and returns the first
-            // ConnectedTransport that reaches the relay. Last-working hint
-            // is recorded so subsequent connects skip dead paths.
-            //
-            // RELAY_ONION_URL is consumed only when the chosen kind is Tor;
-            // Direct and Reality both exit via the public WSS endpoint
-            // (Reality just tunnels that exit through its outer envelope).
-            // R-N1.16 review item 3: fail-closed must be recoverable.
-            // If an earlier handover could not confirm the previous walk
-            // had stopped, the lease is still held and every claim is
-            // refused. Retry the handover here, on whatever signal got
-            // us this far -- a start, a retry attempt or the alarm
-            // heartbeat. If that walk has since finished, the join
-            // returns at once and the lease is released; if it has not,
-            // the claim below is refused exactly as before.
-            //
-            // Without this the only thing that could lift the block was
-            // another network rewalk, so on a stable network the app
-            // would have stayed dark permanently.
-            handoffRecovery.onSignal(
-                if (isRetryAttempt) "retry_attempt" else "onStartCommand",
-            )
-
-            // R-N1.16 P1-1. Steps 2-4 of the handover: cancel the walk
-            // that currently owns the lease, WAIT for it to finish, and
-            // only then take the slot. This runs here rather than in
-            // onStartCommand because it joins, and joining on the main
-            // thread is an ANR.
-            //
-            // Revoking the token alone used to be the whole handover,
-            // which left the displaced coroutine running inside
-            // TransportManager.connect() beside its successor.
-            if (rewalkReason != null) {
-                when (val outcome = connectOwnership.handOver("rewalk_$rewalkReason")) {
-                    is Handover.TimedOut -> {
-                        // Fail-closed. We could not prove the previous
-                        // walk stopped, so we do not start another one:
-                        // being briefly disconnected is better than two
-                        // transports competing over the same subsystems.
-                        // The lease is deliberately still held, and
-                        // recovery waits for the next allowed signal,
-                        // which retries the handover.
-                        Log.w(
-                            "PhantomHybrid",
-                            "NETWORK_TRACE handoff_timeout reason=$rewalkReason " +
-                                "previousOwner=${outcome.previousOwner} " +
-                                "timeoutMs=${outcome.timeoutMs} " +
-                                "lease=kept successor=refused",
-                        )
-                        // Belt and braces. The coordinator arms recovery
-                        // through handOverOrArm before it ever sends a
-                        // restart, so this branch is normally
-                        // unreachable: a failed handover abandons the
-                        // rewalk instead of restarting the service.
-                        // Arming again is idempotent - arm() replaces the
-                        // timer rather than adding one.
-                        handoffRecovery.arm(rewalkReason)
-                        return@launch
-                    }
-                    Handover.AlreadyInProgress -> {
-                        Log.w(
-                            "PhantomHybrid",
-                            "NETWORK_TRACE handoff_skipped reason=$rewalkReason " +
-                                "cause=already_in_progress",
-                        )
-                        return@launch
-                    }
-                    is Handover.Quiesced -> Log.i(
-                        "PhantomHybrid",
-                        "NETWORK_TRACE handoff_complete reason=$rewalkReason " +
-                            "previousOwner=${outcome.previousOwner}",
-                    )
-                    Handover.NothingToStop -> Log.i(
-                        "PhantomHybrid",
-                        "NETWORK_TRACE handoff_noop reason=$rewalkReason",
-                    )
-                }
-            }
-
-            // Guard against a second onStartCommand (e.g. AlarmManager wakeup,
-            // foreground bring-back, ConnectivityChange broadcast) arriving while
-            // the first connect path is still establishing. The lease is a
-            // single atomic: the first caller wins and every other one bails.
-            // R-N1.16 P1-1: the lease and the walk it owns are taken in
-            // ONE step. The Job is read from inside this coroutine rather
-            // than captured at the launch site, because a
-            // `lateinit var job = scope.launch { ... }` races its own
-            // body and the body needs the handle first.
-            val myWalk: Job? = currentCoroutineContext()[Job]
-            val claimed = connectOwnership.claim(
-                if (isRetryAttempt) "retry_attempt" else "onStartCommand",
-            ) { timeoutMs ->
-                myWalk?.cancel(CancellationException("ownership_handover"))
-                myWalk == null || withTimeoutOrNull(timeoutMs) { myWalk.join() } != null
-            }
-            if (claimed == null) {
-                Log.d(TAG, "connect already in progress — duplicate onStartCommand ignored")
-                if (isRetryAttempt) {
-                    // A walk is already running, so this attempt is
-                    // dropped. That is safe without re-arming: the
-                    // running walk arms on its own AllFailed exit, and
-                    // the alarm heartbeat is the backstop.
-                    //
-                    // Nothing is put back, because this launch never
-                    // held a grant — there is no token to restore and
-                    // inventing one would let a launch that lost the
-                    // race schedule work.
-                    //
-                    // R-N1.16 P3: two sentences here used to say the
-                    // claim was "put back", three lines above the
-                    // sentence saying there was nothing to put back.
-                    Log.i(
-                        "PhantomHybrid",
-                        "RETRY_TRACE attempt_deferred reason=connect_in_progress",
-                    )
-                }
-                return@launch
-            }
-
-            // The token is minted only on a successful claim, so a
-            // refused launch never consumes one. Every cleanup site
-            // below goes through [releaseConnectOwnership], which
-            // compares and clears in one atomic step, so a displaced
-            // generation cannot free a slot that has changed hands.
-            val myGen = claimed
-            Log.i(
-                "PhantomHybrid",
-                "NETWORK_TRACE generation_claimed gen=$myGen",
-            )
-
-
-            // F11 + F26: signed-challenge auth requires our Ed25519 signing
-            // keypair. Resolve BEFORE asking TransportManager to start an
-            // outer subsystem — no point bootstrapping Tor / Xray if we
-            // cannot present a valid signed challenge once the WSS opens.
-            // The signing keypair was already resolved in prepareStart(),
-            // read through the unlock gate and refused there when absent, so
-            // it is available before any ownership is claimed. Reading it a
-            // second time here would bypass that gate on a locked device.
-            val signingPubKeyHex = signingPair.publicKey.bytes
-                .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
-
-            // RC-DIRECT-STABILITY1 Arm A short-circuit. When DEBUG_BYPASS_URL
-            // is non-empty in a debug build, route the service to the
-            // Caddy-bypass diagnostic raw-OkHttp socket instead of the
-            // production Hybrid Ktor `transport.connect(...)` path. Same
-            // Inv-ParallelArmIsolation rationale as Arm B below — production
-            // and diagnostic WS must never share `state.clients[identity]`.
-            //
-            // This branch is checked BEFORE the Arm B branch so that if
-            // both flags were somehow set simultaneously, Arm A takes
-            // precedence (the bypass URL is the more specific override).
-            // Both arms should never be active at once in practice — they
-            // measure different things and would compete for the same
-            // identity slot on the relay.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if `DEBUG_BYPASS_URL` was somehow non-empty — the release
-            // BuildConfig block pins it to "" as defence-in-depth.
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A + §7 step 2.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_A",
-                    "RC_DIRECT_ARM_A_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "bypass_url=${phantom.android.BuildConfig.DEBUG_BYPASS_URL} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmA?.start(myPubKey, signingPubKeyHex)
-                // Service stays alive (foreground service is the diagnostic
-                // host); the arm runs its own reconnect loop until cancelled
-                // via container.rcDirectArmA?.stop() or the app dies.
-                return@launch
-            }
-
-            // RC-DIRECT-STABILITY1 Arm A.2 short-circuit. When
-            // DEBUG_RC_DIRECT_ARM_A2_URL is non-empty in a debug build,
-            // route the service to the public non-Caddy TLS bypass
-            // diagnostic raw-OkHttp socket (stunnel on host `:8444`)
-            // instead of the production Hybrid Ktor `transport.connect(...)`
-            // path. Same Inv-ParallelArmIsolation rationale as Arm A
-            // above — production and diagnostic WS must never share
-            // `state.clients[identity]` at the relay.
-            //
-            // Precedence per §7 step 5e (locked in mini-lock): Arm A
-            // (Caddy-bypass loopback URL) → Arm A.2 (public non-Caddy
-            // TLS bypass URL via stunnel `:8444`) → Arm B (raw OkHttp
-            // baseline through Caddy `:443`) → Arm C (ping interval
-            // matrix) → Arm D (heartbeat echo) → production. Arms A
-            // and A.2 both use a `BuildConfig.DEBUG_*_URL.isNotEmpty()`
-            // gate; they are mutually exclusive in practice because a
-            // build sets one or the other. If both happened to be set,
-            // Arm A wins (above) because its block is earlier — the
-            // narrower override.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this
-            // branch even if `DEBUG_RC_DIRECT_ARM_A2_URL` was somehow
-            // non-empty — the release BuildConfig block pins it to "".
-            //
-            // Server-side dependency: this branch is meaningful only if
-            // the §4 Arm A.2 PR-8a stunnel overlay is deployed and
-            // verified on the VPS (`docker compose -f docker-compose.yml
-            // -f docker-compose.armA2.yml up -d stunnel-arm-a2`). Without
-            // that, the URL `wss://relay.phntm.pro:8444/ws` returns
-            // connection refused and Arm A.2 logs ws_failure on every
-            // session.
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2
-            // + §7 step 5e + PR-8a implementation record subsection.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_A2",
-                    "RC_DIRECT_ARM_A2_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "bypass_url=${phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmA2?.start(myPubKey, signingPubKeyHex)
-                // Service stays alive (foreground service is the diagnostic
-                // host); the arm runs its own reconnect loop until cancelled
-                // via container.rcDirectArmA2?.stop() or the app dies.
-                return@launch
-            }
-
-            // RC-DIRECT-STABILITY1 §10 T2 short-circuit. When DEBUG_T2_SLOW_POST_URL
-            // is non-empty in a debug build, route the service to the slow-POST
-            // byte-threshold diagnostic instead of the production Hybrid Ktor
-            // `transport.connect(...)` path. Same Inv-ParallelArmIsolation
-            // rationale as Arms A / A.2 / B / C / D above.
-            //
-            // T2 is **ONE-SHOT** — NOT a reconnect loop. One POST sends 40 960
-            // bytes chunked over ~70-80 s, the POST completes (or aborts), and
-            // the diagnostic job terminates. The Service stays alive (it's the
-            // foreground host) but T2 itself is finished after one run. Re-
-            // running requires killing the app and starting it again with the
-            // BuildConfig flag still set.
-            //
-            // Precedence per §7 step 5f (T2 inserted between A.2 and B):
-            // Arm A → Arm A.2 → T2 → Arm B → Arm C → Arm D → production. T2
-            // and the WebSocket arms are mutually exclusive in practice
-            // because a build sets DEBUG_T2_SLOW_POST_URL OR DEBUG_RC_DIRECT_*
-            // — never both.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if `DEBUG_T2_SLOW_POST_URL` was somehow non-empty — the
-            // release BuildConfig block pins it to "".
-            //
-            // Server-side dependency: this branch is meaningful only if the
-            // operator has flipped `RELAY_ENABLE_SLOW_POST_DIAG=1` on the
-            // VPS `.env` and recreated relay so `/diag/slow-post` is mounted.
-            // Without that, the endpoint returns 404 and T2 logs failure on
-            // first POST.
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §10 T2 mini-lock.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL.isNotEmpty()
-            ) {
-                Log.i(
-                    "T2_SLOW_POST",
-                    "T2_SLOW_POST_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "endpoint_url=${phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL} " +
-                        "gen=$myGen",
-                )
-                container.t2SlowPostDiag?.start()
-                // Service stays alive (foreground service is the diagnostic
-                // host); T2 runs ONE shot and the job terminates. No
-                // reconnect loop. Re-run requires app restart.
-                return@launch
-            }
-
-            // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
-            // diagnostic flag selects Arm B, the production Hybrid Ktor path
-            // is bypassed entirely so the diagnostic raw-OkHttp socket and a
-            // production socket cannot collide on the relay's
-            // state.clients[identity] map (Inv-ParallelArmIsolation).
-            //
-            // Inv-NoProductionBehaviour: the gate is
-            // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`.
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if the flag string was somehow non-"0" — the release
-            // BuildConfig block pins it to "0" as defence-in-depth.
-            //
-            // Locked in `docs/tracks/rc-direct-ws-death1.md` § Commit 3.2b
-            // (rev4) §7 step 3.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM == "B"
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_B",
-                    "RC_DIRECT_ARM_B_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmB?.start(myPubKey, signingPubKeyHex)
-                // Service stays alive (foreground service is the diagnostic
-                // host); the arm runs its own reconnect loop until cancelled
-                // via container.rcDirectArmB?.stop() or the app dies.
-                return@launch
-            }
-
-            // RC-DIRECT-STABILITY1 Arm C short-circuit. When the ping
-            // interval matrix flag is non-"0" in a debug build, route the
-            // service to the cadence diagnostic raw-OkHttp socket instead
-            // of the production Hybrid Ktor `transport.connect(...)` path.
-            // Same Inv-ParallelArmIsolation rationale as Arm A and Arm B
-            // above.
-            //
-            // Precedence: Arm A (bypass URL) → Arm B (raw OkHttp baseline)
-            // → Arm C (ping interval matrix) → production. They are all
-            // sequential diagnostic experiments and should never be active
-            // at once in practice — they would compete for the same
-            // identity slot on the relay.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if `DEBUG_RC_DIRECT_PING_INTERVAL_MS` was somehow non-"0"
-            // — the release BuildConfig block pins it to "0" as
-            // defence-in-depth.
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm C + §7 step 4.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_C",
-                    "RC_DIRECT_ARM_C_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "ping_interval_ms=${phantom.android.BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmC?.start(myPubKey, signingPubKeyHex)
-                return@launch
-            }
-
-            // RC-DIRECT-STABILITY1 Arm D short-circuit. When the heartbeat
-            // echo flag is "1" in a debug build, route the service to the
-            // data-frame heartbeat diagnostic raw-OkHttp socket instead
-            // of the production Hybrid Ktor `transport.connect(...)` path.
-            // Same Inv-ParallelArmIsolation rationale as Arms A / B / C
-            // above.
-            //
-            // Precedence: Arm A (bypass URL) → Arm B (raw OkHttp baseline)
-            // → Arm C (ping interval matrix) → Arm D (heartbeat echo) →
-            // production. They are all sequential diagnostic experiments
-            // and should never be active at once in practice — they would
-            // compete for the same identity slot on the relay.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if `DEBUG_RC_DIRECT_HEARTBEAT_ECHO` was somehow non-"0"
-            // — the release BuildConfig block pins it to "0".
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D + §7 step 5.
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_D",
-                    "RC_DIRECT_ARM_D_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmD?.start(myPubKey, signingPubKeyHex)
-                return@launch
-            }
-
-            // RC-DIRECT-STABILITY1 §14 Arm G short-circuit. When
-            // DEBUG_RC_DIRECT_ARM_G_VIA_REALITY is exactly "1" in a debug
-            // build, route the service to the Reality-tunneled WS heartbeat
-            // diagnostic. Arm G's OkHttp client connects through a SOCKS5
-            // proxy at `127.0.0.1:<Ready.socksPort>` provided by the
-            // embedded libXray daemon (production `xrayService` singleton),
-            // which wraps the outbound stream in VLESS+REALITY to the
-            // Stage 5E production endpoint at `:8443`. The inner target
-            // endpoint stays `BuildConfig.RELAY_URL` (production WSS
-            // through Caddy) — single-variable change vs Arm D baseline.
-            //
-            // **Transport isolation, NOT structural bootstrap isolation**
-            // (per §14 hard gate 6 + PR-G1 fixup commit `06486195`). This
-            // short-circuit prevents production `transport.connect(...)`
-            // — no production `KtorRelayTransport` WS to relay in parallel.
-            // **However**, `container.initMessagingFromStorage()` and
-            // `service.startReceiving()` already ran at lines ~344-393
-            // above. MessagingService internal state may therefore still
-            // generate short-lived `prekey_publish` / `rest_session_issued`
-            // REST traffic during the Arm G capture window. This is the
-            // same surface §13 T2 hit per the T2 Outcome isolation caveat.
-            // Mitigation: PR-G3 outcome capture grep-verifies absence (or
-            // annotates counts + timings) of `PREKEY_TRACE|REST_TRACE|
-            // prekey_publish|rest_session_issued` in both the UTF-8-
-            // decoded Tecno logcat (per §13 T2 Outcome UTF-16-vs-ASCII
-            // grep-mismatch lesson) and the relay log over the Arm G
-            // window.
-            //
-            // Precedence per §14 hard gate 7: Arm A → Arm A.2 → T2 →
-            // Arm B → Arm C → Arm D → **Arm G** → production. All
-            // diagnostic arms are sequential `if` blocks gated by
-            // mutually-exclusive BuildConfig flags; only one arm runs
-            // per build.
-            //
-            // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
-            // even if `DEBUG_RC_DIRECT_ARM_G_VIA_REALITY` was somehow
-            // non-empty — the release BuildConfig block pins it to "".
-            //
-            // Server-side dependency: this branch is meaningful only if
-            // the operator has flipped `RELAY_ENABLE_HEARTBEAT_ECHO=1` on
-            // the VPS `.env` (same flag Arm A.2 / Arm D used). Without
-            // that, Arm G logs `echo_sent` but never `echo_received`,
-            // which still produces a useful (PARTIAL or FAIL) signal but
-            // is not the intended PASS experiment.
-            //
-            // Locked in `docs/tracks/rc-direct-stability1.md` §14 Arm G
-            // mini-lock (PR #294 squash `f0b436a5` master 2026-06-05).
-            if (phantom.android.BuildConfig.DEBUG &&
-                phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
-            ) {
-                Log.i(
-                    "RC_DIRECT_ARM_G",
-                    "RC_DIRECT_ARM_G_service_short_circuit " +
-                        "identity_prefix=${myPubKey.take(16)} " +
-                        "signing_prefix=${signingPubKeyHex.take(16)} " +
-                        "relay_url=${phantom.android.BuildConfig.RELAY_URL} " +
-                        "gen=$myGen",
-                )
-                container.rcDirectArmG?.start(myPubKey, signingPubKeyHex)
-                return@launch
-            }
-
-            val connected: ConnectedTransport = try {
-                container.transportManager.connect()
-            } catch (e: TransportPolicyChangedException) {
-                // R-N1.16 P1: this walk started under a policy that is no
-                // longer in force - a privacy switch cancelled it and it
-                // wedged somewhere non-cancellable, then resumed. It must
-                // not open a socket.
-                //
-                // No retry is armed here on purpose. The live policy
-                // implies a different chain, and whoever changed the
-                // policy owns starting the next connect: a successful
-                // switch starts one itself, and a switch whose handover
-                // timed out has recovery armed, which starts exactly one
-                // as soon as this walk is finally joinable.
-                Log.w(
-                    "PhantomHybrid",
-                    "NETWORK_TRACE walk_discarded reason=privacy_mode_changed " +
-                        "attempted=${e.attempted} startedUnder=${e.startedUnder} " +
-                        "liveNow=${e.liveNow} gen=$myGen",
-                )
-                releaseConnectOwnership(myGen, "privacy_mode_changed")
-                return@launch
-            } catch (e: NoTransportReachableException) {
-                Log.e(TAG, "TransportManager: no path reachable — ${e.message}", e)
-                val stillOwner = releaseConnectOwnership(myGen, "transportManager_no_path")
-                // N1-F3: this is the AllFailed exit that used to end the
-                // story. The chain is exhausted; nobody else will retry.
-                //
-                // Only the CURRENT generation may arm. A superseded one
-                // has lost ownership, and its arm would carry a newer
-                // epoch than the live generation's -- so epoch checking
-                // alone would let it through and put a timer on top of
-                // live work.
-                armConnectRetry(myGen, "all_failed", stillOwner)
-                return@launch
-            } catch (unsettled: TorLifecycleUnsettled) {
-                Log.e(
-                    TAG,
-                    "NETWORK_TRACE connect_tor_lifecycle_unsettled " +
-                        "gen=$myGen torGen=${unsettled.attempt.generation} " +
-                        "result=${unsettled.result.label}",
-                    unsettled,
-                )
-                releaseConnectOwnership(myGen, "tor_lifecycle_unsettled")
-                // Deliberately NOT armed. Every other exit here ends with a
-                // transport that is merely not connected, and trying again later
-                // is the right answer. This one ends with a daemon that was never
-                // confirmed gone, or a host still holding its threads. A timer
-                // would walk straight back into a start the owner refuses by
-                // construction, and each pass would leave one more unreleased
-                // host behind. Recovery has to come from the lifecycle settling,
-                // not from the ladder.
-                return@launch
-            } catch (t: Throwable) {
-                Log.e(TAG, "TransportManager.connect threw: ${t::class.simpleName}: ${t.message}", t)
-                val stillOwnerAfterThrow =
-                    releaseConnectOwnership(myGen, "transportManager_connect_threw")
-                // N1-F3: an unexpected throw leaves the manager off
-                // Connected just as surely as chain exhaustion does, so it
-                // gets the same cadence rather than a silent dead end.
-                armConnectRetry(myGen, "connect_threw", stillOwnerAfterThrow)
-                return@launch
-            }
-            // N1-F3: the outer chain walk succeeded, so the backoff
-            // ladder starts again from the bottom next time. This says
-            // nothing about whether the WSS session below is healthy or
-            // messages are flowing -- a wedged session after a good outer
-            // connect is F-7, a separate open finding.
-            retryScheduler.onOuterConnectSucceeded()
-            retryJob?.cancel()
-            retryJob = null
-            // R-N1.16 P1: the second half of the gate. connect()
-            // returning proves the policy was current at the instant of
-            // publication and nothing more - a privacy switch can land
-            // while this coroutine is on its way here, and opening a
-            // Direct socket then is the silent downgrade with extra
-            // steps.
-            // R-N1.16 P1: a PERMIT, not a check. `isStillCurrent()`
-            // answered a question and left a window; a permit registers
-            // this socket with the thing that can invalidate it, so a
-            // privacy switch either lands before the permit is issued or
-            // finds it and revokes it - and does not complete until the
-            // revocation has torn the socket down.
-            // R-N1.16 P1: the whole permission-and-open step goes through
-            // TransportActivation, which is Android-free and therefore
-            // driven by the same fixtures that prove the boundary. What
-            // used to live here as a few lines could only ever be
-            // asserted from source text.
-            //
-            // The permit deliberately stays live past this point: it is
-            // released when the socket closes, not when it opens, so a
-            // privacy switch arriving later still finds an open Direct
-            // socket and tears it down.
-            val socksProxyPort: Int? = connected.socksPort
-            val relayUrl =
-                if (connected.kind == TransportKind.Tor) BuildConfig.RELAY_ONION_URL
-                else BuildConfig.RELAY_URL
-
-            // R-N1.17 P1: the session Job IS the socket, and it must be
-            // started under the permit.
-            //
-            // An earlier revision passed an empty `openSocket` and called
-            // `transport.connect()` forty lines further down, outside the
-            // permit entirely - so the permit protected nothing in
-            // production while the fixtures, whose `openSocket` really
-            // opened a fake socket, stayed green. The mechanism was
-            // decorative exactly where it mattered.
-            //
-            // It cannot simply move inside `useToOpen`: that holds the
-            // permit's lock until the callback returns, and connect()
-            // does not return until disconnect(). So the callback STARTS
-            // the session and returns; the waiting happens outside the
-            // lock, and revocation cancels and joins it.
-            // R-N1.17 P1: the session is a CHILD of this walk. A sibling
-            // outlives an ownership handover that believed it had stopped
-            // everything, and that is what the previous revision created.
-            val session = TransportSession(
-                ownerScope = CoroutineScope(currentCoroutineContext()),
-                connectLoop = {
-                    container.transport.connect(
-                        relayUrl = relayUrl,
-                        identityPublicKeyHex = myPubKey,
-                        signingPublicKeyHex = signingPubKeyHex,
-                        signChallenge = { nonce ->
-                            container.identityManager.signRelayChallenge(nonce)
-                        },
-                        socksProxyPort = socksProxyPort,
-                    )
-                },
-                closeTransport = {
-                    // R-N1.17 P1: `disconnect()` is the wrong close
-                    // here, for two reasons - and not the one an earlier
-                    // revision of this comment gave.
-                    //
-                    // It DOES cancel the reconnect loop: it routes to
-                    // `teardownAndJoin(flushBeforeClose = true)`. What it
-                    // does wrong is flush, and then throw the join result
-                    // away.
-                    //
-                    // The flush spends up to three seconds pushing
-                    // pendingOutbox and pendingAcks through the very
-                    // socket the switch is closing, so a switch away from
-                    // Standard kept sending the user's queued payloads
-                    // over Direct AFTER they asked Direct to stop.
-                    // PrivacyModeTeardown states that prohibition for its
-                    // own path; this path had it too and did not obey it.
-                    //
-                    // And discarding the join result means an unconfirmed
-                    // teardown is indistinguishable from a clean one.
-                    //
-                    // But `disconnectAndJoin` is not enough either, and
-                    // saying it was is what an earlier revision got wrong.
-                    // It confirms that the RECONNECT LOOP ended; the
-                    // session and HTTP-client closes are handed to a
-                    // cleanup scope and may finish afterwards - or be
-                    // refused outright when that scope's budget is
-                    // exhausted. A permit released on that answer can
-                    // leave a live WSS in no register at all.
-                    //
-                    // `disconnectAndConfirm` reports the loop and the
-                    // closes as the separate facts they are. Anything less
-                    // than `confirmed` is a FAILED close, which is what
-                    // keeps the permit registered.
-                    val teardown = container.transport.disconnectAndConfirm(
-                        phantom.android.di.PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS,
-                    )
-                    if (!teardown.confirmed) {
-                        throw SessionNotStoppedException(
-                            "loopJoined=${teardown.loopJoined} " +
-                                "closesConfirmed=${teardown.closesConfirmed}",
-                        )
-                    }
-                },
-                log = { line -> Log.i("PhantomHybrid", line) },
-            )
-            val activation = TransportActivation(
-                // The authority comes FROM the manager, so the permits
-                // this registers cannot end up in a different register
-                // from the one a privacy switch revokes.
-                manager = container.transportManager,
-                openSocket = { session.start() },
-                closeSocket = {
-                    // cancel -> close -> confirmed join, inside the
-                    // session. A stop that cannot be confirmed throws, so
-                    // the permit records a FAILED close rather than a
-                    // completed one.
-                    if (!session.stop("privacy_mode_changed")) {
-                        throw SessionNotStoppedException("privacy_mode_changed")
-                    }
-                },
-                log = { line -> Log.i("PhantomHybrid", line) },
-            )
-            val usePermit = when (val outcome = activation.activate(connected)) {
-                is TransportActivation.Outcome.Opened -> outcome.permit
-                TransportActivation.Outcome.RefusedStale,
-                TransportActivation.Outcome.RevokedBeforeOpen -> {
-                    Log.w(
-                        "PhantomHybrid",
-                        "NETWORK_TRACE connected_transport_discarded " +
-                            "reason=privacy_mode_changed kind=${connected.kind} " +
-                            "outcome=$outcome gen=$myGen",
-                    )
-                    releaseConnectOwnership(myGen, "connected_transport_stale")
-                    return@launch
-                }
-            }
-            Log.i(
-                "PhantomRelay",
-                "PhantomMessagingService about to connect: " +
-                    "url=$relayUrl " +
-                    "auth=signed-challenge " +
-                    "socks=${socksProxyPort ?: "direct"} " +
-                    "myPubKey=${myPubKey.take(16)}… " +
-                    "signing=${signingPubKeyHex.take(16)}…",
-            )
-            // ADR-011: schedule the AlarmManager wakeup BEFORE entering
-            // the suspending connect loop. connect() doesn't return until
-            // disconnect() is called — if we scheduled after, the alarm
-            // would never be set up. Idempotent: re-schedules replace.
-            val exactGranted = PhantomWakeupReceiver.schedule(applicationContext)
-            Log.d(
-                TAG,
-                "AlarmManager keepalive scheduled (exact=$exactGranted, interval=${PhantomWakeupReceiver.WAKEUP_INTERVAL_MS}ms)",
-            )
-
-            // Wait for the session OUTSIDE the permit lock. The release
-            // runs non-cancellably AFTER it has finished: an ordinary
-            // `finally` runs while this coroutine is being cancelled and
-            // can be skipped at a suspension point, leaving a permit
-            // registered against a socket that has closed.
-            runCatching { session.awaitCompletion() }
-            session.afterCompletion {
-                // R-N1.17 P1: the socket is closed THROUGH the permit,
-                // and only a close that succeeded releases it.
-                //
-                // Cancelling this walk ends the wait on the transport, not
-                // necessarily the transport. Releasing here used to claim
-                // the socket was closed - a claim this side cannot check -
-                // so a possibly-live socket left every register. Now a
-                // refusal is the interesting case: the permit stays
-                // registered and something has to retry the close.
-                if (!usePermit.closeAndRelease("transport_loop_exited")) {
-                    Log.w(
-                        TAG,
-                        "NETWORK_TRACE permit_release_refused reason=socket_not_closed " +
-                            "gen=$myGen — arming a sweep",
-                    )
-                    handoffRecovery.arm("socket_not_confirmed_closed")
-                }
-                releaseConnectOwnership(myGen, "transport_loop_exited")
-            }
+        // Stage 2 B7d: one start path. Review round 7 registered an
+        // external start as the coordinator's start job; review round 8
+        // closed the two holes that left.
+        //
+        // UNDISPATCHED, deliberately: the coordinator's admission is the
+        // first thing the body does and it does not suspend when the
+        // mutex is free, so the registration completes on THIS thread
+        // before `onStartCommand` returns. A plain `launch` left a window
+        // in which the platform had asked for a start and the coordinator
+        // could still see a vacuum. The work itself suspends immediately
+        // afterwards and finishes on `serviceScope`'s dispatcher; nothing
+        // blocking runs on the main thread here.
+        serviceScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            recoveryCoordinator.runExternalStart(isRetryAttempt, rewalkReason)
         }
         return START_STICKY
+    }
+
+    /**
+     * Stage 2 B7d (2026-09-13): ONE start path, in-process.
+     *
+     * `onStartCommand` runs it for an external start; the recovery
+     * coordinator runs it for a granted retry on [serviceScope] and keeps
+     * the handle as its start job. Before Stage 2 a granted retry crossed
+     * an Intent (`startForegroundService`) carrying no token, and between
+     * `Granted` and the next `onStartCommand` there was neither an owner
+     * nor a pending slot -- a start the platform accepted but never
+     * delivered left that state permanently. The grant is now made and
+     * consumed inside the same instance.
+     *
+     * [grantStamp] identifies the coordinator's attempt, so the ownership
+     * claim below can retire exactly that grant and a superseded attempt
+     * cannot retire a newer one. Null for an external start, which
+     * carries no grant.
+     */
+    /**
+     * One start attempt, as the coordinator runs it. Admission,
+     * registration and completion reporting all belong to
+     * [TransportRecoveryCoordinator]; what is left here is the Android
+     * work itself.
+     */
+    private suspend fun runStartAttempt(
+        isRetryAttempt: Boolean,
+        rewalkReason: String?,
+        grantStamp: Long,
+    ) {
+        // Startup admission, identity and receive wiring all live in
+        // prepareStart(): it refuses duplicate concurrent starts, waits
+        // for readiness and reads identity only through the unlock gate.
+        val prepared =
+            prepareStart { recoveryCoordinator.noteStartPrerequisitesReady(grantStamp) } ?: return
+        val container = prepared.container
+        val myPubKey = prepared.publicKeyHex
+        val signingPair = prepared.signingPair
+        // ADR-020 Phase 2: outer transport is now selected at runtime by
+        // TransportManager. It walks the strategy chain implied by the
+        // user's PrivacyMode (Standard → DIRECT_FIRST, Private →
+        // REALITY_FIRST, Ghost → TOR_FIRST), starts the matching
+        // subsystem, probes /health through it, and returns the first
+        // ConnectedTransport that reaches the relay. Last-working hint
+        // is recorded so subsequent connects skip dead paths.
+        //
+        // RELAY_ONION_URL is consumed only when the chosen kind is Tor;
+        // Direct and Reality both exit via the public WSS endpoint
+        // (Reality just tunnels that exit through its outer envelope).
+        // R-N1.16 review item 3: fail-closed must be recoverable.
+        // If an earlier handover could not confirm the previous walk
+        // had stopped, the lease is still held and every claim is
+        // refused. Retry the handover here, on whatever signal got
+        // us this far -- a start, a retry attempt or the alarm
+        // heartbeat. If that walk has since finished, the join
+        // returns at once and the lease is released; if it has not,
+        // the claim below is refused exactly as before.
+        //
+        // Without this the only thing that could lift the block was
+        // another network rewalk, so on a stable network the app
+        // would have stayed dark permanently.
+        handoffRecovery.onSignal(
+            if (isRetryAttempt) "retry_attempt" else "onStartCommand",
+        )
+
+        // R-N1.16 P1-1. Steps 2-4 of the handover: cancel the walk
+        // that currently owns the lease, WAIT for it to finish, and
+        // only then take the slot. This runs here rather than in
+        // onStartCommand because it joins, and joining on the main
+        // thread is an ANR.
+        //
+        // Revoking the token alone used to be the whole handover,
+        // which left the displaced coroutine running inside
+        // TransportManager.connect() beside its successor.
+        if (rewalkReason != null) {
+            when (val outcome = connectOwnership.handOver("rewalk_$rewalkReason")) {
+                is Handover.TimedOut -> {
+                    // Fail-closed. We could not prove the previous
+                    // walk stopped, so we do not start another one:
+                    // being briefly disconnected is better than two
+                    // transports competing over the same subsystems.
+                    // The lease is deliberately still held, and
+                    // recovery waits for the next allowed signal,
+                    // which retries the handover.
+                    Log.w(
+                        "PhantomHybrid",
+                        "NETWORK_TRACE handoff_timeout reason=$rewalkReason " +
+                            "previousOwner=${outcome.previousOwner} " +
+                            "timeoutMs=${outcome.timeoutMs} " +
+                            "lease=kept successor=refused",
+                    )
+                    // Belt and braces. The coordinator arms recovery
+                    // through handOverOrArm before it ever sends a
+                    // restart, so this branch is normally
+                    // unreachable: a failed handover abandons the
+                    // rewalk instead of restarting the service.
+                    // Arming again is idempotent - arm() replaces the
+                    // timer rather than adding one.
+                    handoffRecovery.arm(rewalkReason)
+                    return
+                }
+                Handover.AlreadyInProgress -> {
+                    Log.w(
+                        "PhantomHybrid",
+                        "NETWORK_TRACE handoff_skipped reason=$rewalkReason " +
+                            "cause=already_in_progress",
+                    )
+                    return
+                }
+                is Handover.Quiesced -> Log.i(
+                    "PhantomHybrid",
+                    "NETWORK_TRACE handoff_complete reason=$rewalkReason " +
+                        "previousOwner=${outcome.previousOwner}",
+                )
+                Handover.NothingToStop -> Log.i(
+                    "PhantomHybrid",
+                    "NETWORK_TRACE handoff_noop reason=$rewalkReason",
+                )
+            }
+        }
+
+        // Guard against a second onStartCommand (e.g. AlarmManager wakeup,
+        // foreground bring-back, ConnectivityChange broadcast) arriving while
+        // the first connect path is still establishing. The lease is a
+        // single atomic: the first caller wins and every other one bails.
+        // R-N1.16 P1-1: the lease and the walk it owns are taken in
+        // ONE step. The Job is read from inside this coroutine rather
+        // than captured at the launch site, because a
+        // `lateinit var job = scope.launch { ... }` races its own
+        // body and the body needs the handle first.
+        val myWalk: Job? = currentCoroutineContext()[Job]
+        val claimed = connectOwnership.claim(
+            if (isRetryAttempt) "retry_attempt" else "onStartCommand",
+        ) { timeoutMs ->
+            myWalk?.cancel(CancellationException("ownership_handover"))
+            myWalk == null || withTimeoutOrNull(timeoutMs) { myWalk.join() } != null
+        }
+        if (claimed == null) {
+            Log.d(TAG, "connect already in progress — duplicate onStartCommand ignored")
+            if (isRetryAttempt) {
+                // A walk is already running, so this attempt is
+                // dropped. That is safe without re-arming: the
+                // running walk arms on its own AllFailed exit, and
+                // the alarm heartbeat is the backstop.
+                //
+                // Nothing is put back, because this launch never
+                // held a grant — there is no token to restore and
+                // inventing one would let a launch that lost the
+                // race schedule work.
+                //
+                // R-N1.16 P3: two sentences here used to say the
+                // claim was "put back", three lines above the
+                // sentence saying there was nothing to put back.
+                Log.i(
+                    "PhantomHybrid",
+                    "RETRY_TRACE attempt_deferred reason=connect_in_progress",
+                )
+            }
+            return
+        }
+
+        // The token is minted only on a successful claim, so a
+        // refused launch never consumes one. Every cleanup site
+        // below goes through [releaseConnectOwnership], which
+        // compares and clears in one atomic step, so a displaced
+        // generation cannot free a slot that has changed hands.
+        val myGen = claimed
+        Log.i(
+            "PhantomHybrid",
+            "NETWORK_TRACE generation_claimed gen=$myGen",
+        )
+        // Stage 2 B7d: the grant this attempt carried has become an
+        // owned walk. From here it can never be restored: a restore
+        // after a claim would put a second attempt on top of a live one.
+        recoveryCoordinator.noteStartJobClaimedOwnership(grantStamp)
+
+
+        // F11 + F26: signed-challenge auth requires our Ed25519 signing
+        // keypair. Resolve BEFORE asking TransportManager to start an
+        // outer subsystem — no point bootstrapping Tor / Xray if we
+        // cannot present a valid signed challenge once the WSS opens.
+        // The signing keypair was already resolved in prepareStart(),
+        // read through the unlock gate and refused there when absent, so
+        // it is available before any ownership is claimed. Reading it a
+        // second time here would bypass that gate on a locked device.
+        val signingPubKeyHex = signingPair.publicKey.bytes
+            .joinToString("") { ((it.toInt() and 0xFF) or 0x100).toString(16).substring(1) }
+
+        // RC-DIRECT-STABILITY1 Arm A short-circuit. When DEBUG_BYPASS_URL
+        // is non-empty in a debug build, route the service to the
+        // Caddy-bypass diagnostic raw-OkHttp socket instead of the
+        // production Hybrid Ktor `transport.connect(...)` path. Same
+        // Inv-ParallelArmIsolation rationale as Arm B below — production
+        // and diagnostic WS must never share `state.clients[identity]`.
+        //
+        // This branch is checked BEFORE the Arm B branch so that if
+        // both flags were somehow set simultaneously, Arm A takes
+        // precedence (the bypass URL is the more specific override).
+        // Both arms should never be active at once in practice — they
+        // measure different things and would compete for the same
+        // identity slot on the relay.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if `DEBUG_BYPASS_URL` was somehow non-empty — the release
+        // BuildConfig block pins it to "" as defence-in-depth.
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A + §7 step 2.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_BYPASS_URL.isNotEmpty()
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_A",
+                "RC_DIRECT_ARM_A_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "bypass_url=${phantom.android.BuildConfig.DEBUG_BYPASS_URL} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmA?.start(myPubKey, signingPubKeyHex)
+            // Service stays alive (foreground service is the diagnostic
+            // host); the arm runs its own reconnect loop until cancelled
+            // via container.rcDirectArmA?.stop() or the app dies.
+            return
+        }
+
+        // RC-DIRECT-STABILITY1 Arm A.2 short-circuit. When
+        // DEBUG_RC_DIRECT_ARM_A2_URL is non-empty in a debug build,
+        // route the service to the public non-Caddy TLS bypass
+        // diagnostic raw-OkHttp socket (stunnel on host `:8444`)
+        // instead of the production Hybrid Ktor `transport.connect(...)`
+        // path. Same Inv-ParallelArmIsolation rationale as Arm A
+        // above — production and diagnostic WS must never share
+        // `state.clients[identity]` at the relay.
+        //
+        // Precedence per §7 step 5e (locked in mini-lock): Arm A
+        // (Caddy-bypass loopback URL) → Arm A.2 (public non-Caddy
+        // TLS bypass URL via stunnel `:8444`) → Arm B (raw OkHttp
+        // baseline through Caddy `:443`) → Arm C (ping interval
+        // matrix) → Arm D (heartbeat echo) → production. Arms A
+        // and A.2 both use a `BuildConfig.DEBUG_*_URL.isNotEmpty()`
+        // gate; they are mutually exclusive in practice because a
+        // build sets one or the other. If both happened to be set,
+        // Arm A wins (above) because its block is earlier — the
+        // narrower override.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this
+        // branch even if `DEBUG_RC_DIRECT_ARM_A2_URL` was somehow
+        // non-empty — the release BuildConfig block pins it to "".
+        //
+        // Server-side dependency: this branch is meaningful only if
+        // the §4 Arm A.2 PR-8a stunnel overlay is deployed and
+        // verified on the VPS (`docker compose -f docker-compose.yml
+        // -f docker-compose.armA2.yml up -d stunnel-arm-a2`). Without
+        // that, the URL `wss://relay.phntm.pro:8444/ws` returns
+        // connection refused and Arm A.2 logs ws_failure on every
+        // session.
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm A.2
+        // + §7 step 5e + PR-8a implementation record subsection.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL.isNotEmpty()
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_A2",
+                "RC_DIRECT_ARM_A2_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "bypass_url=${phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_A2_URL} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmA2?.start(myPubKey, signingPubKeyHex)
+            // Service stays alive (foreground service is the diagnostic
+            // host); the arm runs its own reconnect loop until cancelled
+            // via container.rcDirectArmA2?.stop() or the app dies.
+            return
+        }
+
+        // RC-DIRECT-STABILITY1 §10 T2 short-circuit. When DEBUG_T2_SLOW_POST_URL
+        // is non-empty in a debug build, route the service to the slow-POST
+        // byte-threshold diagnostic instead of the production Hybrid Ktor
+        // `transport.connect(...)` path. Same Inv-ParallelArmIsolation
+        // rationale as Arms A / A.2 / B / C / D above.
+        //
+        // T2 is **ONE-SHOT** — NOT a reconnect loop. One POST sends 40 960
+        // bytes chunked over ~70-80 s, the POST completes (or aborts), and
+        // the diagnostic job terminates. The Service stays alive (it's the
+        // foreground host) but T2 itself is finished after one run. Re-
+        // running requires killing the app and starting it again with the
+        // BuildConfig flag still set.
+        //
+        // Precedence per §7 step 5f (T2 inserted between A.2 and B):
+        // Arm A → Arm A.2 → T2 → Arm B → Arm C → Arm D → production. T2
+        // and the WebSocket arms are mutually exclusive in practice
+        // because a build sets DEBUG_T2_SLOW_POST_URL OR DEBUG_RC_DIRECT_*
+        // — never both.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if `DEBUG_T2_SLOW_POST_URL` was somehow non-empty — the
+        // release BuildConfig block pins it to "".
+        //
+        // Server-side dependency: this branch is meaningful only if the
+        // operator has flipped `RELAY_ENABLE_SLOW_POST_DIAG=1` on the
+        // VPS `.env` and recreated relay so `/diag/slow-post` is mounted.
+        // Without that, the endpoint returns 404 and T2 logs failure on
+        // first POST.
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §10 T2 mini-lock.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL.isNotEmpty()
+        ) {
+            Log.i(
+                "T2_SLOW_POST",
+                "T2_SLOW_POST_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "endpoint_url=${phantom.android.BuildConfig.DEBUG_T2_SLOW_POST_URL} " +
+                    "gen=$myGen",
+            )
+            container.t2SlowPostDiag?.start()
+            // Service stays alive (foreground service is the diagnostic
+            // host); T2 runs ONE shot and the job terminates. No
+            // reconnect loop. Re-run requires app restart.
+            return
+        }
+
+        // PR-RC-DIRECT-WS-DEATH1 Phase 1 Arm B short-circuit. When the
+        // diagnostic flag selects Arm B, the production Hybrid Ktor path
+        // is bypassed entirely so the diagnostic raw-OkHttp socket and a
+        // production socket cannot collide on the relay's
+        // state.clients[identity] map (Inv-ParallelArmIsolation).
+        //
+        // Inv-NoProductionBehaviour: the gate is
+        // `BuildConfig.DEBUG && BuildConfig.DEBUG_RC_DIRECT_ARM == "B"`.
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if the flag string was somehow non-"0" — the release
+        // BuildConfig block pins it to "0" as defence-in-depth.
+        //
+        // Locked in `docs/tracks/rc-direct-ws-death1.md` § Commit 3.2b
+        // (rev4) §7 step 3.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM == "B"
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_B",
+                "RC_DIRECT_ARM_B_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmB?.start(myPubKey, signingPubKeyHex)
+            // Service stays alive (foreground service is the diagnostic
+            // host); the arm runs its own reconnect loop until cancelled
+            // via container.rcDirectArmB?.stop() or the app dies.
+            return
+        }
+
+        // RC-DIRECT-STABILITY1 Arm C short-circuit. When the ping
+        // interval matrix flag is non-"0" in a debug build, route the
+        // service to the cadence diagnostic raw-OkHttp socket instead
+        // of the production Hybrid Ktor `transport.connect(...)` path.
+        // Same Inv-ParallelArmIsolation rationale as Arm A and Arm B
+        // above.
+        //
+        // Precedence: Arm A (bypass URL) → Arm B (raw OkHttp baseline)
+        // → Arm C (ping interval matrix) → production. They are all
+        // sequential diagnostic experiments and should never be active
+        // at once in practice — they would compete for the same
+        // identity slot on the relay.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if `DEBUG_RC_DIRECT_PING_INTERVAL_MS` was somehow non-"0"
+        // — the release BuildConfig block pins it to "0" as
+        // defence-in-depth.
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm C + §7 step 4.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS != "0"
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_C",
+                "RC_DIRECT_ARM_C_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "ping_interval_ms=${phantom.android.BuildConfig.DEBUG_RC_DIRECT_PING_INTERVAL_MS} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmC?.start(myPubKey, signingPubKeyHex)
+            return
+        }
+
+        // RC-DIRECT-STABILITY1 Arm D short-circuit. When the heartbeat
+        // echo flag is "1" in a debug build, route the service to the
+        // data-frame heartbeat diagnostic raw-OkHttp socket instead
+        // of the production Hybrid Ktor `transport.connect(...)` path.
+        // Same Inv-ParallelArmIsolation rationale as Arms A / B / C
+        // above.
+        //
+        // Precedence: Arm A (bypass URL) → Arm B (raw OkHttp baseline)
+        // → Arm C (ping interval matrix) → Arm D (heartbeat echo) →
+        // production. They are all sequential diagnostic experiments
+        // and should never be active at once in practice — they would
+        // compete for the same identity slot on the relay.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if `DEBUG_RC_DIRECT_HEARTBEAT_ECHO` was somehow non-"0"
+        // — the release BuildConfig block pins it to "0".
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §4 Arm D + §7 step 5.
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_HEARTBEAT_ECHO == "1"
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_D",
+                "RC_DIRECT_ARM_D_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmD?.start(myPubKey, signingPubKeyHex)
+            return
+        }
+
+        // RC-DIRECT-STABILITY1 §14 Arm G short-circuit. When
+        // DEBUG_RC_DIRECT_ARM_G_VIA_REALITY is exactly "1" in a debug
+        // build, route the service to the Reality-tunneled WS heartbeat
+        // diagnostic. Arm G's OkHttp client connects through a SOCKS5
+        // proxy at `127.0.0.1:<Ready.socksPort>` provided by the
+        // embedded libXray daemon (production `xrayService` singleton),
+        // which wraps the outbound stream in VLESS+REALITY to the
+        // Stage 5E production endpoint at `:8443`. The inner target
+        // endpoint stays `BuildConfig.RELAY_URL` (production WSS
+        // through Caddy) — single-variable change vs Arm D baseline.
+        //
+        // **Transport isolation, NOT structural bootstrap isolation**
+        // (per §14 hard gate 6 + PR-G1 fixup commit `06486195`). This
+        // short-circuit prevents production `transport.connect(...)`
+        // — no production `KtorRelayTransport` WS to relay in parallel.
+        // **However**, `container.initMessagingFromStorage()` and
+        // `service.startReceiving()` already ran at lines ~344-393
+        // above. MessagingService internal state may therefore still
+        // generate short-lived `prekey_publish` / `rest_session_issued`
+        // REST traffic during the Arm G capture window. This is the
+        // same surface §13 T2 hit per the T2 Outcome isolation caveat.
+        // Mitigation: PR-G3 outcome capture grep-verifies absence (or
+        // annotates counts + timings) of `PREKEY_TRACE|REST_TRACE|
+        // prekey_publish|rest_session_issued` in both the UTF-8-
+        // decoded Tecno logcat (per §13 T2 Outcome UTF-16-vs-ASCII
+        // grep-mismatch lesson) and the relay log over the Arm G
+        // window.
+        //
+        // Precedence per §14 hard gate 7: Arm A → Arm A.2 → T2 →
+        // Arm B → Arm C → Arm D → **Arm G** → production. All
+        // diagnostic arms are sequential `if` blocks gated by
+        // mutually-exclusive BuildConfig flags; only one arm runs
+        // per build.
+        //
+        // Release builds (`!BuildConfig.DEBUG`) NEVER enter this branch
+        // even if `DEBUG_RC_DIRECT_ARM_G_VIA_REALITY` was somehow
+        // non-empty — the release BuildConfig block pins it to "".
+        //
+        // Server-side dependency: this branch is meaningful only if
+        // the operator has flipped `RELAY_ENABLE_HEARTBEAT_ECHO=1` on
+        // the VPS `.env` (same flag Arm A.2 / Arm D used). Without
+        // that, Arm G logs `echo_sent` but never `echo_received`,
+        // which still produces a useful (PARTIAL or FAIL) signal but
+        // is not the intended PASS experiment.
+        //
+        // Locked in `docs/tracks/rc-direct-stability1.md` §14 Arm G
+        // mini-lock (PR #294 squash `f0b436a5` master 2026-06-05).
+        if (phantom.android.BuildConfig.DEBUG &&
+            phantom.android.BuildConfig.DEBUG_RC_DIRECT_ARM_G_VIA_REALITY == "1"
+        ) {
+            Log.i(
+                "RC_DIRECT_ARM_G",
+                "RC_DIRECT_ARM_G_service_short_circuit " +
+                    "identity_prefix=${myPubKey.take(16)} " +
+                    "signing_prefix=${signingPubKeyHex.take(16)} " +
+                    "relay_url=${phantom.android.BuildConfig.RELAY_URL} " +
+                    "gen=$myGen",
+            )
+            container.rcDirectArmG?.start(myPubKey, signingPubKeyHex)
+            return
+        }
+
+        val connected: ConnectedTransport = try {
+            container.transportManager.connect()
+        } catch (e: TransportPolicyChangedException) {
+            // R-N1.16 P1: this walk started under a policy that is no
+            // longer in force - a privacy switch cancelled it and it
+            // wedged somewhere non-cancellable, then resumed. It must
+            // not open a socket.
+            //
+            // No retry is armed here on purpose. The live policy
+            // implies a different chain, and whoever changed the
+            // policy owns starting the next connect: a successful
+            // switch starts one itself, and a switch whose handover
+            // timed out has recovery armed, which starts exactly one
+            // as soon as this walk is finally joinable.
+            Log.w(
+                "PhantomHybrid",
+                "NETWORK_TRACE walk_discarded reason=privacy_mode_changed " +
+                    "attempted=${e.attempted} startedUnder=${e.startedUnder} " +
+                    "liveNow=${e.liveNow} gen=$myGen",
+            )
+            releaseConnectOwnership(myGen, "privacy_mode_changed")
+            return
+        } catch (e: NoTransportReachableException) {
+            Log.e(TAG, "TransportManager: no path reachable — ${e.message}", e)
+            val stillOwner = releaseConnectOwnership(myGen, "transportManager_no_path")
+            // N1-F3: this is the AllFailed exit that used to end the
+            // story. The chain is exhausted; nobody else will retry.
+            //
+            // Only the CURRENT generation may arm. A superseded one
+            // has lost ownership, and its arm would carry a newer
+            // epoch than the live generation's -- so epoch checking
+            // alone would let it through and put a timer on top of
+            // live work.
+            armConnectRetry(myGen, "all_failed", stillOwner)
+            return
+        } catch (unsettled: TorLifecycleUnsettled) {
+            Log.e(
+                TAG,
+                "NETWORK_TRACE connect_tor_lifecycle_unsettled " +
+                    "gen=$myGen torGen=${unsettled.attempt.generation} " +
+                    "result=${unsettled.result.label}",
+                unsettled,
+            )
+            releaseConnectOwnership(myGen, "tor_lifecycle_unsettled")
+            // Stage 2 B7c: the obligation is REGISTERED rather than
+            // forgotten. While it stands the coordinator is a no-op for a
+            // Tor-first walk, and only an authoritative settlement of this
+            // same generation -- or a handover to the privacy settlement
+            // path -- lifts it. Before Stage 2 nothing observed the
+            // lifecycle at all, so "recovery has to come from the lifecycle
+            // settling" named a route that did not exist.
+            registerTorObligation(unsettled.attempt.generation)
+            // Deliberately NOT armed. Every other exit here ends with a
+            // transport that is merely not connected, and trying again later
+            // is the right answer. This one ends with a daemon that was never
+            // confirmed gone, or a host still holding its threads. A timer
+            // would walk straight back into a start the owner refuses by
+            // construction, and each pass would leave one more unreleased
+            // host behind. Recovery has to come from the lifecycle settling,
+            // not from the ladder.
+            return
+        } catch (t: Throwable) {
+            Log.e(TAG, "TransportManager.connect threw: ${t::class.simpleName}: ${t.message}", t)
+            val stillOwnerAfterThrow =
+                releaseConnectOwnership(myGen, "transportManager_connect_threw")
+            // N1-F3: an unexpected throw leaves the manager off
+            // Connected just as surely as chain exhaustion does, so it
+            // gets the same cadence rather than a silent dead end.
+            armConnectRetry(myGen, "connect_threw", stillOwnerAfterThrow)
+            return
+        }
+        // N1-F3: the outer chain walk succeeded, so the backoff
+        // ladder starts again from the bottom next time. This says
+        // nothing about whether the WSS session below is healthy or
+        // messages are flowing -- a wedged session after a good outer
+        // connect is F-7, a separate open finding.
+        retryScheduler.onOuterConnectSucceeded()
+        retryJob?.cancel()
+        retryJob = null
+        // R-N1.16 P1: the second half of the gate. connect()
+        // returning proves the policy was current at the instant of
+        // publication and nothing more - a privacy switch can land
+        // while this coroutine is on its way here, and opening a
+        // Direct socket then is the silent downgrade with extra
+        // steps.
+        // R-N1.16 P1: a PERMIT, not a check. `isStillCurrent()`
+        // answered a question and left a window; a permit registers
+        // this socket with the thing that can invalidate it, so a
+        // privacy switch either lands before the permit is issued or
+        // finds it and revokes it - and does not complete until the
+        // revocation has torn the socket down.
+        // R-N1.16 P1: the whole permission-and-open step goes through
+        // TransportActivation, which is Android-free and therefore
+        // driven by the same fixtures that prove the boundary. What
+        // used to live here as a few lines could only ever be
+        // asserted from source text.
+        //
+        // The permit deliberately stays live past this point: it is
+        // released when the socket closes, not when it opens, so a
+        // privacy switch arriving later still finds an open Direct
+        // socket and tears it down.
+        val socksProxyPort: Int? = connected.socksPort
+        val relayUrl =
+            if (connected.kind == TransportKind.Tor) BuildConfig.RELAY_ONION_URL
+            else BuildConfig.RELAY_URL
+
+        // R-N1.17 P1: the session Job IS the socket, and it must be
+        // started under the permit.
+        //
+        // An earlier revision passed an empty `openSocket` and called
+        // `transport.connect()` forty lines further down, outside the
+        // permit entirely - so the permit protected nothing in
+        // production while the fixtures, whose `openSocket` really
+        // opened a fake socket, stayed green. The mechanism was
+        // decorative exactly where it mattered.
+        //
+        // It cannot simply move inside `useToOpen`: that holds the
+        // permit's lock until the callback returns, and connect()
+        // does not return until disconnect(). So the callback STARTS
+        // the session and returns; the waiting happens outside the
+        // lock, and revocation cancels and joins it.
+        // R-N1.17 P1: the session is a CHILD of this walk. A sibling
+        // outlives an ownership handover that believed it had stopped
+        // everything, and that is what the previous revision created.
+        val session = TransportSession(
+            ownerScope = CoroutineScope(currentCoroutineContext()),
+            connectLoop = {
+                container.transport.connect(
+                    relayUrl = relayUrl,
+                    identityPublicKeyHex = myPubKey,
+                    signingPublicKeyHex = signingPubKeyHex,
+                    signChallenge = { nonce ->
+                        container.identityManager.signRelayChallenge(nonce)
+                    },
+                    socksProxyPort = socksProxyPort,
+                )
+            },
+            closeTransport = {
+                // R-N1.17 P1: `disconnect()` is the wrong close
+                // here, for two reasons - and not the one an earlier
+                // revision of this comment gave.
+                //
+                // It DOES cancel the reconnect loop: it routes to
+                // `teardownAndJoin(flushBeforeClose = true)`. What it
+                // does wrong is flush, and then throw the join result
+                // away.
+                //
+                // The flush spends up to three seconds pushing
+                // pendingOutbox and pendingAcks through the very
+                // socket the switch is closing, so a switch away from
+                // Standard kept sending the user's queued payloads
+                // over Direct AFTER they asked Direct to stop.
+                // PrivacyModeTeardown states that prohibition for its
+                // own path; this path had it too and did not obey it.
+                //
+                // And discarding the join result means an unconfirmed
+                // teardown is indistinguishable from a clean one.
+                //
+                // But `disconnectAndJoin` is not enough either, and
+                // saying it was is what an earlier revision got wrong.
+                // It confirms that the RECONNECT LOOP ended; the
+                // session and HTTP-client closes are handed to a
+                // cleanup scope and may finish afterwards - or be
+                // refused outright when that scope's budget is
+                // exhausted. A permit released on that answer can
+                // leave a live WSS in no register at all.
+                //
+                // `disconnectAndConfirm` reports the loop and the
+                // closes as the separate facts they are. Anything less
+                // than `confirmed` is a FAILED close, which is what
+                // keeps the permit registered.
+                val teardown = container.transport.disconnectAndConfirm(
+                    phantom.android.di.PRIVACY_SWITCH_DISCONNECT_TIMEOUT_MS,
+                )
+                if (!teardown.confirmed) {
+                    throw SessionNotStoppedException(
+                        "loopJoined=${teardown.loopJoined} " +
+                            "closesConfirmed=${teardown.closesConfirmed}",
+                    )
+                }
+            },
+            log = { line -> Log.i("PhantomHybrid", line) },
+        )
+        val activation = TransportActivation(
+            // The authority comes FROM the manager, so the permits
+            // this registers cannot end up in a different register
+            // from the one a privacy switch revokes.
+            manager = container.transportManager,
+            openSocket = { session.start() },
+            closeSocket = {
+                // cancel -> close -> confirmed join, inside the
+                // session. A stop that cannot be confirmed throws, so
+                // the permit records a FAILED close rather than a
+                // completed one.
+                if (!session.stop("privacy_mode_changed")) {
+                    throw SessionNotStoppedException("privacy_mode_changed")
+                }
+            },
+            log = { line -> Log.i("PhantomHybrid", line) },
+        )
+        val usePermit = when (val outcome = activation.activate(connected)) {
+            is TransportActivation.Outcome.Opened -> outcome.permit
+            TransportActivation.Outcome.RefusedStale,
+            TransportActivation.Outcome.RevokedBeforeOpen -> {
+                Log.w(
+                    "PhantomHybrid",
+                    "NETWORK_TRACE connected_transport_discarded " +
+                        "reason=privacy_mode_changed kind=${connected.kind} " +
+                        "outcome=$outcome gen=$myGen",
+                )
+                releaseConnectOwnership(myGen, "connected_transport_stale")
+                return
+            }
+        }
+        Log.i(
+            "PhantomRelay",
+            "PhantomMessagingService about to connect: " +
+                "url=$relayUrl " +
+                "auth=signed-challenge " +
+                "socks=${socksProxyPort ?: "direct"} " +
+                "myPubKey=${myPubKey.take(16)}… " +
+                "signing=${signingPubKeyHex.take(16)}…",
+        )
+        // ADR-011: schedule the AlarmManager wakeup BEFORE entering
+        // the suspending connect loop. connect() doesn't return until
+        // disconnect() is called — if we scheduled after, the alarm
+        // would never be set up. Idempotent: re-schedules replace.
+        val exactGranted = PhantomWakeupReceiver.schedule(applicationContext)
+        Log.d(
+            TAG,
+            "AlarmManager keepalive scheduled (exact=$exactGranted, interval=${PhantomWakeupReceiver.WAKEUP_INTERVAL_MS}ms)",
+        )
+
+        // Wait for the session OUTSIDE the permit lock. The release
+        // runs non-cancellably AFTER it has finished: an ordinary
+        // `finally` runs while this coroutine is being cancelled and
+        // can be skipped at a suspension point, leaving a permit
+        // registered against a socket that has closed.
+        runCatching { session.awaitCompletion() }
+        session.afterCompletion {
+            // R-N1.17 P1: the socket is closed THROUGH the permit,
+            // and only a close that succeeded releases it.
+            //
+            // Cancelling this walk ends the wait on the transport, not
+            // necessarily the transport. Releasing here used to claim
+            // the socket was closed - a claim this side cannot check -
+            // so a possibly-live socket left every register. Now a
+            // refusal is the interesting case: the permit stays
+            // registered and something has to retry the close.
+            if (!usePermit.closeAndRelease("transport_loop_exited")) {
+                Log.w(
+                    TAG,
+                    "NETWORK_TRACE permit_release_refused reason=socket_not_closed " +
+                        "gen=$myGen — arming a sweep",
+                )
+                handoffRecovery.arm("socket_not_confirmed_closed")
+            }
+            releaseConnectOwnership(myGen, "transport_loop_exited")
+        }
     }
 
     private suspend fun awaitContainerForService(): AppContainer? = serviceStartupOrNull(
@@ -1187,7 +1258,18 @@ class PhantomMessagingService : Service() {
         val signingPair: IdentitySigningKeyPair,
     )
 
-    private suspend fun prepareStart(): PreparedStart? {
+    /**
+     * Stage 2 B7d: [onPrerequisitesReady] fires at the moment the two
+     * things a start WAITS for are true -- the container is up and both
+     * identity reads returned through the unlock gate. `T_react` is
+     * measured from there, not from the coordinator's decision: on a
+     * locked phone `readWhenUnlocked` suspends for as long as the user
+     * leaves it locked, and a budget started before that would expire
+     * against a coroutine that is doing exactly what it should.
+     */
+    private suspend fun prepareStart(
+        onPrerequisitesReady: suspend () -> Unit = {},
+    ): PreparedStart? {
         // Duplicate alarms must not accumulate unlock waiters or initialize in parallel.
         if (!startupInProgress.compareAndSet(false, true)) return null
         try {
@@ -1214,6 +1296,9 @@ class PhantomMessagingService : Service() {
                     stopSelf()
                     return@serviceStartupOrNull null
                 }
+                // Both unlock-gated reads returned: the device is unlocked
+                // and the container is up, so the reaction budget starts now.
+                onPrerequisitesReady()
                 // These operations are not retried as reads: partial setup may own work.
                 container.initMessagingFromStorage()
                 container.networkChangeObserver?.register()
@@ -1276,15 +1361,13 @@ class PhantomMessagingService : Service() {
                     "delayMs=${arm.delayMs} streak=${arm.streak} epoch=${arm.epoch}",
             )
             delay(arm.delayMs)
-            when (val claim = retryScheduler.claim(arm.epoch, "timer", connectGeneration.get())) {
-                is ConnectRetryScheduler.Claim.Granted ->
-                    startSelfForRetry("timer_epoch_${arm.epoch}", claim.token)
-                else ->
-                    Log.i(
-                        "PhantomHybrid",
-                        "RETRY_TRACE timer_yielded epoch=${arm.epoch} outcome=$claim",
-                    )
-            }
+            // Stage 2 B7b: the timer is a TRIGGER, not a decision. It used
+            // to claim and then send an Intent; the claim cleared the
+            // pending slot and the grant crossed a process boundary with
+            // no token. Now the single coordinator decides -- it sees the
+            // owner, the handover, a live start job and the live session,
+            // none of which this timer can see.
+            ensureRecoveryProgress("timer_epoch_${arm.epoch}")
         }
     }
 
@@ -1317,59 +1400,126 @@ class PhantomMessagingService : Service() {
                 }
                 HandoffRecovery.Signal.StillBlocked -> return@launch
             }
-            when (val claim = retryScheduler.claim(null, source, connectGeneration.get())) {
-                is ConnectRetryScheduler.Claim.Granted -> startSelfForRetry(source, claim.token)
-                else ->
-                    Log.i(
-                        "PhantomHybrid",
-                        "RETRY_TRACE nudge_yielded source=$source outcome=$claim",
-                    )
+            ensureRecoveryProgress("nudge_$source")
+        }
+    }
+
+    // ── Stage 2 B7: the single recovery coordinator ─────────────────────
+
+    /** The Tor generation a walk left unsettled, while the obligation stands (B7c). */
+    @Volatile private var torObligationGeneration: Long? = null
+
+    /** Set in [onDestroy]; a shutdown may not start anything. */
+    @Volatile private var shuttingDown: Boolean = false
+
+    /**
+     * Review round 8 (2026-09-13): the coordinator moved OUT of this class
+     * and into [TransportRecoveryCoordinator].
+     *
+     * It used to be a set of private methods and `@Volatile` fields here,
+     * which meant its contract could only ever be pinned by source-scanning
+     * tripwires: constructing a `Service` in a unit test is not practical,
+     * so nothing could exercise two concurrent external starts, the unlock
+     * wait, the overdue cancel and join, the grant restore or the spacing
+     * wake-up. An external-start race passed exactly that review. The
+     * coordinator now takes everything it needs from Android as an injected
+     * function, and its whole contract is exercised behaviourally in
+     * `TransportRecoveryCoordinatorTest`.
+     *
+     * What stays here is what genuinely belongs to Android: the Tor
+     * obligation, which reads the container's lifecycle owner; the shutdown
+     * flag; and the start attempt itself.
+     */
+    private val recoveryCoordinator: TransportRecoveryCoordinator by lazy {
+        TransportRecoveryCoordinator(
+            scope = serviceScope,
+            nowMs = { SystemClock.elapsedRealtime() },
+            log = { line -> Log.i("PhantomHybrid", line) },
+            ownership = connectOwnership,
+            handoffRecovery = handoffRecovery,
+            retryScheduler = retryScheduler,
+            connectGeneration = { connectGeneration.get() },
+            environment = object : TransportRecoveryCoordinator.Environment {
+                override suspend fun isShuttingDown(): Boolean = shuttingDown
+
+                override suspend fun torObligationBlocks(): Boolean =
+                    this@PhantomMessagingService.torObligationBlocks()
+
+                override suspend fun liveSessionEpoch(): Long? =
+                    readyContainer?.hybridTransport?.stateMachine?.liveSessionEpoch
+
+                override suspend fun restUsable(): Boolean =
+                    readyContainer?.restHealth?.value?.usable == true
+            },
+            runStartAttempt = { isRetryAttempt, rewalkReason, grantStamp ->
+                runStartAttempt(isRetryAttempt, rewalkReason, grantStamp)
+            },
+        )
+    }
+
+    /**
+     * Stage 2 B7b: the single decision point, delegated. Safe to call from
+     * anywhere, as often as anything likes.
+     */
+    suspend fun ensureRecoveryProgress(trigger: String) {
+        recoveryCoordinator.ensureRecoveryProgress(trigger)
+    }
+
+    /**
+     * B9: mirror the coordinator's start-job state into the process-wide
+     * presentation flow. A start job that is alive and has not claimed the
+     * lease is L1 state (e): `Reconnecting` / `Recovering`, never `Offline`
+     * (I5).
+     */
+    private fun collectRecoveryActivity() {
+        serviceScope.launch {
+            recoveryCoordinator.startJobPending.collect { pending ->
+                recoveryActivity.value =
+                    if (pending) RecoveryActivity.StartJobPending else RecoveryActivity.Idle
             }
         }
     }
 
-    /**
-     * Re-enter through `onStartCommand` rather than calling `connect()`
-     * inline, so the retry uses exactly the same path - CAS, generation,
-     * privacy-mode re-read - as any other connect.
-     *
-     * It carries its OWN extra, [EXTRA_RETRY_ATTEMPT], and not the
-     * rewalk one. The rewalk extra clears the CAS unconditionally, which
-     * is safe only after the coordinator has disconnected and released;
-     * a retry has not, so borrowing it could start a second concurrent
-     * chain walk. Going through the CAS instead means a retry is refused
-     * while a walk is running.
-     *
-     * Nothing is cached between attempts: `TransportManager.connect()`
-     * takes a fresh policy snapshot from the authority on entry, so Ghost stays
-     * Tor-only across a retry with no downgrade.
-     *
-     * [token] identifies the grant this start is acting on. If the start
-     * throws, only that exact grant may be put back - a restore without
-     * identity would resurrect a retry that had been invalidated in the
-     * meantime.
-     */
-    private fun startSelfForRetry(source: String, token: ConnectRetryScheduler.ClaimToken) {
-        Log.i("PhantomHybrid", "RETRY_TRACE attempt_start source=$source")
-        runCatching {
-            val intent = Intent(applicationContext, PhantomMessagingService::class.java)
-                .putExtra(EXTRA_RETRY_ATTEMPT, true)
-                .putExtra(EXTRA_RETRY_NUDGE_SOURCE, source)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                applicationContext.startForegroundService(intent)
-            } else {
-                applicationContext.startService(intent)
-            }
-        }.onFailure {
-            Log.e(TAG, "RETRY_TRACE attempt_start_failed source=$source: ${it.message}", it)
-            // The claim already cleared the pending slot. If the start
-            // threw, nothing is scheduled and every later nudge would see
-            // NotPending -- the original latch, reintroduced. Put it back.
-            serviceScope.launch {
-                retryScheduler.restoreAfterFailedStart(token, "start_failed_$source")
-            }
+    private suspend fun torObligationBlocks(): Boolean {
+        val generation = torObligationGeneration ?: return false
+        val container = readyContainer ?: return true // cannot check: fail closed
+        val settlement = runCatching { container.torService.settlementFor(generation) }.getOrNull()
+        if (settlement is TorSettlement.Settled) {
+            torObligationGeneration = null
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE tor_obligation_cleared generation=$generation reason=settled",
+            )
+            return false
         }
+        val requested = runCatching { container.privacyModeCoordinator.state.value.requested }
+            .getOrNull() ?: PrivacyMode.Ghost
+        if (TransportStrategy.from(requested) != TransportStrategy.TOR_FIRST) {
+            // The walk ahead does not lead with Tor, so the obligation no
+            // longer blocks it -- but it is owed, and the settlement owns
+            // it from here.
+            torObligationGeneration = null
+            container.recordPendingTorSettlement(generation)
+            Log.i(
+                "PhantomHybrid",
+                "NETWORK_TRACE tor_obligation_handed_over generation=$generation mode=$requested",
+            )
+            return false
+        }
+        val gap = (settlement as? TorSettlement.NotSettled)?.gap
+        Log.i(
+            "PhantomHybrid",
+            "NETWORK_TRACE tor_obligation_kept generation=$generation gap=$gap",
+        )
+        return true
     }
+
+    /** B7c: a walk ended with an unsettled Tor lifecycle. */
+    private fun registerTorObligation(generation: Long) {
+        torObligationGeneration = generation
+        Log.i("PhantomHybrid", "NETWORK_TRACE tor_obligation_registered generation=$generation")
+    }
+
 
     /**
      * Drop a pending retry because something else has taken over
@@ -1420,6 +1570,13 @@ class PhantomMessagingService : Service() {
     override fun onDestroy() {
         Log.d(TAG, "onDestroy — disconnecting transport")
         super.onDestroy()
+        // Stage 2 B7b: a shutdown may not start anything. Set BEFORE the
+        // scheduler is invalidated so a trigger racing this teardown is
+        // refused at clause (1) rather than arming a fresh attempt.
+        shuttingDown = true
+        if (liveInstance === this) liveInstance = null
+        recoveryCoordinator.shutdownNow()
+        recoveryActivity.value = RecoveryActivity.Idle
         // N1-F3: an explicit stop must not leave a timer behind that
         // starts the service again a few minutes later. Cancelling the
         // job alone would not be enough - a timer already past its delay
@@ -1914,6 +2071,37 @@ class PhantomMessagingService : Service() {
             },
         )
 
+        /**
+         * The live service instance, or null between instances. Stage 2
+         * B7b: the coordinator's inputs (the lease, the scheduler, the
+         * fence, the start job) only exist inside a running instance, so
+         * a trigger that arrives without one starts the service and lets
+         * ITS coordinator decide -- exactly what the receiver did for a
+         * cold start before Stage 2.
+         */
+        @Volatile
+        private var liveInstance: PhantomMessagingService? = null
+
+        /**
+         * Deliver a recovery trigger from outside a service instance.
+         * Never decides anything: it either reaches the live instance's
+         * coordinator or asks the platform for an instance.
+         */
+        internal suspend fun nudgeRecovery(trigger: String) {
+            val instance = liveInstance
+            if (instance != null) {
+                instance.ensureRecoveryProgress(trigger)
+                return
+            }
+            val ctx = appContext
+            if (ctx == null) {
+                Log.w("PhantomHybrid", "RETRY_TRACE nudge_dropped trigger=$trigger reason=no_context")
+                return
+            }
+            Log.i("PhantomHybrid", "RETRY_TRACE nudge_starts_service trigger=$trigger")
+            startForHandoffRecovery(trigger)
+        }
+
         private fun startForHandoffRecovery(reason: String): Boolean {
             val ctx = appContext
             if (ctx == null) {
@@ -1933,6 +2121,16 @@ class PhantomMessagingService : Service() {
                 Log.e(TAG, "handoff_recovery_start_failed reason=$reason: ${it.message}", it)
             }.isSuccess
         }
+
+        /**
+         * Stage 2 B9: whether a start job is in flight, for presentation.
+         * Process-scoped like the lease, because the container's UI state
+         * outlives any one service instance.
+         */
+        internal val recoveryActivity = MutableStateFlow(RecoveryActivity.Idle)
+
+        /** Read-only view for the container's presentation combine. */
+        val recoveryActivityState: StateFlow<RecoveryActivity> = recoveryActivity.asStateFlow()
 
         private const val TAG = "PhantomMessagingService"
         const val CHANNEL_ID = "phantom_messaging"

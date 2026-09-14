@@ -89,10 +89,10 @@ class WsDegradationDetector(
         /** Maps from `WsSessionEndedEvent.okhttpPingTimeoutDetected = true`. */
         object PingTimeout : Event()
 
-        /** Maps from `InboundStalledEvent`. */
+        /** Maps from `WsSessionSignal.Stalled`. */
         object IdleTimeout : Event()
 
-        /** Maps from `OutboundAckDeadlineExpiredEvent`. */
+        /** Maps from `WsSessionSignal.AckDeadlineExpired`. */
         object AckTimeout : Event()
     }
 

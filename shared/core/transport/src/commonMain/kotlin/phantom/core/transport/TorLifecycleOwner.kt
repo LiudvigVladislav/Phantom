@@ -78,6 +78,40 @@ internal class TorLifecycleOwner(
     val status: StateFlow<GenerationStatus> = _status.asStateFlow()
 
     /**
+     * Stage 2 B7c (2026-09-13): is [generation] settled, authoritatively?
+     *
+     * Read inside [monitor], like every other decision this class makes,
+     * and about ONE generation -- the one a walk left unsettled. [status]
+     * cannot answer it: it is a notification, it carries only the live
+     * generation, and a `Settled` emission on it can belong to an older
+     * generation or to one whose host never let go. A recovery rule keyed
+     * on such an emission would lift a Tor obligation the owner still
+     * refuses to start over, and every pass would leave one more
+     * unreleased host behind.
+     *
+     * `Settled` requires all three facts together: this exact generation,
+     * an outcome that permits a successor, and a host that was observed
+     * released. Anything else names which fact is missing.
+     */
+    fun settlementFor(generation: Long): TorSettlement = synchronized(monitor) {
+        val current = live
+        if (current == null || current.id != generation) {
+            return TorSettlement.NotSettled(TorSettlementGap.OtherGeneration)
+        }
+        if (current.phase != Phase.Settled) {
+            return TorSettlement.NotSettled(TorSettlementGap.PhaseNotSettled)
+        }
+        val outcome = current.outcome
+        if (outcome == null || !outcome.permitsNextGeneration) {
+            return TorSettlement.NotSettled(TorSettlementGap.OutcomeInadmissible)
+        }
+        if (!current.hostReleased) {
+            return TorSettlement.NotSettled(TorSettlementGap.HostNotReleased)
+        }
+        TorSettlement.Settled
+    }
+
+    /**
      * Start a generation, refusing while the previous one has no outcome
      * that permits a successor, or has one whose host never let go.
      */

@@ -170,6 +170,49 @@ class ConnectRetryScheduler(
     }
 
     /**
+     * Stage 2 B7b (2026-09-13): arm a retry that is due NOW.
+     *
+     * The ladder answers "how long after a failed walk", and that is the
+     * right question after a walk. It is the wrong question in a vacuum:
+     * `claim(null, ...)` on an empty slot returns [Claim.NotPending], so
+     * a nudge arriving when nothing is pending -- no owner, no walk, no
+     * timer, which is exactly the state the 19:07 phone was in -- found
+     * nothing to claim and did nothing. The coordinator arms here and
+     * claims in the same call, so the vacuum ends with an attempt rather
+     * than with a log line.
+     *
+     * The streak is NOT advanced: this is not evidence that an attempt
+     * failed, and letting a vacuum climb the ladder would push the next
+     * genuine backoff to 15 minutes. [armAfterFailure] remains the only
+     * thing that advances it.
+     *
+     * Re-arming while a retry is already pending replaces it and bumps
+     * the epoch, so a superseded timer cannot claim. A generation that is
+     * no longer current is refused, for the same reason as in
+     * [armAfterFailure]: its arm would sit on top of live work.
+     */
+    suspend fun armImmediate(
+        generation: Long,
+        currentGeneration: Long = generation,
+        reason: String,
+    ): Arm? = mutex.withLock {
+        if (generation != currentGeneration) {
+            log?.invoke(
+                "RETRY_TRACE arm_immediate_refused cause=stale_generation " +
+                    "gen=$generation current=$currentGeneration reason=$reason",
+            )
+            return@withLock null
+        }
+        epoch += 1
+        pendingDueAtMs = nowMs()
+        pendingGeneration = generation
+        log?.invoke(
+            "RETRY_TRACE armed_immediate reason=$reason epoch=$epoch gen=$generation streak=$streak",
+        )
+        Arm(delayMs = 0L, epoch = epoch, streak = streak)
+    }
+
+    /**
      * Try to take ownership of the pending retry.
      *
      * This is the single-flight point. Every source of a retry signal -

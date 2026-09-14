@@ -118,19 +118,15 @@
 # `class ... { *; }` or `class ... { public *; }` — the structural pin
 # test in `androidUnitTest` will fail.
 -keepclassmembers class phantom.core.transport.KtorRelayTransport {
-    # R3.6 lifecycle channel consumed by `HybridRelayTransport.startWsPassthroughCollectors`
-    # at `apps/android/src/androidMain/kotlin/phantom/android/transport/HybridRelayTransport.kt:495`
-    # via the concrete `wsTransport.wsSessionLifecycle` flow. Not on `RelayTransport`.
-    public *** wsSessionLifecycle;
-    public *** getWsSessionLifecycle();
-    # PR-D1d ACK-deadline expiry flow consumed by `HybridRelayTransport`
-    # at `HybridRelayTransport.kt:510`. Not on `RelayTransport`.
-    public *** outboundAckDeadlineExpired;
-    public *** getOutboundAckDeadlineExpired();
-    # PR-RECV-DIAG1 inbound stall flow consumed by `HybridRelayTransport`
-    # at `HybridRelayTransport.kt:553`. Not on `RelayTransport`.
-    public *** inboundStalled;
-    public *** getInboundStalled();
+    # Stage 2 (2026-09-13) single session-signal subscription, consumed by
+    # `HybridRelayTransport.startWsPassthroughCollectors` via the concrete
+    # `wsTransport.attachSessionSignalConsumer()`. Not on `RelayTransport`.
+    # It replaces the three separate flows this block used to keep
+    # (`wsSessionLifecycle`, `outboundAckDeadlineExpired`, `inboundStalled`):
+    # lifecycle, activity, stall and ACK-deadline signals now travel on one
+    # channel and reach the Hybrid through this one entry point.
+    public *** attachSessionSignalConsumer(...);
+    public *** hasSessionSignalConsumer(...);
     # PR-D1c snapshot API consumed by `HybridRelayTransport.startRestFallbackMigration`
     # at `HybridRelayTransport.kt:894`. Returns the WS pending-outbound union;
     # the WS → REST migration path uses it to drain in encrypt-time order.
