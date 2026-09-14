@@ -137,8 +137,13 @@ class TransportRewalkCoordinatorTransactionTest {
         var disconnectBehaviour: String? = null
         var submitBehaviour: String? = null
 
-        override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
-            log.add("submitNetworkChangedEvent:$clearsMode2Sticky")
+        override suspend fun submitNetworkChangedEvent(
+            clearsMode2Sticky: Boolean,
+            networkGeneration: Long,
+        ) {
+            // Stage 2 B5: the generation rides along so a poll issued on
+            // the old network cannot re-prove REST health on the new one.
+            log.add("submitNetworkChangedEvent:$clearsMode2Sticky:gen=$networkGeneration")
             when (submitBehaviour) {
                 "ce" -> throw CancellationException("submit CE")
                 "ex" -> throw IllegalStateException("submit error")
@@ -260,7 +265,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val log = CallLog()
         val (coord, _, _) = newCoordinator(log, TracingGate(log), TracingHybrid(log))
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -293,7 +298,7 @@ class TransportRewalkCoordinatorTransactionTest {
             handOver = { false },
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -360,7 +365,7 @@ class TransportRewalkCoordinatorTransactionTest {
             },
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(walk.isCompleted, "the displaced walk was actually stopped")
@@ -387,7 +392,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val log = CallLog()
         val (coord, _, _) = newCoordinator(log, gate = null, hybrid = TracingHybrid(log))
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -413,7 +418,7 @@ class TransportRewalkCoordinatorTransactionTest {
             handOver = { false },
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -500,7 +505,7 @@ class TransportRewalkCoordinatorTransactionTest {
             handOver = { reason -> recovery.handOverOrArm(reason) },
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         // The rewalk was abandoned: nothing released, nobody restarted.
@@ -537,12 +542,12 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, prefs, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val expected = listOf(
             "beginRouteChange:1",
-            "submitNetworkChangedEvent:true",
+            "submitNetworkChangedEvent:true:gen=1",
             "disconnectAndJoin:10000",
             "release",
             "issueProbeAfterRewalk:1",
@@ -567,7 +572,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log).apply { disconnectBehaviour = "false" }
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("revokeRouteChange:1:disconnect_join_timeout"), "got ${log.snapshot()}")
@@ -583,7 +588,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log).apply { disconnectBehaviour = "ce" }
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("revokeRouteChange:1:disconnectAndJoin_cancelled"), "got ${log.snapshot()}")
@@ -598,7 +603,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid, releaseBehaviour = "ex")
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("revokeRouteChange:1:release_failed"), "got ${log.snapshot()}")
@@ -621,7 +626,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val (coord, _, restartLog) =
             newCoordinator(log, gate, hybrid, releaseBehaviour = "unclean")
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertEquals(1, log.count("release"), "release attempted exactly once")
@@ -651,7 +656,7 @@ class TransportRewalkCoordinatorTransactionTest {
             releaseBehaviour = "unclean",
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -675,7 +680,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(
@@ -700,7 +705,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val (coord, _, restartLog) =
             newCoordinator(log, gate, hybrid, releaseBehaviour = "unclean_xray")
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(
@@ -722,7 +727,7 @@ class TransportRewalkCoordinatorTransactionTest {
             releaseBehaviour = "unclean_xray",
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -748,7 +753,7 @@ class TransportRewalkCoordinatorTransactionTest {
             hybrid = TracingHybrid(log),
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         val observed = log.snapshot()
@@ -769,7 +774,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("issueProbeAfterRewalk:1"))
@@ -784,7 +789,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid, restartBehaviour = "ex")
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("revokeProbe:1:service_restart_failed"), "got ${log.snapshot()}")
@@ -800,14 +805,14 @@ class TransportRewalkCoordinatorTransactionTest {
         val (coord, _, _) = newCoordinator(log, gate, hybrid, nowMs = { t })
         coord.seedNetworkPresent(true)
 
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
         assertTrue(log.any { it.startsWith("revokeRouteChange:1") })
 
         // Advance clock by 1s — well inside NETWORK_REWALK_MIN_INTERVAL_MS.
         t += 1_000L
         hybrid.disconnectBehaviour = null
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
         assertTrue(
             log.contains("beginRouteChange:2"),
@@ -824,12 +829,12 @@ class TransportRewalkCoordinatorTransactionTest {
         val (coord, _, _) = newCoordinator(log, gate, hybrid, nowMs = { t })
         coord.seedNetworkPresent(true)
 
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
         assertTrue(log.contains("beginRouteChange:1"))
 
         t += 1_000L
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
         assertEquals(
             1, log.count("beginRouteChange:"),
@@ -843,7 +848,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val gate = TracingGate(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid = null)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("beginRouteChange:1"))
@@ -858,10 +863,10 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate = null, hybrid = hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
-        assertTrue(log.contains("submitNetworkChangedEvent:true"))
+        assertTrue(log.contains("submitNetworkChangedEvent:true:gen=1"))
         assertTrue(log.contains("disconnect"), "legacy path uses disconnect; got ${log.snapshot()}")
         assertTrue(log.none { it.startsWith("disconnectAndJoin") })
         assertEquals(1, log.count("release"))
@@ -882,7 +887,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val hybrid = TracingHybrid(log)
         val (coord, _, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("outcome:OpenReconnect:cms=true"), "got ${log.snapshot()}")
@@ -909,7 +914,7 @@ class TransportRewalkCoordinatorTransactionTest {
         val (coord, prefs, restartLog) = newCoordinator(log, gate, hybrid)
         coord.seedNetworkPresent(true)
 
-        coord.onMeaningfulChange(NetworkChangeReason.VALIDATED_CHANGED, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.VALIDATED_CHANGED, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("outcome:QuiescencePreserved:cms=false"), "got ${log.snapshot()}")
@@ -1024,7 +1029,7 @@ class TransportRewalkCoordinatorTransactionTest {
             gateCoordinator = gate,
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         assertTrue(log.contains("issueProbeAfterRewalk:1"))
@@ -1088,7 +1093,7 @@ class TransportRewalkCoordinatorTransactionTest {
             gateCoordinator = gate,
         )
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         // The probe was issued (StickyRecovery path).
@@ -1117,7 +1122,7 @@ class TransportRewalkCoordinatorTransactionTest {
         var t = 10_000L
         val (coord, _, _) = newCoordinator(log, gate, hybrid, restartBehaviour = "ex", nowMs = { t })
         coord.seedNetworkPresent(true)
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
 
         // The Open-path failure must revoke the routeChange (no probe
@@ -1132,7 +1137,7 @@ class TransportRewalkCoordinatorTransactionTest {
         // forced attempt within the rate-limit window must trigger a
         // fresh beginRouteChange.
         t += 1_000L
-        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot())
+        coord.onMeaningfulChange(NetworkChangeReason.WIFI_TO_CELLULAR, snapshot(), networkGeneration = 1L)
         awaitJobDone(coord)
         assertEquals(
             2, log.count("beginRouteChange:"),

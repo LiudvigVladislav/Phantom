@@ -203,6 +203,12 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(transport, longPollEnabled = false, cursor = cursor)
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         orch.start()
         // Yield enough times to ensure that, IF a parallel job had been
         // spawned, it would have called `transport.poll` at least once.
@@ -271,6 +277,12 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(transport, longPollEnabled = true, cursor = cursor)
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         orch.start()
         val landed = pumpUntilFirstPoll(transport)
         orch.stop()
@@ -314,6 +326,12 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         orch.start()
         val landed = pumpUntilFirstPoll(transport)
         orch.stop()
@@ -368,6 +386,12 @@ class WsActivePollJobLifecycleTest {
         )
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         runCurrent()
         // Subscribe BEFORE start: MutableSharedFlow inside the
         // orchestrator has replay=0, so a tryEmit before any collector
@@ -485,7 +509,10 @@ class WsActivePollJobLifecycleTest {
         // public RestStateMachine API as the orchestrator does:
         // `WsOutboundAckReceived` is the canonical event that puts the
         // machine into WsActive (see `RestStateMachine.kt`).
-        orch.stateMachine.onEvent(RestStateMachine.Event.WsOutboundAckReceived)
+        // Stage 2: proof belongs to a session, so the ack names one and the
+        // session has to be live first.
+        orch.stateMachine.onEvent(RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L))
+        orch.stateMachine.onEvent(RestStateMachine.Event.WsOutboundAckReceived(sessionEpoch = 1L))
         runCurrent()
         assertEquals(RestMode.WsActive, orch.stateMachine.state.value)
 
@@ -515,6 +542,12 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         orch.start()
         val landed = pumpUntilFirstPoll(transport)
         orch.stop()
@@ -536,6 +569,12 @@ class WsActivePollJobLifecycleTest {
         val orch = orchestrator(transport, longPollEnabled = true, cursor = null)
 
         orch.bootstrap()
+        // Review round 7: the machine starts in `RestActive` now, so the
+        // legacy `pollLoop` would run beside the parallel job and this
+        // case would be measuring both. `WsActive` is the mode that
+        // suppresses the legacy loop, and it is established by the B3
+        // proof rather than assumed.
+        orch.driveToWsActiveNow()
         orch.start()
         assertTrue(pumpUntilFirstPoll(transport))
         orch.stop()

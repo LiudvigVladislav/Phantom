@@ -99,14 +99,9 @@ class RestFallbackOrchestratorC6Test {
         try {
             val caps = orch.bootstrap()
             check(caps.restFallback)
-            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEvent(
-                    RestStateMachine.Event.WsSessionEnded(
-                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                        sessionEpoch = 0L,
-                    ),
-                )
-            }
+            // Stage 2: one live session end degrades, and a close of a session
+            // the machine never saw connect is stale. The helper does both.
+            orch.driveToRestActive()
             orch.start()
             runCurrent()
             // Pump enough virtual time for ~5 pollLoop iterations.
@@ -520,14 +515,9 @@ class RestFallbackOrchestratorC6Test {
         )
         try {
             orch.bootstrap()
-            repeat(RestStateMachine.ACTIVE_FAIL_THRESHOLD) {
-                orch.submitEvent(
-                    RestStateMachine.Event.WsSessionEnded(
-                        durationMs = 1000L, inboundFrames = 0, pendingAcksAtClose = 1,
-                        sessionEpoch = 0L,
-                    ),
-                )
-            }
+            // Stage 2: one live session end degrades, and a close of a session
+            // the machine never saw connect is stale. The helper does both.
+            orch.driveToRestActive()
             orch.start()
             runCurrent()
             // Pump a few pollLoop iterations so at least one

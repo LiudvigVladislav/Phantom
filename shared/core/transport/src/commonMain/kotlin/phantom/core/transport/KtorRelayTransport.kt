@@ -105,7 +105,7 @@ data class WsSessionEndedEvent(
  * IMPL-LOCK #1 (scope memo): exposed via [receiveAsFlow], NOT
  * [consumeAsFlow], so collector termination does NOT close the channel.
  */
-sealed interface WsSessionLifecycleEvent {
+sealed interface WsSessionLifecycleEvent : WsSessionSignal {
     /**
      * Emitted after the WS handshake succeeds, before any frames are read.
      *
@@ -120,7 +120,9 @@ sealed interface WsSessionLifecycleEvent {
     data class Connected(
         val sessionEpoch: Long,
         val connectionGeneration: Long = 0L,
-    ) : WsSessionLifecycleEvent
+    ) : WsSessionLifecycleEvent {
+        override val sessionId: WsSessionId get() = WsSessionId(sessionEpoch)
+    }
 
     /**
      * Emitted in the `finally` block of each per-session iteration,
@@ -137,6 +139,8 @@ sealed interface WsSessionLifecycleEvent {
         val okhttpPingTimeoutDetected: Boolean,
         val sessionEpoch: Long,
     ) : WsSessionLifecycleEvent {
+        override val sessionId: WsSessionId get() = WsSessionId(sessionEpoch)
+
         /** Helper for IMPL-LOCK #4 error logging — returns epoch as string. */
         fun epochOrUnknown(): String = sessionEpoch.toString()
     }
@@ -147,33 +151,6 @@ fun WsSessionLifecycleEvent.epochOrUnknown(): String = when (this) {
     is WsSessionLifecycleEvent.Connected -> sessionEpoch.toString()
     is WsSessionLifecycleEvent.Ended -> sessionEpoch.toString()
 }
-
-/**
- * PR-D1d (2026-05-17): emitted when a sent envelope's per-envelope ACK
- * deadline elapses without a relay AckDeliver being received.
- *
- * [msgId] is the envelope's messageId (first 12 chars are logged;
- * the full value is carried here so the orchestrator can correlate
- * without truncation). [ageMs] is the elapsed time since the envelope
- * was inserted into pendingAcks (i.e. since it was handed to the WS
- * layer) — always >= [RelayTransportConfig.ACK_DEADLINE_MS].
- *
- * The transport emits this at most once per envelope. It does NOT
- * remove the envelope from pendingAcks — removal is still owned by
- * the regular ACK path (on relay AckDeliver) and session-end cleanup,
- * so the existing ACK watchdog / reconnect retry continues working
- * in parallel. This event is a pure signal to the REST state machine.
- */
-data class OutboundAckDeadlineExpiredEvent(val msgId: String, val ageMs: Long)
-
-/**
- * PR-RECV-DIAG1 v1.6 — emitted by [KtorRelayTransport.startIdleWatchdog]
- * once per WS session when `sinceLastInbound >=
- * [RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS]` (60 s by default).
- * Signals the "half-dead inbound" case where WS handshake succeeded but
- * no server-pushed frames arrive.
- */
-data class InboundStalledEvent(val sinceLastInboundMs: Long)
 
 class KtorRelayTransport(
     /**
@@ -250,66 +227,72 @@ class KtorRelayTransport(
     // Typing events are ephemeral and never stored or encrypted.
     // extraBufferCapacity = 10 ensures rapid keystrokes never block the read loop.
 
-    // R3.6 Fast REST degradation (2026-06-20): ordered lifecycle channel.
-    // Channel.UNLIMITED-backed stream; trySend on UNLIMITED never fails
-    // while the channel is open. The channel is never explicitly closed —
-    // its lifetime equals the transport object lifetime. The
-    // check(... .isSuccess) wrapper (IMPL-LOCK #2) turns any invariant
-    // violation into a loud failure rather than a silent drop.
+    // Stage 2 B1 (2026-09-13): ONE ordered channel of session signals.
+    // Channel.UNLIMITED-backed; trySend on UNLIMITED never fails while the
+    // channel is open, and the channel is never closed -- its lifetime is
+    // the transport object's. [enqueueSignal] turns a failed enqueue into
+    // a loud failure rather than a silent drop (IMPL-LOCK #2, kept).
     //
-    // IMPL-LOCK #1: exposed via receiveAsFlow() so collector termination
-    // does NOT close the channel. consumeAsFlow() would close it and make
-    // subsequent trySend(...).isSuccess return false.
-    private val _wsSessionLifecycle: Channel<WsSessionLifecycleEvent> =
-        Channel(Channel.UNLIMITED)
+    // Before Stage 2 the lifecycle stream (`Connected` / `Ended`) had its
+    // own channel while frames, acks, pongs, the idle-stall watchdog and
+    // the per-envelope ACK deadline reached the state machine through
+    // separate flows and separate collectors, in collector order and
+    // without a session identity. Every signal now carries its
+    // [WsSessionId] and is enqueued here by the code that holds that
+    // session, so the enqueue order is the causal order the state
+    // machine relies on (see [WsSessionSignal]).
+    //
+    // IMPL-LOCK #1 (kept): exposed via receiveAsFlow() so a collector's
+    // termination does NOT close the channel.
+    private val _wsSessionSignals: Channel<WsSessionSignal> = Channel(Channel.UNLIMITED)
 
     /**
-     * Ordered, guaranteed-delivery lifecycle stream. Emits [WsSessionLifecycleEvent.Connected]
-     * after each successful WS handshake and [WsSessionLifecycleEvent.Ended] in each
-     * session's `finally` block. Single consumer only ([HybridRelayTransport]).
-     *
-     * IMPL-LOCK #1: backed by [receiveAsFlow] so collector cancellation does
-     * NOT close the underlying [Channel]. The producer emits into [_wsSessionLifecycle]
-     * for the lifetime of this transport object — independent of how many times the
-     * flow is collected and abandoned.
+     * The one consumer of [_wsSessionSignals] at a time. A channel-backed
+     * flow DISTRIBUTES elements between concurrent collectors, so a second
+     * subscriber would steal signals rather than observe them; the slot
+     * makes that a programming error instead of a silent race.
      */
-    val wsSessionLifecycle: Flow<WsSessionLifecycleEvent> =
-        _wsSessionLifecycle.receiveAsFlow()
+    private val signalConsumerLock = Mutex()
+    private var signalSubscription: SessionSignalSubscription? = null
 
-    // PR-D1d (2026-05-17): fast per-envelope ACK deadline. Emitted on
-    // [transportScope] after [RelayTransportConfig.ACK_DEADLINE_MS] elapses
-    // without the relay confirming AckDeliver for a sent envelope. The
-    // orchestrator ([HybridRelayTransport]) feeds this into
-    // [RestStateMachine.Event.ActiveOutboundAckTimeout] which immediately
-    // switches WS_ACTIVE → REST_ACTIVE on the first bad send — without
-    // waiting for two full WS session deaths as the existing
-    // active_outbound_threshold requires.
-    //
-    // replay = 0: stale deadline events after a mode switch must not be
-    //   replayed to a new subscriber (the state machine is already in
-    //   RestActive at that point and would no-op them, but skipping the
-    //   replay makes the intent explicit).
-    // extraBufferCapacity = 16: typical burst is one expired timer per
-    //   concurrent outbound envelope; 16 is ample headroom.
-    private val _outboundAckDeadlineExpired =
-        MutableSharedFlow<OutboundAckDeadlineExpiredEvent>(
-            replay = 0,
-            extraBufferCapacity = 16,
-        )
-    val outboundAckDeadlineExpired: SharedFlow<OutboundAckDeadlineExpiredEvent> =
-        _outboundAckDeadlineExpired.asSharedFlow()
+    /**
+     * Stage 2 B1: hand out the receive side of the session-signal channel.
+     * Throws while a subscription is attached; the holder frees the slot
+     * with [SessionSignalSubscription.detachAndJoin] after cancelling its
+     * collector. The single production caller is the Android
+     * `HybridRelayTransport`, which owns the subscription for its life.
+     */
+    suspend fun attachSessionSignalConsumer(): SessionSignalSubscription =
+        signalConsumerLock.withLock {
+            check(signalSubscription == null) { "wsSessionSignals already consumed" }
+            val subscription = SessionSignalSubscription(
+                source = _wsSessionSignals.receiveAsFlow(),
+                release = { released ->
+                    signalConsumerLock.withLock {
+                        if (signalSubscription === released) signalSubscription = null
+                    }
+                },
+            )
+            signalSubscription = subscription
+            relayLog(RelayLogLevel.INFO, "${genTag()} session_signal_consumer_attached")
+            subscription
+        }
 
-    // PR-RECV-DIAG1 v1.6 — emitted once per WS session when the read
-    // loop has not seen any Frame.Text for INBOUND_STALL_THRESHOLD_MS
-    // (60 s). The orchestrator forwards this into the state machine
-    // as Event.InboundIdleTimeout, which transitions WsActive → REST
-    // even though no outbound is in flight. Re-armed at each new
-    // session via the per-session pingJob restart.
-    private val _inboundStalled = MutableSharedFlow<InboundStalledEvent>(
-        replay = 0,
-        extraBufferCapacity = 4,
-    )
-    val inboundStalled: SharedFlow<InboundStalledEvent> = _inboundStalled.asSharedFlow()
+    /** Whether a [SessionSignalSubscription] is currently attached. Diagnostic/test surface. */
+    suspend fun hasSessionSignalConsumer(): Boolean =
+        signalConsumerLock.withLock { signalSubscription != null }
+
+    /**
+     * Every signal goes through here. `trySend` on an UNLIMITED channel
+     * fails only when the channel is closed, which never happens by
+     * design -- so a failure is an invariant violation and is loud.
+     */
+    private fun enqueueSignal(signal: WsSessionSignal) {
+        check(_wsSessionSignals.trySend(signal).isSuccess) {
+            "WS session signal channel unexpectedly closed (signal=${signal::class.simpleName} " +
+                "epoch=${signal.sessionId.sessionEpoch})"
+        }
+    }
 
     private val _typingEvents = MutableSharedFlow<String>(
         replay = 0,
@@ -496,7 +479,7 @@ class KtorRelayTransport(
     // [logPrefix] is the gen/session tag computed by the caller (`genTag()` or
     // `genTag(mySession)`), passed in so this helper does not need to know
     // about session context.
-    private fun armAckDeadlineLocked(entry: AckPending, logPrefix: String) {
+    private fun armAckDeadlineLocked(entry: AckPending, logPrefix: String, sessionEpoch: Long) {
         val msgId = entry.message.messageId
         val sentMark = entry.sentAt
         val deadlineScope = ackDeadlineScopeOverride ?: transportScope
@@ -532,8 +515,16 @@ class KtorRelayTransport(
                     RelayLogLevel.WARN,
                     "$logPrefix outbound_ack_deadline_expired id=${msgId.take(12)}… ageMs=$ageMs",
                 )
-                _outboundAckDeadlineExpired.tryEmit(
-                    OutboundAckDeadlineExpiredEvent(msgId = msgId, ageMs = ageMs)
+                // Stage 2 B3: the deadline names the session that WROTE the
+                // frame, captured at arm time. A deadline armed on session N
+                // fires against N even when N+1 is live by then; the state
+                // machine drops it as stale rather than degrading N+1.
+                enqueueSignal(
+                    WsSessionSignal.AckDeadlineExpired(
+                        sessionId = WsSessionId(sessionEpoch),
+                        msgId = msgId,
+                        ageMs = ageMs,
+                    ),
                 )
             }
         }
@@ -1017,7 +1008,7 @@ class KtorRelayTransport(
     /**
      * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §6 + §7 + §13.3.9
      * synthetic Mode 2 trigger. Enqueues a synthetic
-     * [WsSessionLifecycleEvent.Ended] event into [_wsSessionLifecycle]
+     * [WsSessionLifecycleEvent.Ended] event into [_wsSessionSignals]
      * so the production dispatcher's two downstream consumers
      * (state-machine actuation + telemetry detector) run unchanged on
      * the same code path a real Mode 2 wire-level death would
@@ -1049,7 +1040,7 @@ class KtorRelayTransport(
      * If all four gates pass: the latch is consumed for the snapshot
      * epoch, a synthetic [WsSessionLifecycleEvent.Ended] is constructed
      * with the production constructor (no field overrides), and
-     * `trySend(...)` enqueues it into [_wsSessionLifecycle].
+     * `trySend(...)` enqueues it into [_wsSessionSignals].
      * `closeOrigin = "synthetic"` is the L1 mini-lock §13.3.4 telemetry
      * tell — distinguishes synthetic from real `local / remote / error
      * / unknown` close origins in post-mortem; the dispatcher and the
@@ -1128,7 +1119,7 @@ class KtorRelayTransport(
             okhttpPingTimeoutDetected = true,
             sessionEpoch = epoch,
         )
-        _wsSessionLifecycle.trySend(synthetic)
+        enqueueSignal(synthetic)
         return SyntheticTriggerResult.Fired
     }
 
@@ -1669,14 +1660,12 @@ class KtorRelayTransport(
                     // open a recovery probation window on this new session.
                     // IMPL-LOCK #2: check isSuccess — trySend on UNLIMITED only
                     // fails if the channel is closed (invariant violation).
-                    check(
-                        _wsSessionLifecycle.trySend(
+                    enqueueSignal(
                             WsSessionLifecycleEvent.Connected(
                                 sessionEpoch = mySession,
                                 connectionGeneration = ownerGeneration,
                             )
-                        ).isSuccess
-                    ) { "WS lifecycle channel unexpectedly closed (Connected emission epoch=$mySession)" }
+                    )
                     // RC-RECONNECT-QUIESCENCE1 commit 2b: a successful
                     // Connected consumes the carried claim — the state
                     // machine transitions ProbeClaimed → CandidateProving
@@ -1802,8 +1791,7 @@ class KtorRelayTransport(
                 // trySend on UNLIMITED only fails if the channel is closed;
                 // the check enforces the invariant loudly rather than
                 // silently dropping a load-bearing lifecycle event.
-                check(
-                    _wsSessionLifecycle.trySend(
+                enqueueSignal(
                         WsSessionLifecycleEvent.Ended(
                             durationMs = sessionDurationMs,
                             inboundFrames = sessionInboundFrames,
@@ -1813,8 +1801,7 @@ class KtorRelayTransport(
                             okhttpPingTimeoutDetected = pingTimeoutDetected,
                             sessionEpoch = mySession,
                         )
-                    ).isSuccess
-                ) { "WS lifecycle channel unexpectedly closed (Ended emission epoch=$mySession)" }
+                    )
 
                 if (currentSessionStats === sessionStats) {
                     currentSessionStats = null
@@ -1964,7 +1951,7 @@ class KtorRelayTransport(
             var lastLoggedAt = TimeSource.Monotonic.markNow()
             // PR-RECV-DIAG1 v1.6 — emit-once flag per session. The
             // half-dead-inbound condition is sticky: once we cross the
-            // threshold we want to fire ONE InboundStalledEvent and let
+            // threshold we want to fire ONE `WsSessionSignal.Stalled` and let
             // the state machine handle it. If we kept emitting every
             // 10 s, the state machine would log redundant transitions
             // and the REST poll loop would get noisier than necessary.
@@ -1990,7 +1977,7 @@ class KtorRelayTransport(
                     )
                 }
 
-                // PR-RECV-DIAG1 v1.6 — fire InboundStalledEvent once per
+                // PR-RECV-DIAG1 v1.6 — fire the stall signal once per
                 // session when the read loop has not seen any Frame.Text
                 // for INBOUND_STALL_THRESHOLD_MS. This is the real
                 // production-class trigger that test #84.7 isolated:
@@ -2004,9 +1991,9 @@ class KtorRelayTransport(
                         RelayLogLevel.WARN,
                         "${genTag(mySession)} inbound_stall_detected " +
                             "sinceLastInbound=${sinceLastInbound}ms — emitting " +
-                            "InboundStalledEvent (REST fallback should activate)",
+                            "WsSessionSignal.Stalled (REST fallback should activate)",
                     )
-                    _inboundStalled.tryEmit(InboundStalledEvent(sinceLastInbound))
+                    enqueueSignal(WsSessionSignal.Stalled(WsSessionId(mySession), sinceLastInbound))
                 }
 
                 // Reset emit flag if traffic resumes mid-session (e.g. WS
@@ -2176,6 +2163,11 @@ class KtorRelayTransport(
                         is RelayMessage.Deliver -> {
                             currentSessionStats?.takeIf { it.sessionEpoch == mySession }
                                 ?.let { it.deliversReceived += 1 }
+                            // Stage 2 B1 ordering (i): enqueued by the read loop of
+                            // `mySession`, hence after this session's Connected.
+                            enqueueSignal(
+                                WsSessionSignal.Activity(WsSessionId(mySession), WsSessionSignal.ActivityKind.Frame),
+                            )
                             relayLog(
                                 RelayLogLevel.INFO,
                                 "${genTag(mySession)} Received envelope: id=${msg.messageId.take(12)}… sealed=${msg.sealedSender.isNotEmpty()} payloadBytes=${msg.payload.length}",
@@ -2199,6 +2191,9 @@ class KtorRelayTransport(
                                 RelayLogLevel.INFO,
                                 "${genTag(mySession)} Ack from relay: id=${msg.messageId.take(12)}… status=${msg.status}",
                             )
+                            enqueueSignal(
+                                WsSessionSignal.Activity(WsSessionId(mySession), WsSessionSignal.ActivityKind.Ack),
+                            )
                             _acks.emit(msg)
                         }
                         is RelayMessage.Pong -> {
@@ -2209,6 +2204,10 @@ class KtorRelayTransport(
                             // ping_send, frames are arriving on a stale
                             // generation's reader.
                             lastPongMark = timeSource.markNow()
+                            // Liveness only: the state machine never promotes on a pong.
+                            enqueueSignal(
+                                WsSessionSignal.Activity(WsSessionId(mySession), WsSessionSignal.ActivityKind.Pong),
+                            )
                             currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
                                 stats.pongsReceived += 1
                                 stats.lastPongAtMs = Clock.System.now().toEpochMilliseconds()
@@ -2304,7 +2303,7 @@ class KtorRelayTransport(
             // PR-D1d: arm the per-envelope deadline timer under the same lock
             // so the arm and pendingAcks insertion are atomic. If the relay
             // does not AckDeliver within ACK_DEADLINE_MS the timer emits
-            // [outboundAckDeadlineExpired], which the orchestrator forwards to
+            // [WsSessionSignal.AckDeadlineExpired], which the orchestrator forwards to
             // the state machine as Event.ActiveOutboundAckTimeout. This fires
             // on the first bad send, orthogonal to the existing
             // active_outbound_threshold (which requires two session deaths).
@@ -2313,7 +2312,7 @@ class KtorRelayTransport(
             val entry = AckPending(message, sentMark, seq, nowMs)
             pendingAcksLock.withLock {
                 pendingAcks[msgId] = entry
-                armAckDeadlineLocked(entry, logPrefix = genTag())
+                armAckDeadlineLocked(entry, logPrefix = genTag(), sessionEpoch = wsSessionEpoch)
             }
             val ok = sendRaw(message)
             if (!ok) {
@@ -2473,7 +2472,7 @@ class KtorRelayTransport(
                         )
                         pendingAcksLock.withLock {
                             pendingAcks[msg.messageId] = rearmedEntry
-                            armAckDeadlineLocked(rearmedEntry, logPrefix = genTag(mySession))
+                            armAckDeadlineLocked(rearmedEntry, logPrefix = genTag(mySession), sessionEpoch = mySession)
                         }
                         relayLog(
                             RelayLogLevel.INFO,
@@ -2600,7 +2599,7 @@ class KtorRelayTransport(
         //
         // Discards the Boolean result — disconnect() callers do not need
         // to discriminate timeout from clean join.
-        teardownAndJoin(timeoutMs = 10_000L, flushBeforeClose = true)
+        teardownAndJoin(timeoutMs = 10_000L, flushBeforeClose = true, reason = "disconnect")
     }
 
     /**
@@ -2659,8 +2658,15 @@ class KtorRelayTransport(
      * calls are logged on [cleanupScope] and never propagate into the
      * strict-bound body.
      */
-    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean {
-        return teardownAndJoin(timeoutMs = timeoutMs, flushBeforeClose = false).loopJoined
+    override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
+        disconnectAndJoin(timeoutMs, reason = "teardown")
+
+    /**
+     * Stage 2 B11: the reason travels into the `Invalidated` signal so a
+     * privacy teardown is distinguishable from a rewalk in the trace.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long, reason: String): Boolean {
+        return teardownAndJoin(timeoutMs = timeoutMs, flushBeforeClose = false, reason = reason).loopJoined
     }
 
     /**
@@ -2669,6 +2675,12 @@ class KtorRelayTransport(
     override suspend fun disconnectAndConfirm(
         timeoutMs: Long,
         onlyIfIdentity: Long?,
+    ): TransportTeardownResult = disconnectAndConfirm(timeoutMs, onlyIfIdentity, reason = "teardown")
+
+    override suspend fun disconnectAndConfirm(
+        timeoutMs: Long,
+        onlyIfIdentity: Long?,
+        reason: String,
     ): TransportTeardownResult {
         // The identity is compared INSIDE the lifecycle mutex, together
         // with the capture of what is being torn down.
@@ -2683,6 +2695,7 @@ class KtorRelayTransport(
             flushBeforeClose = false,
             confirmCloses = true,
             onlyIfIdentity = onlyIfIdentity,
+            reason = reason,
         )
     }
 
@@ -2702,6 +2715,7 @@ class KtorRelayTransport(
         flushBeforeClose: Boolean,
         confirmCloses: Boolean = false,
         onlyIfIdentity: Long? = null,
+        reason: String = "teardown",
     ): TransportTeardownResult {
         return connectionLifecycleMutex.withLock {
             // Same critical section as the capture below.
@@ -2823,6 +2837,11 @@ class KtorRelayTransport(
             var closeDispatches = 0
             val closeAttempts = mutableListOf<Pair<PendingClose, Deferred<Boolean>>>()
             withContext(NonCancellable) {
+                // Stage 2 I6: the session being torn down is invalidated
+                // for the state machine BEFORE the loop is cancelled and
+                // the socket closed, and therefore before any later
+                // Connected of a successor loop.
+                enqueueSignal(WsSessionSignal.Invalidated(WsSessionId(wsSessionEpoch), reason))
                 job?.cancel()
 
                 val sessionRef = session
@@ -3142,6 +3161,17 @@ class KtorRelayTransport(
             // Belt-and-suspenders: kill the current generation's engine and
             // client first so the abandoned loop has no resources to use even
             // if it does eventually unpark.
+            // Stage 2 B6, two separate guarantees. (1) Ordering: the
+            // invalidation of the session this loop owns is enqueued INSIDE
+            // the lifecycle mutex, before the old scope is cancelled and
+            // before the new loop is launched, so no `Connected(new)` can
+            // be observed ahead of it. (2) Presentation: every caller
+            // publishes `Reconnecting` before returning (only the ACK
+            // watchdog did before). No claim of synchronous processing.
+            enqueueSignal(
+                WsSessionSignal.Invalidated(WsSessionId(wsSessionEpoch), reason = "force_reconnect"),
+            )
+            _state.value = TransportState.Reconnecting
             forceShutdownActiveEngine()
             runCatching { currentGenerationClient?.close() }
             scope?.cancel()
@@ -3361,10 +3391,69 @@ class KtorRelayTransport(
      * Must only be called from tests. Production code uses [send] which arms
      * the timer under the lock atomically with the pendingAcks insertion.
      */
-    internal suspend fun armAckDeadlineForTest(entry: AckPending) {
+    /**
+     * Stage 2 test seam: bring the transport to `Connected` for session
+     * [sessionEpoch] WITHOUT a WS handshake and enqueue the same
+     * `Connected` signal the reconnect loop enqueues right after it
+     * publishes `TransportState.Connected`. Advances `wsSessionEpoch` to
+     * [sessionEpoch] so `currentSessionEpoch` and every later signal agree.
+     * Matches the `*ForTest*` deny pattern: R8 strips it from release.
+     */
+    internal fun simulateSessionConnectedForTest(sessionEpoch: Long, ownerGeneration: Long = 0L) {
+        require(sessionEpoch > wsSessionEpoch) { "session epochs are monotonic" }
+        wsSessionEpoch = sessionEpoch
+        _state.value = TransportState.Connected
+        enqueueSignal(
+            WsSessionLifecycleEvent.Connected(
+                sessionEpoch = sessionEpoch,
+                connectionGeneration = ownerGeneration,
+            ),
+        )
+    }
+
+    /**
+     * Stage 2 test seam: an inbound `Deliver` for [sessionEpoch], in the
+     * production order -- the activity signal is enqueued before the
+     * envelope reaches [incoming], exactly as the read loop does.
+     */
+    internal suspend fun simulateInboundDeliverForTest(deliver: RelayMessage.Deliver, sessionEpoch: Long) {
+        enqueueSignal(WsSessionSignal.Activity(WsSessionId(sessionEpoch), WsSessionSignal.ActivityKind.Frame))
+        _incoming.emit(deliver)
+    }
+
+    /** Stage 2 test seam: the idle watchdog's stall signal for [sessionEpoch]. */
+    internal fun simulateInboundStallForTest(sessionEpoch: Long, sinceLastInboundMs: Long) {
+        enqueueSignal(WsSessionSignal.Stalled(WsSessionId(sessionEpoch), sinceLastInboundMs))
+    }
+
+    /** Stage 2 test seam: a session end for [sessionEpoch] with the given shape. */
+    internal fun simulateSessionEndedForTest(
+        sessionEpoch: Long,
+        durationMs: Long = 30_000L,
+        inboundFrames: Int = 0,
+        pendingAcksAtClose: Int = 0,
+        closeOrigin: String = "error",
+        closeError: String? = null,
+        okhttpPingTimeoutDetected: Boolean = false,
+    ) {
+        if (_state.value is TransportState.Connected) _state.value = TransportState.Disconnected
+        enqueueSignal(
+            WsSessionLifecycleEvent.Ended(
+                durationMs = durationMs,
+                inboundFrames = inboundFrames,
+                pendingAcksAtClose = pendingAcksAtClose,
+                closeOrigin = closeOrigin,
+                closeError = closeError,
+                okhttpPingTimeoutDetected = okhttpPingTimeoutDetected,
+                sessionEpoch = sessionEpoch,
+            ),
+        )
+    }
+
+    internal suspend fun armAckDeadlineForTest(entry: AckPending, sessionEpoch: Long = wsSessionEpoch) {
         pendingAcksLock.withLock {
             pendingAcks[entry.message.messageId] = entry
-            armAckDeadlineLocked(entry, logPrefix = "[test]")
+            armAckDeadlineLocked(entry, logPrefix = "[test]", sessionEpoch = sessionEpoch)
         }
     }
 

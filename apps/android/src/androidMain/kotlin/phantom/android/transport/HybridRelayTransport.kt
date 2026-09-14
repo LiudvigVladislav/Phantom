@@ -5,6 +5,7 @@ package phantom.android.transport
 
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -28,11 +29,13 @@ import phantom.core.transport.RestInboundDeduplicator
 import phantom.core.transport.RestMode
 import phantom.core.transport.RestStateMachine
 import phantom.core.transport.SendOutcome
+import phantom.core.transport.SessionSignalSubscription
 import phantom.core.transport.TransportKind
 import phantom.core.transport.TransportState
 import phantom.core.transport.WsDegradationDetector
 import phantom.core.transport.WsSessionEndedEvent
 import phantom.core.transport.WsSessionLifecycleEvent
+import phantom.core.transport.WsSessionSignal
 import phantom.core.transport.epochOrUnknown
 
 /**
@@ -87,16 +90,15 @@ import phantom.core.transport.epochOrUnknown
  *       on the tracker so subsequent duplicates flip to `ReAck`.
  *     - Else delegate to `wsTransport.sendDeliveryAck(messageId)`.
  *
- * **State-machine feeds** wired by [startWsCollectors] (always) and
- * [startRestCollectors] (only after a successful bootstrap):
- * - `wsTransport.wsSessionLifecycle` → [RestStateMachine.Event.WsSessionConnected] /
- *   [RestStateMachine.Event.WsSessionEnded] (single ordered lifecycle stream).
- * - every `wsTransport.incoming` emission → forward to `_incoming`
- *   (ALWAYS), and if REST is up, also `WsFrameTextReceived`.
- * - every `wsTransport.acks` emission → forward acks via Flow chain
- *   (ALWAYS — `acks` is just the upstream Flow reference) and, if REST is
- *   up, also `WsFrameTextReceived` AND `WsOutboundAckReceived`
- *   (commits a candidate session into `WsActive` immediately).
+ * **State-machine feeds** (Stage 2, 2026-09-13): ONE ordered stream.
+ * [startWsPassthroughCollectors] attaches the transport's single
+ * [phantom.core.transport.SessionSignalSubscription] and runs exactly one
+ * consumer that maps every [phantom.core.transport.WsSessionSignal]
+ * (Connected / Ended / Activity / Stalled / AckDeadlineExpired /
+ * Invalidated) to exactly one [RestStateMachine.Event] carrying the same
+ * session id. `wsTransport.incoming` is only forwarded into `_incoming`;
+ * it no longer feeds the machine. This instance OWNS the subscription
+ * and every job it launches, and [closeAndJoin] releases all of them.
  *
  * `NetworkChanged` events are deliberately NOT wired in D1b
  * (deferred to PR-D1d).
@@ -123,13 +125,15 @@ import phantom.core.transport.epochOrUnknown
  * [pendingMigration] until the migration completes, so bootstrap-first
  * encrypt-time order is preserved.
  *
- * **Thread safety.** [RestStateMachine] is NOT thread-safe; every event
- * submission goes through [submitStateEvent] which takes [stateMachineLock].
- * The WS → REST transition is detected synchronously inside that lock,
- * and migration is armed (both [migrationJob] and [pendingMigration]
- * written in that order) under the same lock so a concurrent
- * [send] that sees the new mode is guaranteed to see the migration in
- * flight and suspend on [awaitPendingMigrationIfNeeded].
+ * **Thread safety.** Every event submission -- this instance's consumer
+ * and, through [RestFallbackOrchestrator.eventRouter], the orchestrator's
+ * own producers -- goes through [stateMachineLock]. The WS → REST
+ * transition is returned by the machine as a
+ * [RestStateMachine.Transition] and migration is armed (both
+ * [migrationJob] and [pendingMigration] written in that order) under the
+ * same lock so a concurrent [send] that sees the new mode is guaranteed
+ * to see the migration in flight and suspend on
+ * [awaitPendingMigrationIfNeeded].
  */
 
 /**
@@ -257,7 +261,16 @@ class HybridRelayTransport(
      * is retained for a subsequent call to re-await.
      */
     override suspend fun disconnectAndJoin(timeoutMs: Long): Boolean =
-        wsTransport.disconnectAndJoin(timeoutMs)
+        wsTransport.disconnectAndJoin(timeoutMs, reason = "teardown")
+
+    /**
+     * Stage 2 B11: the reason reaches the transport so the session
+     * invalidation it enqueues before closing the socket says WHY -- a
+     * privacy teardown and a network rewalk are different facts and the
+     * state machine's trace should not conflate them.
+     */
+    override suspend fun disconnectAndJoin(timeoutMs: Long, reason: String): Boolean =
+        wsTransport.disconnectAndJoin(timeoutMs, reason)
 
     override val teardownIdentity: Long get() = wsTransport.teardownIdentity
 
@@ -265,7 +278,14 @@ class HybridRelayTransport(
         timeoutMs: Long,
         onlyIfIdentity: Long?,
     ): phantom.core.transport.TransportTeardownResult =
-        wsTransport.disconnectAndConfirm(timeoutMs, onlyIfIdentity)
+        wsTransport.disconnectAndConfirm(timeoutMs, onlyIfIdentity, reason = "teardown")
+
+    override suspend fun disconnectAndConfirm(
+        timeoutMs: Long,
+        onlyIfIdentity: Long?,
+        reason: String,
+    ): phantom.core.transport.TransportTeardownResult =
+        wsTransport.disconnectAndConfirm(timeoutMs, onlyIfIdentity, reason)
 
     override suspend fun forceReconnect() = wsTransport.forceReconnect()
 
@@ -291,18 +311,28 @@ class HybridRelayTransport(
     private val restDedup = RestInboundDeduplicator(nowMs = nowMs)
 
     /**
-     * Lock serialising all writes to [RestStateMachine] via
-     * [RestFallbackOrchestrator.submitEvent]. Without it, three independent
-     * collectors (WS session-end, WS frames, WS acks) can race and corrupt
-     * the state machine's transition counters.
+     * Stage 2 B4: the atomic boundary `event -> RestMode change -> migration
+     * arming`. Every producer takes it: the single session-signal consumer
+     * below and, through [RestFallbackOrchestrator.eventRouter], the
+     * orchestrator's own producers (the candidate tick, `RestPollDegraded`).
+     * Lock order, fixed: `stateMachineLock -> RestStateMachine.eventMutex ->
+     * gateLock`; the reverse is forbidden and [lockTraceForTest] lets a
+     * fixture prove the nesting.
      */
     private val stateMachineLock = Mutex()
 
     /**
+     * Stage 2 test seam (row 24): observes `stateMachineLock` acquire /
+     * release so a lock-order fixture can assert the nesting together
+     * with [RestStateMachine.lockTraceForTest]. Null in production.
+     */
+    @Volatile internal var lockTraceForTest: ((String) -> Unit)? = null
+
+    /**
      * PR-WS-HEALTH-STATE1 Commit 3.2a (architect P2-1, 2026-06-01): the
-     * three WS event collectors below ([wsSessionLifecycle] /
-     * [outboundAckDeadlineExpired] / [inboundStalled]) each run in their
-     * own `scope.launch` on [appScope] (`Dispatchers.Default`). The
+     * signal consumer and its telemetry feeds run on [scope]
+     * (`Dispatchers.Default`); the dispatcher's Ended branch and the
+     * stall / deadline branches are separate call sites. The
      * detector is documented as "not thread-safe" — it owns a mutable
      * `ArrayDeque`, session counters, and rising-edge boolean flags. Without
      * this lock, parallel `recordAndEmit` / `emitSessionTotal` calls from
@@ -349,13 +379,26 @@ class HybridRelayTransport(
     @Volatile private var lastBootstrapAttemptMs: Long = 0L
 
     /**
-     * Tracking handles for the REST-specific collectors so a future retry
-     * can avoid starting duplicates. WS-passthrough collectors are started
-     * once at [bootstrapAndStart] entry and never replaced.
+     * Stage 2 B1: every job this instance launches is kept, so
+     * [closeAndJoin] can cancel and join all of them. Before Stage 2 the
+     * WS collectors were launched on [scope] without handles and a Hybrid
+     * abandoned after a failed initialisation kept consuming the
+     * transport's flows for the life of the process.
      */
-    private var wsFramesStateJob: Job? = null
-    private var wsAcksStateJob: Job? = null
+    private var signalSubscription: SessionSignalSubscription? = null
+    private var signalConsumerJob: Job? = null
+    private var wsInboundForwardJob: Job? = null
     private var restInboundJob: Job? = null
+
+    /**
+     * Serialises the two lifecycle transitions of this instance -- the
+     * attach-and-launch, and the close -- so neither can observe the other
+     * half-done.
+     */
+    private val lifecycleMutex = Mutex()
+
+    /** Set by [closeAndJoin]; a closed instance refuses to start anything. */
+    @Volatile private var closed: Boolean = false
 
     /**
      * Idempotence guard for [startWsPassthroughCollectors]. The current
@@ -457,165 +500,255 @@ class HybridRelayTransport(
     }
 
     /**
-     * WS-passthrough collectors. Started once at [bootstrapAndStart] entry
-     * and never stopped. Forward inbound WS frames into [_incoming] so DMS
-     * keeps receiving messages independently of REST capability.
+     * Stage 2 B1: attach the transport's single session-signal subscription
+     * and launch exactly one consumer of it, plus the inbound-envelope
+     * forwarder. Idempotent per instance ([wsPassthroughStarted]); a second
+     * Hybrid against the same transport fails loudly inside
+     * [KtorRelayTransport.attachSessionSignalConsumer] instead of silently
+     * stealing signals.
      *
-     * State-machine event submission via [submitStateEvent] is a no-op when
-     * [restCapabilityActive] is false (see [submitStateEvent] for rationale).
-     *
-     * Idempotent: a second call is a no-op. Guarded by [wsPassthroughStarted]
-     * so a future retry path cannot accidentally spawn a second WS inbound
-     * collector and cause duplicate delivery into [_incoming].
+     * The consumer maps each signal to exactly one [RestStateMachine.Event]
+     * carrying the same session id and submits it through
+     * [submitStateEvent]. The frame / ack collectors that used to submit
+     * untagged events from `wsTransport.incoming` / `acks` are gone: the
+     * forwarder below only moves envelopes into [_incoming].
      */
-    private fun startWsPassthroughCollectors() {
-        if (wsPassthroughStarted) return
-        wsPassthroughStarted = true
+    internal suspend fun startWsPassthroughCollectors() = lifecycleMutex.withLock {
+        // Review round 7 (2026-09-13): closed is checked FIRST, and the
+        // started flag is published only after the attach and both launches
+        // have succeeded.
+        //
+        // The first shape set the flag before attaching, so a Hybrid whose
+        // attach was refused -- the expected outcome for a second instance
+        // against the same transport -- was left permanently "started" with
+        // nothing running, and a later retry returned silently. It also
+        // returned silently after `closeAndJoin`, because the flag was still
+        // set from the first run. Both are now loud.
+        check(!closed) { "HybridRelayTransport is closed" }
+        if (wsPassthroughStarted) return@withLock
         android.util.Log.i(
             "PhantomMessaging",
             "RECV_DIAG ws_passthrough_started",
         )
-        scope.launch {
-            wsTransport.incoming.collect { deliver ->
-                // PR-RECV-DIAG1 v1.2 — log every WS frame BEFORE it crosses
-                // into the messaging-service's _incoming SharedFlow. If we
-                // see `ws_deliver_in` but no `envelope_seen` downstream
-                // (DefaultMessagingService), the SharedFlow subscription
-                // is broken. If we see neither, WS isn't delivering at
-                // all and the diagnostic narrows to wsTransport itself.
-                android.util.Log.i(
-                    "PhantomMessaging",
-                    "RECV_DIAG ws_deliver_in id=${deliver.messageId.take(8)} " +
-                        "sealed=${deliver.sealedSender.isNotEmpty()} " +
-                        "payloadBytes=${deliver.payload.length}",
-                )
-                _incoming.emit(deliver)
-                submitStateEvent(RestStateMachine.Event.WsFrameTextReceived)
+        val subscription = wsTransport.attachSessionSignalConsumer()
+        var consumer: Job? = null
+        var forwarder: Job? = null
+        try {
+            consumer = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                subscription.signals.collect { signal -> consumeSessionSignal(signal) }
             }
-        }
-        scope.launch {
-            wsTransport.acks.collect {
-                // WS ACK = strongest "bidirectional WS" signal — must commit
-                // a WsCandidate session into WsActive atomically. Feeding
-                // both events under one lock acquisition prevents a
-                // WsSessionEnded from racing in between and reverting the
-                // mode before the ack's commit lands.
-                submitStateEvents(
-                    RestStateMachine.Event.WsFrameTextReceived,
-                    RestStateMachine.Event.WsOutboundAckReceived,
-                )
-            }
-        }
-        // R3.6 (2026-06-20): single ordered lifecycle collector backed by a
-        // Channel.UNLIMITED stream so Connected and Ended events are delivered in
-        // strict emission order with no loss (Channel.UNLIMITED + check isSuccess).
-        //
-        // The dispatch body is extracted to [dispatchWsSessionLifecycleEvent] (internal)
-        // so unit tests can drive it directly without needing to stand up a full
-        // coroutine / Flow pipeline.
-        //
-        // IMPL-LOCK #3: all three side effects preserved in [dispatchWsSessionLifecycleEvent].
-        // IMPL-LOCK #4: continue-on-error policy is inside the extracted helper.
-        scope.launch {
-            wsTransport.wsSessionLifecycle.collect { event ->
-                dispatchWsSessionLifecycleEvent(event)
-            }
-        }
-        // PR-D1d: per-envelope ACK deadline. Parallel to the lifecycle collector.
-        // Fires when a sent envelope is not acknowledged by the relay within
-        // 10 s, triggering an immediate WS_ACTIVE → REST_ACTIVE switch on
-        // the first bad send — without waiting for two full session deaths as
-        // the active_outbound_threshold mechanism requires.
-        //
-        // Short-circuits when REST is not active (same pattern as the acks
-        // and incoming collectors above): if the relay bootstrap has not yet
-        // returned restFallback=true, feeding deadline events into an
-        // uninitialised state machine is a no-op and we avoid the overhead.
-        scope.launch {
-            wsTransport.outboundAckDeadlineExpired.collect { event ->
-                if (!restCapabilityActive) return@collect
-                // Routing still changes only from WsActive. Forward the event
-                // in every mode so a late failure replaces silence-only evidence.
-                val wasWsActive = stateMachine.current == RestMode.WsActive
-                submitStateEvent(
-                    RestStateMachine.Event.ActiveOutboundAckTimeout(
-                        msgId = event.msgId,
-                        ageMs = event.ageMs,
+            forwarder = scope.launch {
+                wsTransport.incoming.collect { deliver ->
+                    // PR-RECV-DIAG1 v1.2 — log every WS frame BEFORE it crosses
+                    // into the messaging-service's _incoming SharedFlow.
+                    android.util.Log.i(
+                        "PhantomMessaging",
+                        "RECV_DIAG ws_deliver_in id=${deliver.messageId.take(8)} " +
+                            "sealed=${deliver.sealedSender.isNotEmpty()} " +
+                            "payloadBytes=${deliver.payload.length}",
                     )
-                )
-                // Even in fallback this replaces "silence only" presentation evidence.
-                // Actuation and detector telemetry retain their previous mode guard.
-                if (!wasWsActive) return@collect
-                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
-                wsDegradationDetector?.let { det ->
-                    wsDegradationMutex.withLock {
-                        feedDegradationDetectorOnAckTimeout(
-                            detector = det,
-                            currentKind = degradationCurrentKindProvider(),
-                        )
-                    }
+                    _incoming.emit(deliver)
                 }
             }
+        } catch (t: Throwable) {
+            // Roll the whole stage back: a half-launched attach must not
+            // hold the transport's only consumer slot.
+            withContext(NonCancellable) {
+                consumer?.cancel()
+                forwarder?.cancel()
+                runCatching { consumer?.join() }
+                runCatching { forwarder?.join() }
+                subscription.detachAndJoin()
+            }
+            throw t
         }
+        signalSubscription = subscription
+        signalConsumerJob = consumer
+        wsInboundForwardJob = forwarder
+        wsPassthroughStarted = true
+    }
 
-        // PR-RECV-DIAG1 v1.6 — inbound-stall fast-path. Forwards the new
-        // half-dead-inbound signal from KtorRelayTransport.startIdleWatchdog
-        // into the state machine. Without this, a WS session that
-        // hand-shook successfully but receives no server-pushed frames
-        // (test #84.7 case) keeps the device stuck in WsActive
-        // indefinitely — REST poll never starts, queued envelopes in
-        // mirror_envelope_to_rest_store never get pulled.
-        //
-        // Same short-circuits as the outboundAckDeadlineExpired path:
-        // skip when REST capability not yet bootstrapped, skip when
-        // state has already moved away from WsActive (state machine
-        // would no-op anyway, but cheap fast-path here avoids
-        // submitStateEvent's lock acquisition).
-        scope.launch {
-            wsTransport.inboundStalled.collect { event ->
-                if (!restCapabilityActive) {
-                    // PR-RECV-DIAG1 v1.8 (Vladislav-architect 2026-05-27).
-                    // Test #84.9 exposed a v1.6/v1.7 dead-end: if REST
-                    // bootstrap failed at app start (e.g. /auth/session
-                    // SocketTimeoutException), restCapabilityActive stays
-                    // false forever and this collector previously silently
-                    // returned. So a WS session that connected but
-                    // received no inbound frames was stuck — neither REST
-                    // poll started (no capability) nor was bootstrap
-                    // re-attempted. The chip emit was wasted.
-                    //
-                    // Now: when inbound stalls without REST capability,
-                    // trigger maybeRetryBootstrap() — the same recovery
-                    // path the lifecycle dispatcher's Ended branch uses. Rate-limited
-                    // inside maybeRetryBootstrap via
-                    // BOOTSTRAP_RETRY_MIN_INTERVAL_MS so a chronically-
-                    // silent socket doesn't hammer /auth/session.
-                    Log.i(
-                        "PhantomHybrid",
-                        "REST_TRACE inbound_stall_bootstrap_retry " +
-                            "sinceLastInboundMs=${event.sinceLastInboundMs}",
-                    )
-                    maybeRetryBootstrap()
-                    return@collect
+    /**
+     * Stage 2 B1: one signal, one state-machine event, same session id.
+     * IMPL-LOCK #4 supervision as in [WsSessionLifecycleDispatcher]: a
+     * [CancellationException] rethrows; any other failure is logged and
+     * the consumer keeps consuming so the channel never backs up behind a
+     * dead collector.
+     */
+    private suspend fun consumeSessionSignal(signal: WsSessionSignal) {
+        try {
+            when (signal) {
+                is WsSessionLifecycleEvent -> dispatchWsSessionLifecycleEvent(signal)
+                is WsSessionSignal.Activity -> when (signal.kind) {
+                    WsSessionSignal.ActivityKind.Frame ->
+                        submitStateEvent(RestStateMachine.Event.WsFrameTextReceived(signal.sessionId.sessionEpoch))
+                    WsSessionSignal.ActivityKind.Ack ->
+                        submitStateEvent(RestStateMachine.Event.WsOutboundAckReceived(signal.sessionId.sessionEpoch))
+                    WsSessionSignal.ActivityKind.Pong ->
+                        submitStateEvent(RestStateMachine.Event.WsPongReceived(signal.sessionId.sessionEpoch))
                 }
-                if (stateMachine.current != RestMode.WsActive) return@collect
-                submitStateEvent(
-                    RestStateMachine.Event.InboundIdleTimeout(
-                        sinceLastInboundMs = event.sinceLastInboundMs,
+                is WsSessionSignal.Stalled -> onInboundStalled(signal)
+                is WsSessionSignal.AckDeadlineExpired -> onAckDeadlineExpired(signal)
+                is WsSessionSignal.Invalidated ->
+                    submitStateEvent(
+                        RestStateMachine.Event.WsSessionInvalidated(
+                            sessionEpoch = signal.sessionId.sessionEpoch,
+                            reason = signal.reason,
+                        ),
                     )
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Log.e(
+                TAG,
+                "SIGNAL_CONSUMER_ERROR kind=${signal::class.simpleName} " +
+                    "epoch=${signal.sessionId.sessionEpoch} error=${t::class.simpleName} " +
+                    "msg=${t.message?.take(120)}",
+            )
+        }
+    }
+
+    /**
+     * PR-RECV-DIAG1 v1.6 / v1.8 inbound-stall path, now keyed by session.
+     * Without REST capability the stall triggers a bootstrap retry (the
+     * v1.8 dead-end fix); with it the tagged event goes to the machine,
+     * which decides by freshness and mode (Stage 2 B3: in candidate it
+     * cancels the proof, in WsActive it degrades, elsewhere it is dropped).
+     */
+    private suspend fun onInboundStalled(signal: WsSessionSignal.Stalled) {
+        if (!restCapabilityActive) {
+            Log.i(
+                "PhantomHybrid",
+                "REST_TRACE inbound_stall_bootstrap_retry " +
+                    "sinceLastInboundMs=${signal.sinceLastInboundMs}",
+            )
+            maybeRetryBootstrap()
+            return
+        }
+        val wasWsActive = stateMachine.current == RestMode.WsActive
+        submitStateEvent(
+            RestStateMachine.Event.InboundIdleTimeout(
+                sessionEpoch = signal.sessionId.sessionEpoch,
+                sinceLastInboundMs = signal.sinceLastInboundMs,
+            ),
+        )
+        if (!wasWsActive) return
+        // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
+        wsDegradationDetector?.let { det ->
+            wsDegradationMutex.withLock {
+                feedDegradationDetectorOnInboundStalled(
+                    detector = det,
+                    currentKind = degradationCurrentKindProvider(),
                 )
-                // PR-WS-HEALTH-STATE1 Commit 3.2a: telemetry-only.
-                wsDegradationDetector?.let { det ->
-                    wsDegradationMutex.withLock {
-                        feedDegradationDetectorOnInboundStalled(
-                            detector = det,
-                            currentKind = degradationCurrentKindProvider(),
-                        )
-                    }
-                }
             }
         }
     }
+
+    /**
+     * PR-D1d per-envelope ACK deadline, now carrying the epoch captured
+     * when the deadline was armed. Forwarded in every mode so a late
+     * failure replaces silence-only evidence; the detector telemetry keeps
+     * its previous WsActive guard.
+     */
+    private suspend fun onAckDeadlineExpired(signal: WsSessionSignal.AckDeadlineExpired) {
+        if (!restCapabilityActive) return
+        val wasWsActive = stateMachine.current == RestMode.WsActive
+        submitStateEvent(
+            RestStateMachine.Event.ActiveOutboundAckTimeout(
+                sessionEpoch = signal.sessionId.sessionEpoch,
+                msgId = signal.msgId,
+                ageMs = signal.ageMs,
+            ),
+        )
+        if (!wasWsActive) return
+        wsDegradationDetector?.let { det ->
+            wsDegradationMutex.withLock {
+                feedDegradationDetectorOnAckTimeout(
+                    detector = det,
+                    currentKind = degradationCurrentKindProvider(),
+                )
+            }
+        }
+    }
+
+    /**
+     * Review round 8 (2026-09-13): the ONE completion every caller of
+     * [closeAndJoin] waits on.
+     *
+     * Setting `closed` and returning was not a join. The first caller
+     * flipped the flag inside [lifecycleMutex], released it, and only
+     * THEN cancelled the jobs and detached the subscription; a second
+     * caller saw the flag and returned immediately, while the collector
+     * it believed gone was still reading and the transport's consumer
+     * slot was still held. Everything after the flag now happens once,
+     * and every caller waits for it.
+     */
+    private var closeCompletion: CompletableDeferred<Unit>? = null
+
+    /**
+     * Stage 2 B1: release everything this instance owns -- cancel and join
+     * the signal consumer, the inbound forwarder, the REST inbound
+     * collector and a migration job, then detach the signal subscription
+     * so a successor can attach.
+     *
+     * Idempotent AND a real join: exactly one caller performs the close,
+     * and every other caller -- concurrent or later -- returns only after
+     * that same close has finished. Runs under [NonCancellable] so a
+     * cancelled caller cannot leave a collector alive. The orchestrator is
+     * NOT closed here: it has its own `close()` and the container closes
+     * the two in reverse construction order.
+     */
+    suspend fun closeAndJoin() {
+        var mine = false
+        val completion = lifecycleMutex.withLock {
+            val existing = closeCompletion
+            if (existing != null) return@withLock existing
+            mine = true
+            closed = true
+            wsPassthroughStarted = false
+            CompletableDeferred<Unit>().also { closeCompletion = it }
+        }
+        if (!mine) {
+            // Someone else owns this close. Wait for THEIR completion, not
+            // for the flag they set on the way in.
+            withContext(NonCancellable) { completion.await() }
+            return
+        }
+        try {
+            withContext(NonCancellable) {
+                orchestrator.eventRouter = null
+                val jobs = listOfNotNull(
+                    signalConsumerJob, wsInboundForwardJob, restInboundJob, migrationJob,
+                )
+                jobs.forEach { it.cancel() }
+                jobs.forEach { job ->
+                    try {
+                        job.join()
+                    } catch (_: Throwable) {
+                        // Diagnostic; join() only ensures the body has unwound.
+                    }
+                }
+                signalConsumerJob = null
+                wsInboundForwardJob = null
+                restInboundJob = null
+                pendingMigration = false
+                // The detach is itself a join now: it returns only once the
+                // collector has unwound and the transport's slot is free, so
+                // a successor cannot attach before this point.
+                signalSubscription?.detachAndJoin()
+                signalSubscription = null
+                Log.i(TAG, "REST_TRACE hybrid_closed")
+            }
+        } catch (t: Throwable) {
+            completion.completeExceptionally(t)
+            throw t
+        }
+        completion.complete(Unit)
+    }
+
+    /** Whether [closeAndJoin] has run. Diagnostic/test surface. */
+    val isClosed: Boolean get() = closed
 
     /**
      * R3.6 (2026-06-20) IMPL-LOCK #3 + #4: top-level [WsSessionLifecycleDispatcher]
@@ -630,7 +763,7 @@ class HybridRelayTransport(
      */
     private val lifecycleDispatcher: WsSessionLifecycleDispatcher by lazy {
         WsSessionLifecycleDispatcher(
-            submitStateEvent = { event -> submitStateEvent(event) },
+            submitStateEvent = { event -> submitStateEvent(event); Unit },
             maybeRetryBootstrap = { maybeRetryBootstrap() },
             feedDegradationDetector = { legacyEvent ->
                 wsDegradationDetector?.let { det ->
@@ -703,6 +836,7 @@ class HybridRelayTransport(
             if (restCapabilityActive) {
                 return@withLock
             }
+            check(!closed) { "HybridRelayTransport is closed" }
             // Trek 2 Stage 2B-B (C3 review-fix) — register the inbound
             // collector BEFORE starting the orchestrator. `SharedFlow`
             // with `replay=0` does NOT buffer envelopes for retroactive
@@ -794,23 +928,43 @@ class HybridRelayTransport(
         }
     }
 
+    init {
+        // Stage 2 B4: the orchestrator's own producers (candidate tick,
+        // RestPollDegraded) reach the machine through this instance's
+        // lock, so every mode change -- whoever produced it -- is armed
+        // for migration under the same critical section. Not gated on
+        // [restCapabilityActive]: those producers only exist after the
+        // orchestrator started, and a telemetry event must not be lost
+        // in the window before the flag flips.
+        orchestrator.eventRouter = { event -> routeThroughLock(event) }
+    }
+
     /**
      * Funnel every [RestStateMachine] event through one mutex so the
-     * machine's internal counters stay consistent under concurrent emit /
-     * ack / session-end signals. Short-circuits when REST has not been
-     * activated — feeding events into an unstarted machine has no useful
-     * effect and we don't want to churn it.
+     * event, the resulting mode change and the migration arming are one
+     * indivisible step relative to every other producer. Short-circuits
+     * when REST has not been activated -- feeding events into an
+     * unstarted machine has no useful effect.
      *
-     * Also detects WS → RestActive transitions synchronously and arms the
-     * pending-outbox migration under the same critical section (see
-     * [maybeArmMigrationLocked]).
+     * Returns the machine's [RestStateMachine.Transition] (null when the
+     * mode did not change) so a caller can act on the SAME transition the
+     * migration was armed for.
      */
-    private suspend fun submitStateEvent(event: RestStateMachine.Event) {
-        if (!restCapabilityActive) return
-        stateMachineLock.withLock {
-            val before = stateMachine.current
-            orchestrator.submitEvent(event)
-            maybeArmMigrationLocked(before, stateMachine.current)
+    private suspend fun submitStateEvent(event: RestStateMachine.Event): RestStateMachine.Transition? {
+        if (!restCapabilityActive) return null
+        return routeThroughLock(event)
+    }
+
+    private suspend fun routeThroughLock(event: RestStateMachine.Event): RestStateMachine.Transition? {
+        lockTraceForTest?.invoke("stateMachineLock:acquire")
+        return stateMachineLock.withLock {
+            try {
+                val transition = orchestrator.submitEvent(event)
+                maybeArmMigrationLocked(transition)
+                transition
+            } finally {
+                lockTraceForTest?.invoke("stateMachineLock:release")
+            }
         }
     }
 
@@ -818,77 +972,53 @@ class HybridRelayTransport(
      * PR-LTE-NETCHANGE1 (2026-05-28): NARROW public entry-point for
      * submitting `Event.NetworkChanged` into the REST state machine.
      *
-     * R3.6 (2026-06-20): signature extended with [clearsMode2Sticky] so
-     * [TransportRewalkCoordinator] can propagate whether this network change
-     * should lift a sticky REST window into recovery mode. `true` for
-     * genuine route changes (Wi-Fi ↔ cellular, VPN, network gained/lost);
-     * `false` for VALIDATED_CHANGED which is not a true route change
-     * (sticky_kept in state machine).
+     * Stage 2 B5: carries the observer's monotonic [networkGeneration].
+     * The orchestrator learns it FIRST so REST health is invalidated and a
+     * poll dispatched under the old generation cannot re-prove it; the
+     * machine then invalidates the WSS proof and never enters candidate.
      *
-     * **Deliberately scoped.** [HybridRelayTransport] does NOT own the rewalk
-     * (clear preferences, `disconnect()`, `transportManager.release()`, restart).
-     * Those live in [TransportRewalkCoordinator]. This method only forwards
-     * the event so the state machine can run its existing NetworkChanged logic.
-     *
-     * Short-circuits on `restCapabilityActive=false` like the rest of the
-     * `submitStateEvent` family.
+     * **Deliberately scoped.** [HybridRelayTransport] does NOT own the
+     * rewalk; those steps live in [TransportRewalkCoordinator].
      */
-    override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean) {
-        submitStateEvent(RestStateMachine.Event.NetworkChanged(clearsMode2Sticky = clearsMode2Sticky))
+    override suspend fun submitNetworkChangedEvent(clearsMode2Sticky: Boolean, networkGeneration: Long) {
+        orchestrator.noteNetworkChanged(networkGeneration)
+        submitStateEvent(
+            RestStateMachine.Event.NetworkChanged(
+                clearsMode2Sticky = clearsMode2Sticky,
+                networkGeneration = networkGeneration,
+            ),
+        )
     }
 
     /**
-     * Atomic batch variant: submits the given events under a SINGLE
-     * acquisition of [stateMachineLock] so they are applied as one
-     * indivisible step relative to other collectors. Use this for event
-     * pairs that must observe each other's effect — e.g. WS ACK = (frame
-     * received + outbound ack), where a WsSessionEnded racing between them
-     * would let WsCandidate revert before commit.
-     *
-     * Detects WS → RestActive transitions on the COMPOSITE before/after
-     * mode pair — if any of the events in the batch produces the
-     * transition, migration is armed once at the end.
-     */
-    private suspend fun submitStateEvents(vararg events: RestStateMachine.Event) {
-        if (!restCapabilityActive) return
-        stateMachineLock.withLock {
-            val before = stateMachine.current
-            for (event in events) {
-                orchestrator.submitEvent(event)
-            }
-            maybeArmMigrationLocked(before, stateMachine.current)
-        }
-    }
-
-    /**
-     * MUST be called while holding [stateMachineLock]. If the state
-     * machine just transitioned out of any non-RestActive mode into
-     * RestActive, arm the pending-outbox migration:
+     * MUST be called while holding [stateMachineLock]. If the machine just
+     * transitioned out of any non-RestActive mode into RestActive, arm the
+     * pending-outbox migration:
      *  1. Allocate a LAZY-started migration coroutine (it cannot run yet).
      *  2. Assign [migrationJob] and set [pendingMigration] = true while
      *     the coroutine is still suspended in its NEW state.
-     *  3. Call `job.start()` — only now can the coroutine begin running
+     *  3. Call `job.start()` -- only now can the coroutine begin running
      *     (and, eventually, set [pendingMigration] = false in its finally).
      *
      * Why LAZY (PR-D1c review round 2 fix). With a default-start `launch`
      * the dispatcher can pick up the coroutine on another worker thread
      * immediately, run [runMigration] to completion (including its
-     * `finally { pendingMigration = false }`), and return — all before
-     * the calling thread reaches `pendingMigration = true` below. That
-     * race would leave [pendingMigration] permanently true with a Job
-     * that is already completed; [awaitPendingMigrationIfNeeded] would
-     * spin forever on `job.join()` returning instantly. LAZY closes the
-     * window because no coroutine code runs until explicit `start()`.
+     * `finally { pendingMigration = false }`), and return -- all before
+     * the calling thread reaches `pendingMigration = true` below. LAZY
+     * closes the window because no coroutine code runs until `start()`.
      *
      * Write order under the lock is still: [migrationJob] FIRST,
-     * [pendingMigration] SECOND, [job.start] LAST — so the @Volatile
-     * happens-before for a concurrent reader of [pendingMigration]
-     * still gives them the new ref.
+     * [pendingMigration] SECOND, [job.start] LAST.
+     *
+     * Stage 2: driven by the [RestStateMachine.Transition] the machine
+     * returned for this very event, not by a before/after read.
      */
-    private fun maybeArmMigrationLocked(before: RestMode, after: RestMode) {
-        if (after != RestMode.RestActive) return
-        if (before == RestMode.RestActive) return
-        Log.i(TAG, "REST_TRACE migrate_pending_arm from=$before to=$after")
+    private fun maybeArmMigrationLocked(transition: RestStateMachine.Transition?) {
+        if (transition == null) return
+        if (transition.to != RestMode.RestActive) return
+        if (transition.from == RestMode.RestActive) return
+        if (closed) return
+        Log.i(TAG, "REST_TRACE migrate_pending_arm from=${transition.from} to=${transition.to}")
         val job = scope.launch(start = CoroutineStart.LAZY) { runMigration() }
         migrationJob = job
         pendingMigration = true

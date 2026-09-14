@@ -342,7 +342,7 @@ class KtorRelayTransportPendingOutboundTest {
     /**
      * Arms a deadline for an envelope and advances virtual time past
      * ACK_DEADLINE_MS (10 s) without delivering an ACK.
-     * [KtorRelayTransport.outboundAckDeadlineExpired] must emit exactly one
+     * the session-signal channel must carry exactly one
      * event with the correct msgId, and pendingAcks must still hold the entry
      * (the timer must NOT remove it — removal is owned by the ACK/session-end
      * paths, not the timer itself).
@@ -369,14 +369,22 @@ class KtorRelayTransportPendingOutboundTest {
             queuedAtMs = 0L,
         )
 
-        // Subscribe BEFORE arming (replay=0).
-        val emitted = mutableListOf<OutboundAckDeadlineExpiredEvent>()
+        // Stage 2: the deadline travels on the transport's single session
+        // signal channel, tagged with the session that WROTE the frame.
+        // Subscribe BEFORE arming -- the channel has one consumer and a
+        // signal enqueued before the collector starts is still delivered,
+        // but the assertions below want the collection running first.
+        val subscription = transport.attachSessionSignalConsumer()
+        val emitted = mutableListOf<WsSessionSignal.AckDeadlineExpired>()
         val collectJob: Job = launch {
-            transport.outboundAckDeadlineExpired.collect { emitted += it }
+            subscription.signals.collect { signal ->
+                if (signal is WsSessionSignal.AckDeadlineExpired) emitted += signal
+            }
         }
 
         // Arm the deadline (seeds pendingAcks + launches timer on TestScope).
-        transport.armAckDeadlineForTest(entry)
+        // Stage 2: the arm captures the writing session's epoch.
+        transport.armAckDeadlineForTest(entry, sessionEpoch = 7L)
 
         // Advance virtual time past the deadline.
         advanceTimeBy(RelayTransportConfig.ACK_DEADLINE_MS + 1L)
@@ -387,6 +395,10 @@ class KtorRelayTransportPendingOutboundTest {
 
         assertEquals(1, emitted.size, "Exactly one deadline event must be emitted")
         assertEquals(msgId, emitted.single().msgId)
+        assertEquals(
+            7L, emitted.single().sessionId.sessionEpoch,
+            "the deadline names the session that WROTE the frame, captured at arm time",
+        )
         // ageMs is measured against TimeSource.Monotonic (real clock), so in a
         // virtual-time test the elapsed real duration is near-zero. We cannot
         // assert ageMs >= ACK_DEADLINE_MS here — just verify the field is
@@ -404,7 +416,7 @@ class KtorRelayTransportPendingOutboundTest {
      * Arms a deadline for an envelope, simulates an ACK arriving at 5 s
      * (before the 10 s deadline), then advances virtual time past the
      * deadline. No event must be emitted on
-     * [KtorRelayTransport.outboundAckDeadlineExpired] because the ACK
+     * the session-signal channel because the ACK
      * cancels the timer Job before it fires.
      */
     @Test
@@ -423,10 +435,13 @@ class KtorRelayTransportPendingOutboundTest {
             queuedAtMs = 0L,
         )
 
-        // Subscribe before arming.
-        val emitted = mutableListOf<OutboundAckDeadlineExpiredEvent>()
+        // Subscribe before arming; same single-channel subscription.
+        val subscription = transport.attachSessionSignalConsumer()
+        val emitted = mutableListOf<WsSessionSignal.AckDeadlineExpired>()
         val collectJob: Job = launch {
-            transport.outboundAckDeadlineExpired.collect { emitted += it }
+            subscription.signals.collect { signal ->
+                if (signal is WsSessionSignal.AckDeadlineExpired) emitted += signal
+            }
         }
 
         // Arm the deadline timer.

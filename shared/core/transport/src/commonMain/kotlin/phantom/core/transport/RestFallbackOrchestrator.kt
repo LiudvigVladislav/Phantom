@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.concurrent.Volatile
 import kotlin.coroutines.CoroutineContext
 import phantom.core.crypto.Csprng
 import phantom.core.crypto.LibsodiumCsprng
@@ -353,6 +354,11 @@ class RestFallbackOrchestrator(
         jitterFactorFor(csprng.uniformLong(JITTER_RESOLUTION.toLong()))
 
     init {
+        // Stage 2 B8: the gate tells this orchestrator when a revocation
+        // happened; the handler re-decides and publishes accordingly.
+        egressGate.onRevoked = { _, reason -> onEgressRevoked(reason) }
+        // The handler suspends, which is what lets a revocation invalidate
+        // the armed expiry atomically instead of racing it.
         // Trek 2 Stage 2B-B (C3, L3) — backoff-array contract: there
         // is exactly one wait BETWEEN attempts and NONE after the
         // final attempt. An array mismatch would either skip a
@@ -383,6 +389,42 @@ class RestFallbackOrchestrator(
 
     /** Convenience flow proxying [stateMachine.state]. */
     val state: StateFlow<RestMode> get() = stateMachine.state
+
+    /**
+     * Stage 2 B4 seam. The Android Hybrid installs its `stateMachineLock`
+     * here so this orchestrator's own producers (the candidate tick,
+     * `RestPollDegraded`) reach the machine through the same critical
+     * section as every other producer, and every mode change is armed
+     * for migration under it. Null (tests, no Hybrid) means direct
+     * submission through [submitEvent].
+     */
+    @Volatile
+    var eventRouter: (suspend (RestStateMachine.Event) -> RestStateMachine.Transition?)? = null
+
+    // ── Stage 2 B8: REST health for presentation ────────────────────────────
+
+    private val _restHealth = MutableStateFlow(RestHealth.UNKNOWN)
+
+    /** Whether REST is a usable path right now. Presentation and the recovery coordinator only. */
+    val restHealth: StateFlow<RestHealth> = _restHealth.asStateFlow()
+
+    /** Serialises the health generation and the expiry job handle. */
+    private val healthMutex = Mutex()
+
+    /** The observer's monotonic network generation, as last reported through [noteNetworkChanged]. */
+    @Volatile private var currentNetworkGeneration: Long = 0L
+
+    /**
+     * Bumped on every `PollOk`, every network change and every egress
+     * revocation; a stale expiry body publishes nothing.
+     */
+    private var healthGeneration: Long = 0L
+
+    /** The armed expiry timer, owned by this orchestrator's lifecycle ([cancelAndJoinAll]). */
+    private var healthExpiryJob: Job? = null
+
+    /** The candidate session the running tick loop is proving; null when no loop runs. */
+    @Volatile private var tickCandidateEpoch: Long? = null
 
     private val _capabilities = MutableStateFlow(RelayCapabilities.SAFE_DEFAULTS)
 
@@ -934,8 +976,9 @@ class RestFallbackOrchestrator(
                     _breakerEpoch += 1
                 }
                 log("REST_TRACE poison_state_reset_on_start")
+                publishHealth(usable = false, reason = RestHealthReason.Unknown)
                 stateObserverJob = scope.launch {
-                    stateMachine.state.collect { mode -> onModeChanged(mode) }
+                    stateMachine.snapshot.collect { snapshot -> onSnapshotChanged(snapshot) }
                 }
                 // Trek 2 Stage 2B-A (B3, L3) — spawn the parallel
                 // REST poll job iff `LONGPOLL_V2_ENABLED == "1"`
@@ -995,6 +1038,7 @@ class RestFallbackOrchestrator(
                     return@withLock
                 }
                 cancelAndJoinAll()
+                publishHealth(usable = false, reason = RestHealthReason.Stopped)
             }
         }
     }
@@ -1091,6 +1135,26 @@ class RestFallbackOrchestrator(
                 // Diagnostic; same rationale as Phase 1.
             }
         }
+        // Phase 4 (Stage 2 B8) — the health expiry timer belongs to this
+        // lifecycle too: cancelled and joined so a body cannot publish
+        // `Expired` into a restarted or closed orchestrator.
+        val expiry = healthMutex.withLock {
+            val job = healthExpiryJob
+            healthExpiryJob = null
+            healthGeneration += 1
+            job
+        }
+        tickCandidateEpoch = null
+        if (expiry != null) {
+            expiry.cancel()
+            try {
+                expiry.join()
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Diagnostic; same rationale as Phase 1.
+            }
+        }
     }
 
     /**
@@ -1115,6 +1179,7 @@ class RestFallbackOrchestrator(
                     return@withLock
                 }
                 cancelAndJoinAll()
+                publishHealth(usable = false, reason = RestHealthReason.Stopped)
                 _closed = true
                 scope.cancel()
             }
@@ -1128,8 +1193,164 @@ class RestFallbackOrchestrator(
      * state-machine's gate-mutating event handlers can acquire their
      * single gateLock for atomic compute-then-publish transitions.
      */
-    suspend fun submitEvent(event: RestStateMachine.Event) {
+    suspend fun submitEvent(event: RestStateMachine.Event): RestStateMachine.Transition? =
         stateMachine.onEvent(event)
+
+    /**
+     * Stage 2 B4: the ONLY way this orchestrator's own producers reach the
+     * machine. Goes through the Hybrid's lock when one is installed
+     * ([eventRouter]), else straight to [submitEvent]. `stateMachine.onEvent`
+     * anywhere else in this class is a defect (row 23 static guard).
+     */
+    private suspend fun submitEventThrough(event: RestStateMachine.Event): RestStateMachine.Transition? =
+        eventRouter?.invoke(event) ?: submitEvent(event)
+
+    /**
+     * Stage 2 B8: the presentation window for one `2xx`. A call,
+     * successful or not, lasts at most the read timeout
+     * (`max((pollHoldSecs + 5) * 1000, 10_000)`, or the legacy 10 s floor
+     * when long-poll is off); one failed cycle then a success spans at most
+     * `2 * (POLL_LONG_IDLE_MS * 1.2 + readTimeoutMs)`, so the window is that
+     * plus 2 s: 58 s at hold 0, 108 s at hold 30, 1008 s at hold 480. One
+     * failed cycle never expires health; two consecutive failed cycles do.
+     */
+    fun restHealthWindowMs(): Long {
+        val readTimeoutMs = computeLongPollReadTimeoutMs(
+            longPollEnabled = longPollEnabled,
+            pollHoldSecs = _capabilities.value.pollHoldSecs,
+        ) ?: LEGACY_SHORT_POLL_TIMEOUT_MS
+        return 2L * (POLL_LONG_IDLE_MS * 12L / 10L + readTimeoutMs) + REST_HEALTH_WINDOW_MARGIN_MS
+    }
+
+    /**
+     * Stage 2 B5/B8: a meaningful network change. Every result produced
+     * under the old generation stops counting: health is unusable until a
+     * poll dispatched under the NEW generation answers `2xx`. Called by
+     * the Hybrid before it submits `NetworkChanged` to the machine.
+     */
+    suspend fun noteNetworkChanged(networkGeneration: Long) {
+        healthMutex.withLock {
+            if (networkGeneration > currentNetworkGeneration) currentNetworkGeneration = networkGeneration
+        }
+        invalidateHealth(RestHealthReason.NetworkChanged)
+        log("REST_TRACE rest_health_network_changed generation=$networkGeneration")
+    }
+
+    /**
+     * Make every result produced under the old conditions worthless, in
+     * one step: bump the health generation so an armed expiry body
+     * publishes nothing, cancel that timer, and publish the new reason.
+     */
+    private suspend fun invalidateHealth(reason: RestHealthReason) {
+        val expiry: Job? = healthMutex.withLock {
+            healthGeneration += 1
+            val job = healthExpiryJob
+            healthExpiryJob = null
+            if (_restHealth.value.reason != RestHealthReason.Stopped) {
+                publishHealth(usable = false, reason = reason)
+            }
+            job
+        }
+        expiry?.cancel()
+    }
+
+    /**
+     * The two generations a poll must still carry when it answers for its
+     * `2xx` to prove anything: the network it was issued on, and the
+     * egress lease it was authorised under.
+     *
+     * Review round 7 (2026-09-13): the network generation alone was not
+     * enough. A dispatch that had already returned, followed by a
+     * revocation, followed by this orchestrator recording the result,
+     * republished `usable = true` over a posture that had just refused
+     * direct REST. The gate's own generation is the authority for that
+     * second question, and it is captured here, before the call.
+     */
+    private fun healthDispatchGenerations(): Pair<Long, Long> =
+        currentNetworkGeneration to egressGate.currentGeneration
+
+    /**
+     * An authenticated poll answered `2xx`. Counts only under the current
+     * network generation; re-arms the expiry timer with a fresh generation
+     * so an older timer's body cannot expire this proof.
+     */
+    private suspend fun notePollOk(dispatched: Pair<Long, Long>) {
+        val (dispatchedNetwork, dispatchedEgress) = dispatched
+        val expiry: Job? = healthMutex.withLock {
+            if (dispatchedNetwork != currentNetworkGeneration) {
+                log(
+                    "REST_TRACE rest_health_stale_poll_ok reason=network " +
+                        "dispatched=$dispatchedNetwork current=$currentNetworkGeneration",
+                )
+                return@withLock null
+            }
+            if (dispatchedEgress != egressGate.currentGeneration) {
+                log(
+                    "REST_TRACE rest_health_stale_poll_ok reason=egress_revoked " +
+                        "dispatched=$dispatchedEgress current=${egressGate.currentGeneration}",
+                )
+                return@withLock null
+            }
+            if (_restHealth.value.reason == RestHealthReason.Stopped) return@withLock null
+            healthGeneration += 1
+            val myGeneration = healthGeneration
+            val previous = healthExpiryJob
+            val windowMs = restHealthWindowMs()
+            publishHealth(usable = true, reason = RestHealthReason.PollOk, lastPollOkAtMs = now())
+            healthExpiryJob = scope.launch {
+                delay(windowMs)
+                healthMutex.withLock {
+                    if (healthGeneration != myGeneration) return@withLock
+                    if (_restHealth.value.reason != RestHealthReason.PollOk) return@withLock
+                    publishHealth(usable = false, reason = RestHealthReason.Expired)
+                    log("REST_TRACE rest_health_expired window_ms=$windowMs")
+                }
+            }
+            previous
+        }
+        expiry?.cancel()
+    }
+
+    /** The poll loop found direct REST refused: health says so at once (B8), the gate stays the authority. */
+    private suspend fun noteEgressBlocked() {
+        invalidateHealth(RestHealthReason.EgressBlocked)
+    }
+
+    /**
+     * B8 `onRevoked` handler: a revocation is not a policy block by itself.
+     * Re-evaluate the decision and publish `EgressBlocked` only when direct
+     * REST is refused now; otherwise the proof is merely unknown again.
+     */
+    private suspend fun onEgressRevoked(reason: String) {
+        val decision = egressGate.decide()
+        // One step, not two: the invalidation cancels the armed expiry and
+        // bumps the generation, so a poll that was already in flight under
+        // the revoked lease can no longer republish `usable` behind it.
+        invalidateHealth(
+            if (decision is RestEgressDecision.DirectAllowed) {
+                RestHealthReason.Unknown
+            } else {
+                RestHealthReason.EgressBlocked
+            },
+        )
+        log("REST_TRACE rest_health_after_revoke reason=$reason decision=${decision::class.simpleName}")
+    }
+
+    private fun publishHealth(
+        usable: Boolean,
+        reason: RestHealthReason,
+        lastPollOkAtMs: Long? = _restHealth.value.lastPollOkAtMs,
+    ) {
+        val next = RestHealth(
+            usable = usable,
+            lastPollOkAtMs = lastPollOkAtMs,
+            networkGeneration = currentNetworkGeneration,
+            reason = reason,
+        )
+        if (_restHealth.value != next) {
+            _restHealth.value = next
+            log("REST_TRACE rest_health usable=$usable reason=$reason generation=${next.networkGeneration}")
+        }
     }
 
     /**
@@ -1837,13 +2058,14 @@ class RestFallbackOrchestrator(
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    private fun onModeChanged(mode: RestMode) {
-        when (mode) {
+    private fun onSnapshotChanged(snapshot: RestModeSnapshot) {
+        when (val mode = snapshot.mode) {
             RestMode.WsActive -> {
                 // Stop polling + alive tick. Token refresh stays cached
                 // for next time the orchestrator needs it.
                 pollJob?.cancel(); pollJob = null
                 aliveTickJob?.cancel(); aliveTickJob = null
+                tickCandidateEpoch = null
                 log("REST_TRACE poll_stopped reason=ws_active")
             }
             RestMode.RestActive, RestMode.WsCandidate -> {
@@ -1851,11 +2073,24 @@ class RestFallbackOrchestrator(
                     pollJob = scope.launch { pollLoop() }
                     log("REST_TRACE poll_started mode=$mode")
                 }
-                if (mode == RestMode.WsCandidate && (aliveTickJob == null || aliveTickJob?.isActive != true)) {
-                    aliveTickJob = scope.launch { aliveTickLoop() }
+                if (mode == RestMode.WsCandidate) {
+                    // Stage 2 B4: the tick loop is bound to ONE candidate
+                    // session. A refreshed candidate (a newer session while
+                    // still in candidate) gets its own loop; the old loop
+                    // exits on its next tick because its id is no longer
+                    // the candidate.
+                    val proving = snapshot.candidateEpoch
+                    if (proving != null &&
+                        (aliveTickJob?.isActive != true || tickCandidateEpoch != proving)
+                    ) {
+                        aliveTickJob?.cancel()
+                        tickCandidateEpoch = proving
+                        aliveTickJob = scope.launch { aliveTickLoop(proving) }
+                    }
                 }
                 if (mode == RestMode.RestActive) {
                     aliveTickJob?.cancel(); aliveTickJob = null
+                    tickCandidateEpoch = null
                 }
             }
         }
@@ -1891,7 +2126,10 @@ class RestFallbackOrchestrator(
             // spinning against a closed policy. Re-entry to Standard
             // restores polling through the existing state-machine and
             // bootstrap-retry paths.
-            if (egressBlocked("poll_loop") != null) break
+            if (egressBlocked("poll_loop") != null) {
+                noteEgressBlocked()
+                break
+            }
             val mode = stateMachine.state.value
             if (mode == RestMode.WsActive) break
 
@@ -2016,6 +2254,10 @@ class RestFallbackOrchestrator(
                         "durable_since_seq=${durableSince ?: -1L} scan_since_seq=${scanSince ?: -1L}",
                 )
                 val startMs = now()
+                // Stage 2 B8: the network and egress generations this call is
+                // dispatched under; a `2xx` proves health only if BOTH are
+                // still current when it answers.
+                val dispatchedGeneration = healthDispatchGenerations()
                 val outcome = runCatching {
                     // Trek 2 Stage 2B-A (B1) — gate the long-poll opt-in pair
                     // (`X-Phantom-Long-Poll: 1` + `X-Phantom-Padded-Poll: 1`)
@@ -2118,6 +2360,7 @@ class RestFallbackOrchestrator(
                     }
                     PollResponseClass.Ok200 -> {
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = true)
+                        notePollOk(dispatchedGeneration)
                         val parsed = response.bodyParsed
                         if (parsed == null || parsed.envelopes.isEmpty()) {
                             log("REST_TRACE poll_empty elapsedMs=$elapsed")
@@ -2212,15 +2455,24 @@ class RestFallbackOrchestrator(
         }
     }
 
-    private suspend fun aliveTickLoop() {
+    /**
+     * Stage 2 B3/B4: the candidate tick for ONE session. It submits
+     * `WsAliveTickElapsed(proving)` through the Hybrid's lock, exits when
+     * the candidate changes or clears or the mode leaves candidate, and
+     * is not gated by the egress policy (a tick makes no network call;
+     * Private / Ghost must be able to prove a Reality / Tor socket).
+     */
+    private suspend fun aliveTickLoop(proving: Long) {
         // Fix (2026-07-04): same orphan-`scope`-Job issue as `pollLoop` — see
         // the extended comment on `pollLoop`'s `while (currentCoroutineContext().isActive)`
-        // line above. `aliveTickJob.cancel()` from `onModeChanged` (RestActive
-        // branch, WsActive branch) cannot exit this loop via `scope.isActive`.
+        // line above. `aliveTickJob.cancel()` from `onSnapshotChanged` cannot
+        // exit this loop via `scope.isActive`.
         while (currentCoroutineContext().isActive) {
             delay(CANDIDATE_TICK_MS)
-            stateMachine.onEvent(RestStateMachine.Event.WsAliveTickElapsed)
+            if (stateMachine.candidateSessionEpoch != proving) break
+            submitEventThrough(RestStateMachine.Event.WsAliveTickElapsed(proving))
             if (stateMachine.state.value != RestMode.WsCandidate) break
+            if (stateMachine.candidateSessionEpoch != proving) break
         }
     }
 
@@ -2263,7 +2515,10 @@ class RestFallbackOrchestrator(
         // this loop via `scope.isActive`.
         while (currentCoroutineContext().isActive) {
             // N1-F2: same stop-at-iteration-boundary rule as [pollLoop].
-            if (egressBlocked("ws_active_poll_loop") != null) break
+            if (egressBlocked("ws_active_poll_loop") != null) {
+                noteEgressBlocked()
+                break
+            }
             val token = acquireOrRefreshToken(
                 reason = if (staleToken != null) "ws_active_poll_401" else "ws_active_poll",
                 staleToken = staleToken,
@@ -2374,6 +2629,7 @@ class RestFallbackOrchestrator(
                         "durable_since_seq=${durableSince ?: -1L} scan_since_seq=${scanSince ?: -1L}",
                 )
                 val startMs = now()
+                val dispatchedGeneration = healthDispatchGenerations()
                 val outcome = runCatching {
                     // Same L1 + L2 gating as the legacy poll site below —
                     // both call sites of `transport.poll(...)` carry the
@@ -2422,10 +2678,27 @@ class RestFallbackOrchestrator(
                     PollResponseClass.TokenStale -> {
                         recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = false)
                         staleToken = token
+                        // Review round 8 (2026-09-13): this arm was the ONE
+                        // path out of either poll loop with no backoff. A
+                        // relay answering 401 to every poll -- a revoked or
+                        // mismatched identity, which is exactly when the
+                        // client should be quietest -- drove this loop at
+                        // full speed: 401, refresh, poll, 401, with nothing
+                        // between the iterations. On a phone that is a hot
+                        // CPU and a hammered relay; under virtual time in a
+                        // test it is a loop that never yields an instant, so
+                        // the scheduler can never advance. The legacy
+                        // `pollLoop` always backed off here; the parallel
+                        // loop now does the same.
+                        val nominalDelay = POLL_FAIL_BACKOFF_MS
+                        val jitterFactor = nextJitterFactor()
+                        val jitteredDelay = (nominalDelay * jitterFactor).toLong()
                         log(
                             "REST_TRACE ws_active_poll_unauthorised status=401 " +
-                                "elapsedMs=$elapsed — will refresh token",
+                                "elapsedMs=$elapsed next_delay_ms=$jitteredDelay " +
+                                "nominal_delay_ms=$nominalDelay — will refresh token",
                         )
+                        delay(jitteredDelay)
                         continue
                     }
                     PollResponseClass.RateLimit -> {
@@ -2487,6 +2760,7 @@ class RestFallbackOrchestrator(
                 // is logged as `ws_active_poll_empty` and the
                 // loop delays for `intervalMs`.
                 recordRestSuccess(iterationEpoch = iterationEpoch, isProbe = isProbe, isOkResponse = true)
+                notePollOk(dispatchedGeneration)
                 val parsedBody = response.bodyParsed
                 if (parsedBody == null || parsedBody.envelopes.isEmpty()) {
                     log(
@@ -3015,7 +3289,7 @@ class RestFallbackOrchestrator(
         }
         if (openedReason != null) {
             log("REST_TRACE breaker_open reason=$openedReason cooldown_ms=$capturedCooldownMs")
-            stateMachine.onEvent(RestStateMachine.Event.RestPollDegraded(openedReason))
+            submitEventThrough(RestStateMachine.Event.RestPollDegraded(openedReason))
         }
     }
 
@@ -3030,6 +3304,9 @@ class RestFallbackOrchestrator(
     private fun transitionToOpenUnderMutex(reason: BreakerOpenReason, cooldownMs: Long) {
         _breakerFailCount = 0
         _breakerState = LongPollBreakerState.Open(reason, cooldownMs)
+        // Stage 2 B8: an open breaker means nothing is being asked, so
+        // REST is not a usable path until a probe answers `2xx`.
+        publishHealth(usable = false, reason = RestHealthReason.BreakerOpen)
         // Round-4 P1.2: every state-class change bumps the epoch
         // so in-flight iteration responses with the old epoch
         // are detected as stale at record* / handle410 time.
@@ -3041,6 +3318,7 @@ class RestFallbackOrchestrator(
                 if (_breakerState is LongPollBreakerState.Open) {
                     _breakerState = LongPollBreakerState.HalfOpen(probeInFlight = false)
                     _breakerEpoch += 1
+                    publishHealth(usable = false, reason = RestHealthReason.HalfOpen)
                     log("REST_TRACE breaker_half_open")
                 }
             }
@@ -3302,7 +3580,7 @@ class RestFallbackOrchestrator(
                 "REST_TRACE breaker_open reason=${BreakerOpenReason.Status410Storm} " +
                     "cooldown_ms=$BREAKER_410_STORM_COOLDOWN_MS loop=$loopTag",
             )
-            stateMachine.onEvent(RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.Status410Storm))
+            submitEventThrough(RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.Status410Storm))
         }
         if (authoritative) {
             // Refresh the token only on authoritative path. A
@@ -3990,7 +4268,7 @@ class RestFallbackOrchestrator(
                 "reason=${BreakerOpenReason.ConsecutiveRestFailures} " +
                 "cooldown_ms=$capturedCooldownMs",
         )
-        stateMachine.onEvent(
+        submitEventThrough(
             RestStateMachine.Event.RestPollDegraded(BreakerOpenReason.ConsecutiveRestFailures),
         )
     }
@@ -4235,6 +4513,12 @@ class RestFallbackOrchestrator(
          * avoid a 401 during a critical send.
          */
         const val TOKEN_REFRESH_LEAD_MS: Long = 5 * 60_000L
+
+        /**
+         * Stage 2 B8: safety margin added to the REST health window on top
+         * of one failed cycle plus the next successful poll.
+         */
+        const val REST_HEALTH_WINDOW_MARGIN_MS: Long = 2_000L
 
         /**
          * Tick interval for the [RestMode.WsCandidate] alive timer. Faster

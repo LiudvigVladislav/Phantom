@@ -508,6 +508,12 @@ class HybridRelayTransportIntegrationTest20 {
         )
 
         // ── Phase 1: drive Mode 2 fast-path → RestActive → migration ─
+        // Stage 2: the session has to be live before its close means
+        // anything; a close of a session the machine never saw connect is
+        // stale and is ignored by freshness (B2).
+        hybrid.dispatchWsSessionLifecycleEvent(
+            WsSessionLifecycleEvent.Connected(sessionEpoch = 1L),
+        )
         hybrid.dispatchWsSessionLifecycleEvent(
             WsSessionLifecycleEvent.Ended(
                 durationMs = 31_000L,

@@ -13,7 +13,7 @@ import kotlin.test.assertEquals
  * Coverage story for this PARTIAL hypothesis is distributed across
  * the MC stack:
  *
- *   - The gate-aware `WsActive → RestActive` transition itself is
+ *   - The gate-aware "a live session died" transition itself is
  *     asserted at ctor-wiring level by
  *     `RestFallbackOrchestratorQuiescenceWiringTest.armSticky_engages_quiescence_when_currentKindProvider_returns_Direct`
  *     (MC-3, byte-identical with PR #330).
@@ -22,7 +22,8 @@ import kotlin.test.assertEquals
  *
  * This cell adds the "state stays in `RestActive` across the
  * quiescence window" reinforcement at the state-machine layer:
- * after a Mode 2 signature drives `WsActive → RestActive` under
+ * after a Mode 2 signature drives the live session down to
+ * `RestActive` under
  * `reconnectQuiescenceEnabled = true`, subsequent qualifying
  * `WsSessionEnded` events (retry-tick artefacts, delayed real close
  * of the dying session, etc.) must NOT bounce the state back out of
@@ -48,13 +49,23 @@ class GateQuiescenceRestPreservationReinforcementTest {
     fun rest_active_state_survives_across_quiescence_window_under_gate_armed() {
         val sm = newSm()
 
-        // 1. Connected: state = WsActive
+        // 1. Connected: the session is live and on probation.
+        //
+        // Review round 7 (2026-09-13): a handshake is no longer proof, so a
+        // cold start lands in `WsCandidate`, not `WsActive`. What this cell
+        // is about is unchanged — the Mode-2 signature is evaluated for any
+        // mode that is not already `RestActive`, so the gate still engages
+        // from here, and the dedup guarantee it pins is still the one that
+        // keeps REST inbound delivery running.
         sm.onEventNow(
             RestStateMachine.Event.WsSessionConnected(sessionEpoch = 1L),
         )
-        assertEquals(RestMode.WsActive, sm.state.value, "cold-start after Connected must be WsActive")
+        assertEquals(
+            RestMode.WsCandidate, sm.state.value,
+            "cold-start after Connected is a candidate: nothing has arrived on the socket yet",
+        )
 
-        // 2. Mode 2 signature drives WsActive → RestActive + engages gate.
+        // 2. Mode 2 signature drives the live session to RestActive + engages gate.
         sm.onEventNow(
             RestStateMachine.Event.WsSessionEnded(
                 durationMs = 45_000L,
@@ -67,7 +78,7 @@ class GateQuiescenceRestPreservationReinforcementTest {
         assertEquals(
             RestMode.RestActive,
             sm.state.value,
-            "first Mode-2-signature Ended must drive WsActive → RestActive",
+            "first Mode-2-signature Ended must drive the live session to RestActive",
         )
         val gateAfterFirstEnded = sm.gate.value
         assertEquals(
@@ -77,9 +88,11 @@ class GateQuiescenceRestPreservationReinforcementTest {
                 "reconnectQuiescenceEnabled + Direct — got $gateAfterFirstEnded",
         )
 
-        // 3. Repeat Ended events for the same epoch — the L1 D-1 dedup
-        // verdict says the `RestActive` arm silently absorbs
-        // duplicates. Under gate-armed conditions, that guarantee MUST
+        // 3. Repeat Ended events for the same epoch — under Stage 2 the
+        // session is no longer live after its own close, so each repeat is
+        // a STALE signal and freshness (B2) absorbs it. The L1 D-1 dedup
+        // verdict is unchanged in what it guarantees; what enforces it is
+        // now the session identity rather than the mode arm. Under gate-armed conditions, that guarantee MUST
         // still hold — otherwise a subsequent `WsSessionEnded` (from a
         // real socket close arriving after synthetic, or from a delayed
         // watchdog tick) could bounce state out of `RestActive` and
@@ -116,7 +129,7 @@ class GateQuiescenceRestPreservationReinforcementTest {
         // `WsCandidate`; the tick is stale for this quiescence
         // window). This pins that stray ticks do not accidentally
         // wake `RestActive` back into a candidate mode.
-        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed)
+        sm.onEventNow(RestStateMachine.Event.WsAliveTickElapsed(sessionEpoch = 1L))
         assertEquals(
             RestMode.RestActive,
             sm.state.value,

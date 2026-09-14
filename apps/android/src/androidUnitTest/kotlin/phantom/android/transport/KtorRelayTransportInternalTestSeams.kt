@@ -3,6 +3,7 @@
 
 package phantom.android.transport
 
+import kotlinx.coroutines.CoroutineScope
 import kotlin.reflect.full.callSuspend
 import kotlin.reflect.full.declaredMemberFunctions
 import kotlin.reflect.full.memberProperties
@@ -151,3 +152,123 @@ internal suspend fun KtorRelayTransport.cleanupInflightCountForIntegrationTest()
     return fn.callSuspend(this) as Int
 }
 
+
+/**
+ * Stage 2 (2026-09-13) bridges to the transport's own signal seams.
+ *
+ * They enqueue onto the SAME single channel production uses, at the same
+ * points production enqueues, so a fixture drives the real ordering
+ * instead of a parallel one. `internal` does not cross a Gradle module
+ * boundary, hence the reflection bridge; the file lives in
+ * `androidUnitTest` and is excluded from any APK.
+ */
+internal fun KtorRelayTransport.simulateSessionConnected(
+    sessionEpoch: Long,
+    ownerGeneration: Long = 0L,
+) {
+    val fn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "simulateSessionConnectedForTest" }
+    fn.isAccessible = true
+    fn.call(this, sessionEpoch, ownerGeneration)
+}
+
+internal suspend fun KtorRelayTransport.simulateInboundDeliver(
+    deliver: RelayMessage.Deliver,
+    sessionEpoch: Long,
+) {
+    val fn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "simulateInboundDeliverForTest" }
+    fn.isAccessible = true
+    fn.callSuspend(this, deliver, sessionEpoch)
+}
+
+internal fun KtorRelayTransport.simulateInboundStall(sessionEpoch: Long, sinceLastInboundMs: Long) {
+    val fn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "simulateInboundStallForTest" }
+    fn.isAccessible = true
+    fn.call(this, sessionEpoch, sinceLastInboundMs)
+}
+
+internal fun KtorRelayTransport.simulateSessionEnded(
+    sessionEpoch: Long,
+    durationMs: Long = 30_000L,
+    inboundFrames: Int = 0,
+    pendingAcksAtClose: Int = 0,
+    closeOrigin: String = "error",
+    closeError: String? = null,
+    okhttpPingTimeoutDetected: Boolean = false,
+) {
+    val fn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "simulateSessionEndedForTest" }
+    fn.isAccessible = true
+    fn.call(
+        this,
+        sessionEpoch,
+        durationMs,
+        inboundFrames,
+        pendingAcksAtClose,
+        closeOrigin,
+        closeError,
+        okhttpPingTimeoutDetected,
+    )
+}
+
+/**
+ * Build an `AckPending` for [messageId] without going through `send()`
+ * (which needs a live WebSocket session).
+ */
+internal suspend fun KtorRelayTransport.newAckPendingForIntegrationTest(messageId: String): Any {
+    val ackPendingKClass = Class.forName(
+        "phantom.core.transport.KtorRelayTransport\$AckPending",
+    ).kotlin
+    val ctor = ackPendingKClass.constructors.first()
+    ctor.isAccessible = true
+    val seqFn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "nextSequenceTsForTest" }
+    seqFn.isAccessible = true
+    val sequenceTs = seqFn.callSuspend(this) as Long
+    return ctor.call(
+        RelayMessage.Send(
+            to = "dd".repeat(32),
+            payload = "",
+            messageId = messageId,
+            sealedSender = "",
+        ),
+        kotlin.time.TimeSource.Monotonic.markNow(),
+        sequenceTs,
+        0L,
+    )
+}
+
+/**
+ * Point the per-envelope ACK deadline timers at [scope] instead of the
+ * transport's own scope.
+ *
+ * `ackDeadlineScopeOverride` is an EXISTING production test hook -- the
+ * property is already read by `armAckDeadlineLocked`, and production never
+ * sets it. Nothing is widened here; this is the same reflection bridge the
+ * rest of this file uses to reach an `internal` member from a sibling
+ * Gradle module.
+ *
+ * Why a fixture needs it: the deadline is `RelayTransportConfig.ACK_DEADLINE_MS`
+ * = 10 s. Left on the transport's scope it is 10 s of WALL CLOCK, which a
+ * virtual-time fixture can neither reach nor afford to wait for. Handed a
+ * `StandardTestDispatcher` scope, the same production timer fires when the
+ * test advances its own clock.
+ */
+internal fun KtorRelayTransport.installAckDeadlineScopeForIntegrationTest(scope: CoroutineScope) {
+    val prop = KtorRelayTransport::class.memberProperties
+        .first { it.name == "ackDeadlineScopeOverride" }
+    prop.isAccessible = true
+    @Suppress("UNCHECKED_CAST")
+    (prop as kotlin.reflect.KMutableProperty1<KtorRelayTransport, CoroutineScope?>)
+        .set(this, scope)
+}
+
+/** Arm the per-envelope ACK deadline for [entry] on [sessionEpoch]. */
+internal suspend fun KtorRelayTransport.armAckDeadline(entry: Any, sessionEpoch: Long) {
+    val fn = KtorRelayTransport::class.declaredMemberFunctions
+        .first { it.name == "armAckDeadlineForTest" }
+    fn.isAccessible = true
+    fn.callSuspend(this, entry, sessionEpoch)
+}

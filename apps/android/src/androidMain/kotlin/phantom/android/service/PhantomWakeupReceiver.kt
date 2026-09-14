@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import phantom.android.PhantomApplication
+import phantom.android.di.AppContainer
 import phantom.core.transport.RelayTransportConfig
 
 /**
@@ -104,87 +105,50 @@ class PhantomWakeupReceiver : BroadcastReceiver() {
             startMessagingService(appContext)
             return
         }
-        // No identity yet → service start is a no-op anyway, no reason
-        // to force a reconnect on a transport that hasn't connected yet.
-        val identityLoaded = runCatching { container.messagingService != null }.getOrDefault(false)
-        if (!identityLoaded) {
-            Log.i(TAG, "no identity yet — skipping wake action")
+        // Review round 7 (2026-09-13): a null `messagingService` is NOT
+        // "no identity". It is also what an `Uninitialized` stack looks
+        // like, and what a stack that FAILED midway and was cleaned up
+        // looks like -- and reading it as "no identity" is how the
+        // receiver used to return without starting anything, leaving a
+        // container that could only be repaired by a service start with
+        // no way to get one.
+        //
+        // The only thing that can build the stack is a service start: the
+        // identity is read there, through the unlock gate, and a start
+        // that finds no identity at all stops itself (`service_identity_missing`).
+        // So the honest answer here is to start the service and let it
+        // decide, exactly as the two branches above already do for "app
+        // not ready" and "no transport".
+        val initState = runCatching { container.messagingInit }.getOrNull()
+        if (initState !is AppContainer.MessagingInit.Ready) {
+            val initStateName = initState?.let { it::class.simpleName }
+            Log.i(
+                TAG,
+                "messaging stack not ready (state=$initStateName) — starting the " +
+                    "service so it can build or rebuild it",
+            )
+            startMessagingService(appContext)
             return
         }
 
-        // Skip the keepalive nudge while the outer TransportManager is
-        // mid-Probing (Reality libXray init / Tor bridge bootstrap) or
-        // sitting on AllFailed after chain exhaustion.
+        // Stage 2 B7b (2026-09-13): the receiver stops deciding.
         //
-        // Why: forceReconnect() tears down the OkHttp engine the
-        // in-flight HTTP / WS attempt is using. During a fresh Tor
-        // bootstrap that means we kill the auth-handshake mid-traversal
-        // every 30 s and bounce off the start, indefinitely. Surfaced
-        // in cross-device test 2026-05-10: Ghost mode 2nd entry cycled
-        // 7× forceReconnect during Tor bootstrap and ended in
-        // `Tor probe returned false` instead of completing.
+        // It used to read `ManagerState` as its oracle and act on it:
+        // skip on `Probing`, nudge only on `AllFailed`, log and do nothing
+        // on everything else. Every one of those readings could be wrong.
+        // `Probing` survives a policy-changed abort, so the state sat there
+        // with no walk running and the receiver skipped it forever.
+        // `Connected` survives a WSS drop, because no assignment site
+        // observes the socket, so a dead socket read as healthy. And
+        // `AllFailed` was the only state that produced a nudge, while the
+        // vacuum the phone was actually in at 19:07 was none of them.
         //
-        // The inner `transport.isConnected() == false` check below would
-        // otherwise misread Probing as "WS dead, reconnect". The outer
-        // ManagerState is the source of truth for whether a reconnect
-        // would be useful right now.
-        val managerState = runCatching {
-            container.transportManager.state.value
-        }.getOrNull()
-        if (managerState is phantom.core.transport.ManagerState.Probing) {
-            Log.i(
-                TAG,
-                "TransportManager Probing(${managerState.kind}) — skipping keepalive forceReconnect",
-            )
-            return
-        }
-        if (managerState is phantom.core.transport.ManagerState.AllFailed) {
-            // N1-F3. This branch used to return here, on the grounds that
-            // "the foreground service owns the retry cadence". The service
-            // had no such cadence: it caught NoTransportReachableException,
-            // logged it, released its CAS and returned. The receiver
-            // deferred to the service, the service deferred to nobody, and
-            // a chain exhausted while the network stayed up left the app
-            // dark until something restarted the service. That is the
-            // observed `direct_unavailable`.
-            //
-            // forceReconnect() is still wrong here - it tears down the
-            // OkHttp engine an in-flight attempt is using, which is why
-            // the skip existed. So the receiver does not reconnect and
-            // does not call connect(). It sends a NUDGE and stops. The
-            // service checks due time, epoch and single-flight and
-            // decides; duplicate nudges collapse into at most one attempt.
-            Log.i(
-                TAG,
-                "TransportManager AllFailed (chain exhausted, " +
-                    "${managerState.attempts.size} attempts) - sending retry nudge " +
-                    "to the service, which owns the cadence",
-            )
-            sendRetryNudge(appContext, source = "alarm_all_failed")
-            return
-        }
-
-        // Skip the keepalive nudge when the WS layer itself is mid-handshake.
-        // After Reality / Tor probe success TransportManager flips to
-        // Connected and the foreground service notification updates to
-        // "Online via …" — but the WS auth-handshake (GET /auth/challenge
-        // + WS upgrade) can still take 30-90 s on a cold onion circuit.
-        // During that window `isConnected()` returns false because the WS
-        // hasn't reached TransportState.Connected yet, and the inherited
-        // `lastPongElapsedMs` from the previous session looks "stale" by
-        // wall-clock — without this guard the alarm fires forceReconnect
-        // and tears down the in-flight handshake mid-flight, requiring a
-        // retry from scratch (cross-device test 2026-05-10 saw 2 cycles
-        // before the handshake finally landed).
-        val wsState = runCatching { transport.state.value }.getOrNull()
-        if (wsState is phantom.core.transport.TransportState.Connecting) {
-            Log.i(
-                TAG,
-                "WS layer still mid-handshake (Connecting) — skipping " +
-                    "keepalive forceReconnect; let the auth handshake finish",
-            )
-            return
-        }
+        // The receiver has no generation, no lease, no scheduler and no
+        // view of the live session, so it is not allowed to decide. It
+        // delivers the trigger unconditionally; the service's single
+        // coordinator, which can see all of those, decides whether
+        // anything is owed and refuses duplicates by construction.
+        sendRetryNudge(appContext, source = "alarm_heartbeat")
 
         // PR-R0.4a: removed stale-inbound proactive forceReconnect.
         // Idle 1:1 chat with no messages produces zero inbound frames indefinitely —

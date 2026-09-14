@@ -127,6 +127,19 @@ class RestEgressGate(
 
     val currentGeneration: Long get() = generation
 
+    /**
+     * Stage 2 B8 (2026-09-13): observer of revocations, invoked inside
+     * [revokeAndJoin] right after the generation bump, off the registry
+     * lock, with the new generation and the caller's reason. The
+     * orchestrator re-evaluates [decide] there and publishes REST health
+     * accordingly -- a revocation by itself is NOT a policy block, and
+     * [invalidate] (generation bump without cancellation) does not
+     * invoke this. Nothing here widens or narrows the authority: the
+     * decision still comes from [decide] alone.
+     */
+    @Volatile
+    var onRevoked: (suspend (generation: Long, reason: String) -> Unit)? = null
+
     /** Number of registered in-flight dispatches (diagnostic/test). */
     suspend fun activeDispatchCount(): Int = registryLock.withLock { active.size }
 
@@ -178,6 +191,11 @@ class RestEgressGate(
             gen = generation
             toCancel = active.toList()
         }
+        // Stage 2 B8: the observer runs after the bump so a dispatch it
+        // sees as refused is one that can no longer register under the
+        // old lease, and before the cancel/join so presentation does not
+        // wait on a bounded join.
+        onRevoked?.invoke(gen, reason)
 
         // Abort the real network first. Cancelling only the coroutine
         // would leave the blocking socket call running AND make the

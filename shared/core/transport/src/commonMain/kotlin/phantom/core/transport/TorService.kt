@@ -67,6 +67,20 @@ interface TorService {
      * not cancel it, and does not consult whichever generation is live now.
      */
     suspend fun awaitRelease(attempt: TorStopAttempt, budget: TorBudget): TorStopResult
+
+    /**
+     * Stage 2 B7c (2026-09-13): the authoritative settlement of ONE
+     * generation, read under the lifecycle owner's own monitor.
+     *
+     * A walk that ended with `TorLifecycleUnsettled(generation)` registers
+     * an obligation; only [TorSettlement.Settled] for that same generation
+     * lifts it. Implementations that own no lifecycle answer
+     * [TorSettlementGap.OtherGeneration] -- fail-closed, so an
+     * implementation that forgets to override this cannot silently lift an
+     * obligation it knows nothing about.
+     */
+    fun settlementFor(generation: Long): TorSettlement =
+        TorSettlement.NotSettled(TorSettlementGap.OtherGeneration)
 }
 
 /**
