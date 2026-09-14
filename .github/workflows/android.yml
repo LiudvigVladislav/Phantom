@@ -206,6 +206,7 @@ jobs:
             --tests "phantom.android.navigation.ScreenSaverTest" \
             --tests "phantom.android.navigation.StartupRouteResolverTest" \
             --tests "phantom.android.notifications.NotificationsOptInMigrationTest" \
+            --tests "phantom.android.proguard.GomobileJniKeepRulePinTest" \
             --tests "phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest" \
@@ -453,6 +454,7 @@ jobs:
           phantom.android.navigation.StartupRouteLateWriteIntegrationTest
           phantom.android.navigation.StartupRouteResolverTest
           phantom.android.notifications.NotificationsOptInMigrationTest
+          phantom.android.proguard.GomobileJniKeepRulePinTest
           phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
           phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
           phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest
