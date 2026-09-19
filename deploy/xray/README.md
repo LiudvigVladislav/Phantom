@@ -5,7 +5,7 @@ Copyright (c) 2026 Willen LLC
 
 # Stage 5E.A — Xray VLESS+REALITY server (Hetzner)
 
-Operator deployment guide for the Xray-core daemon that PHANTOM clients use as the **outer transport** when on censored networks (Russia / Iran / China). REALITY makes the TLS handshake genuinely indistinguishable from one to `www.microsoft.com` — TSPU's "16-kilobyte curtain" classifier puts it in the trusted-big-tech bucket and applies no throttle.
+Operator deployment guide for the Xray-core daemon that PHANTOM clients use as the **outer transport** when on censored networks (Russia / Iran / China). REALITY reshapes the TLS handshake so that it aims to resemble one to `www.microsoft.com`. In founder-run tests on specific networks and dates, TSPU's "16-kilobyte curtain" classifier did not throttle the resulting flow. That is an observation from those tests, not a guarantee of indistinguishability, of freedom from throttling, or of bypassing any particular DPI policy. Recorded runs are in [`docs/field-tests/TEST_MATRIX.md`](../../docs/field-tests/TEST_MATRIX.md).
 
 This is **server-only**. Stage 5E.B brings the matching libXray Android library; Stage 5E.A exists to validate the wire format with a desktop NekoBox client before any Kotlin work.
 

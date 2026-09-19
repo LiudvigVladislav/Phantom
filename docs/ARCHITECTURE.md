@@ -186,9 +186,10 @@ outer path:
 
 - **Direct WSS** is the lowest-overhead path on ordinary networks.
 - **Xray VLESS+REALITY** wraps the relay path for networks where direct WSS is
-  disrupted by DPI. This path was production-validated against TSPU on a real
+  disrupted by DPI. This path was field-tested against TSPU on a real
   Russian mobile network; that result is evidence for the tested path and
-  date, not a guarantee for every carrier or future blocking regime.
+  date, not a guarantee for every carrier or future blocking regime. The
+  recorded runs are in [`field-tests/TEST_MATRIX.md`](field-tests/TEST_MATRIX.md).
 - **Tor v3 onion** is the strongest current network-origin hiding option and
   is deliberately scoped to text-only emergency delivery.
 - **REST fallback** uses authenticated send/poll/ack endpoints when a network

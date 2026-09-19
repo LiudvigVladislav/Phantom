@@ -55,8 +55,11 @@ Two outer transports plug into the same `RelayTransport` interface:
   `www.microsoft.com` to bypass Russia's TSPU 16-KB curtain
   ([ADR-019](docs/adr/ADR-019-Xray-REALITY-Outer-Transport.md))
 
-Stage 5E (Xray) was production-validated on Tecno + MTS without
-VPN on 2026-05-07.
+Stage 5E (Xray) was field-tested on a Tecno handset over MTS without
+VPN on 2026-05-07. That is a single founder-run acceptance run on one
+network and date; it does not establish universal resistance to filtering.
+Every recorded run is listed in
+[`docs/field-tests/TEST_MATRIX.md`](docs/field-tests/TEST_MATRIX.md).
 
 ## Future architectural directions
 

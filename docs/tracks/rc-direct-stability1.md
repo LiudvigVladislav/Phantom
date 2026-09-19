@@ -4,6 +4,14 @@
 
 > **Single-source-of-truth pattern.** Phase 1 and Phase 2 of RC-DIRECT-WS-DEATH1 stacked their mini-locks + outcome summaries in a single file (`rc-direct-ws-death1.md`) because both phases share an evidence-gathering goal. RC-DIRECT-STABILITY1 has a different goal (fix, not characterize) so it lives in a **new file**. Cross-references to the closed RC-DIRECT-WS-DEATH1 evidence appear inline.
 
+> **Terminology note, 2026-09-17.** Entries below use "production-validated"
+> and similar wording for what were founder-run acceptance runs against the
+> live deployment, usually on a single device, carrier and date. That was an
+> internal shorthand, not a claim of independent or universal validation. The
+> history is left as written; the label is clarified here rather than edited
+> out. Every recorded run, including the failures, is listed in
+> [`docs/field-tests/TEST_MATRIX.md`](../field-tests/TEST_MATRIX.md).
+
 ---
 
 ## §1 — Proven facts (carry-forward from RC-DIRECT-WS-DEATH1 Phase 1+2)
@@ -82,7 +90,7 @@ Six arms total. Order in §7 is cheap-first (server-side → client-side → alt
    # 2. (Physical Tecno only — skip for emulator.) Forward the on-device
    #    127.0.0.1:8081 over USB to the dev machine's 127.0.0.1:8081, which
    #    in turn is the SSH-tunnel endpoint from step 1.
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 reverse tcp:8081 tcp:8081
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> reverse tcp:8081 tcp:8081
    ```
 
    After both commands the data path is:

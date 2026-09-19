@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PHANTOM — Мессенджер, устойчивый к слежке и сетевой цензуре</title>
-<meta name="description" content="Мессенджер с открытым кодом и сквозным шифрованием для Android. Спроектирован для работы во враждебных мобильных сетях. Проверен против ТСПУ в production.">
+<meta name="description" content="Мессенджер с открытым кодом и сквозным шифрованием для Android в стадии Alpha 2. Несколько транспортных путей проверены на отдельных мобильных сетях и конфигурациях. Номер телефона и email не требуются. Границы защиты и видимые ретранслятору метаданные описаны публично.">
 <meta name="robots" content="index,follow">
 <link rel="canonical" href="https://phntm.pro/ru/">
 <link rel="alternate" hreflang="en" href="https://phntm.pro/">
@@ -52,7 +52,7 @@
   "url": "https://phntm.pro",
   "downloadUrl": "https://github.com/LiudvigVladislav/Phantom/releases",
   "image": "https://phntm.pro/static/og-image.png",
-  "description": "Мессенджер с открытым кодом и сквозным шифрованием для Android. Спроектирован для работы во враждебных мобильных сетях. Без номера телефона, без email, без сбора метаданных. Несколько транспортов, включая REALITY/Xray, проверенный против DPI государственного уровня.",
+  "description": "Мессенджер с открытым кодом и сквозным шифрованием для Android в стадии Alpha 2. Несколько транспортных путей проверены на отдельных мобильных сетях и конфигурациях. Номер телефона и email не требуются. Границы защиты и видимые ретранслятору метаданные описаны публично.",
   "featureList": [
     "Сквозное шифрование (Double Ratchet поверх libsodium)",
     "Ключи личности ED25519 генерируются на устройстве",
@@ -73,7 +73,7 @@
   "name": "Willen LLC",
   "url": "https://phntm.pro",
   "logo": "https://phntm.pro/static/favicon.png",
-  "description": "Независимый разработчик PHANTOM — мессенджера с открытым кодом и сквозным шифрованием, устойчивого к слежке и сетевой цензуре.",
+  "description": "Независимый разработчик PHANTOM — Android-мессенджера с открытым кодом и сквозным шифрованием, который строится для работы в условиях цензуры и ненадёжных сетей.",
   "foundingLocation": {
     "@type": "Place",
     "address": {"@type": "PostalAddress", "addressRegion": "Wyoming", "addressCountry": "US"}
@@ -399,10 +399,10 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
       <span class="pill"><span style="color:var(--success)">●</span> Alpha 2 · Android</span>
       <span class="pill">AGPL-3.0</span>
       <span class="pill">Без номера телефона</span>
-      <span class="pill">Проверен против TSPU</span>
+      <span class="pill">Полевые тесты против TSPU</span>
     </div>
-        <h1>Мессенджер со сквозным шифрованием, который <span style="color:var(--cyan)">продолжает работать под государственной слежкой</span> и сетевой цензурой.</h1>
-        <p class="hero-sub">Открытый код. Без номера телефона, без email, без сбора метаданных. Спроектирован, чтобы работать во враждебных мобильных сетях, где другие мессенджеры ограничены.</p>
+        <h1>Мессенджер со сквозным шифрованием, который <span style="color:var(--cyan)">продолжает работать во враждебных сетях</span> и под цензурой.</h1>
+        <p class="hero-sub">Мессенджер с открытым кодом и сквозным шифрованием для Android в стадии Alpha 2. Несколько транспортных путей проверены на отдельных мобильных сетях и конфигурациях. Номер телефона и email не требуются. Границы защиты и видимые ретранслятору метаданные описаны публично.</p>
     <div class="hero-cta">
       <a href="donate.html" class="btn btn-primary">Поддержать проект</a>
       <a href="https://github.com/LiudvigVladislav/Phantom" class="btn btn-ghost">Исходный код ↗</a>
@@ -442,21 +442,21 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" opacity="0.5"/></svg></div>
           <div>
             <h3>Устойчивость к цензуре</h3>
-                        <p>Несколько транспортных путей до сети, включая трафик, неотличимый от обычного HTTPS. Когда один маршрут блокируется, его подхватывает другой.</p>
+                        <p>Несколько транспортных путей до сети, включая тот, который меняет наблюдаемый вид трафика так, чтобы он был похож на обычный TLS. Когда один маршрут блокируется, его подхватывает другой.</p>
           </div>
         </div>
         <div class="fitem reveal">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L3 6v6c0 5 3.5 8 9 10 5.5-2 9-5 9-10V6z"/></svg></div>
           <div>
-            <h3>Без привязки к личности</h3>
-                        <p>Без номера телефона, email и настоящего имени. Технология sealed sender не даёт серверу построить граф того, кто с кем общается.</p>
+            <h3>Сниженные требования к идентификации</h3>
+                        <p>Номер телефона, email и настоящее имя не требуются. Конверты в стиле sealed sender уменьшают объём метаданных об отправителе, но ретранслятор по-прежнему видит время, размер, аутентифицированные сессии и адресатов доставки.</p>
           </div>
         </div>
         <div class="fitem reveal">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></div>
           <div>
             <h3>Полностью открытый код</h3>
-                        <p>Лицензия AGPL-3.0. Каждую строку можно проверить — никаких закрытых компонентов, скрытой телеметрии и «чёрных ящиков».</p>
+                        <p>Лицензия AGPL-3.0-or-later. Исходный код, модель угроз, известные ограничения и архитектурные решения открыты. Независимого аудита собственной протокольной композиции пока не было.</p>
           </div>
         </div>
       </div>
@@ -476,7 +476,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
       <div class="mode reveal">
         <div class="mic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
         <h4>Private</h4>
-                <p>Цепочка Reality-first. Скрывает ваш IP от сервера за маскирующим трафиком.</p>
+                <p>Использует транспорт REALITY в первую очередь. Объём раскрываемых метаданных и ограничения описаны в модели угроз; этот режим не обеспечивает анонимность.</p>
       </div>
       <div class="mode reveal">
         <div class="mic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 21V10a6 6 0 0 1 12 0v11l-2-1.5-2 1.5-2-1.5-2 1.5-2-1.5z"/><circle cx="9.5" cy="11" r="0.8" fill="currentColor"/><circle cx="14.5" cy="11" r="0.8" fill="currentColor"/></svg></div>
@@ -496,7 +496,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
         <div class="path reveal"><div class="dot"></div><h4>Direct WSS</h4>
                     <p>Шифрованный WebSocket поверх TLS для обычных условий.</p></div>
         <div class="path reveal"><div class="dot"></div><h4>REALITY / Xray</h4>
-                    <p>Трафик, неотличимый от обычного TLS. Проверен против российской TSPU в production.</p></div>
+                    <p>REALITY изменяет наблюдаемый вид трафика так, чтобы он был похож на обычный TLS. Это не система анонимности и не гарантия обхода любой DPI-политики. Тесты основателя проводились на конкретных сетях и датах.</p></div>
         <div class="path reveal"><div class="dot" style="background:var(--warn);box-shadow:0 0 8px var(--warn)"></div><h4>Tor (v3 onion)</h4>
                     <p>Аварийный резерв только для текста во враждебных сетях. Звонки не передаёт.</p></div>
         <div class="path reveal"><div class="dot"></div><h4>REST fallback</h4>
@@ -510,7 +510,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
   <div class="wrap">
     <div class="status-box reveal">
       <div class="label">На какой стадии проект</div>
-            <p style="color:var(--ts);font-size:0.92rem;max-width:760px;line-height:1.7">PHANTOM находится в активной стадии разработки (<strong style="color:var(--tp)">Alpha 2</strong>). Пока проект реализован на платформе Android. Текстовые сообщения работают надёжно через мульти-транспортный стек, а транспорт обхода цензуры проверен против TSPU в production. Голосовые сообщения работают; голосовые звонки — в экспериментальной версии. Групповые чаты разработаны частично. iOS, каналы и офлайн-меш находятся в следующей стадии разработки. Мы выпускаем релиз только когда заявленное протестировано на реальных устройствах.</p>
+            <p style="color:var(--ts);font-size:0.92rem;max-width:760px;line-height:1.7">PHANTOM — Android-first проект в стадии <strong style="color:var(--tp)">Alpha 2</strong>. На GitHub доступны исходники и tagged development snapshots. Публичного end-user APK и открытой beta пока нет. Группы и звонки не готовы к production, независимого аудита собственной протокольной композиции не было.</p>
             <p style="color:var(--ts);font-size:0.86rem;margin-top:14px;margin-bottom:18px">Публичные сборки — на этапе Beta. <a href="https://github.com/LiudvigVladislav/Phantom/releases" style="color:var(--cyan);text-decoration:none">Следите за релизами на GitHub →</a></p>
             <a href="roadmap.html" class="btn btn-ghost">Полная дорожная карта →</a>
     </div>
@@ -519,10 +519,10 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
   <div class="wrap">
     <div class="label ctr">Поддержка</div>
         <h2 class="s-title" style="text-align:center">Если вы хотите помочь проекту расти.</h2>
-        <p style="color:var(--ts);max-width:540px;margin:0 auto 32px;text-align:center;font-size:0.94rem">PHANTOM не берёт венчурных денег и не продаёт данные пользователей — его делает один разработчик. Если вы хотели бы поддержать проект, любая помощь помогает ему двигаться дальше.</p>
+        <p style="color:var(--ts);max-width:540px;margin:0 auto 32px;text-align:center;font-size:0.94rem">PHANTOM развивается независимо и не продаёт данные пользователей. Проект открыт для целевых грантов и pre-seed инвестиций, которые сохраняют открытую лицензию и опубликованные границы защиты.</p>
     <div style="display:flex;gap:13px;flex-wrap:wrap;justify-content:center">
       <a href="donate.html" class="btn btn-primary">Способы поддержать</a>
-      <a href="https://github.com/LiudvigVladislav/Phantom" class="btn btn-ghost">Звезда на GitHub ↗</a>
+      <a href="mailto:hello@phntm.pro?subject=PHANTOM%20investment%20inquiry" class="btn btn-ghost">Инвестиционные запросы</a>
     </div>
   </div>
 </section><footer>
@@ -530,7 +530,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span>
+                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Открытый код · Границы защиты опубликованы.</span>
       </div>
     </div>
     <div class="foot-links">

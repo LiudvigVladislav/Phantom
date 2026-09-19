@@ -145,7 +145,7 @@ Ed25519 signing keypair. Hard cut-over (no migration window) because Alpha 2
 not publicly released. TOFU first connect, 1:1 binding thereafter (mirrors
 `publish_prekeys` invariant). RELAY_TOKEN BuildConfig field removed.
 Reference: [ADR-027](../adr/ADR-027-Per-User-Signed-Challenge-Auth.md). PR #72.
-Production-validated 2026-05-09.
+Field-tested 2026-05-09 on one handset plus an emulator.
 
 ---
 

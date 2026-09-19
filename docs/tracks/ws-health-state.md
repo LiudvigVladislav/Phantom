@@ -1202,7 +1202,7 @@ Rev2's pseudocode had `ws is Connected -> Online` as a fall-through after the `R
 
 ### §1 — Why original 3.2b is superseded (empirical base unified)
 
-Three test runs against the same Tecno (`103603734A004351`) on three different networks confirm a single pattern:
+Three test runs against the same Tecno (`<redacted-device-serial>`) on three different networks confirm a single pattern:
 
 | Test | Network | Run | WS sessions died | Avg WS lifetime | Direct REST | Reality WS | Tor WS |
 |---|---|---|---|---|---|---|---|

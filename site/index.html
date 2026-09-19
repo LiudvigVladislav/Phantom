@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PHANTOM — Encrypted messenger built for hostile networks</title>
-<meta name="description" content="Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks. Production-validated through Russia's TSPU.">
+<meta name="description" content="Open-source, Android-first encrypted messaging in Alpha 2, with multiple transport paths tested on specific mobile networks. No phone number or email is required. Security boundaries and relay-visible metadata are documented publicly.">
 <meta name="robots" content="index,follow">
 <link rel="canonical" href="https://phntm.pro/">
 <link rel="alternate" hreflang="en" href="https://phntm.pro/">
@@ -52,11 +52,11 @@
   "url": "https://phntm.pro",
   "downloadUrl": "https://github.com/LiudvigVladislav/Phantom/releases",
   "image": "https://phntm.pro/static/og-image.png",
-  "description": "Open-source, end-to-end encrypted Android messenger built to work on hostile mobile networks. No phone number, no email, no metadata harvesting. Multiple transports including REALITY/Xray validated against state-level DPI.",
+  "description": "Open-source, Android-first encrypted messaging in Alpha 2, with multiple transport paths tested on specific mobile networks. No phone number or email is required. Security boundaries and relay-visible metadata are documented publicly.",
   "featureList": [
     "End-to-end encryption (Double Ratchet over libsodium)",
     "ED25519 identity keys generated on device",
-    "Sealed sender (server cannot link sender to recipient)",
+    "Sealed-sender-style envelopes that reduce sender metadata exposed to the relay",
     "Censorship-resistant transports (Direct WSS, REALITY/Xray, Tor v3, REST fallback)",
     "No phone number, no email required",
     "Open source under AGPL-3.0"
@@ -73,7 +73,7 @@
   "name": "Willen LLC",
   "url": "https://phntm.pro",
   "logo": "https://phntm.pro/static/favicon.png",
-  "description": "Independent developer of PHANTOM, an open-source encrypted messenger built to resist state-level surveillance and network censorship.",
+  "description": "Independent developer of PHANTOM, an open-source Android-first encrypted messenger built to keep working on censored and unreliable networks.",
   "foundingLocation": {
     "@type": "Place",
     "address": {"@type": "PostalAddress", "addressRegion": "Wyoming", "addressCountry": "US"}
@@ -393,9 +393,9 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
     <div class="badge-row">
       <span class="pill"><span style="color:var(--success)">●</span> Alpha 2 · Android</span>
       <span class="pill">AGPL-3.0</span>
-      <span class="pill">No phone number</span>      <span class="pill">Validated vs TSPU DPI</span>    </div>
-    <h1>An end-to-end encrypted messenger built to <span style="color:var(--cyan)">survive state-level surveillance</span> and network censorship.</h1>
-        <p class="hero-sub">Open-source. No phone number, no email, no metadata harvesting. Engineered to keep working on hostile mobile networks where other messengers are restricted.</p>
+      <span class="pill">No phone number</span>      <span class="pill">Field-tested vs TSPU DPI</span>    </div>
+    <h1>An end-to-end encrypted messenger built to <span style="color:var(--cyan)">keep working on hostile networks</span> and under censorship.</h1>
+        <p class="hero-sub">Open-source, Android-first encrypted messaging in Alpha 2, with multiple transport paths tested on specific mobile networks. No phone number or email is required. Security boundaries and relay-visible metadata are documented publicly.</p>
         <div class="hero-cta">
       <a href="donate.html" class="btn btn-primary">Support the project</a>      <a href="https://github.com/LiudvigVladislav/Phantom" class="btn btn-ghost">View source ↗</a>    </div>
   </div>
@@ -430,19 +430,19 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
         <div class="fitem reveal">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" opacity="0.5"/></svg></div>
           <div>
-            <h3>Censorship-resistant</h3>            <p>Multiple transport paths reach the network, including traffic that blends in with ordinary HTTPS. When one route is blocked, another takes over.</p>
+            <h3>Censorship-resistant</h3>            <p>Multiple transport paths reach the network, including one that reshapes the observable wire pattern to resemble ordinary TLS. When one route is blocked, another takes over.</p>
                       </div>
         </div>
         <div class="fitem reveal">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L3 6v6c0 5 3.5 8 9 10 5.5-2 9-5 9-10V6z"/></svg></div>
           <div>
-            <h3>No identity required</h3>            <p>No phone number, no email, no real name. Sealed-sender routing means the relay cannot build a graph of who talks to whom.</p>
+            <h3>Reduced identity requirements</h3>            <p>No phone number, email, or real name is required. Sealed-sender-style envelopes reduce exposed sender metadata, while the relay can still observe timing, sizes, authenticated sessions, and delivery destinations.</p>
                       </div>
         </div>
         <div class="fitem reveal">
           <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></div>
           <div>
-            <h3>Fully open-source</h3>            <p>Licensed AGPL-3.0. Every line is auditable — no closed components, no hidden telemetry, no trust-us black boxes.</p>
+            <h3>Fully open-source</h3>            <p>Licensed AGPL-3.0-or-later. The source, threat model, known issues, and architecture decisions are public. The custom protocol has not yet received an independent security audit.</p>
                       </div>
         </div>
       </div>
@@ -460,7 +460,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
               </div>
       <div class="mode reveal">
         <div class="mic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
-        <h4>Private</h4>        <p>Reality-first chain. Hides your source IP from the relay behind cover traffic.</p>
+        <h4>Private</h4>        <p>Uses the REALITY transport first. Metadata exposure and limitations are documented in the threat model; this mode does not provide anonymity.</p>
               </div>
       <div class="mode reveal">
         <div class="mic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 21V10a6 6 0 0 1 12 0v11l-2-1.5-2 1.5-2-1.5-2 1.5-2-1.5z"/><circle cx="9.5" cy="11" r="0.8" fill="currentColor"/><circle cx="14.5" cy="11" r="0.8" fill="currentColor"/></svg></div>
@@ -479,7 +479,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
           <p>Encrypted WebSocket over TLS for normal conditions.</p>
           </div>
         <div class="path reveal"><div class="dot"></div><h4>REALITY / Xray</h4>
-          <p>Traffic indistinguishable from ordinary TLS. Validated through Russia's TSPU in production.</p>
+          <p>REALITY changes the observable wire pattern to resemble ordinary TLS. It is not an anonymity system and may not bypass every DPI policy. Founder-run tests covered specific networks and dates.</p>
           </div>
         <div class="path reveal"><div class="dot" style="background:var(--warn);box-shadow:0 0 8px var(--warn)"></div><h4>Tor (v3 onion)</h4>
           <p>Text-only emergency fallback for hostile networks. Does not carry calls.</p>
@@ -495,7 +495,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 </section><section id="status" style="padding-top:10px">
   <div class="wrap">
     <div class="status-box reveal">
-      <div class="label">Where the project stands</div>      <p style="color:var(--ts);font-size:0.92rem;max-width:760px;line-height:1.7">PHANTOM is in active development (<strong style="color:var(--tp)">Alpha 2</strong>), Android for now. Text messaging is reliable across the multi-transport stack, and the censorship-circumvention transport has been validated against TSPU in production. Voice notes work; voice calls are experimental. Group chats are partial. iOS, channels, and offline mesh are in the next stage of development. We ship a release only when the claim has been tested on real devices.</p>
+      <div class="label">Where the project stands</div>      <p style="color:var(--ts);font-size:0.92rem;max-width:760px;line-height:1.7">PHANTOM is an Android-first <strong style="color:var(--tp)">Alpha 2</strong> project. Source builds and tagged development snapshots are available on GitHub. No public end-user APK or open beta is available yet. Groups and calls are not production-ready, and the custom protocol has not been independently audited.</p>
             <p style="color:var(--ts);font-size:0.86rem;margin-top:14px;margin-bottom:18px">Public builds land at Beta — <a href="https://github.com/LiudvigVladislav/Phantom/releases" style="color:var(--cyan);text-decoration:none">watch releases on GitHub →</a></p>
             <a href="roadmap.html" class="btn btn-ghost">See the full roadmap →</a>
           </div>
@@ -503,16 +503,16 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 </section><section class="cta-band" id="support">
   <div class="wrap">
     <div class="label ctr">Support</div>    <h2 class="s-title" style="text-align:center">If you'd like to help PHANTOM grow.</h2>
-        <p style="color:var(--ts);max-width:540px;margin:0 auto 32px;text-align:center;font-size:0.94rem">PHANTOM takes no venture capital and sells no user data — it's built by one developer. If the project is something you'd like to support, any contribution helps it keep moving forward.</p>
+        <p style="color:var(--ts);max-width:540px;margin:0 auto 32px;text-align:center;font-size:0.94rem">PHANTOM is independently developed and does not sell user data. The project is open to mission-aligned grants and pre-seed investment that preserve its open-source license and published security boundaries.</p>
         <div style="display:flex;gap:13px;flex-wrap:wrap;justify-content:center">
-      <a href="donate.html" class="btn btn-primary">Ways to donate</a>      <a href="https://github.com/LiudvigVladislav/Phantom" class="btn btn-ghost">Star on GitHub ↗</a>    </div>
+      <a href="donate.html" class="btn btn-primary">Support the project</a>      <a href="mailto:hello@phntm.pro?subject=PHANTOM%20investment%20inquiry" class="btn btn-ghost">Investment inquiries</a>    </div>
   </div>
 </section><footer>
   <div class="foot-inner">
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · No metadata, no compromise.</span>
+        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · Open source · Security boundaries published.</span>
               </div>
     </div>
     <div class="foot-links">

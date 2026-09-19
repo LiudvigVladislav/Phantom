@@ -155,7 +155,7 @@ Three logs per invocation: `callback_invoked` (always), `callback_returned` (suc
 After APK lands, Vladislav runs scenarios on Tecno (real device, Wi-Fi only since 2026-05-14) with logcat captured to `C:\temp\test78-tecno.log`:
 
 ```powershell
-& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat PhantomNotif:V PhantomMessaging:V PhantomMedia:V PhantomUI:V *:S | Tee-Object -FilePath "C:\temp\test78-tecno.log"
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat PhantomNotif:V PhantomMessaging:V PhantomMedia:V PhantomUI:V *:S | Tee-Object -FilePath "C:\temp\test78-tecno.log"
 ```
 
 **Core (must run before merge):**

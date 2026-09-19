@@ -1,6 +1,15 @@
 # ADR-019: Xray VLESS+REALITY as outer transport for censorship resistance
 
-Status: accepted (2026-05-07, production-validated on Tecno МТС without VPN)
+Status: accepted (2026-05-07, field-tested on a Tecno handset over МТС without VPN)
+
+> **Terminology amendment, 2026-09-17.** This record and several other
+> documents of the period use "production-validated" for what was a founder-run
+> acceptance run on a single device, carrier and date. That was an internal
+> shorthand for "the path worked end to end against the live deployment", never
+> a claim of independent or universal validation. The decision and its rationale
+> stand as written; only the label is corrected. Every recorded run, including
+> its failures, is listed in
+> [`docs/field-tests/TEST_MATRIX.md`](../field-tests/TEST_MATRIX.md).
 Layer: shared/core/xray (KMP, new module), apps/android, deploy/xray
 Extends: ADR-016 (Tor + UnifiedPush hybrid transport)
 

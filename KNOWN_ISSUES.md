@@ -260,7 +260,7 @@ Test 5 (MTS WiFi, both devices): connection lifetime improved 50 s → 120 s, bu
 Calls in restrictive mobile networks remain **unproven** — the Reality+WebRTC combination has not had a production-quality test yet (tracked separately as PR-C2 / PR-C3 in the calls track).
 
 **Implementation references** (multi-PR, ongoing):
-- ADR-019 — Xray VLESS+REALITY as outer transport (production-validated Stage 5E, 2026-05-07).
+- ADR-019 — Xray VLESS+REALITY as outer transport (Stage 5E field-tested 2026-05-07 on one handset, one carrier, without VPN).
 - ADR-018 — Threat Model v0.1 revision (Tor-mode limitations, scope decisions).
 - `docs/PROJECT_LOG.md` — Tele2 diagnostic, M1w voice path, M2 trilogy, D0r / D1 REST fallback, D2a voice-on-Limited-realtime gating.
 
@@ -406,7 +406,7 @@ The non-VPN path is unchanged — Reality remains the privacy-preferred default 
 
 - *What Google sees.* Your IP making TLS connections to a Google CDN endpoint, with `www.google.com` in the SNI field. A frequency / size pattern of these requests can in principle be classified as "this client uses Snowflake-style broker discovery" (this is not PHANTOM-specific — Tor Browser users with Snowflake on RU send the same pattern).
 - *What Google does NOT see.* Your PHANTOM identity, your Ed25519 signing key, the relay's onion address (`zmdrxlrkd7iv...`), your contacts, or any message content. Once the broker matches you to a volunteer browser proxy, the actual Tor circuit traffic flows over WebRTC DataChannel directly between your device and that volunteer — Google is not on that path.
-- *What TSPU sees.* Only the TLS connection to `www.google.com` — indistinguishable from any of the dozens of legitimate Google services Russian carriers route every minute. Blocking `www.google.com` would have catastrophic consequences for the local internet, which is precisely why this fronting domain is resilient.
+- *What TSPU sees.* Only the TLS connection to `www.google.com`. At the SNI layer that is not separable from the dozens of legitimate Google services Russian carriers route every minute; timing and volume analysis is a separate question this does not address. Blocking `www.google.com` would have catastrophic consequences for the local internet, which is precisely why this fronting domain is resilient.
 - *What we relied on before PR-E.* The previous default Snowflake set fronted on `vuejs.org` via Netlify CDN — Netlify saw exactly the same pattern Google now sees. The privacy property is unchanged in kind, only the CDN identity changes; Google's value here is resilience against censorship, not a new privacy compromise.
 
 The other two `bridges-s-ru` entries front on `cdn.zk.mk, img.icons8.com, cdn.kde.org` via cdn77 — no Google involvement. Tor walks the bridge list internally and uses whichever the network admits first, so on a network that does not block cdn77 the request never reaches the AMP path. The AMP entries are the *resilience fallback*, not the primary path.
@@ -468,7 +468,7 @@ These are documented for transparency about what we resolved during the developm
 
 **Status:** Known carrier-network limitation. Mitigated by automatic transport degrade to REST short-poll (PR-D0r / PR-D1d).
 
-**Symptom.** On Tele2 LTE Irkutsk Oblast (verified Test #48 on Tecno `103603734A004351`, 2026-05-16), the WebSocket completes the 101 Upgrade handshake successfully but every subsequent application WS frame from phone to server is silently lost upstream. Server-side `session_summary` lines show `pings_received=0 inbound_frames=0` across ~20 consecutive phone WS sessions, each terminating at the server's ~153 s read timeout. The client side OkHttp `pingInterval(15s)` timeout firing at ~31 s is the **symptom**, not the cause — phone-side ping frames never reach the server in the first place.
+**Symptom.** On Tele2 LTE Irkutsk Oblast (verified Test #48 on Tecno `<redacted-device-serial>`, 2026-05-16), the WebSocket completes the 101 Upgrade handshake successfully but every subsequent application WS frame from phone to server is silently lost upstream. Server-side `session_summary` lines show `pings_received=0 inbound_frames=0` across ~20 consecutive phone WS sessions, each terminating at the server's ~153 s read timeout. The client side OkHttp `pingInterval(15s)` timeout firing at ~31 s is the **symptom**, not the cause — phone-side ping frames never reach the server in the first place.
 
 **Root cause.** Stateful Tele2 middlebox classifier that admits the WS Upgrade but treats subsequent persistent-WS-frame traffic as suspect and silently drops the body. The H1c/H1e hardening (PR-H1d disable-app-level-ping was considered then killed as wrong direction — `pings_received=0` on the server proves the symptom is not "client sends too fast", so removing client pings just extends zombie-WS lifetime without fixing anything).
 

@@ -25,7 +25,8 @@ worked example — see ADR-019) is defeated by the censorship-
 resistance transport layer: today either Tor with operator-
 controlled WebTunnel bridges (ADR-016) or Xray VLESS+REALITY
 masquerading as a TLS handshake to `www.microsoft.com` (ADR-019),
-production-validated 2026-05-07 on a Russian carrier. A
+field-tested 2026-05-07 on one Russian carrier, one handset and
+one date; see `docs/field-tests/TEST_MATRIX.md`. A
 malicious or seized relay sees only opaque ciphertext blobs —
 no plaintext, no decryptable messages; the relay's trust
 posture is recorded in ADR-004 and enforced at the protocol
