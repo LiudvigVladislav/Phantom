@@ -32,6 +32,28 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 updateMessageStatus:
 UPDATE message SET status = ? WHERE id = ?;
 
+-- residual N1 Revision 4: re-encrypting a queued message rewrites its
+-- envelope in place. The row must NOT be removed to do it. `message.id` is
+-- the parent of `reaction.message_id ON DELETE CASCADE`, so a delete-then-
+-- insert destroys every reaction on the message wherever foreign keys are
+-- enforced; and because `insertMessage` does not carry `pinned`, `saved` or
+-- `pinned_by_pubkey`, a re-insert silently resets those three columns even
+-- where they are not.
+--
+-- This UPDATE touches only the columns a re-encryption actually changes.
+-- `id`, `conversation_id` and `created_at` identify the message and are not
+-- rewritten; `pinned`, `saved` and `pinned_by_pubkey` are user state that a
+-- re-encryption has no business altering. Adding a query is not a schema
+-- change: the table declaration above is untouched and no new column exists.
+updateMessageEnvelope:
+UPDATE message
+SET ciphertext = :ciphertext,
+    plaintext_cache = :plaintextCache,
+    sent = :sent,
+    status = :status,
+    expires_at_ms = :expiresAtMs
+WHERE id = :id;
+
 deleteMessage:
 DELETE FROM message WHERE id = ?;
 

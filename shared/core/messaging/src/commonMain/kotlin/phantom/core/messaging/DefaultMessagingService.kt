@@ -57,12 +57,288 @@ import phantom.core.transport.PreKeyApi
 import phantom.core.transport.RelayMessage
 import phantom.core.transport.RelayTransport
 
+/**
+ * residual N1 / F2 + F4 (2026-09-18) — the durable outbox selector.
+ *
+ * A send that fails after encryption is persisted with [MessageStatus.QUEUED]
+ * and its exact ciphertext (see `sendMessage`: `afterEncrypt` writes the row
+ * before the ratchet state is committed). Before this change nothing ever
+ * selected `QUEUED` for retry — `retryWaitingMessages` looked only at
+ * `WAITING_FOR_RECIPIENT_BUNDLE` — so the sender's ratchet had advanced past a
+ * step the peer would never receive, and the next envelope failed MAC there.
+ *
+ * Only rows that carry a real envelope (`ciphertext` non-empty) belong here;
+ * the `WAITING_FOR_RECIPIENT_BUNDLE` placeholders hold an empty array and keep
+ * their own re-encrypting path, which is correct for them because no ratchet
+ * step was ever taken for those. The returned list is unordered: the drain
+ * orders it with [orderOutbox], from the ratchet, never from `createdAt`.
+ */
+internal fun retryableQueuedRows(rows: List<MessageEntity>): List<MessageEntity> =
+    rows.filter { it.status == MessageStatus.QUEUED && it.ciphertext.isNotEmpty() }
+
+/**
+ * residual N1 Revision 3 — what a stored envelope says about itself.
+ *
+ * Every envelope carries the sending-chain public key it was produced under
+ * and its index on that chain (`EncryptedMessage.ratchetPublicKey`,
+ * `EncryptedMessage.messageIndex`). Together they identify the exact ratchet
+ * state that produced it: which generation, and which step.
+ */
+internal data class StoredEnvelopeRef(val chainKeyHex: String, val index: Int)
+
+/** Where a persisted sending chain lives. */
+internal enum class ChainSource { ACTIVE, PENDING }
+
+/**
+ * A sending chain the client has on disk: `sendingRatchetPublicKey` and
+ * `sendCount` of either the active session or the initiator-pending
+ * candidate. Both are existing persisted state; nothing new is stored.
+ */
+internal data class PersistedChain(val chainKeyHex: String, val sendCount: Int, val source: ChainSource)
+
+/**
+ * residual N1 Revision 3 / W1 — what settlement must do with a stored
+ * envelope, decided against the state that actually produced it.
+ *
+ * `encryptUnderLock` has three branches — active session, initiator pending
+ * reuse, fresh bootstrap — and each writes the row (`afterEncrypt`) BEFORE it
+ * commits its state (`saveSession` for active, `commitInitiatorPending` for
+ * both pending shapes). `LibsodiumDoubleRatchet.encrypt` derives the message
+ * key from the persisted sending chain key, sets `messageIndex = sendCount`
+ * and commits `sendCount + 1`; the committed state depends on the chain only,
+ * never on the plaintext.
+ *
+ *  - [RESEND_STORED]: a persisted chain has the envelope's key and
+ *    `index < sendCount`. The commit happened (W2/W3); the stored bytes are
+ *    exactly what the peer's receiving chain expects at that index.
+ *  - [ADOPT_STEP]: a persisted chain has the key and `index == sendCount`.
+ *    The row was written and the commit never followed (W1 on the active or
+ *    the pending-reuse branch). The state on disk is still the state that
+ *    produced the envelope, so the commit can be performed now: advance the
+ *    chain by one step and save it — the result is what the crashed commit
+ *    would have written — and the envelope becomes committed. No plaintext
+ *    and no second envelope are needed.
+ *  - [REENCRYPT_FROM_SESSION]: no persisted chain has the key. The state that
+ *    produced this envelope never reached disk (fresh-bootstrap W1) or has
+ *    been superseded by a DH step. Its bytes can never be decrypted by the
+ *    peer, so only a new encryption from the current state can deliver the
+ *    message; that costs a ratchet step and needs the plaintext. An
+ *    unparsable envelope is in the same position: nothing about it can be
+ *    proven, so it is re-encrypted from the plaintext or, without one, it is
+ *    unrecoverable.
+ *  - [HOLD]: `index > sendCount` on a persisted chain. No code path produces
+ *    it; nothing is done and the reason is logged.
+ *
+ * Why adoption must precede every new encryption on the chain: a new
+ * message would take `index == sendCount` too, and after its commit the
+ * crashed envelope would satisfy `index < sendCount` and be indistinguishable
+ * from a committed one. `settleOutbox` therefore runs before `sendMessage`
+ * encrypts and before the drain re-encrypts anything.
+ */
+internal enum class OutboxRecovery { RESEND_STORED, ADOPT_STEP, REENCRYPT_FROM_SESSION, HOLD }
+
+internal fun outboxRecoveryFor(envelope: StoredEnvelopeRef?, chains: List<PersistedChain>): OutboxRecovery {
+    if (envelope == null) return OutboxRecovery.REENCRYPT_FROM_SESSION
+    val owner = chains.firstOrNull { it.chainKeyHex == envelope.chainKeyHex }
+        ?: return OutboxRecovery.REENCRYPT_FROM_SESSION
+    return when {
+        envelope.index < owner.sendCount -> OutboxRecovery.RESEND_STORED
+        envelope.index == owner.sendCount -> OutboxRecovery.ADOPT_STEP
+        else -> OutboxRecovery.HOLD
+    }
+}
+
+/**
+ * residual N1 Revision 3 — the drain order, derived from the ratchet.
+ *
+ * `createdAt` is a millisecond clock and the row id is random, so neither is
+ * the order the ratchet actually encrypted in. The envelope is: within one
+ * chain, `messageIndex` is the encryption order by construction, and the
+ * peer's `LibsodiumDoubleRatchet.decrypt` advances its receiving chain exactly
+ * once per envelope — it keeps no skipped keys — so the wire order within a
+ * chain must be the index order, strictly. Across chains the rank is what the
+ * persisted state proves: when a pending candidate exists, sends go through
+ * it (`canTakeExistingSessionPath` requires no outbound pending), so the
+ * pending chain is newer than the active one.
+ *
+ * Rows on a chain no state remembers have no position: their bytes cannot be
+ * decrypted by anyone and they are re-encrypted by `settleOutbox` before the
+ * drain orders anything. If one is still present here, or an envelope is
+ * unparsable, or two rows claim the same step, the order is unprovable and the
+ * drain holds and says why instead of reordering a user's messages.
+ */
+internal sealed interface OutboxOrder {
+    data class Ordered(val rows: List<Pair<MessageEntity, StoredEnvelopeRef>>) : OutboxOrder
+    data class Unprovable(val reason: String) : OutboxOrder
+}
+
+/** Rank of a persisted chain; `null` when no state remembers the key. */
+internal fun chainRank(chainKeyHex: String, chains: List<PersistedChain>): Int? =
+    when (chains.firstOrNull { it.chainKeyHex == chainKeyHex }?.source) {
+        null -> null
+        ChainSource.ACTIVE -> 0
+        ChainSource.PENDING -> 1
+    }
+
+internal fun orderOutbox(
+    rows: List<MessageEntity>,
+    envelopeOf: (MessageEntity) -> StoredEnvelopeRef?,
+    chains: List<PersistedChain>,
+): OutboxOrder {
+    val refs = rows.map { it to envelopeOf(it) }
+    val unparsable = refs.filter { it.second == null }
+    if (unparsable.isNotEmpty()) {
+        return OutboxOrder.Unprovable(
+            "unparsable_envelope ids=" + unparsable.joinToString(",") { it.first.id.take(8) },
+        )
+    }
+    val placed = refs.map { it.first to it.second!! }
+    val unsettled = placed.filter { chainRank(it.second.chainKeyHex, chains) == null }
+    if (unsettled.isNotEmpty()) {
+        return OutboxOrder.Unprovable(
+            "unsettled_chain ids=" + unsettled.joinToString(",") { it.first.id.take(8) },
+        )
+    }
+    val duplicate = placed.groupBy { it.second }.values.firstOrNull { it.size > 1 }
+    if (duplicate != null) {
+        val ref = duplicate.first().second
+        return OutboxOrder.Unprovable(
+            "duplicate_index chain=${ref.chainKeyHex.take(8)} index=${ref.index} " +
+                "ids=" + duplicate.joinToString(",") { it.first.id.take(8) },
+        )
+    }
+    return OutboxOrder.Ordered(
+        placed.sortedWith(compareBy({ chainRank(it.second.chainKeyHex, chains)!! }, { it.second.index })),
+    )
+}
+
+/**
+ * residual N1 Revision 4 — which unresolved row settlement may touch next.
+ *
+ * "Unresolved" means [OutboxRecovery.REENCRYPT_FROM_SESSION]: a stored
+ * envelope no persisted chain can explain, either because its generation was
+ * superseded or because its bytes cannot be parsed at all. Those rows are the
+ * only ones settlement re-encrypts, and re-encrypting one gives it a new index
+ * on the current chain — so the sequence in which they are processed IS the
+ * order the peer will see. Choosing it wrongly reorders a user's messages
+ * permanently.
+ *
+ * Revision 3 took the first such row in repository order. `getMessages` orders
+ * by `created_at ASC`, so that was a timestamp order wearing a different name:
+ * exactly what Revision 3 had already rejected for known chains. Two rows
+ * written in the same millisecond, or rows whose stored order does not match
+ * their encryption order, would be reversed with no diagnostic.
+ *
+ * What can be proven, and nothing else:
+ *  - a single unresolved row has no competing position, so it is next;
+ *  - within ONE forgotten chain, `messageIndex` is the encryption order by
+ *    construction, so the lowest index is next.
+ *
+ * What cannot, and therefore stops settlement without mutating or sending:
+ *  - two or more forgotten chain keys, whose relative order no persisted state
+ *    records;
+ *  - two rows claiming the same `(chainKey, messageIndex)`;
+ *  - an unparsable envelope sharing the set with another unresolved row, since
+ *    it has no position at all.
+ *
+ * Note on the rows this does NOT rank. A re-encrypted row necessarily lands
+ * after everything already committed on the current chain, which is inherent:
+ * its old bytes are undeliverable, and the only chain it can go out on is the
+ * present one. That does not reorder anything the user sees, because both
+ * `sendMessage` and the drain settle the whole conversation BEFORE taking a
+ * new index or sending, so no newer message can slip in front of an unresolved
+ * older one.
+ */
+internal sealed interface UnresolvedChoice {
+    /** This row is provably next. */
+    data class Recover(val row: MessageEntity, val ref: StoredEnvelopeRef?) : UnresolvedChoice
+
+    /** Nothing is unresolved. */
+    object None : UnresolvedChoice
+
+    /** The next row cannot be derived from envelope evidence; stop. */
+    data class Unprovable(val reason: String) : UnresolvedChoice
+}
+
+internal fun nextUnresolved(
+    unresolved: List<Pair<MessageEntity, StoredEnvelopeRef?>>,
+): UnresolvedChoice {
+    if (unresolved.isEmpty()) return UnresolvedChoice.None
+    if (unresolved.size == 1) {
+        val (row, ref) = unresolved.single()
+        return UnresolvedChoice.Recover(row, ref)
+    }
+    val unparsable = unresolved.filter { it.second == null }
+    if (unparsable.isNotEmpty()) {
+        return UnresolvedChoice.Unprovable(
+            "unparsable_among_unresolved ids=" + unparsable.joinToString(",") { it.first.id.take(8) },
+        )
+    }
+    val chains = unresolved.map { it.second!!.chainKeyHex }.toSet()
+    if (chains.size > 1) {
+        return UnresolvedChoice.Unprovable(
+            "multiple_forgotten_chains count=${chains.size} " +
+                "keys=" + chains.joinToString(",") { it.take(8) },
+        )
+    }
+    val duplicate = unresolved.groupBy { it.second!! }.values.firstOrNull { it.size > 1 }
+    if (duplicate != null) {
+        val ref = duplicate.first().second!!
+        return UnresolvedChoice.Unprovable(
+            "duplicate_index chain=${ref.chainKeyHex.take(8)} index=${ref.index} " +
+                "ids=" + duplicate.joinToString(",") { it.first.id.take(8) },
+        )
+    }
+    val head = unresolved.minByOrNull { it.second!!.index }!!
+    return UnresolvedChoice.Recover(head.first, head.second)
+}
+
+/**
+ * residual N1 / F2 + F4 — is there an unresolved predecessor of the envelope
+ * just produced for [selfId]? Decided in the same coordinates as the drain:
+ * chain rank, then index. If the queue's order is unprovable the message is
+ * held, because sending it might overtake something.
+ */
+internal fun hasUnresolvedPredecessor(
+    rows: List<MessageEntity>,
+    envelopeOf: (MessageEntity) -> StoredEnvelopeRef?,
+    chains: List<PersistedChain>,
+    self: StoredEnvelopeRef,
+    selfId: String,
+): Boolean {
+    val others = retryableQueuedRows(rows).filter { it.id != selfId }
+    if (others.isEmpty()) return false
+    val selfRank = chainRank(self.chainKeyHex, chains) ?: return true
+    return when (val order = orderOutbox(others, envelopeOf, chains)) {
+        is OutboxOrder.Unprovable -> true
+        is OutboxOrder.Ordered -> order.rows.any { (_, ref) ->
+            val rank = chainRank(ref.chainKeyHex, chains)!!
+            rank < selfRank || (rank == selfRank && ref.index < self.index)
+        }
+    }
+}
+
+private fun ByteArray.chainKeyHex(): String = joinToString("") { "%02x".format(it.toInt().and(0xFF)) }
+
 class DefaultMessagingService(
     private val identity: IdentityRecord,
     private val localKeyPair: DhKeyPair,
     private val ratchet: DoubleRatchet,
     private val sessionManager: SessionManager,
     private val transport: RelayTransport,
+    /**
+     * residual N1 Revision 3 — the sealed-sender wrapper as a function.
+     *
+     * Defaults to [SealedSender.seal], so production behaviour is unchanged.
+     * `SealedSender.seal` mints an ephemeral X25519 keypair through libsodium
+     * and encrypts only the sender's public key: it carries no ratchet state
+     * and makes no security decision, which is why it is the one static call
+     * on the send path that a host without the native binding may substitute
+     * to exercise the outbox end to end. SPK verification is deliberately NOT
+     * made injectable here.
+     */
+    private val sealSender: (fromPubKeyHex: String, toPublicKeyBytes: ByteArray) -> ByteArray =
+        { from, to -> SealedSender.seal(fromPubKeyHex = from, toPublicKeyBytes = to) },
     private val messageRepository: MessageRepository,
     private val conversationRepository: ConversationRepository,
     /**
@@ -171,7 +447,7 @@ class DefaultMessagingService(
      * When null, [sendAudio] falls back to the legacy audio_chunk path so
      * existing tests that construct DMS without this dependency still compile.
      */
-    private val voiceV2Sender: VoiceV2Sender? = null,
+    private val voiceV2Sender: VoiceUploadSender? = null,
     /**
      * Durable download-task store for voice_v2 manifests (PR-M1w, Q4).
      * Nullable + default null for test call-site compatibility. Production
@@ -446,13 +722,41 @@ class DefaultMessagingService(
     private val sessionMutexesLock = Mutex()
     private val sessionMutexes = mutableMapOf<String, Mutex>()
 
+    // residual N1 Revision 5: serialises the complete outbound lifecycle for
+    // one conversation. The existing session mutex remains the short inner
+    // lock for ratchet load/encrypt/save. The only legal order is outer then
+    // inner; network operations never hold the inner mutex.
+    private val outboundMutexesLock = Mutex()
+    private val outboundMutexes = mutableMapOf<String, Mutex>()
+
+    private class OutboundPermit(val conversationId: String)
+
     private suspend fun mutexFor(conversationId: String): Mutex =
         sessionMutexesLock.withLock {
             sessionMutexes.getOrPut(conversationId) { Mutex() }
         }
 
+    private suspend fun outboundMutexFor(conversationId: String): Mutex =
+        outboundMutexesLock.withLock {
+            outboundMutexes.getOrPut(conversationId) { Mutex() }
+        }
+
+    private suspend fun <T> withOutboundPermit(
+        conversationId: String,
+        block: suspend (OutboundPermit) -> T,
+    ): T = outboundMutexFor(conversationId).withLock {
+        block(OutboundPermit(conversationId))
+    }
+
+    private fun OutboundPermit.requireConversation(conversationId: String) {
+        check(this.conversationId == conversationId) {
+            "outbound permit belongs to ${this.conversationId}, not $conversationId"
+        }
+    }
+
     override suspend fun removeConversationMutex(conversationId: String) {
         sessionMutexesLock.withLock { sessionMutexes.remove(conversationId) }
+        outboundMutexesLock.withLock { outboundMutexes.remove(conversationId) }
     }
 
     companion object {
@@ -1634,7 +1938,16 @@ class DefaultMessagingService(
      */
     @Volatile var onCallMessage: ((MessagePayload, String) -> Unit)? = null
 
-    override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> = runCatching {
+    override suspend fun sendMessage(message: OutgoingMessage): Result<Unit> =
+        withOutboundPermit(message.conversationId) { permit ->
+            sendMessageUnderPermit(message, permit)
+        }
+
+    private suspend fun sendMessageUnderPermit(
+        message: OutgoingMessage,
+        permit: OutboundPermit,
+    ): Result<Unit> = runCatching {
+        permit.requireConversation(message.conversationId)
         // PR-G1 (2026-05-12): trace entry. Pair with `SEND_TRACE` lines in
         // encryptUnderLock to localise where a delayed first-send blocks.
         val convTag = message.conversationId.take(12)
@@ -1679,6 +1992,16 @@ class DefaultMessagingService(
         // and the ratchet state has not yet advanced. Better than the inverse
         // (advanced state, lost message).
         var ciphertextBytes = ByteArray(0) // captured from afterEncrypt
+        var producedEnvelope: StoredEnvelopeRef? = null // residual N1 R3: chain + index of this send
+
+        // residual N1 Revision 5: finish both settlement and transport drain
+        // before this message takes a ratchet index. Merely adopting a crashed
+        // predecessor is insufficient: if its resend is refused, encrypting a
+        // successor would leave another durable step behind it and contradict
+        // the common fail-closed outbound barrier used by every control path.
+        check(settleAndDrainOutbox(permit, message.recipientPublicKeyHex)) {
+            "outbox_unsettled conv=$convTag: predecessors could not be settled and drained"
+        }
 
         try {
             encryptUnderLock(
@@ -1688,6 +2011,10 @@ class DefaultMessagingService(
                 afterEncrypt = { wireFrame ->
                     val ct = json.encodeToString(wireFrame).encodeToByteArray()
                     ciphertextBytes = ct
+                    producedEnvelope = StoredEnvelopeRef(
+                        chainKeyHex = wireFrame.encryptedMessage.ratchetPublicKey.chainKeyHex(),
+                        index = wireFrame.encryptedMessage.messageIndex,
+                    )
                     // §12 Round-7 audit P1-1 + Round-8 audit P1:
                     // `sender_enqueue` fires AFTER the row is
                     // successfully persisted, not from an `.also{}`
@@ -1773,14 +2100,32 @@ class DefaultMessagingService(
         messagingLog(MessagingLogLevel.INFO, "SEND_TRACE sealed_sender_pack_start conv=$convTag")
         @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
         val sealedSenderB64 = Base64.encode(
-            SealedSender.seal(
-                fromPubKeyHex = identity.publicKeyHex,
-                toPublicKeyBytes = hexToBytes(message.recipientPublicKeyHex),
-            )
+            sealSender(identity.publicKeyHex, hexToBytes(message.recipientPublicKeyHex)),
         )
         messagingLog(MessagingLogLevel.INFO, "SEND_TRACE sealed_sender_pack_ok conv=$convTag")
 
         val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+
+        // residual N1 / F2 + F4: never overtake an unresolved predecessor. If an
+        // older queued envelope in this conversation is still undelivered, this
+        // message stays QUEUED and the retry sweep drains both in creation
+        // order. Sending now would hand the peer a later ratchet step first.
+        val selfEnvelope = producedEnvelope
+        val blockedByPredecessor = selfEnvelope == null || hasUnresolvedPredecessor(
+            rows = messageRepository.getMessages(message.conversationId),
+            envelopeOf = ::storedEnvelopeRef,
+            chains = loadPersistedChains(message.conversationId),
+            self = selfEnvelope,
+            selfId = message.id,
+        )
+        if (blockedByPredecessor) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "SEND_TRACE held_behind_predecessor id=${message.id.take(12)}… conv=$convTag",
+            )
+            messageRepository.updateStatus(message.id, MessageStatus.QUEUED)
+            return@runCatching Unit
+        }
 
         messagingLog(
             MessagingLogLevel.INFO,
@@ -1802,6 +2147,19 @@ class DefaultMessagingService(
 
         val newStatus = if (sent) MessageStatus.SENT else MessageStatus.QUEUED
         messageRepository.updateStatus(message.id, newStatus)
+        if (!sent) {
+            // residual N1 / F2 + F4: the ratchet has already advanced inside
+            // `encryptUnderLock` and this exact envelope is durably stored on
+            // the row. It MUST stay retryable; `retryWaitingMessages` now picks
+            // QUEUED rows up and re-sends these stored bytes without a second
+            // ratchet step. Before this change the row was simply abandoned and
+            // the peer's next decrypt failed MAC.
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "SEND_TRACE queued_for_retry id=${message.id.take(12)}… conv=$convTag " +
+                    "reason=relay_send_return_false envelopeBytes=${ciphertextBytes.size}",
+            )
+        }
 
         conversationRepository.upsertConversation(
             conversationRepository.getConversation(message.conversationId)
@@ -1882,37 +2240,46 @@ class DefaultMessagingService(
         }
 
         // ── Legacy audio_chunk path (kept for tests + backward compat) ──────────
-        val recipientPublicKeyHex = conv.theirPublicKeyHex
+        return withOutboundPermit(conversationId) { permit ->
+            runCatching {
+                val recipientPublicKeyHex = conv.theirPublicKeyHex
+                check(settleAndDrainOutbox(permit, recipientPublicKeyHex)) {
+                    "outbox_unsettled conv=${conversationId.take(12)} before legacy audio"
+                }
 
-        val voiceId = uuid4().toString()
-        val total = kotlin.math.ceil(audioBytes.size.toDouble() / AUDIO_CHUNK_BYTES).toInt()
-            .coerceAtLeast(1)
+                val voiceId = uuid4().toString()
+                val total = kotlin.math.ceil(audioBytes.size.toDouble() / AUDIO_CHUNK_BYTES).toInt()
+                    .coerceAtLeast(1)
 
-        val insertedAtMs = Clock.System.now().toEpochMilliseconds()
-        val outgoingTimerSecs = conversationRepository.getDisappearingTimer(conversationId)
-        val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
+                val insertedAtMs = Clock.System.now().toEpochMilliseconds()
+                val outgoingTimerSecs = conversationRepository.getDisappearingTimer(conversationId)
+                val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) {
+                    insertedAtMs + outgoingTimerSecs * 1_000L
+                } else {
+                    null
+                }
 
-        val fullBase64 = Base64.encode(audioBytes)
-        val localMsgId = uuid4().toString()
-        messageRepository.insertMessage(
-            MessageEntity(
-                id = localMsgId,
-                conversationId = conversationId,
-                ciphertext = ByteArray(0),
-                plaintextCache = "[AUDIO:$fullBase64]",
-                sent = true,
-                status = MessageStatus.QUEUED,
-                createdAt = insertedAtMs,
-                expiresAtMs = outgoingExpiresAtMs,
-            )
-        )
+                val fullBase64 = Base64.encode(audioBytes)
+                val localMsgId = uuid4().toString()
+                messageRepository.insertMessage(
+                    MessageEntity(
+                        id = localMsgId,
+                        conversationId = conversationId,
+                        ciphertext = ByteArray(0),
+                        plaintextCache = "[AUDIO:$fullBase64]",
+                        sent = true,
+                        status = MessageStatus.QUEUED,
+                        createdAt = insertedAtMs,
+                        expiresAtMs = outgoingExpiresAtMs,
+                    )
+                )
 
-        messagingLog(
-            MessagingLogLevel.INFO,
-            "VOICE_TX send_start voiceId=${voiceId.take(8)} totalChunks=$total rawBytes=${audioBytes.size} chunkSizeBytes=$AUDIO_CHUNK_BYTES",
-        )
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_TX send_start voiceId=${voiceId.take(8)} totalChunks=$total " +
+                        "rawBytes=${audioBytes.size} chunkSizeBytes=$AUDIO_CHUNK_BYTES",
+                )
 
-        return runCatching {
             for (i in 0 until total) {
                 val start = i * AUDIO_CHUNK_BYTES
                 val end = minOf((i + 1) * AUDIO_CHUNK_BYTES, audioBytes.size)
@@ -1959,7 +2326,7 @@ class DefaultMessagingService(
                         to = recipientPublicKeyHex,
                         from = "",
                         sealedSender = Base64.encode(
-                            SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                            sealSender(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
                         ),
                         payload = paddedCiphertext.encodeBase64(),
                         messageId = envelopeId,
@@ -1982,18 +2349,19 @@ class DefaultMessagingService(
                 )
             }
 
-            conversationRepository.upsertConversation(
-                conv.copy(
-                    lastMessagePreview = "Voice message",
-                    lastMessageAt = Clock.System.now().toEpochMilliseconds(),
+                conversationRepository.upsertConversation(
+                    conv.copy(
+                        lastMessagePreview = "Voice message",
+                        lastMessageAt = Clock.System.now().toEpochMilliseconds(),
+                    )
                 )
-            )
-            messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+                messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
 
-            messagingLog(
-                MessagingLogLevel.INFO,
-                "VOICE_TX send_complete voiceId=${voiceId.take(8)} totalChunks=$total",
-            )
+                messagingLog(
+                    MessagingLogLevel.INFO,
+                    "VOICE_TX send_complete voiceId=${voiceId.take(8)} totalChunks=$total",
+                )
+            }
         }
     }
 
@@ -2086,67 +2454,72 @@ class DefaultMessagingService(
                 // `manifestSent` guards against double-send.
                 suspend fun sendManifestEnvelope(manifest: VoiceManifestV2) {
                     if (manifestSent) return
-                    manifestSent = true
-                    val manifestJson = json.encodeToString(manifest)
-                    val payload = MessagePayload(
-                        type           = MessagePayload.TYPE_VOICE_V2,
-                        text           = manifestJson,
-                        sentAt         = Clock.System.now().toEpochMilliseconds(),
-                        senderUsername = identity.username,
-                    )
-                    val payloadBytes = json.encodeToString(payload).encodeToByteArray()
-                    val encrypted = encryptUnderLock(
-                        conversationId        = conversationId,
-                        recipientPublicKeyHex = recipientPublicKeyHex,
-                        plaintext             = payloadBytes,
-                    )
-                    val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
-                    val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
-                    // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT —
-                    // Trek 2 Stage 3 migration audit converts this call
-                    // site to `phantom.core.transport.EnvelopeId.random().value`
-                    // after confirming this path never derives the id
-                    // from payload / ratchet state. uuid4 is CSPRNG-backed
-                    // on Android (SecureRandom). See
-                    // `shared/core/transport/.../EnvelopeId.kt`.
-                    val envelopeId = uuid4().toString()
-
-                    transport.send(
-                        RelayMessage.Send(
-                            to           = recipientPublicKeyHex,
-                            from         = "",
-                            sealedSender = Base64.encode(
-                                SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                            ),
-                            payload   = paddedCiphertext.encodeBase64(),
-                            messageId = envelopeId,
+                    withOutboundPermit(conversationId) { permit ->
+                        check(settleAndDrainOutbox(permit, recipientPublicKeyHex)) {
+                            "outbox_unsettled conv=${conversationId.take(12)} before voice-v2 manifest"
+                        }
+                        manifestSent = true
+                        val manifestJson = json.encodeToString(manifest)
+                        val payload = MessagePayload(
+                            type = MessagePayload.TYPE_VOICE_V2,
+                            text = manifestJson,
+                            sentAt = Clock.System.now().toEpochMilliseconds(),
+                            senderUsername = identity.username,
                         )
-                    )
-                    // transport.send returning false is OK — the envelope is in
-                    // the outbox durable store (HybridRelayTransport retry path).
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
-                            "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
-                    )
-                    // R5-3 — Flip local row UPLOADING → SENT after manifest leaves us.
-                    // With PR-M2e this happens BEFORE the upload tail completes; the
-                    // remaining chunks continue in background and the sender bubble's
-                    // Uploading N/M counter keeps ticking until upload_complete.
-                    messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
-                    messagingLog(
-                        MessagingLogLevel.INFO,
-                        "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
-                            "localMsgId=${localMsgId.take(8)}",
-                    )
-
-                    // Conversation preview update
-                    conversationRepository.upsertConversation(
-                        conv.copy(
-                            lastMessagePreview = "Voice message",
-                            lastMessageAt      = Clock.System.now().toEpochMilliseconds(),
+                        val payloadBytes = json.encodeToString(payload).encodeToByteArray()
+                        val encrypted = encryptUnderLock(
+                            conversationId = conversationId,
+                            recipientPublicKeyHex = recipientPublicKeyHex,
+                            plaintext = payloadBytes,
                         )
-                    )
+                        val ciphertextBytes = json.encodeToString(encrypted).encodeToByteArray()
+                        val paddedCiphertext = MessagePadding.pad(ciphertextBytes)
+                        // TODO(stage3-migration): ENVELOPE_ID_FULL_RETROFIT —
+                        // Trek 2 Stage 3 migration audit converts this call
+                        // site to `phantom.core.transport.EnvelopeId.random().value`
+                        // after confirming this path never derives the id
+                        // from payload / ratchet state. uuid4 is CSPRNG-backed
+                        // on Android (SecureRandom). See
+                        // `shared/core/transport/.../EnvelopeId.kt`.
+                        val envelopeId = uuid4().toString()
+
+                        transport.send(
+                            RelayMessage.Send(
+                                to = recipientPublicKeyHex,
+                                from = "",
+                                sealedSender = Base64.encode(
+                                    sealSender(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
+                                ),
+                                payload = paddedCiphertext.encodeBase64(),
+                                messageId = envelopeId,
+                            )
+                        )
+                        // transport.send returning false is OK — the envelope is in
+                        // the transport outbox (HybridRelayTransport retry path).
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "MEDIA_TX manifest_sent mediaId=${manifest.mediaId.take(8)} " +
+                                "envelopeId=${envelopeId.take(8)} chunkCount=${manifest.chunkCount}",
+                        )
+                        // R5-3 — Flip local row UPLOADING → SENT after manifest leaves us.
+                        // With PR-M2e this happens BEFORE the upload tail completes; the
+                        // remaining chunks continue in background and the sender bubble's
+                        // Uploading N/M counter keeps ticking until upload_complete.
+                        messageRepository.updateStatus(localMsgId, MessageStatus.SENT)
+                        messagingLog(
+                            MessagingLogLevel.INFO,
+                            "MEDIA_TX local_status_sent mediaId=${manifest.mediaId.take(8)} " +
+                                "localMsgId=${localMsgId.take(8)}",
+                        )
+
+                        // Conversation preview update
+                        conversationRepository.upsertConversation(
+                            conv.copy(
+                                lastMessagePreview = "Voice message",
+                                lastMessageAt = Clock.System.now().toEpochMilliseconds(),
+                            )
+                        )
+                    }
                 }
 
                 // PR-MEDIA-UPLOAD-CANCEL2 — early manifest is DISABLED while
@@ -2237,6 +2610,12 @@ class DefaultMessagingService(
                     runCatching { messageRepository.updateStatus(localMsgId, MessageStatus.FAILED) }
                 }
                 throw ce
+            } catch (failure: Throwable) {
+                val failureMsg = "MEDIA_TX manifest_stage_failed localMsgId=${localMsgId.take(8)} " +
+                    "reason=${failure.message?.take(60) ?: failure::class.simpleName}"
+                messagingLog(MessagingLogLevel.WARN, failureMsg)
+                mediaLog(failureMsg)
+                runCatching { messageRepository.updateStatus(localMsgId, MessageStatus.FAILED) }
             } finally {
                 // PR-MEDIA-UPLOAD-CANCEL2 — cleanup runs unconditionally,
                 // even if the coroutine context is already cancelled. Each
@@ -5253,38 +5632,65 @@ class DefaultMessagingService(
      * the relay never learns `from`, `to`, or the referenced messageId.
      */
     @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-    private suspend fun sendSealedPayload(
+    private suspend fun sendSealedPayloadUnderPermit(
+        permit: OutboundPermit,
         payload: MessagePayload,
         conversationId: String,
         theirPublicKeyHex: String,
-    ) {
-        val plaintext = json.encodeToString(payload).encodeToByteArray()
-        val encrypted = try {
-            encryptUnderLock(
-                conversationId = conversationId,
-                recipientPublicKeyHex = theirPublicKeyHex,
-                plaintext = plaintext,
+    ): Result<Unit> {
+        val result = runCatching {
+            permit.requireConversation(conversationId)
+            if (!settleAndDrainOutbox(permit, theirPublicKeyHex)) {
+                throw OutboundNotAttemptedException(
+                    "outbound barrier refused ${payload.type} for ${conversationId.take(12)}",
+                )
+            }
+            val sealedSender = try {
+                Base64.encode(sealSender(identity.publicKeyHex, hexToBytes(theirPublicKeyHex)))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                throw OutboundNotAttemptedException(
+                    "sealed-sender preparation failed for control type=${payload.type}",
+                    e,
+                )
+            }
+            val plaintext = json.encodeToString(payload).encodeToByteArray()
+            val encrypted = try {
+                encryptUnderLock(
+                    conversationId = conversationId,
+                    recipientPublicKeyHex = theirPublicKeyHex,
+                    plaintext = plaintext,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                throw OutboundNotAttemptedException(
+                    "encrypt failed for control type=${payload.type}",
+                    e,
+                )
+            }
+            val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
+            val paddedCiphertext = MessagePadding.pad(ciphertext)
+            val submitted = transport.send(
+                RelayMessage.Send(
+                    to = theirPublicKeyHex,
+                    from = "",
+                    sealedSender = sealedSender,
+                    payload = paddedCiphertext.encodeBase64(),
+                    messageId = uuid4().toString(),
+                )
             )
-        } catch (e: Exception) {
-            messagingLog(
-                MessagingLogLevel.WARN,
-                "sendSealedPayload: encrypt failed for type=${payload.type} — dropping. ${e.message}",
-            )
-            return
+            if (!submitted) {
+                throw OutboundSubmissionException(
+                    "transport did not report immediate submission for control type=${payload.type}",
+                )
+            }
         }
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        val paddedCiphertext = MessagePadding.pad(ciphertext)
-        transport.send(
-            RelayMessage.Send(
-                to = theirPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(theirPublicKeyHex))
-                ),
-                payload = paddedCiphertext.encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
+        result.exceptionOrNull()?.let { failure ->
+            if (failure is CancellationException) throw failure
+        }
+        return result
     }
 
     override suspend fun markConversationRead(
@@ -5302,16 +5708,25 @@ class DefaultMessagingService(
                 // C-2: route the read receipt through the sealed Double Ratchet
                 // pipeline. The relay sees just another sealed envelope — no
                 // `from`, `to`, or `messageId` in plaintext.
-                sendSealedPayload(
-                    payload = MessagePayload(
-                        type = MessagePayload.TYPE_READ_RECEIPT,
-                        targetMessageId = msg.id,
-                        sentAt = Clock.System.now().toEpochMilliseconds(),
-                        senderUsername = identity.username,
-                    ),
-                    conversationId = conversationId,
-                    theirPublicKeyHex = theirPublicKeyHex,
-                )
+                val receipt = withOutboundPermit(conversationId) { permit ->
+                    sendSealedPayloadUnderPermit(
+                        permit = permit,
+                        payload = MessagePayload(
+                            type = MessagePayload.TYPE_READ_RECEIPT,
+                            targetMessageId = msg.id,
+                            sentAt = Clock.System.now().toEpochMilliseconds(),
+                            senderUsername = identity.username,
+                        ),
+                        conversationId = conversationId,
+                        theirPublicKeyHex = theirPublicKeyHex,
+                    )
+                }
+                receipt.exceptionOrNull()?.let { failure ->
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "read receipt dropped id=${msg.id.take(12)} reason=${failure.message}",
+                    )
+                }
             }
             messageRepository.updateStatus(msg.id, MessageStatus.READ)
         }
@@ -5320,17 +5735,26 @@ class DefaultMessagingService(
     override suspend fun sendCallSignal(
         recipientPublicKeyHex: String,
         payload: MessagePayload,
-    ): Result<Unit> = runCatching {
+    ): Result<Unit> {
         val conversationId = deriveConversationId(recipientPublicKeyHex)
-        sendSealedPayload(payload, conversationId, recipientPublicKeyHex)
+        return withOutboundPermit(conversationId) { permit ->
+            sendSealedPayloadUnderPermit(
+                permit,
+                payload,
+                conversationId,
+                recipientPublicKeyHex,
+            )
+        }
     }
 
     override suspend fun sendGroupControlMessage(
         toPubKeyHex: String,
         payload: MessagePayload,
-    ): Result<Unit> = runCatching {
+    ): Result<Unit> {
         val conversationId = deriveConversationId(toPubKeyHex)
-        sendSealedPayload(payload, conversationId, toPubKeyHex)
+        return withOutboundPermit(conversationId) { permit ->
+            sendSealedPayloadUnderPermit(permit, payload, conversationId, toPubKeyHex)
+        }
     }
 
     /**
@@ -5793,6 +6217,367 @@ class DefaultMessagingService(
      * next sweep finds nothing to do. Messages that still fail (peer
      * still has no bundle) stay in WAITING for the next sweep.
      */
+    /**
+     * residual N1 Revision 3 — the chain key and index inside a stored envelope.
+     *
+     * The row holds the exact `WireFrame` JSON, so both are readable without
+     * decrypting anything. Returns `null` when the bytes cannot be parsed; the
+     * callers treat that as "cannot be placed or proven" and hold.
+     */
+    private fun storedEnvelopeRef(row: MessageEntity): StoredEnvelopeRef? = runCatching {
+        val em = json.decodeFromString<WireFrame>(row.ciphertext.decodeToString()).encryptedMessage
+        StoredEnvelopeRef(chainKeyHex = em.ratchetPublicKey.chainKeyHex(), index = em.messageIndex)
+    }.getOrNull()
+
+    /**
+     * residual N1 Revision 3 — every sending chain currently on disk for the
+     * conversation: the active session and, if present, the initiator-pending
+     * candidate. Read fresh at every decision, because a re-encryption of the
+     * previous row commits a new count and can create a new pending chain.
+     */
+    private suspend fun loadPersistedChains(conversationId: String): List<PersistedChain> {
+        val out = mutableListOf<PersistedChain>()
+        sessionManager.tryLoadSession(conversationId)?.let {
+            out += PersistedChain(it.sendingRatchetPublicKey.chainKeyHex(), it.sendCount, ChainSource.ACTIVE)
+        }
+        pendingRatchetStateRepository?.get(conversationId)?.let { entity ->
+            runCatching { json.decodeFromString<phantom.core.crypto.RatchetState>(entity.stateBlob) }
+                .getOrNull()
+                ?.let { out += PersistedChain(it.sendingRatchetPublicKey.chainKeyHex(), it.sendCount, ChainSource.PENDING) }
+        }
+        return out
+    }
+
+    /**
+     * residual N1 / F2 + F4 — put an already-encrypted envelope back on the
+     * wire without touching the ratchet.
+     *
+     * [MessageEntity.ciphertext] is the exact `WireFrame` JSON that
+     * `encryptUnderLock` produced for this message id. Re-sending those bytes
+     * is what makes a committed ratchet step recoverable. Nothing here encrypts
+     * and nothing commits state. The sealed-sender wrapper and the padding are
+     * recomputed, which carries no ratchet state: `MessagePadding.pad` is
+     * deterministic ISO 7816-4 and the wrapper is a fresh ephemeral per call.
+     */
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    private suspend fun resendStoredEnvelope(
+        row: MessageEntity,
+        recipientPublicKeyHex: String,
+    ): Boolean {
+        val sealedSenderB64 = Base64.encode(
+            sealSender(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex)),
+        )
+        return transport.send(
+            RelayMessage.Send(
+                to = recipientPublicKeyHex,
+                from = "",
+                sealedSender = sealedSenderB64,
+                payload = MessagePadding.pad(row.ciphertext).encodeBase64(),
+                messageId = row.id,
+            )
+        )
+    }
+
+    /**
+     * residual N1 Revision 3 / W1 — perform the commit a crash skipped.
+     *
+     * The persisted [source] state still carries the chain key and the count
+     * that produced the row's envelope (same key, `index == sendCount`).
+     * Advancing that state one step through the ratchet and saving it writes
+     * exactly what `encryptUnderLock` would have committed after
+     * `afterEncrypt`, because `LibsodiumDoubleRatchet.encrypt` derives the
+     * next chain key from the current one alone: given a keyed sending chain,
+     * the committed state is a function of the chain and nothing else, not of
+     * the plaintext, the nonce or the ciphertext. The message key derived on
+     * the way is zeroized inside `encrypt` and the empty ciphertext is
+     * dropped.
+     *
+     * The one shape where that is NOT true is an unkeyed sending chain
+     * (`sendingChainKey == null`): there `encrypt` performs a DH ratchet step
+     * with a fresh keypair, so the state it commits belongs to a different
+     * chain than the stored envelope. Such an envelope cannot match a
+     * persisted key in the first place and is re-encrypted instead, but the
+     * guard below refuses it explicitly rather than relying on that.
+     *
+     * Re-using `encrypt` rather than adding an `advanceSendChain` method to
+     * [phantom.core.crypto.DoubleRatchet] is deliberate: the recovery needs no
+     * new surface on a cryptographic interface to do a step that interface
+     * already performs.
+     *
+     * Runs under the conversation mutex and re-reads the state there, so it
+     * never adopts against a view that changed since the decision. Returns
+     * false, having written nothing, when the state no longer matches.
+     */
+    private suspend fun adoptUncommittedStep(
+        conversationId: String,
+        source: ChainSource,
+        ref: StoredEnvelopeRef,
+        rowId: String,
+    ): Boolean = mutexFor(conversationId).withLock {
+        val convTag = conversationId.take(12)
+        when (source) {
+            ChainSource.ACTIVE -> {
+                val state = sessionManager.tryLoadSession(conversationId) ?: return@withLock false
+                if (state.sendingChainKey == null ||
+                    state.sendingRatchetPublicKey.chainKeyHex() != ref.chainKeyHex ||
+                    state.sendCount != ref.index
+                ) return@withLock false
+                val (advanced, _) = ratchet.encrypt(state, ByteArray(0))
+                sessionManager.saveSession(conversationId, advanced)
+            }
+            ChainSource.PENDING -> {
+                val entity = pendingRatchetStateRepository?.get(conversationId) ?: return@withLock false
+                val artifacts = entity.bootstrapArtifactsBlob ?: return@withLock false
+                val tx = sessionTransactionRepository ?: return@withLock false
+                val state = runCatching {
+                    json.decodeFromString<phantom.core.crypto.RatchetState>(entity.stateBlob)
+                }.getOrNull() ?: return@withLock false
+                if (state.sendingChainKey == null ||
+                    state.sendingRatchetPublicKey.chainKeyHex() != ref.chainKeyHex ||
+                    state.sendCount != ref.index
+                ) return@withLock false
+                val (advanced, _) = ratchet.encrypt(state, ByteArray(0))
+                tx.commitInitiatorPending(
+                    conversationId = conversationId,
+                    stateBlob = json.encodeToString(advanced),
+                    bootstrapArtifactsBlob = artifacts,
+                    nowMs = entity.reservedAtMs,
+                )
+            }
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "RETRY_TRACE outbox_step_adopted id=${rowId.take(12)}… conv=$convTag " +
+                "source=${source.name.lowercase()} chain=${ref.chainKeyHex.take(8)} index=${ref.index}",
+        )
+        true
+    }
+
+    /**
+     * residual N1 Revision 3 / W1 — encrypt a queued message again from the
+     * current state, in place, without ever removing its row.
+     *
+     * Used only for an envelope no persisted chain can explain (see
+     * [OutboxRecovery.REENCRYPT_FROM_SESSION]). Revision 2 deleted the row
+     * and called `sendMessage`, because `insertMessage` is `INSERT OR IGNORE`
+     * and the re-insert would otherwise be a no-op; that put the only durable
+     * copy of the message at risk on every failure between the delete and the
+     * insert. Now the encryption runs first, and only inside `afterEncrypt`,
+     * with the new envelope in hand, is the row replaced in one transaction
+     * ([MessageRepository.replaceMessage]). `afterEncrypt` runs before the
+     * branch commits its state, exactly as on the original send, so a failure
+     * inside it leaves the old envelope in place and the state uncommitted.
+     * Any exception leaves the row untouched. Nothing is sent here; the drain
+     * sends the replaced row in index order.
+     *
+     * `sentAt` is the row's own `createdAt`, so the peer sees the time the user
+     * actually composed the message.
+     */
+    private suspend fun reencryptRowInPlace(
+        row: MessageEntity,
+        conversationId: String,
+        recipientPublicKeyHex: String,
+    ): Boolean {
+        val convTag = conversationId.take(12)
+        val text = row.plaintextCache ?: return false
+        val payload = json.encodeToString(
+            MessagePayload(text = text, sentAt = row.createdAt, senderUsername = identity.username),
+        ).encodeToByteArray()
+        var replaced = false
+        try {
+            encryptUnderLock(
+                conversationId = conversationId,
+                recipientPublicKeyHex = recipientPublicKeyHex,
+                plaintext = payload,
+                afterEncrypt = { wireFrame ->
+                    val ct = json.encodeToString(wireFrame).encodeToByteArray()
+                    messageRepository.replaceMessage(row.copy(ciphertext = ct, status = MessageStatus.QUEUED))
+                    replaced = true
+                },
+            )
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "RETRY_TRACE outbox_reencrypt_failed id=${row.id.take(12)}… conv=$convTag " +
+                    "reason=${failure::class.simpleName} row_kept=true",
+            )
+            return false
+        }
+        if (replaced) {
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "RETRY_TRACE outbox_reencrypted id=${row.id.take(12)}… conv=$convTag",
+            )
+        }
+        return replaced
+    }
+
+    /**
+     * residual N1 Revision 3 — bring every queued envelope of a conversation
+     * onto a persisted chain at a committed index, so that the drain can order
+     * it and a new send can take the next index safely.
+     *
+     * Each pass re-reads the rows and the persisted chains, because every
+     * action commits state. Adoption goes first in every pass: it is the only
+     * action that does not consume an index, and an uncommitted step must be
+     * committed before any encryption takes the same index. A row without an
+     * explaining chain is then re-encrypted from its plaintext; without a
+     * plaintext it is unrecoverable and is marked [MessageStatus.FAILED] — the
+     * row and its bytes stay, nothing is sent, and the queue is no longer
+     * blocked behind it.
+     *
+     * Returns true when every remaining queued row is [OutboxRecovery.RESEND_STORED].
+     * Returns false when a row cannot be settled: two rows claiming the same
+     * uncommitted step, an adoption the state refuses, a re-encryption that
+     * fails, or a [OutboxRecovery.HOLD]. Each is logged with its reason.
+     */
+    private suspend fun settleOutbox(conversationId: String, recipientPublicKeyHex: String): Boolean {
+        val convTag = conversationId.take(12)
+        var budget = retryableQueuedRows(messageRepository.getMessages(conversationId)).size * 2 + 1
+        while (budget-- > 0) {
+            val queued = retryableQueuedRows(messageRepository.getMessages(conversationId))
+            if (queued.isEmpty()) return true
+            val chains = loadPersistedChains(conversationId)
+            val decided = queued.map { row ->
+                val ref = storedEnvelopeRef(row)
+                Triple(row, ref, outboxRecoveryFor(ref, chains))
+            }
+            val held = decided.firstOrNull { it.third == OutboxRecovery.HOLD }
+            if (held != null) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "RETRY_TRACE outbox_hold id=${held.first.id.take(12)}… conv=$convTag " +
+                        "chain=${held.second?.chainKeyHex?.take(8)} index=${held.second?.index} " +
+                        "reason=index_ahead_of_persisted_count",
+                )
+                return false
+            }
+            val adoptions = decided.filter { it.third == OutboxRecovery.ADOPT_STEP }
+            if (adoptions.isNotEmpty()) {
+                val (row, ref, _) = adoptions.first()
+                val same = adoptions.filter { it.second == ref }
+                if (same.size > 1) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "RETRY_TRACE outbox_hold conv=$convTag reason=duplicate_uncommitted_index " +
+                            "chain=${ref!!.chainKeyHex.take(8)} index=${ref.index} " +
+                            "ids=" + same.joinToString(",") { it.first.id.take(8) },
+                    )
+                    return false
+                }
+                val source = chains.first { it.chainKeyHex == ref!!.chainKeyHex }.source
+                if (!adoptUncommittedStep(conversationId, source, ref!!, row.id)) {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "RETRY_TRACE outbox_hold id=${row.id.take(12)}… conv=$convTag reason=adoption_refused",
+                    )
+                    return false
+                }
+                continue
+            }
+            // Revision 4: the next row to re-encrypt is derived from envelope
+            // evidence, never from the order `getMessages` happened to return
+            // (which is `created_at ASC`). Where that order cannot be proven,
+            // settlement stops here without mutating or sending anything.
+            val unresolved = decided
+                .filter { it.third == OutboxRecovery.REENCRYPT_FROM_SESSION }
+                .map { it.first to it.second }
+            val (row, ref) = when (val choice = nextUnresolved(unresolved)) {
+                is UnresolvedChoice.None -> return true
+                is UnresolvedChoice.Unprovable -> {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "RETRY_TRACE outbox_unresolved_order_unprovable conv=$convTag " +
+                            "unresolved=${unresolved.size} reason=${choice.reason} " +
+                            "action=hold no_mutation no_send",
+                    )
+                    return false
+                }
+                is UnresolvedChoice.Recover -> choice.row to choice.ref
+            }
+            if (row.plaintextCache == null) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "RETRY_TRACE outbox_unrecoverable id=${row.id.take(12)}… conv=$convTag " +
+                        "chain=${ref?.chainKeyHex?.take(8)} index=${ref?.index} " +
+                        "reason=${if (ref == null) "unparsable_envelope" else "chain_not_persisted"}_and_no_plaintext " +
+                        "row_kept=true status=failed",
+                )
+                messageRepository.updateStatus(row.id, MessageStatus.FAILED)
+                continue
+            }
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "RETRY_TRACE outbox_reencrypt id=${row.id.take(12)}… conv=$convTag " +
+                    "chain=${ref?.chainKeyHex?.take(8)} index=${ref?.index} " +
+                    "reason=${if (ref == null) "unparsable_envelope" else "chain_not_persisted"}",
+            )
+            if (!reencryptRowInPlace(row, conversationId, recipientPublicKeyHex)) return false
+        }
+        messagingLog(MessagingLogLevel.WARN, "RETRY_TRACE outbox_settle_budget_exhausted conv=$convTag")
+        return false
+    }
+
+    /**
+     * Settles every recoverable row and drains committed predecessors while
+     * the caller owns the conversation's outbound permit. A false result is a
+     * fail-closed barrier: callers must not encrypt, mutate local product
+     * state, or submit a successor.
+     */
+    private suspend fun settleAndDrainOutbox(
+        permit: OutboundPermit,
+        recipientPublicKeyHex: String,
+        onResent: () -> Unit = {},
+    ): Boolean {
+        val conversationId = permit.conversationId
+        permit.requireConversation(conversationId)
+        var budget = retryableQueuedRows(messageRepository.getMessages(conversationId)).size + 1
+        while (budget-- > 0) {
+            if (!settleOutbox(conversationId, recipientPublicKeyHex)) return false
+            val queued = retryableQueuedRows(messageRepository.getMessages(conversationId))
+            if (queued.isEmpty()) return true
+            val chains = loadPersistedChains(conversationId)
+            val head = when (val order = orderOutbox(queued, ::storedEnvelopeRef, chains)) {
+                is OutboxOrder.Unprovable -> {
+                    messagingLog(
+                        MessagingLogLevel.WARN,
+                        "RETRY_TRACE outbox_order_unprovable conv=${conversationId.take(12)} " +
+                            "queued=${queued.size} reason=${order.reason} action=hold",
+                    )
+                    return false
+                }
+                is OutboxOrder.Ordered -> order.rows.first()
+            }
+            val (row, ref) = head
+            if (outboxRecoveryFor(ref, chains) != OutboxRecovery.RESEND_STORED) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "RETRY_TRACE outbox_drain_stopped id=${row.id.take(12)}… " +
+                        "conv=${conversationId.take(12)} reason=head_not_committed_after_settle",
+                )
+                return false
+            }
+            if (!resendStoredEnvelope(row, recipientPublicKeyHex)) {
+                messagingLog(
+                    MessagingLogLevel.WARN,
+                    "RETRY_TRACE outbox_drain_stopped id=${row.id.take(12)}… " +
+                        "conv=${conversationId.take(12)} reason=relay_send_return_false",
+                )
+                return false
+            }
+            messageRepository.updateStatus(row.id, MessageStatus.SENT)
+            onResent()
+            messagingLog(
+                MessagingLogLevel.INFO,
+                "RETRY_TRACE outbox_resent id=${row.id.take(12)}… conv=${conversationId.take(12)} " +
+                    "chain=${ref.chainKeyHex.take(8)} index=${ref.index}",
+            )
+        }
+        return retryableQueuedRows(messageRepository.getMessages(conversationId)).isEmpty()
+    }
+
     override suspend fun retryWaitingMessages(source: String): Result<Int> = runCatching {
         // Snapshot the WAITING set first so a successful retry that
         // mutates state doesn't shift the iteration cursor underneath us.
@@ -5800,25 +6585,30 @@ class DefaultMessagingService(
             .map { it.id }
         var attempts = 0
         for (convId in convIds) {
-            val msgs = messageRepository.getMessages(convId)
-                .filter { it.status == MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE }
-            if (msgs.isEmpty()) continue
+            withOutboundPermit(convId) { permit ->
+                val conv = conversationRepository.getConversation(convId)
+                    ?: return@withOutboundPermit
+                if (!settleAndDrainOutbox(permit, conv.theirPublicKeyHex) { attempts++ }) {
+                    return@withOutboundPermit
+                }
 
-            val conv = conversationRepository.getConversation(convId) ?: continue
-            for (m in msgs) {
-                attempts++
-                // Drop the placeholder row first — sendMessage will
-                // re-insert with real ciphertext on success, or
-                // re-insert another WAITING row on continued failure.
-                messageRepository.deleteMessage(m.id)
-                sendMessage(
-                    OutgoingMessage(
-                        id = m.id,
-                        conversationId = conv.id,
-                        recipientPublicKeyHex = conv.theirPublicKeyHex,
-                        text = m.plaintextCache.orEmpty(),
-                    ),
-                )
+                val waiting = messageRepository.getMessages(convId)
+                    .filter { it.status == MessageStatus.WAITING_FOR_RECIPIENT_BUNDLE }
+                for (message in waiting) {
+                    attempts++
+                    // The private under-permit core avoids recursively acquiring
+                    // the non-reentrant outbound mutex.
+                    messageRepository.deleteMessage(message.id)
+                    sendMessageUnderPermit(
+                        OutgoingMessage(
+                            id = message.id,
+                            conversationId = conv.id,
+                            recipientPublicKeyHex = conv.theirPublicKeyHex,
+                            text = message.plaintextCache.orEmpty(),
+                        ),
+                        permit,
+                    )
+                }
             }
         }
         // DWS-UX.1 (2026-06-17): tag every retry sweep with the
@@ -5835,38 +6625,47 @@ class DefaultMessagingService(
         attempts
     }
 
+    private suspend fun sendControlPayload(
+        conversationId: String,
+        recipientPublicKeyHex: String,
+        payload: MessagePayload,
+        afterSubmitted: suspend () -> Unit = {},
+    ): Result<Unit> = withOutboundPermit(conversationId) { permit ->
+        val result = sendSealedPayloadUnderPermit(
+            permit,
+            payload,
+            conversationId,
+            recipientPublicKeyHex,
+        )
+        if (result.isFailure) {
+            result
+        } else {
+            try {
+                afterSubmitted()
+                Result.success(Unit)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                Result.failure(failure)
+            }
+        }
+    }
+
     override suspend fun deleteMessageForBoth(
         messageId: String,
         conversationId: String,
         recipientPublicKeyHex: String,
-    ): Result<Unit> = runCatching {
-        val payload = json.encodeToString(
-            MessagePayload(
-                text = "",
-                sentAt = Clock.System.now().toEpochMilliseconds(),
-                senderUsername = identity.username,
-                type = MessagePayload.TYPE_DELETE,
-                targetMessageId = messageId,
-            )
-        ).encodeToByteArray()
-        val encrypted = encryptUnderLock(
-            conversationId = conversationId,
-            recipientPublicKeyHex = recipientPublicKeyHex,
-            plaintext = payload,
-        )
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-        transport.send(
-            RelayMessage.Send(
-                to = recipientPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                ),
-                payload = MessagePadding.pad(ciphertext).encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
+    ): Result<Unit> = sendControlPayload(
+        conversationId,
+        recipientPublicKeyHex,
+        MessagePayload(
+            text = "",
+            sentAt = Clock.System.now().toEpochMilliseconds(),
+            senderUsername = identity.username,
+            type = MessagePayload.TYPE_DELETE,
+            targetMessageId = messageId,
+        ),
+    ) {
         messageRepository.deleteMessage(messageId)
     }
 
@@ -5874,69 +6673,34 @@ class DefaultMessagingService(
         timerSecs: Long,
         conversationId: String,
         recipientPublicKeyHex: String,
-    ): Result<Unit> = runCatching {
-        val payload = json.encodeToString(
-            MessagePayload(
-                text = "",
-                sentAt = Clock.System.now().toEpochMilliseconds(),
-                senderUsername = identity.username,
-                type = MessagePayload.TYPE_DISAPPEARING_TIMER,
-                disappearingTimerSecs = timerSecs,
-            )
-        ).encodeToByteArray()
-        val encrypted = encryptUnderLock(
-            conversationId = conversationId,
-            recipientPublicKeyHex = recipientPublicKeyHex,
-            plaintext = payload,
-        )
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-        transport.send(
-            RelayMessage.Send(
-                to = recipientPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                ),
-                payload = MessagePadding.pad(ciphertext).encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
-    }
+    ): Result<Unit> = sendControlPayload(
+        conversationId,
+        recipientPublicKeyHex,
+        MessagePayload(
+            text = "",
+            sentAt = Clock.System.now().toEpochMilliseconds(),
+            senderUsername = identity.username,
+            type = MessagePayload.TYPE_DISAPPEARING_TIMER,
+            disappearingTimerSecs = timerSecs,
+        ),
+    )
 
     override suspend fun editMessageForBoth(
         messageId: String,
         newText: String,
         conversationId: String,
         recipientPublicKeyHex: String,
-    ): Result<Unit> = runCatching {
-        val payload = json.encodeToString(
-            MessagePayload(
-                text = newText,
-                sentAt = Clock.System.now().toEpochMilliseconds(),
-                senderUsername = identity.username,
-                type = MessagePayload.TYPE_EDIT,
-                targetMessageId = messageId,
-            )
-        ).encodeToByteArray()
-        val encrypted = encryptUnderLock(
-            conversationId = conversationId,
-            recipientPublicKeyHex = recipientPublicKeyHex,
-            plaintext = payload,
-        )
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-        transport.send(
-            RelayMessage.Send(
-                to = recipientPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                ),
-                payload = MessagePadding.pad(ciphertext).encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
+    ): Result<Unit> = sendControlPayload(
+        conversationId,
+        recipientPublicKeyHex,
+        MessagePayload(
+            text = newText,
+            sentAt = Clock.System.now().toEpochMilliseconds(),
+            senderUsername = identity.username,
+            type = MessagePayload.TYPE_EDIT,
+            targetMessageId = messageId,
+        ),
+    ) {
         messageRepository.updateMessageText(messageId, newText)
     }
 
@@ -5945,13 +6709,15 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
         emoji: String,
-    ): Result<Unit> = runCatching {
+    ): Result<Unit> {
         messagingLog(
             MessagingLogLevel.INFO,
             "sendReaction: target=${messageId.take(12)}… emoji=${emoji.ifEmpty { "<remove>" }} " +
                 "to=${recipientPublicKeyHex.take(16)}…",
         )
-        val payload = json.encodeToString(
+        return sendControlPayload(
+            conversationId,
+            recipientPublicKeyHex,
             MessagePayload(
                 text = "",
                 sentAt = Clock.System.now().toEpochMilliseconds(),
@@ -5959,38 +6725,21 @@ class DefaultMessagingService(
                 type = MessagePayload.TYPE_REACTION,
                 targetMessageId = messageId,
                 emoji = emoji,
-            )
-        ).encodeToByteArray()
-        val encrypted = encryptUnderLock(
-            conversationId = conversationId,
-            recipientPublicKeyHex = recipientPublicKeyHex,
-            plaintext = payload,
-        )
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-        transport.send(
-            RelayMessage.Send(
-                to = recipientPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                ),
-                payload = MessagePadding.pad(ciphertext).encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
-        // Also apply locally so the sender sees their own reaction immediately
-        val repo = reactionRepository
-        if (repo != null) {
-            if (emoji.isEmpty()) {
-                repo.deleteReaction(messageId, identity.publicKeyHex)
-            } else {
-                repo.upsertReaction(
-                    messageId = messageId,
-                    senderKeyHex = identity.publicKeyHex,
-                    emoji = emoji,
-                    createdAt = Clock.System.now().toEpochMilliseconds(),
-                )
+            ),
+        ) {
+            // Also apply locally so the sender sees their own reaction immediately
+            val repo = reactionRepository
+            if (repo != null) {
+                if (emoji.isEmpty()) {
+                    repo.deleteReaction(messageId, identity.publicKeyHex)
+                } else {
+                    repo.upsertReaction(
+                        messageId = messageId,
+                        senderKeyHex = identity.publicKeyHex,
+                        emoji = emoji,
+                        createdAt = Clock.System.now().toEpochMilliseconds(),
+                    )
+                }
             }
         }
     }
@@ -6000,35 +6749,18 @@ class DefaultMessagingService(
         conversationId: String,
         recipientPublicKeyHex: String,
         pinned: Boolean,
-    ): Result<Unit> = runCatching {
-        val payload = json.encodeToString(
-            MessagePayload(
-                text = "",
-                sentAt = Clock.System.now().toEpochMilliseconds(),
-                senderUsername = identity.username,
-                type = MessagePayload.TYPE_PIN,
-                targetMessageId = messageId,
-                pinned = pinned,
-            )
-        ).encodeToByteArray()
-        val encrypted = encryptUnderLock(
-            conversationId = conversationId,
-            recipientPublicKeyHex = recipientPublicKeyHex,
-            plaintext = payload,
-        )
-        val ciphertext = json.encodeToString(encrypted).encodeToByteArray()
-        @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
-        transport.send(
-            RelayMessage.Send(
-                to = recipientPublicKeyHex,
-                from = "",
-                sealedSender = Base64.encode(
-                    SealedSender.seal(identity.publicKeyHex, hexToBytes(recipientPublicKeyHex))
-                ),
-                payload = MessagePadding.pad(ciphertext).encodeBase64(),
-                messageId = uuid4().toString(),
-            )
-        )
+    ): Result<Unit> = sendControlPayload(
+        conversationId,
+        recipientPublicKeyHex,
+        MessagePayload(
+            text = "",
+            sentAt = Clock.System.now().toEpochMilliseconds(),
+            senderUsername = identity.username,
+            type = MessagePayload.TYPE_PIN,
+            targetMessageId = messageId,
+            pinned = pinned,
+        ),
+    ) {
         // Apply locally so the sender sees the pin state immediately. We
         // are the pinner — record our own pubkey so the banner reads
         // "Pinned by you" on this side.

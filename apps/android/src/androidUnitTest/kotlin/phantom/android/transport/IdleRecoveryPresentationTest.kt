@@ -10,6 +10,7 @@ import phantom.core.transport.RestStateMachine
 import phantom.core.transport.TransportState
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 /**
  * Input-driven checks: these simulate transport signals, not a network
@@ -75,13 +76,27 @@ class IdleRecoveryPresentationTest {
         sm.frame(1)
         assertEquals(RestMode.WsCandidate, sm.current)
         assertEquals(ConnectionUiState.LimitedRealtime, present(sm))
-        now = 59_999
+        // residual N1 / F3: the commit dwell is
+        // RestStateMachine.CANDIDATE_COMMIT_MS, which is the 60 s external
+        // recovery limit MINUS the 5 s margin — the promotion has to land
+        // inside that limit, not exactly on it. Derived here rather than
+        // written as a literal so the test cannot drift from the constant.
+        val dwell = RestStateMachine.CANDIDATE_COMMIT_MS
+        assertEquals(
+            RestStateMachine.ROUTE_RECOVERY_EXTERNAL_LIMIT_MS - RestStateMachine.ROUTE_RECOVERY_MARGIN_MS,
+            dwell,
+        )
+        now = dwell - 1
         sm.tick(1)
         assertEquals(RestMode.WsCandidate, sm.current)
-        now = 60_000
+        now = dwell
         sm.tick(1)
         assertEquals(RestMode.WsActive, sm.current)
         assertEquals(ConnectionUiState.Online, present(sm))
+        assertTrue(
+            dwell < RestStateMachine.ROUTE_RECOVERY_EXTERNAL_LIMIT_MS,
+            "recovery must complete before the external limit, not at it",
+        )
     }
 
     @Test

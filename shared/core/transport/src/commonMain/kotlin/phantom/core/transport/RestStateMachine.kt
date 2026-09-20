@@ -1886,7 +1886,24 @@ class RestStateMachine(
          * showed isolated successful Frame.Text on otherwise-broken
          * sessions, so a single Frame.Text is not enough to commit.
          */
-        const val CANDIDATE_COMMIT_MS: Long = 60_000L
+        /**
+         * residual N1 / F3 — the external recovery oracle: `WS_ACTIVE` must be
+         * reached within this long after the last effective route change. This
+         * is the product limit and is NOT to be raised to make a run pass.
+         */
+        const val ROUTE_RECOVERY_EXTERNAL_LIMIT_MS: Long = 60_000L
+
+        /**
+         * residual N1 / F3 — the part of the external limit reserved for the
+         * work that happens before the candidate is even entered: socket
+         * reconnect, handshake and scheduling. The field run measured 1 817 ms
+         * of reconnect latency after the route change; the dwell below must
+         * leave at least that much room, or promotion can never fit the limit.
+         */
+        const val ROUTE_RECOVERY_MARGIN_MS: Long = 5_000L
+
+        const val CANDIDATE_COMMIT_MS: Long =
+            ROUTE_RECOVERY_EXTERNAL_LIMIT_MS - ROUTE_RECOVERY_MARGIN_MS
 
         /**
          * 3.6 Fast REST degradation (2026-06-18) — lower bound of the

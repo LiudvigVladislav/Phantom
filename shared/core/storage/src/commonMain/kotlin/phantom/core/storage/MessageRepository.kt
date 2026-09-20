@@ -32,6 +32,32 @@ interface MessageRepository {
 
     suspend fun getMessageById(id: String): MessageEntity?
     suspend fun insertMessage(entity: MessageEntity)
+
+    /**
+     * residual N1 Revision 4 — rewrite the envelope of an EXISTING message in
+     * place, without removing the row.
+     *
+     * Why this exists: `insertMessage` is `INSERT OR IGNORE`, so re-encrypting
+     * a queued message cannot take effect through it. Revision 3 solved that
+     * by deleting the row and re-inserting it inside one transaction; the row
+     * was never observably absent, but everything that hangs off it was lost.
+     * `reaction.message_id` cascades on delete, and the re-insert did not
+     * carry `pinned`, `saved` or `pinned_by_pubkey`. Both losses were silent.
+     *
+     * The contract is therefore narrower than "replace": only the columns a
+     * re-encryption changes are written — `ciphertext`, `plaintextCache`,
+     * `sent`, `status`, `expiresAtMs`. The identity columns (`id`,
+     * `conversationId`, `createdAt`) and the user-state columns (`pinned`,
+     * `saved`, pin author) are untouched, and any dependent row survives.
+     *
+     * The implementation must THROW when no row with this id exists, or when
+     * the update did not take effect. A caller re-encrypting a queued message
+     * runs this inside `encryptUnderLock`'s `afterEncrypt`, before the ratchet
+     * state is committed, so a failure here leaves the stored envelope and the
+     * ratchet state both untouched and the message recoverable on the next
+     * sweep. Creating a row here instead would hide the loss of the original.
+     */
+    suspend fun replaceMessage(entity: MessageEntity)
     suspend fun updateStatus(messageId: String, status: MessageStatus)
     suspend fun updateMessageText(messageId: String, text: String)
     suspend fun deleteMessage(messageId: String)

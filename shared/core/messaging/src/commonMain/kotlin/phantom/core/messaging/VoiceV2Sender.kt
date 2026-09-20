@@ -34,6 +34,17 @@ import phantom.core.transport.MediaUploadTransport
  * Network retry: 5 attempts per chunk, backoff [1 s, 3 s, 8 s, 20 s, 60 s].
  * Auth refresh: max 3 cycles per chunk; on exhaustion returns failure.
  */
+interface VoiceUploadSender {
+    suspend fun uploadVoice(
+        audioBytes: ByteArray,
+        durationMs: Long,
+        mime: String,
+        onSplit: ((total: Int) -> Unit)? = null,
+        onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
+        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)? = null,
+    ): Result<VoiceManifestV2>
+}
+
 @OptIn(ExperimentalEncodingApi::class)
 class VoiceV2Sender(
     private val mediaCrypto: MediaCrypto,
@@ -53,7 +64,7 @@ class VoiceV2Sender(
      * the new value applies only to the NEXT voice.
      */
     private val chunkSizeProvider: () -> Int = { MediaChunker.TARGET_RAW_CHUNK_BYTES },
-) {
+) : VoiceUploadSender {
 
     /**
      * Encrypt [audioBytes] then upload all ciphertext chunks.
@@ -62,13 +73,13 @@ class VoiceV2Sender(
      *         [Result.failure] on terminal error (auth exhausted, quota, conflict,
      *         repeated network failure). Callers mark the local row FAILED on failure.
      */
-    suspend fun uploadVoice(
+    override suspend fun uploadVoice(
         audioBytes: ByteArray,
         durationMs: Long,
         mime: String,
-        onSplit: ((total: Int) -> Unit)? = null,
-        onChunkUploaded: ((sent: Int, total: Int) -> Unit)? = null,
-        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)? = null,
+        onSplit: ((total: Int) -> Unit)?,
+        onChunkUploaded: ((sent: Int, total: Int) -> Unit)?,
+        onEarlyManifest: (suspend (manifest: VoiceManifestV2) -> Unit)?,
     ): Result<VoiceManifestV2> = try {
         // PR-MEDIA-UPLOAD-CANCEL2 — explicit try/catch. The previous
         // `runCatching` swallowed CancellationException as part of

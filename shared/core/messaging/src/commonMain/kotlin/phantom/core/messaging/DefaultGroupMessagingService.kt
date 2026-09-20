@@ -6,6 +6,7 @@ package phantom.core.messaging
 import com.benasher44.uuid.uuid4
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -121,7 +122,7 @@ class DefaultGroupMessagingService(
         audioBytes: ByteArray,
         durationMs: Long,
         mimeType: String,
-    ): Result<Unit> {
+    ): Result<GroupSendReport> {
         if (audioBytes.size > DefaultMessagingService.MAX_AUDIO_BYTES) {
             return Result.failure(IllegalArgumentException(
                 "Group audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap " +
@@ -133,47 +134,68 @@ class DefaultGroupMessagingService(
         val total = kotlin.math.ceil(audioBytes.size.toDouble() / DefaultMessagingService.AUDIO_CHUNK_BYTES).toInt()
             .coerceAtLeast(1)
 
-        return runCatching {
-            for (i in 0 until total) {
-                val start = i * DefaultMessagingService.AUDIO_CHUNK_BYTES
-                val end = minOf((i + 1) * DefaultMessagingService.AUDIO_CHUNK_BYTES, audioBytes.size)
+        val result = runCatching {
+            val recipients = groupRepo.getMembers(groupId)
+                .filter { it.pubkeyHex != myPubKeyHex }
+            val report = collectGroupAudioReport(
+                recipientPublicKeys = recipients.map { it.pubkeyHex },
+                chunkCount = total,
+            ) { chunkIndex, activeRecipientPublicKeys ->
+                val start = chunkIndex * DefaultMessagingService.AUDIO_CHUNK_BYTES
+                val end = minOf((chunkIndex + 1) * DefaultMessagingService.AUDIO_CHUNK_BYTES, audioBytes.size)
                 val slice = audioBytes.copyOfRange(start, end)
                 @OptIn(ExperimentalEncodingApi::class)
                 val chunkBase64 = Base64.encode(slice)
-
+                val activeRecipients = recipients.filter {
+                    it.pubkeyHex in activeRecipientPublicKeys
+                }
                 sendGroupChunk(
                     groupId = groupId,
                     chunkId = chunkId,
-                    chunkIndex = i,
+                    chunkIndex = chunkIndex,
                     chunkTotal = total,
                     chunkBase64 = chunkBase64,
                     durationMs = durationMs,
                     mimeType = mimeType,
-                )
+                    recipients = activeRecipients,
+                ).associate { it.recipientPublicKeyHex to it.result }
             }
 
             // Store one outgoing message row locally so the sender's UI shows
-            // the voice note immediately. The full reassembled base64 is stored
-            // so AudioBubble can play it back without waiting for chunk acks.
-            @OptIn(ExperimentalEncodingApi::class)
-            val fullBase64 = Base64.encode(audioBytes)
-            val now = Clock.System.now().toEpochMilliseconds()
-            val msgId = uuid4().toString()
-            messageRepo.insertMessage(
-                MessageEntity(
-                    id = msgId,
-                    conversationId = groupId,
-                    ciphertext = ByteArray(0),
-                    plaintextCache = "[AUDIO:$fullBase64]",
-                    sent = true,
-                    status = MessageStatus.QUEUED,
-                    createdAt = now,
-                    expiresAtMs = null,
+            // the voice note when at least one recipient accepted every chunk.
+            // A partial report remains visible to the UI, but a total failure
+            // does not create a misleading sent bubble.
+            if (report.submittedCount > 0) {
+                @OptIn(ExperimentalEncodingApi::class)
+                val fullBase64 = Base64.encode(audioBytes)
+                val now = Clock.System.now().toEpochMilliseconds()
+                val msgId = uuid4().toString()
+                messageRepo.insertMessage(
+                    MessageEntity(
+                        id = msgId,
+                        conversationId = groupId,
+                        ciphertext = ByteArray(0),
+                        plaintextCache = "[AUDIO:$fullBase64]",
+                        sent = true,
+                        status = MessageStatus.QUEUED,
+                        createdAt = now,
+                        expiresAtMs = null,
+                    )
                 )
-            )
-            groupRepo.updateLastMessage(groupId, "[voice]", now)
+                groupRepo.updateLastMessage(groupId, "[voice]", now)
+            }
+            report
         }
+        result.exceptionOrNull()?.let { failure ->
+            if (failure is CancellationException) throw failure
+        }
+        return result
     }
+
+    private data class ChunkRecipientResult(
+        val recipientPublicKeyHex: String,
+        val result: Result<Unit>,
+    )
 
     private suspend fun sendGroupChunk(
         groupId: String,
@@ -183,8 +205,8 @@ class DefaultGroupMessagingService(
         chunkBase64: String,
         durationMs: Long,
         mimeType: String,
-    ) {
-        val members = groupRepo.getMembers(groupId)
+        recipients: List<GroupMemberEntity>,
+    ): List<ChunkRecipientResult> {
         val bundleEntity = senderKeyRepo.get(groupId, myPubKeyHex)
         var bundle = if (bundleEntity != null) {
             SenderKey.Bundle(
@@ -231,8 +253,11 @@ class DefaultGroupMessagingService(
 
         // ADR-026: per-recipient group audio chunks go through the Double
         // Ratchet + Sealed Sender pipeline like every other group envelope.
-        members.filter { it.pubkeyHex != myPubKeyHex }.forEach { member ->
-            messagingService.sendGroupControlMessage(member.pubkeyHex, outerPayload)
+        return recipients.map { member ->
+            ChunkRecipientResult(
+                recipientPublicKeyHex = member.pubkeyHex,
+                result = messagingService.sendGroupControlMessage(member.pubkeyHex, outerPayload),
+            )
         }
     }
 
