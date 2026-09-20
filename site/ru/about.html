@@ -314,8 +314,8 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
   <div class="about-block reveal">
     <div class="label">Как это устроено</div>
         <h2>Построен из допущения, что сеть враждебна.</h2>
-        <p>Сообщения защищены сквозным шифрованием — собственной реализацией Double Ratchet поверх libsodium, с <strong>ключами личности ED25519, которые генерируются на устройстве</strong>. Технология sealed sender не даёт серверу-ретранслятору узнать, кто с кем общается.</p>
-        <p>Чтобы оставаться доступным под цензурой, приложение использует несколько транспортов — включая трафик, неотличимый от обычного HTTPS, — и автоматически переключается, когда маршрут блокируется. Весь код открыт под лицензией <strong>AGPL-3.0</strong>.</p>
+        <p>Сообщения защищены сквозным шифрованием — собственной реализацией Double Ratchet поверх libsodium, с <strong>ключами личности ED25519, которые генерируются на устройстве</strong>. Конверты в стиле sealed sender уменьшают объём метаданных об отправителе. Ретранслятор всё ещё видит время, размеры сообщений, аутентифицированные сессии и адресатов доставки.</p>
+        <p>Чтобы оставаться доступным под цензурой, приложение использует несколько транспортов и автоматически переключается, когда маршрут блокируется. REALITY изменяет наблюдаемый вид трафика, чтобы он был похож на обычный TLS, но не обеспечивает анонимность и не гарантирует обход любой блокировки. Весь код открыт под лицензией <strong>AGPL-3.0-or-later</strong>.</p>
         <p style="color:var(--ts);font-size:0.88rem;margin-top:6px">Допущения, противники и то, что вне модели угроз, зафиксированы отдельно — <a href="https://github.com/LiudvigVladislav/Phantom/blob/master/docs/threat-model/Threat_Model_v0.md" style="color:var(--cyan);text-decoration:none">полная модель угроз →</a></p>
     <div class="principles">
       <div class="principle reveal">
@@ -325,8 +325,8 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
       </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L3 6v6c0 5 3.5 8 9 10 5.5-2 9-5 9-10V6z"/></svg></div>
-        <h4>Без графа метаданных</h4>
-        <p>Sealed sender скрывает, кто с кем общается.</p>
+        <h4>Меньше раскрываемых метаданных</h4>
+        <p>Видимость для ретранслятора и остаточные риски корреляции описаны в модели угроз.</p>
       </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" opacity="0.5"/></svg></div>
@@ -335,17 +335,17 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
       </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></div>
-        <h4>Открыт и проверяем</h4>
-        <p>AGPL-3.0. Без скрытых компонентов.</p>
+        <h4>Открыт и доступен для проверки</h4>
+        <p>Исходный код под AGPL-3.0-or-later и границы защиты опубликованы; независимый аудит ещё не проводился.</p>
       </div>
     </div>
   </div>
 
   <div class="about-block reveal">
     <div class="label">Кто его делает</div>
-        <h2>Один разработчик. Без инвесторов. Без компромиссов.</h2>
-        <p>PHANTOM делает один независимый разработчик под <strong>Willen LLC (Вайоминг, США)</strong>. Это не стартап в погоне за ростом, и проект не привлекает венчурных денег.</p>
-        <p>Им движет простое убеждение: приватное, устойчивое к цензуре общение — это инфраструктура, которую люди заслуживают иметь, и она должна быть открытой, проверяемой и подотчётной только своим пользователям.</p>
+        <h2>Независимая разработка и прозрачное финансирование.</h2>
+        <p>PHANTOM разрабатывает Владислав Людвиг через <strong>Willen LLC</strong>, компанию штата Вайоминг, созданную в июне 2025 года. Проект пока не получает выручку и ищет целевые гранты и pre-seed инвестиции для внешней проверки безопасности, beta-тестирования, iOS-разработки и операционного runway.</p>
+        <p>Финансирование не меняет лицензию AGPL и не отменяет публикацию модели угроз, известных ограничений и границ защиты.</p>
   </div>
 
   <div class="about-cta">
@@ -357,7 +357,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span>
+                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Открытый код · Границы защиты опубликованы.</span>
       </div>
     </div>
     <div class="foot-links">

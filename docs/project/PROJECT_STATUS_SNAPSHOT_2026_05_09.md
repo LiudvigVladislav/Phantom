@@ -9,6 +9,14 @@
 > with per-user Ed25519 signed challenge (#72)`. Repository in clean state, no
 > active branches, no pending merges.
 
+> **Terminology note, 2026-09-17.** Entries below use "production-validated"
+> and similar wording for what were founder-run acceptance runs against the
+> live deployment, usually on a single device, carrier and date. That was an
+> internal shorthand, not a claim of independent or universal validation. The
+> history is left as written; the label is clarified here rather than edited
+> out. Every recorded run, including the failures, is listed in
+> [`docs/field-tests/TEST_MATRIX.md`](../field-tests/TEST_MATRIX.md).
+
 ---
 
 ## 1. Architecture overview (current state)

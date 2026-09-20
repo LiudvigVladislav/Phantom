@@ -43,7 +43,7 @@ The `-PpollSkipLpAndPp=1` Gradle property flows into the existing `localOrEnv("p
 
 Per the existing Tele2 smoke runbook at `docs/tracks/trek2-stage2b-b-tele2-smoke.md`, replace the APK path with the relevant Round 12 APK. Pre-flight steps (SHA check, install, variant flag, S6 trigger sanity, WiFi off) are unchanged.
 
-In every condition below the Tecno serial is `103603734A004351` and the laptop runs Windows / PowerShell. `adb` is at `$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe`.
+In every condition below the Tecno serial is `<redacted-device-serial>` and the laptop runs Windows / PowerShell. `adb` is at `$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe`.
 
 Before EACH condition: re-verify the Tecno's PrivacyMode is `Standard`. The diagnostic strip in C2 only fires in Standard.
 
@@ -70,15 +70,15 @@ A `breaker_closed` line MAY appear in C0 if breaker happened to be Open from a p
 
 2. On laptop — install APK-A baseline:
    ```powershell
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 install -r "D:\VL Stories Studio\Phantom\apps\android\build\outputs\apk\debug\android-debug-A-baseline.apk"
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> install -r "D:\VL Stories Studio\Phantom\apps\android\build\outputs\apk\debug\android-debug-A-baseline.apk"
    ```
 
 3. On Tecno — force-stop, relaunch, confirm Standard mode in app settings, wait for home screen.
 
 4. On laptop — clear logcat + start capture in a dedicated PS window:
    ```powershell
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -c
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c0-baseline.log" -Encoding utf8
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -c
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c0-baseline.log" -Encoding utf8
    ```
 
 5. From peer device, send 5 short text messages over 30 seconds to the Tecno's identity. Wait 60 seconds.
@@ -131,8 +131,8 @@ $log = "C:\temp\c0-baseline.log"
 
 5. Start capture in dedicated PS window:
    ```powershell
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -c
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c1-kill-switch-repro.log" -Encoding utf8
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -c
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c1-kill-switch-repro.log" -Encoding utf8
    ```
 
 6. Sustained Tele2 LTE outbound for 10 minutes. Do not exceed — this is a discriminator run, not a 30-minute smoke.
@@ -172,7 +172,7 @@ Capture the precise observation. C2 will use the SAME network state with a small
 
 2. On laptop — install APK-B diagnostic over APK-A:
    ```powershell
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 install -r "D:\VL Stories Studio\Phantom\apps\android\build\outputs\apk\debug\android-debug-B-diagnostic.apk"
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> install -r "D:\VL Stories Studio\Phantom\apps\android\build\outputs\apk\debug\android-debug-B-diagnostic.apk"
    ```
 
 3. On Tecno — force-stop, relaunch, **CONFIRM the app is in Standard mode** (the strip only fires when `PrivacyMode == Standard`). If a user accidentally has Private or Ghost, the strip stays off and C2 collapses into C1 — invalid run.
@@ -181,8 +181,8 @@ Capture the precise observation. C2 will use the SAME network state with a small
 
 5. Start capture:
    ```powershell
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -c
-   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s 103603734A004351 logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c2-small-body-diagnostic.log" -Encoding utf8
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -c
+   & "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" -s <redacted-device-serial> logcat -v threadtime PhantomHybrid:I PhantomMessaging:I Phantom/S6Debug:I '*:S' | Out-File "C:\temp\c2-small-body-diagnostic.log" -Encoding utf8
    ```
 
 6. Sustained Tele2 LTE outbound for 10 minutes.
@@ -223,7 +223,7 @@ Round 12 field re-test — branch HEAD c2a77d17 — <date>
 
 APK-A SHA-256: e47d9f7a45ba9ef06637234ac7d1648a94a9f0ca1b5749975eb506c538df5881
 APK-B SHA-256: 7985e40e0b6ec469a05a232b3a345214b32c0ec0ae03678f2311e201f4459357
-Device: TECNO BF7-12 (serial 103603734A004351)
+Device: TECNO BF7-12 (serial <redacted-device-serial>)
 Carrier: Tele2 LTE
 Field site: Иркутская (or alternate; specify)
 

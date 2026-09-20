@@ -306,8 +306,8 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 
   <div class="about-block reveal">
     <div class="label">How it's built</div>    <h2>Built assuming the network is hostile.</h2>
-        <p>Messages are end-to-end encrypted with a custom Double Ratchet implementation over libsodium, using <strong>ED25519 identity keys generated on your device</strong>. A sealed-sender design keeps the relay from learning who is talking to whom.</p>
-        <p>To stay reachable under censorship, the app routes through several transports — including traffic that is indistinguishable from ordinary HTTPS — and falls back automatically when a route is blocked. Everything is open-source under <strong>AGPL-3.0</strong>.</p>
+        <p>Messages are end-to-end encrypted with a custom Double Ratchet implementation over libsodium, using <strong>ED25519 identity keys generated on your device</strong>. Sealed-sender-style envelopes reduce sender metadata exposed to the relay. The relay still observes timing, message size, authenticated sessions, and delivery destinations.</p>
+        <p>To stay reachable under censorship, the app routes through several transports and falls back automatically when a route is blocked. REALITY changes the wire pattern but does not provide anonymity or guaranteed censorship bypass. Everything is open-source under <strong>AGPL-3.0-or-later</strong>.</p>
         <p style="color:var(--ts);font-size:0.88rem;margin-top:6px">The assumptions, adversaries, and out-of-scope cases are written down in full — <a href="https://github.com/LiudvigVladislav/Phantom/blob/master/docs/threat-model/Threat_Model_v0.md" style="color:var(--cyan);text-decoration:none">read the threat model →</a></p>
         <div class="principles">
       <div class="principle reveal">
@@ -315,20 +315,20 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
         <h4>On-device keys</h4>        <p>Identity keys never leave your phone.</p>      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L3 6v6c0 5 3.5 8 9 10 5.5-2 9-5 9-10V6z"/></svg></div>
-        <h4>No metadata graph</h4>        <p>Sealed sender hides who talks to whom.</p>      </div>
+        <h4>Reduced metadata exposure</h4>        <p>Relay visibility and remaining correlation risks are documented in the threat model.</p>      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" opacity="0.5"/></svg></div>
         <h4>Routes around blocks</h4>        <p>Multiple transports, automatic fallback.</p>      </div>
       <div class="principle reveal">
         <div class="pi"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></div>
-        <h4>Open & auditable</h4>        <p>AGPL-3.0. No hidden components.</p>      </div>
+        <h4>Open and inspectable</h4>        <p>AGPL-3.0-or-later source and security boundaries are public; independent audit is still pending.</p>      </div>
     </div>
   </div>
 
   <div class="about-block reveal">
-    <div class="label">Who builds it</div>    <h2>One developer. No investors. No compromise.</h2>
-        <p>PHANTOM is built by a single independent developer, operating through <strong>Willen LLC (Wyoming, USA)</strong>. It is not a startup chasing growth and takes no venture funding.</p>
-        <p>The project is driven by a simple conviction: that private, censorship-resistant communication is infrastructure people deserve to have — and that it should be open, auditable, and answerable to no one but its users.</p>
+    <div class="label">Who builds it</div>    <h2>Independent development with transparent funding.</h2>
+        <p>PHANTOM is built by Vladislav Liudvig through <strong>Willen LLC</strong>, a Wyoming company formed in June 2025. The project is currently pre-revenue and is seeking mission-aligned grants and pre-seed investment for external security review, beta testing, iOS development, and operating runway.</p>
+        <p>Funding will not change the AGPL license or remove the published threat model, known issues, and security boundaries.</p>
       </div>
 
   <div class="about-cta">
@@ -338,7 +338,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · No metadata, no compromise.</span>
+        <span>Maintained by Willen LLC · Wyoming, USA<br>AGPL-3.0-or-later · Open source · Security boundaries published.</span>
               </div>
     </div>
     <div class="foot-links">

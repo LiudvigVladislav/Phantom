@@ -278,7 +278,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 .methods-sub{color:var(--ts);font-size:0.9rem;text-align:center;margin-bottom:34px}
 .dn-cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px}
 @media(max-width:640px){.dn-cards{grid-template-columns:1fr}}
-.donate-card{border:1px solid var(--border-sub);border-radius:14px;background:var(--elev);padding:26px 24px;display:flex;flex-direction:column}
+.donate-card{border:1px solid var(--border-sub);border-radius:14px;background:var(--elev);padding:26px 24px;display:flex;flex-direction:column;min-width:0}
 .dc-head{display:flex;align-items:center;gap:12px;margin-bottom:8px}
 .dc-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .dc-icon.lp{background:#f6c915}.dc-icon.bmc{background:#ffdd00}
@@ -290,8 +290,8 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 .dc-desc{color:var(--ts);font-size:0.82rem;line-height:1.5;margin-bottom:18px;flex:1}
 .dc-btn{font-family:var(--mono);font-weight:500;font-size:0.8rem;padding:12px 20px;border-radius:8px;text-decoration:none;text-align:center;background:var(--cyan);color:#04141a;border:1px solid var(--cyan);transition:all .25s;cursor:pointer}
 .dc-btn:hover{background:var(--cyan-hover);box-shadow:0 0 24px rgba(0,212,255,0.25)}
-.addr-row{display:flex;align-items:center;gap:8px;background:var(--surface-deep);border:1px solid var(--border-sub);border-radius:8px;padding:10px 12px;margin-top:auto}
-.addr-row code{font-family:var(--mono);font-size:0.68rem;color:var(--ts);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.addr-row{display:flex;align-items:center;gap:8px;background:var(--surface-deep);border:1px solid var(--border-sub);border-radius:8px;padding:10px 12px;margin-top:auto;min-width:0}
+.addr-row code{font-family:var(--mono);font-size:0.68rem;color:var(--ts);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
 .copy-btn{font-family:var(--mono);font-size:0.68rem;color:var(--cyan);background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.25);border-radius:6px;padding:6px 11px;cursor:pointer;flex-shrink:0;transition:all .2s}
 .copy-btn:hover{background:rgba(0,212,255,0.16)}
 .copy-btn.copied{background:var(--success);color:#04140a;border-color:var(--success)}
@@ -318,7 +318,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
 </nav><header class="dn-hero">
   <div class="wrap">
     <h1>Поддержать PHANTOM</h1>
-        <p>PHANTOM не берёт венчурных денег и не продаёт данные пользователей. Если вы хотели бы помочь проекту расти, любая поддержка помогает ему двигаться дальше.</p>
+        <p>PHANTOM развивается независимо и не продаёт данные пользователей. Пожертвования поддерживают разработку открытого проекта. Инвестиционные предложения рассматриваются отдельно и требуют письменных документов и compliance review.</p>
   </div>
 </header><div class="dn-wrap">
   <div class="funds-head reveal">
@@ -352,7 +352,7 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
         <div class="dc-icon lp"><svg width="22" height="22" viewBox="0 0 24 24" fill="#1a1a00"><path d="M8 4h5.5a4.5 4.5 0 0 1 0 9H11v7H8zm3 6h2.2a1.7 1.7 0 0 0 0-3.4H11z"/></svg></div>
         <div><div class="dc-title">Liberapay</div><div class="dc-meta">РЕГУЛЯРНО · 0% КОМИССИЯ</div></div>
       </div>
-            <p class="dc-desc">Некоммерческая платформа с открытым кодом для регулярной еженедельной или ежемесячной поддержки. Карта или PayPal. Донор по умолчанию анонимен.</p>
+            <p class="dc-desc">Некоммерческая платформа с открытым кодом для регулярной еженедельной или ежемесячной поддержки. Карта или PayPal. Имя можно скрыть с публичной страницы проекта в настройках Liberapay; платёжный провайдер всё равно обрабатывает необходимые данные аккаунта и платежа.</p>
       <a href="https://liberapay.com/Phantom-messenger/" class="dc-btn">Поддержать на Liberapay ↗</a>
     </div>
     <div class="donate-card reveal" data-delay="80">
@@ -407,14 +407,14 @@ footer{position:relative;z-index:2;border-top:1px solid var(--border-sub);margin
     <p class="crypto-note">Всегда проверяйте адрес после вставки. Криптовалютные транзакции необратимы.</p>
 
   <div class="big-wire reveal">
-        <p>Для крупных пожертвований или поддержки в рамках грантов можно согласовать банковский перевод через <a href="mailto:legal@phntm.pro">legal@phntm.pro</a>.</p>
+        <p>Для грантов и крупных пожертвований: <a href="mailto:legal@phntm.pro">legal@phntm.pro</a>. Для инвестиционных предложений: <a href="mailto:hello@phntm.pro?subject=PHANTOM%20investment%20inquiry">hello@phntm.pro</a>. Не отправляйте инвестиционные средства на опубликованные адреса для пожертвований.</p>
   </div>
 </div><footer>
   <div class="foot-inner">
     <div>
       <div class="foot-brand">PHANTOM</div>
       <div class="foot-meta">
-                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Без метаданных, без компромиссов.</span>
+                <span>Проект Willen LLC · Вайоминг, США<br>AGPL-3.0-or-later · Открытый код · Границы защиты опубликованы.</span>
       </div>
     </div>
     <div class="foot-links">

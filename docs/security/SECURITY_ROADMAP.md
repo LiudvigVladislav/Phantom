@@ -15,6 +15,14 @@
 > stack. If you spot a finding that is not listed, please report it
 > per [`SECURITY.md`](../../SECURITY.md).
 
+> **Terminology note, 2026-09-17.** Entries below use "production-validated"
+> and similar wording for what were founder-run acceptance runs against the
+> live deployment, usually on a single device, carrier and date. That was an
+> internal shorthand, not a claim of independent or universal validation. The
+> history is left as written; the label is clarified here rather than edited
+> out. Every recorded run, including the failures, is listed in
+> [`docs/field-tests/TEST_MATRIX.md`](../field-tests/TEST_MATRIX.md).
+
 ---
 
 ## Status legend

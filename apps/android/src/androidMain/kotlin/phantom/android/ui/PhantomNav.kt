@@ -385,7 +385,13 @@ fun ComingSoonOverlay(kicker: String = "COMING SOON") {
                     ),
             )
             Text(
-                text = "Secure peer-to-peer calls are in development.\nNo servers, no metadata, end-to-end keys only.",
+                // Wording must match the published threat model: PHANTOM routes
+                // through a relay, and that relay sees routing metadata. The
+                // wording this replaced promised a serverless, metadata-free
+                // architecture the project does not have.
+                text = "Secure calls are in development.\n" +
+                    "Messages are end-to-end encrypted. The relay still sees " +
+                    "limited routing metadata — see the threat model.",
                 fontSize = 13.sp,
                 color = TextDim,
                 textAlign = TextAlign.Center,

@@ -363,12 +363,13 @@ services:
   # ──────────────────────────────────────────────────────────────────────
   # Xray-core — VLESS+REALITY outer transport (Stage 5E.A).
   #
-  # REALITY makes the TLS handshake byte-for-byte identical to a handshake
-  # with www.microsoft.com (Xray transparently reverse-proxies the genuine
-  # cert chain on cache-miss). TSPU classifies the resulting flow as
-  # benign big-tech CDN traffic and applies no throttle — bypassing the
-  # "16-kilobyte curtain" empirically confirmed to break our WebTunnel
-  # bridges on Hetzner AND FlokiNET (Test 11/12/13, 2026-05-05/06).
+  # REALITY reshapes the TLS handshake to resemble one to
+  # www.microsoft.com (Xray transparently reverse-proxies the genuine
+  # cert chain on cache-miss). In Tests 11/12/13 on 2026-05-05/06, TSPU did
+  # not throttle the resulting flow, where the "16-kilobyte curtain" had
+  # broken our WebTunnel bridges on Hetzner AND FlokiNET. That is what those
+  # runs showed on those networks and dates; it is not a guarantee of
+  # indistinguishability or of freedom from throttling.
   #
   # Stage 5E.A scope (this PR):
   #   - Server-only. No Android changes.

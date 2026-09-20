@@ -38,7 +38,7 @@ Sibling tracks: `docs/tracks/ws-health-state.md` (PR-WS-HEALTH-STATE1, currently
 
 ### F1. Direct WS death rhythm is carrier-independent
 
-Three field runs against the same Tecno (`103603734A004351`) on three different network paths show one pattern:
+Three field runs against the same Tecno (`<redacted-device-serial>`) on three different network paths show one pattern:
 
 | Test | Network | Sessions | Avg lifetime | Killer signature |
 |---|---|---|---|---|

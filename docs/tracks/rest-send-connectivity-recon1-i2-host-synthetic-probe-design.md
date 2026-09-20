@@ -82,7 +82,7 @@ Probe rate is 1/second to give dense temporal coverage of any failure burst (the
 
 ```powershell
 $ADB = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-$TECNO = "103603734A004351"
+$TECNO = "<redacted-device-serial>"
 & $ADB -s $TECNO logcat -c
 & $ADB -s $TECNO logcat -v time *:I | ForEach-Object {
     $ts = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")

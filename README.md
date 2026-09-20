@@ -3,7 +3,8 @@
 # PHANTOM
 
 End-to-end encrypted Android messaging with censorship-resistant transports,
-production-validated against carrier-grade DPI (TSPU) on real Russian mobile networks.
+field-tested against carrier-grade DPI (TSPU) on specific Russian mobile networks
+and configurations. These tests do not establish universal resistance to filtering.
 
 [![Status: Alpha 2](https://img.shields.io/badge/status-alpha%202-orange)](#status)
 [![Release: v0.1.0-alpha.2](https://img.shields.io/badge/release-v0.1.0--alpha.2-orange)](https://github.com/LiudvigVladislav/Phantom/releases/tag/v0.1.0-alpha.2)
@@ -127,8 +128,8 @@ The current design aims to protect against:
 - a compromised relay reading correctly encrypted messages or media;
 - retrospective decryption of earlier traffic after later ratchet-state
   compromise;
-- endpoint blocking and DPI through production-validated pluggable transport
-  paths;
+- endpoint blocking and DPI through pluggable transport paths that have been
+  field-tested on specific networks and dates;
 - offline extraction from a locked Android device through encrypted local
   storage and platform-keystore protection.
 
@@ -218,6 +219,14 @@ PHANTOM is maintained by Willen LLC and accepts support through:
 The machine-readable funding file also documents current budgets and project
 funding goals. Repository Sponsor links are configured in
 [`.github/FUNDING.yml`](.github/FUNDING.yml).
+
+PHANTOM is open to mission-aligned grants and pre-seed investment. Investment
+inquiries: `hello@phntm.pro`. Payment-provider and cryptocurrency addresses in
+`funding.json` are donation channels only and must not be used to purchase
+equity, tokens, revenue rights, or other investment interests.
+
+Current stage: pre-revenue Alpha 2; four known testers; no public end-user APK
+and no independent security audit as of September 2026.
 
 ## License
 
