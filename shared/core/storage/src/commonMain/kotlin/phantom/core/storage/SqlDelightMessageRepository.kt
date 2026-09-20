@@ -66,6 +66,65 @@ class SqlDelightMessageRepository(
             )
         }
 
+    override suspend fun replaceMessage(entity: MessageEntity): Unit =
+        withContext(Dispatchers.IO) {
+            // residual N1 Revision 4 — the row is UPDATED, never removed.
+            //
+            // Revision 3 did this as a delete-then-insert inside one
+            // transaction. Atomicity kept the message row from being
+            // observably absent, but it did not protect what hangs off the
+            // row: `reaction.message_id` references `message(id) ON DELETE
+            // CASCADE`, so wherever foreign keys are enforced the delete took
+            // every reaction with it and the insert did not bring them back.
+            // Independently of foreign keys, `insertMessage` does not carry
+            // `pinned`, `saved` or `pinned_by_pubkey`, so the re-insert reset
+            // all three to their defaults. Both losses were silent.
+            //
+            // The update is still issued inside a transaction together with
+            // its verification, so a row that vanished between the outbox's
+            // decision and this write cannot be papered over: the caller
+            // throws before `encryptUnderLock` commits the new ratchet state,
+            // and the outbox keeps the old envelope for the next sweep.
+            //
+            // The queries are issued directly inside `db.transaction { }`, as
+            // the atomic commit repositories do, because a context switch
+            // inside it would leave the transaction's thread.
+            db.transaction {
+                val before = db.messageQueries.getMessageById(entity.id).executeAsOneOrNull()
+                    ?: throw NoSuchElementException(
+                        "replaceMessage: no row with id=${entity.id}; refusing to create one, " +
+                            "because the caller is replacing an envelope on an existing message",
+                    )
+                db.messageQueries.updateMessageEnvelope(
+                    ciphertext = entity.ciphertext,
+                    plaintextCache = entity.plaintextCache,
+                    sent = if (entity.sent) 1L else 0L,
+                    status = entity.status.name.lowercase(),
+                    expiresAtMs = entity.expiresAtMs,
+                    id = entity.id,
+                )
+                val after = db.messageQueries.getMessageById(entity.id).executeAsOneOrNull()
+                    ?: throw IllegalStateException("replaceMessage: row id=${entity.id} disappeared during update")
+                if (!after.ciphertext.contentEquals(entity.ciphertext) ||
+                    after.status != entity.status.name.lowercase()
+                ) {
+                    throw IllegalStateException(
+                        "replaceMessage: update did not take effect for id=${entity.id}",
+                    )
+                }
+                // The identity columns must be exactly what they were: this
+                // operation replaces an envelope, not a message.
+                if (after.id != before.id ||
+                    after.conversation_id != before.conversation_id ||
+                    after.created_at != before.created_at
+                ) {
+                    throw IllegalStateException(
+                        "replaceMessage: identity columns changed for id=${entity.id}",
+                    )
+                }
+            }
+        }
+
     override suspend fun updateStatus(messageId: String, status: MessageStatus): Unit =
         withContext(Dispatchers.IO) {
             db.messageQueries.updateMessageStatus(

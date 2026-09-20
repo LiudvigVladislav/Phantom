@@ -108,6 +108,110 @@ import phantom.core.transport.TransportState
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
 private const val PREFS_NAME = "phantom_prefs"
 
+/**
+ * residual N1 / F1 (2026-09-18) — where "scroll to the newest message" is.
+ *
+ * `getMessages` is `ORDER BY created_at ASC`, so `messages` and `chatItems` are
+ * oldest-first. The list renders `displayItems = chatItems.asReversed()` under
+ * `reverseLayout = true`, preceded by `item(key = "__bottom_anchor__")`, so in
+ * LazyColumn coordinates index 0 is the visual bottom — the newest end.
+ *
+ * `animateScrollToItem(messages.lastIndex)` therefore scrolled to the OLDEST
+ * message, not the newest: it used the oldest-first index of one list against a
+ * state attached to the reversed one. The Mac campaign measured exactly that —
+ * `CHAT_CACHE emit count=240` and `CHAT_LIST open_state total=252
+ * firstVisible=239`, and 240 - 1 = 239. The user's own `S1-warmup` and the three
+ * messages that arrived while the phone was locked were all off-screen, far
+ * below the viewport, until the chat was closed and reopened.
+ *
+ * The pinned-message jump at the other call site already computes its target
+ * with `displayItems.indexOfFirst { … }`, i.e. in the correct coordinates; that
+ * is the shape every scroll target must have.
+ */
+internal const val NEWEST_ITEM_INDEX = 0
+
+/**
+ * residual N1 / F1 — how close to the bottom counts as "following".
+ *
+ * Index 0 is the bottom anchor and index 1 the newest message, so a viewport at
+ * 0 or 1 is at the live end. A small tolerance absorbs a date separator sitting
+ * between the anchor and the newest message.
+ */
+internal const val FOLLOW_NEWEST_THRESHOLD = 2
+
+/**
+ * residual N1 / F1 — may an inbound message move the viewport?
+ *
+ * Only when the reader is already at the live end. Someone scrolled back into
+ * history must not be yanked to the bottom every time a message arrives; that
+ * is the behaviour the owner ruled out, and it is why this is a decision rather
+ * than an unconditional scroll. A send by the user is a different case: the user
+ * acted, so those call sites scroll unconditionally.
+ */
+internal fun shouldFollowNewest(firstVisibleItemIndex: Int): Boolean =
+    firstVisibleItemIndex <= FOLLOW_NEWEST_THRESHOLD
+
+/**
+ * residual N1 Revision 4 — what the composer holds, as a value.
+ *
+ * Only the two things a send consumes: the text and which message it replies
+ * to. The reply is held by id so a comparison "is this still what the user had
+ * when they tapped send" is exact and cheap.
+ */
+internal data class ComposerState(val text: String, val replyToId: String?)
+
+/** What tapping send should do, given the composer and whether one is already in flight. */
+internal sealed interface ComposerSendDecision {
+    /** Start a send for exactly these captured values. */
+    data class Send(val captured: ComposerState) : ComposerSendDecision
+
+    /** Do nothing: there is nothing to send, or a send is already running. */
+    data class Ignore(val reason: String) : ComposerSendDecision
+}
+
+internal fun composerSendDecision(current: ComposerState, sendInFlight: Boolean): ComposerSendDecision =
+    when {
+        sendInFlight -> ComposerSendDecision.Ignore("send_already_in_flight")
+        current.text.isBlank() -> ComposerSendDecision.Ignore("empty_text")
+        else -> ComposerSendDecision.Send(ComposerState(current.text.trim(), current.replyToId))
+    }
+
+/**
+ * residual N1 Revision 4 / owner decision A1 — what the composer holds after a
+ * send settles.
+ *
+ * Before this, `ChatScreen` cleared the text and the reply target the instant
+ * the user tapped send and then ignored the returned `Result`. Revision 3 gave
+ * `sendMessage` a reason to fail before writing any row — an outbox that
+ * cannot be settled must not let a new message take a ratchet index — and on
+ * that path the user's message existed nowhere at all: not on screen, not in
+ * the database, not on the wire.
+ *
+ * The rule the owner chose:
+ *
+ *  - **failure** keeps whatever the composer holds now. Not the captured
+ *    values: what the user is looking at. Restoring the capture would
+ *    overwrite anything they typed while the send was in flight.
+ *  - **success** clears only what the user has not touched since. If the text
+ *    still equals what was sent, it goes; if they started a new message on top
+ *    of it, it stays. The reply target is judged the same way, separately,
+ *    because a user can change one without the other.
+ *
+ * No new persisted status and no database field: this is composer state, it
+ * lives as long as the screen does, and a failed send leaves no row behind.
+ */
+internal fun composerAfterSend(
+    current: ComposerState,
+    captured: ComposerState,
+    succeeded: Boolean,
+): ComposerState {
+    if (!succeeded) return current
+    return ComposerState(
+        text = if (current.text == captured.text) "" else current.text,
+        replyToId = if (current.replyToId == captured.replyToId) null else current.replyToId,
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -288,6 +392,11 @@ fun ChatScreen(
     // Reply / Edit / Forward state
     var replyToMessage by remember { mutableStateOf<MessageEntity?>(null) }
     var editingMessage by remember { mutableStateOf<MessageEntity?>(null) }
+    // residual N1 Revision 4 — ephemeral in-flight guard for the new-message
+    // send. It lives exactly as long as the screen; no persisted status and no
+    // database field is involved. Its only job is that a second tap while the
+    // first send is still running cannot enqueue a second message.
+    var sendInFlight by remember { mutableStateOf(false) }
     var forwardText by remember { mutableStateOf<String?>(null) }
     var forwardSenderLabel by remember { mutableStateOf("") }
     var conversations by remember { mutableStateOf<List<phantom.core.storage.ConversationEntity>>(emptyList()) }
@@ -446,7 +555,7 @@ fun ChatScreen(
                         ).show()
                     } else {
                         reloadMessages()
-                        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                        listState.animateScrollToItem(NEWEST_ITEM_INDEX)
                     }
                 } finally {
                     voiceSendInProgress = false
@@ -572,6 +681,9 @@ fun ChatScreen(
                     return@collect
                 }
 
+                // residual N1 / F1: decide BEFORE the list grows, otherwise the
+                // new items have already shifted what "at the bottom" means.
+                val wasFollowing = shouldFollowNewest(listState.firstVisibleItemIndex)
                 reloadMessages()
                 val conv = container.conversationRepo.getConversation(conversationId)
                 if (conv != null) {
@@ -584,7 +696,9 @@ fun ChatScreen(
                         conversationId, conv.theirPublicKeyHex, sendReceipts,
                     )
                 }
-                listState.animateScrollToItem(messages.lastIndex.coerceAtLeast(0))
+                if (wasFollowing) {
+                    listState.animateScrollToItem(NEWEST_ITEM_INDEX)
+                }
             }
         }
     }
@@ -1052,45 +1166,100 @@ fun ChatScreen(
                         finalizeAndSendVoice()
                     },
                     onSend = {
-                        val text = inputText.trim()
-                        if (text.isEmpty()) return@InputBar
                         val editMsg = editingMessage
-                        val replyMsg = replyToMessage   // capture BEFORE clearing
-                        inputText = ""
-                        showEmojiPanel = false
-                        editingMessage = null
-                        replyToMessage = null
-                        scope.launch {
-                            if (editMsg != null) {
-                                // Save edit locally and notify recipient
-                                val conversation = container.conversationRepo.getConversation(conversationId)
-                                    ?: return@launch
-                                container.messagingService?.editMessageForBoth(
-                                    messageId = editMsg.id,
-                                    newText = text,
-                                    conversationId = conversationId,
-                                    recipientPublicKeyHex = conversation.theirPublicKeyHex,
-                                )
-                                reloadMessages()
-                            } else {
-                                // Send new message (with optional reply prefix)
-                                val finalText = if (replyMsg != null) {
-                                    "> ${replyMsg.plaintextCache?.take(60) ?: "•••"}\n$text"
-                                } else {
-                                    text
-                                }
-                                val conversation = container.conversationRepo.getConversation(conversationId)
-                                    ?: return@launch
-                                container.messagingService?.sendMessage(
-                                    OutgoingMessage(
-                                        id = uuid4().toString(),
+                        if (editMsg != null) {
+                            // Edit path, unchanged: an edit rewrites a message
+                            // that already exists, so there is nothing to lose
+                            // by clearing the composer first.
+                            val text = inputText.trim()
+                            if (text.isNotEmpty()) {
+                                inputText = ""
+                                showEmojiPanel = false
+                                editingMessage = null
+                                replyToMessage = null
+                                scope.launch {
+                                    val conversation = container.conversationRepo.getConversation(conversationId)
+                                        ?: return@launch
+                                    container.messagingService?.editMessageForBoth(
+                                        messageId = editMsg.id,
+                                        newText = text,
                                         conversationId = conversationId,
                                         recipientPublicKeyHex = conversation.theirPublicKeyHex,
-                                        text = finalText,
                                     )
-                                )
-                                reloadMessages()
-                                if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+                                    reloadMessages()
+                                }
+                            }
+                        } else {
+                            // residual N1 Revision 4 / owner decision A1 — the
+                            // new-message path does NOT clear the composer
+                            // before it knows the send succeeded. `sendMessage`
+                            // can legitimately fail before writing any row, and
+                            // clearing first left the user's message nowhere.
+                            val replyMsg = replyToMessage
+                            val decision = composerSendDecision(
+                                current = ComposerState(inputText, replyMsg?.id),
+                                sendInFlight = sendInFlight,
+                            )
+                            if (decision is ComposerSendDecision.Send) {
+                                val captured = decision.captured
+                                sendInFlight = true
+                                showEmojiPanel = false
+                                scope.launch {
+                                    val outcome = try {
+                                        val conversation = container.conversationRepo
+                                            .getConversation(conversationId)
+                                        if (conversation == null) {
+                                            Result.failure(
+                                                IllegalStateException("conversation $conversationId is missing"),
+                                            )
+                                        } else {
+                                            val finalText = if (replyMsg != null) {
+                                                "> ${replyMsg.plaintextCache?.take(60) ?: "•••"}\n${captured.text}"
+                                            } else {
+                                                captured.text
+                                            }
+                                            container.messagingService?.sendMessage(
+                                                OutgoingMessage(
+                                                    id = uuid4().toString(),
+                                                    conversationId = conversationId,
+                                                    recipientPublicKeyHex = conversation.theirPublicKeyHex,
+                                                    text = finalText,
+                                                )
+                                            ) ?: Result.failure(
+                                                IllegalStateException("messaging service is not available"),
+                                            )
+                                        }
+                                    } finally {
+                                        sendInFlight = false
+                                    }
+
+                                    // Only values the user has not touched since
+                                    // the tap are cleared; on failure nothing is.
+                                    val settled = composerAfterSend(
+                                        current = ComposerState(inputText, replyToMessage?.id),
+                                        captured = captured,
+                                        succeeded = outcome.isSuccess,
+                                    )
+                                    inputText = settled.text
+                                    if (settled.replyToId == null) {
+                                        replyToMessage = null
+                                    }
+
+                                    if (outcome.isSuccess) {
+                                        reloadMessages()
+                                        listState.animateScrollToItem(NEWEST_ITEM_INDEX)
+                                    } else {
+                                        Log.w(
+                                            "PhantomChat",
+                                            "SEND_UI send_failed conv=${conversationId.take(12)} " +
+                                                "reason=${outcome.exceptionOrNull()?.let { it::class.simpleName }} " +
+                                                "composer_retained=true",
+                                        )
+                                        snackbarHostState.showSnackbar(
+                                            "Message not sent. Your text is still here — tap send to try again.",
+                                        )
+                                    }
+                                }
                             }
                         }
                     }

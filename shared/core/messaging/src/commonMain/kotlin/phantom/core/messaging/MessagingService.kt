@@ -6,6 +6,23 @@ package phantom.core.messaging
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 
+/**
+ * A control envelope could not reach the transport because the outbound
+ * conversation barrier or encryption failed. The ratchet was not advanced by
+ * the rejected operation and no transport send was attempted.
+ */
+class OutboundNotAttemptedException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalStateException(message, cause)
+
+/**
+ * A control envelope was encrypted, but the transport did not report an
+ * immediate submission. The transport may have queued it for retry; this
+ * does not claim relay receipt or recipient delivery.
+ */
+class OutboundSubmissionException(message: String) : IllegalStateException(message)
+
 interface MessagingService {
     /**
      * Becomes true once the initial prekey-bundle bootstrap succeeds (or

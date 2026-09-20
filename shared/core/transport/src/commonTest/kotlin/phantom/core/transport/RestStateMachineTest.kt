@@ -477,7 +477,18 @@ class RestStateMachineTest {
 
     @Test
     fun the_commit_dwell_is_the_locked_constant() {
-        assertEquals(60_000L, RestStateMachine.CANDIDATE_COMMIT_MS)
+        // residual N1 / F3 (2026-09-18): the dwell was pinned at 60_000L, which
+        // is the whole external post-route-change budget. Promotion happens at
+        // route_change + reconnect + dwell, so an exactly-60 s dwell made the
+        // 60 s oracle unreachable — the field run landed at 61 823 ms. The
+        // dwell is now derived from the external limit minus a reserved margin.
+        // It is still locked; the locked value changed, and the derivation is
+        // asserted so the dwell can never silently reclaim the whole budget.
+        assertEquals(55_000L, RestStateMachine.CANDIDATE_COMMIT_MS)
+        assertEquals(
+            RestStateMachine.ROUTE_RECOVERY_EXTERNAL_LIMIT_MS - RestStateMachine.ROUTE_RECOVERY_MARGIN_MS,
+            RestStateMachine.CANDIDATE_COMMIT_MS,
+        )
     }
 
     // ── 3.6 Fast REST degradation: signature and telemetry ───────────────────

@@ -79,6 +79,18 @@ private class FakeMessageRepository(
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
         statusUpdates[messageId] = status
     }
+    override suspend fun replaceMessage(entity: MessageEntity) {
+        // residual N1 Revision 4: in-place envelope rewrite, never a delete.
+        val i = messages.indexOfFirst { it.id == entity.id }
+        if (i == -1) throw NoSuchElementException("replaceMessage: no row with id=${entity.id}")
+        messages[i] = messages[i].copy(
+            ciphertext = entity.ciphertext,
+            plaintextCache = entity.plaintextCache,
+            sent = entity.sent,
+            status = entity.status,
+            expiresAtMs = entity.expiresAtMs,
+        )
+    }
     override suspend fun updateMessageText(messageId: String, text: String) {
         val i = messages.indexOfFirst { it.id == messageId }
         if (i != -1) messages[i] = messages[i].copy(plaintextCache = text)
@@ -3228,14 +3240,12 @@ class DefaultMessagingServiceTest {
     }
 
     @Test
-    fun markConversationRead_failedReceiptDoesNotKeepBadgeUnread() = runTest {
+    fun markConversationRead_failedReceiptIsDroppedAndDoesNotKeepBadgeUnread() = runTest {
         val transport = FakeRelayTransport().apply {
             beforeSend = { throw IllegalStateException("receipt transport failed") }
         }
         val (service, conversations) = unreadReceiptFixture(this, transport)
-        kotlin.test.assertFailsWith<IllegalStateException> {
-            service.markConversationRead("conv-1", "ccdd", true)
-        }
+        service.markConversationRead("conv-1", "ccdd", true)
         assertEquals(0, conversations.getConversation("conv-1")?.unreadCount)
         assertTrue(transport.sent.isEmpty())
     }

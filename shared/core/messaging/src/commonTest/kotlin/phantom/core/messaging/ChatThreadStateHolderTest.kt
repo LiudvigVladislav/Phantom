@@ -202,6 +202,7 @@ class ChatThreadStateHolderTest {
 
         override suspend fun getMessageById(id: String): MessageEntity? = null
         override suspend fun insertMessage(entity: MessageEntity) {}
+        override suspend fun replaceMessage(entity: MessageEntity) {}
         override suspend fun updateStatus(messageId: String, status: MessageStatus) {}
         override suspend fun updateMessageText(messageId: String, text: String) {}
         override suspend fun deleteMessage(messageId: String) {}

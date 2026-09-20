@@ -190,13 +190,26 @@ fun GroupChatScreen(
                                         groupId, bytes, recordingDurationMs, mimeType
                                     )
                                     if (result != null && result.isFailure) {
+                                        val message = if (result.exceptionOrNull() is IllegalArgumentException) {
+                                            "Голосовое сообщение слишком длинное"
+                                        } else {
+                                            "Не удалось отправить голосовое сообщение"
+                                        }
                                         android.widget.Toast.makeText(
                                             context,
-                                            "Голосовое сообщение слишком длинное",
+                                            message,
                                             android.widget.Toast.LENGTH_SHORT,
                                         ).show()
                                     } else {
                                         reloadMessages()
+                                        val report = result?.getOrNull()
+                                        if (report != null && report.incompleteCount > 0) {
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                "Отправлено ${report.submitted} из ${report.recipientCount}",
+                                                android.widget.Toast.LENGTH_LONG,
+                                            ).show()
+                                        }
                                     }
                                 }
                             }

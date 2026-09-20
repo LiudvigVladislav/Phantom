@@ -171,6 +171,22 @@ private class FakeMessageRepository : MessageRepository {
         if (index != -1) store[index] = store[index].copy(status = status)
     }
 
+    override suspend fun replaceMessage(entity: MessageEntity) {
+        // residual N1 Revision 4: rewrite the envelope in place. Identity and
+        // user-state columns stay as they were, and a missing row is an error
+        // rather than an insert, matching the SQLDelight contract.
+        val index = store.indexOfFirst { it.id == entity.id }
+        if (index == -1) throw NoSuchElementException("replaceMessage: no row with id=${entity.id}")
+        store[index] = store[index].copy(
+            ciphertext = entity.ciphertext,
+            plaintextCache = entity.plaintextCache,
+            sent = entity.sent,
+            status = entity.status,
+            expiresAtMs = entity.expiresAtMs,
+        )
+        bump()
+    }
+
     override suspend fun updateMessageText(messageId: String, text: String) {
         val index = store.indexOfFirst { it.id == messageId }
         if (index != -1) store[index] = store[index].copy(plaintextCache = text)
