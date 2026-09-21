@@ -105,14 +105,13 @@ kotlin {
                 implementation(project(":shared:core:crypto"))
                 implementation(libs.sqldelight.runtime)
                 implementation(libs.sqldelight.sqlite.driver)
-                // The JVM bindings ask for a JNA version whose Android
-                // artifact this build has never resolved. Pin the one that
-                // is already part of the build instead; JNA is only the
-                // native-library loader for libsodium here.
-                implementation("com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings-jvm:0.9.2") {
+                // Keep JVM-hosted Android tests on the same JNA release as
+                // the packaged app. JNA is the native-library loader for
+                // libsodium here.
+                implementation("com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings-jvm:0.9.5") {
                     exclude(group = "net.java.dev.jna")
                 }
-                implementation("net.java.dev.jna:jna:5.12.1")
+                implementation(libs.jna)
             }
         }
 
@@ -136,12 +135,17 @@ kotlin {
             implementation(libs.camerax.view)
             implementation(libs.mlkit.barcode)
             implementation(libs.libsodium.bindings)
+            // Override libsodium-bindings' legacy JNA 5.12.1. JNA 5.17+
+            // includes the complete Android 16 KB page-size fix; keeping the
+            // version explicit prevents the old libjnidispatch.so from being
+            // repackaged if the transitive dependency changes again.
+            implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
             implementation(libs.sqlcipher.android)
             implementation("androidx.biometric:biometric:1.1.0")
             // WebRTC for voice calls — provides PeerConnectionFactory, AudioTrack, IceCandidate.
             // stream/webrtc-android wraps Google's pre-built libwebrtc .aar so we avoid
             // compiling WebRTC from source (which requires depot_tools + Linux host).
-            implementation("io.getstream:stream-webrtc-android:1.1.1")
+            implementation("io.getstream:stream-webrtc-android:1.2.3")
             implementation(project(":shared:core:identity"))
             implementation(project(":shared:core:crypto"))
             implementation(project(":shared:core:storage"))
