@@ -51,7 +51,7 @@ import phantom.android.transport.ConnectionUiState
  * [ConnectionUiState], derived in `AppContainer` from
  * `(wsTransport.state, hybridTransport.stateMachine.state)`. The
  * `RestActive`/`WsCandidate` cases now show `"Online · Limited realtime"` /
- * `"Online · Recovering"` instead of misleading `"Connecting…"` /
+ * `"Online · Verifying realtime"` instead of misleading `"Connecting…"` /
  * `"Offline — messages queued"`. Aligns ChatList with the notification shade
  * overlay phrasing already in production at `PhantomMessagingService.kt:256`.
  *
@@ -147,7 +147,7 @@ fun ConnectionBanner(
             // is still in WsCandidate (60 s uptime OR outbound ACK round-trip
             // not yet observed). REST polling continues until promotion.
             // Amber so the user knows it is transitional, not fully stable.
-            label = "Online · Recovering"
+            label = "Online · Verifying realtime"
             dotColor = Warning
         }
         is ConnectionUiState.Connecting -> {

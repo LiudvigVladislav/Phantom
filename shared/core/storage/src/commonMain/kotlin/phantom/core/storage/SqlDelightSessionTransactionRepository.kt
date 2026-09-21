@@ -449,4 +449,53 @@ class SqlDelightSessionTransactionRepository(
             InboundCommitOutcome.Committed
         }
     }
+
+    override suspend fun commitInboundControlEvent(
+        conversationId: String,
+        envelopeId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+        action: ControlEventCommitRepository.Action,
+        advancedStateBlob: String,
+        stateTarget: InboundStateTarget,
+    ): InboundCommitOutcome = withContext(Dispatchers.IO) {
+        db.transactionWithResult {
+            val archiveTarget = stateTarget as? InboundStateTarget.Archive
+                ?: throw IllegalArgumentException("archived control commit requires an archive target")
+            val stored = db.receiveSessionArchiveQueries
+                .getArchive(archiveTarget.id, conversationId)
+                .executeAsOneOrNull()
+            if (stored == null || stored.revision != archiveTarget.revision || stored.expires_at_ms <= clock()) {
+                return@transactionWithResult InboundCommitOutcome.ArchiveUnavailable
+            }
+
+            val advanced = RatchetStateStorageCodec.encodeForStorage(advancedStateBlob, blobCipher)
+            if (archiveTarget.activate) {
+                db.receiveSessionArchiveQueries.deleteArchive(archiveTarget.id, conversationId)
+                replaceOrRetainActive(conversationId, advanced, false, nowMs)
+            } else {
+                db.receiveSessionArchiveQueries.advanceArchive(
+                    advanced,
+                    archiveTarget.id,
+                    conversationId,
+                    archiveTarget.revision,
+                )
+            }
+            transactionProbe("after_state")
+            db.applyControlEventAction(action)
+            transactionProbe("after_control")
+            db.processedEnvelopeQueries.markProcessed(
+                envelope_id = envelopeId,
+                conversation_id = conversationId,
+                sender_pubkey_hex = senderPubKeyHex,
+                payload_type = payloadType,
+                status = ProcessedEnvelopeRepository.Status.PROCESSED.wire,
+                created_at_ms = nowMs,
+            )
+            db.decryptFailedEnvelopeQueries.deleteByEnvelopeId(envelopeId)
+            transactionProbe("after_completion")
+            InboundCommitOutcome.Committed
+        }
+    }
 }

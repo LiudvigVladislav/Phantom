@@ -7,6 +7,54 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import phantom.core.storage.db.PhantomDatabase
 
+internal fun PhantomDatabase.applyControlEventAction(
+    action: ControlEventCommitRepository.Action,
+) {
+    when (action) {
+        is ControlEventCommitRepository.Action.DeleteMessage ->
+            messageQueries.deleteMessage(action.messageId)
+
+        is ControlEventCommitRepository.Action.EditMessageText ->
+            messageQueries.updateMessageText(
+                plaintext_cache = action.text,
+                id = action.messageId,
+            )
+
+        is ControlEventCommitRepository.Action.SetDisappearingTimer ->
+            conversationQueries.setDisappearingTimer(
+                secs = action.seconds,
+                id = action.conversationId,
+            )
+
+        is ControlEventCommitRepository.Action.UpsertReaction ->
+            reactionQueries.upsertReaction(
+                message_id = action.messageId,
+                sender_key_hex = action.senderKeyHex,
+                emoji = action.emoji,
+                created_at = action.createdAtMs,
+            )
+
+        is ControlEventCommitRepository.Action.DeleteReaction ->
+            reactionQueries.deleteReaction(
+                message_id = action.messageId,
+                sender_key_hex = action.senderKeyHex,
+            )
+
+        is ControlEventCommitRepository.Action.PinMessage ->
+            messageQueries.pinMessage(
+                pinned = if (action.pinned) 1L else 0L,
+                pinnedByPubkey = action.pinnedByPubkeyHex,
+                id = action.messageId,
+            )
+
+        is ControlEventCommitRepository.Action.MarkRead ->
+            messageQueries.updateMessageStatus(
+                status = MessageStatus.READ.name.lowercase(),
+                id = action.messageId,
+            )
+    }
+}
+
 /**
  * SqlDelight-backed [ControlEventCommitRepository] (N1-F1b R-N1.12).
  *
@@ -36,49 +84,7 @@ class SqlDelightControlEventCommitRepository(
         nowMs: Long,
     ): Unit = withContext(Dispatchers.IO) {
         db.transaction {
-            when (action) {
-                is ControlEventCommitRepository.Action.DeleteMessage ->
-                    db.messageQueries.deleteMessage(action.messageId)
-
-                is ControlEventCommitRepository.Action.EditMessageText ->
-                    db.messageQueries.updateMessageText(
-                        plaintext_cache = action.text,
-                        id = action.messageId,
-                    )
-
-                is ControlEventCommitRepository.Action.SetDisappearingTimer ->
-                    db.conversationQueries.setDisappearingTimer(
-                        secs = action.seconds,
-                        id = action.conversationId,
-                    )
-
-                is ControlEventCommitRepository.Action.UpsertReaction ->
-                    db.reactionQueries.upsertReaction(
-                        message_id = action.messageId,
-                        sender_key_hex = action.senderKeyHex,
-                        emoji = action.emoji,
-                        created_at = action.createdAtMs,
-                    )
-
-                is ControlEventCommitRepository.Action.DeleteReaction ->
-                    db.reactionQueries.deleteReaction(
-                        message_id = action.messageId,
-                        sender_key_hex = action.senderKeyHex,
-                    )
-
-                is ControlEventCommitRepository.Action.PinMessage ->
-                    db.messageQueries.pinMessage(
-                        pinned = if (action.pinned) 1L else 0L,
-                        pinnedByPubkey = action.pinnedByPubkeyHex,
-                        id = action.messageId,
-                    )
-
-                is ControlEventCommitRepository.Action.MarkRead ->
-                    db.messageQueries.updateMessageStatus(
-                        status = MessageStatus.READ.name.lowercase(),
-                        id = action.messageId,
-                    )
-            }
+            db.applyControlEventAction(action)
             db.processedEnvelopeQueries.markProcessed(
                 envelope_id = envelopeId,
                 conversation_id = conversationId,

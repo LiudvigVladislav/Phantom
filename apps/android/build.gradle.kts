@@ -19,15 +19,25 @@ plugins {
 }
 
 // Load release signing credentials from keystores/signing.properties (gitignored)
-// or fall back to SIGNING_* env vars (for CI). If neither is available, the
-// release build falls back to the debug signing config — lets contributors
-// build release APKs locally without access to the production key.
+// or SIGNING_* env vars (for CI). Release packaging fails closed when any
+// credential is absent; debug builds and JVM tests remain key-free.
 val signingProps = Properties().apply {
     val f = rootProject.file("keystores/signing.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
 fun signingValue(propertyKey: String, envKey: String): String? =
     signingProps.getProperty(propertyKey) ?: System.getenv(envKey)
+
+val releaseSigningStoreFile = signingValue("storeFile", "SIGNING_STORE_FILE")
+val releaseSigningStorePassword = signingValue("storePassword", "SIGNING_STORE_PASSWORD")
+val releaseSigningKeyAlias = signingValue("keyAlias", "SIGNING_KEY_ALIAS")
+val releaseSigningKeyPassword = signingValue("keyPassword", "SIGNING_KEY_PASSWORD")
+val releaseSigningConfigured = listOf(
+    releaseSigningStoreFile,
+    releaseSigningStorePassword,
+    releaseSigningKeyAlias,
+    releaseSigningKeyPassword,
+).all { !it.isNullOrBlank() }
 
 // Local dev overrides — values in local.properties or env vars override the
 // defaults below. local.properties is gitignored (Android Studio default).
@@ -159,6 +169,7 @@ kotlin {
 android {
     namespace = "phantom.android"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
+    compileSdkMinor = 1
 
     defaultConfig {
         applicationId = "phantom.android"
@@ -174,21 +185,12 @@ android {
 
     signingConfigs {
         create("release") {
-            val storeFileProp = signingValue("storeFile", "SIGNING_STORE_FILE")
-            val storePasswordProp = signingValue("storePassword", "SIGNING_STORE_PASSWORD")
-            val keyAliasProp = signingValue("keyAlias", "SIGNING_KEY_ALIAS")
-            val keyPasswordProp = signingValue("keyPassword", "SIGNING_KEY_PASSWORD")
-
-            if (storeFileProp != null && storePasswordProp != null &&
-                keyAliasProp != null && keyPasswordProp != null
-            ) {
-                storeFile = rootProject.file(storeFileProp)
-                storePassword = storePasswordProp
-                keyAlias = keyAliasProp
-                keyPassword = keyPasswordProp
+            if (releaseSigningConfigured) {
+                storeFile = rootProject.file(requireNotNull(releaseSigningStoreFile))
+                storePassword = requireNotNull(releaseSigningStorePassword)
+                keyAlias = requireNotNull(releaseSigningKeyAlias)
+                keyPassword = requireNotNull(releaseSigningKeyPassword)
             }
-            // If any field is null, this config is left unusable and release
-            // below falls back to the debug signing config.
         }
     }
 
@@ -1016,17 +1018,7 @@ android {
             // for release as well — outer transport is selected at runtime by
             // TransportManager + the user's Privacy Mode preference.
 
-            // Use the release key if keystores/signing.properties or SIGNING_*
-            // env vars supplied valid credentials; otherwise fall back to debug
-            // signing so contributors without the production key can still
-            // build a release APK locally (it just won't be Play Store-ready).
-            val releaseConfig = signingConfigs.getByName("release")
-            signingConfig = if (releaseConfig.storeFile != null) {
-                releaseConfig
-            } else {
-                logger.warn("No release keystore configured — falling back to debug signing for release build.")
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -1872,6 +1864,36 @@ val verifyR8KeepsGomobileJniSurface = tasks.register("verifyR8KeepsGomobileJniSu
                 "${strippedMisses.size}/${contract.size}.",
         )
     }
+}
+
+val verifyReleaseSigningConfigured by tasks.registering {
+    group = "verification"
+    description = "Fails release artifact builds unless production signing is fully configured."
+    doLast {
+        if (!releaseSigningConfigured) {
+            throw GradleException(
+                "Release signing is not configured. Provide all four values in " +
+                    "keystores/signing.properties or SIGNING_STORE_FILE, " +
+                    "SIGNING_STORE_PASSWORD, SIGNING_KEY_ALIAS and SIGNING_KEY_PASSWORD.",
+            )
+        }
+        val keyStore = rootProject.file(requireNotNull(releaseSigningStoreFile))
+        if (!keyStore.isFile) {
+            throw GradleException("Release keystore does not exist: ${keyStore.absolutePath}")
+        }
+    }
+}
+
+tasks.matching {
+    it.name in setOf(
+        "assembleRelease",
+        "packageRelease",
+        "bundleRelease",
+        "packageReleaseBundle",
+        "signReleaseBundle",
+    )
+}.configureEach {
+    dependsOn(verifyReleaseSigningConfigured)
 }
 
 tasks.matching { it.name == "assembleRelease" }.configureEach {

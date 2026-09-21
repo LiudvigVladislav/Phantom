@@ -348,7 +348,7 @@ class PhantomMessagingService : Service() {
                     phantom.android.transport.ConnectionUiState.LimitedRealtime ->
                         "Online via $transportName · Limited realtime · $modeLabel"
                     phantom.android.transport.ConnectionUiState.Recovering ->
-                        "Online via $transportName · Recovering · $modeLabel"
+                        "Online via $transportName · Verifying realtime · $modeLabel"
                     else ->
                         null // Let the TransportManager state collector reassert
                 }

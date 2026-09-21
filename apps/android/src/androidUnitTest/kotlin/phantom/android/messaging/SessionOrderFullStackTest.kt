@@ -43,6 +43,7 @@ import phantom.core.storage.LocalOneTimePreKeyEntity
 import phantom.core.storage.LocalSignedPreKeyEntity
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
+import phantom.core.storage.MessageStatus
 import phantom.core.storage.SqlDelightConversationRepository
 import phantom.core.storage.SqlDelightDecryptFailedEnvelopeRepository
 import phantom.core.storage.SqlDelightLocalOneTimePreKeyRepository
@@ -787,6 +788,26 @@ class SessionOrderFullStackTest {
                             json.encodeToString(WireFrame.serializer(), forged).encodeToByteArray()))
                     }
                 }
+                val receiptPlaintext = json.encodeToString(
+                    MessagePayload.serializer(),
+                    MessagePayload(
+                        type = MessagePayload.TYPE_READ_RECEIPT,
+                        targetMessageId = "outgoing-for-receipt",
+                        sentAt = 1_700_001_000_004L,
+                        senderUsername = "alice",
+                    ),
+                ).encodeToByteArray()
+                val (_, receiptEncrypted) = ratchet.encrypt(secondState, receiptPlaintext)
+                val receiptWire = WireFrame(
+                    encryptedMessage = receiptEncrypted,
+                    x3dhInit = null,
+                    senderSigningPublicKeyHex = "ee".repeat(32),
+                )
+                payloads["NEW_RECEIPT_NO_HEADER"] = Base64.encode(
+                    phantom.core.crypto.MessagePadding.pad(
+                        json.encodeToString(WireFrame.serializer(), receiptWire).encodeToByteArray(),
+                    ),
+                )
             }
             val sealedSender = Base64.encode(
                 phantom.core.crypto.SealedSender.seal(
@@ -1192,6 +1213,41 @@ class SessionOrderFullStackTest {
         assertNull(rig.opks.get("102132435465768798a9bacbdcedfe0f"))
         assertEquals(0L, rig.held.count())
         assertTrue(rig.ackObservations.all { it.second })
+    }
+
+    @Test
+    fun an_archived_read_receipt_commits_the_chain_action_and_ledger_instead_of_being_held() = runBlocking {
+        val rig = buildRig(withSecondChain = true)
+        rig.messages.insertMessage(
+            MessageEntity(
+                id = "outgoing-for-receipt",
+                conversationId = rig.convId,
+                ciphertext = byteArrayOf(1),
+                plaintextCache = "sent",
+                sent = true,
+                status = MessageStatus.SENT,
+                createdAt = 1L,
+            ),
+        )
+        for ((frame, id) in listOf(
+            "NEW0" to "env-new-0",
+            "NEW1" to "env-new-1",
+            "NEW2" to "env-new-2",
+            "S" to "env-old-0",
+        )) {
+            rig.deliver(frame, id)
+            awaitTrue("$id acked") { id in rig.relay.acked }
+        }
+
+        rig.deliver("NEW_RECEIPT_NO_HEADER", "env-new-receipt")
+        awaitTrue("archived receipt acked") { "env-new-receipt" in rig.relay.acked }
+
+        assertEquals(MessageStatus.READ, rig.messages.getMessageById("outgoing-for-receipt")?.status)
+        assertTrue(rig.processed.exists("env-new-receipt"))
+        assertFalse(rig.held.existsByEnvelopeId("env-new-receipt"))
+        assertTrue(
+            logLines("inbound_control_commit").any { "msgId=env-new-" in it && "outcome=Committed" in it },
+        )
     }
 
     @Test

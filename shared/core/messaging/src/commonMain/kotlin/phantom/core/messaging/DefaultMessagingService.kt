@@ -3168,8 +3168,10 @@ class DefaultMessagingService(
         conversationId: String,
         senderPubKeyHex: String,
         payloadType: String,
+        alreadyCommittedAtomically: Boolean = false,
         fallback: suspend () -> Unit,
     ) {
+        if (alreadyCommittedAtomically) return
         val repo = controlEventCommitRepository
         if (repo != null) {
             repo.commitControlEvent(
@@ -3453,6 +3455,7 @@ class DefaultMessagingService(
             // ONE transaction. The downstream text branch then skips its
             // own insert: the row is already there.
             var committedAtomically = false
+            var controlCommittedAtomically = false
             val plainBytes: ByteArray? = withReceiveLock(mutex) withLock@ {
                 // The live collector and local replay use the same lock. A
                 // completion may have happened since the outer fast check.
@@ -3544,8 +3547,27 @@ class DefaultMessagingService(
                                     recovered.archive.id, recovered.archive.revision, activate = !localReplay),
                             )
                             committedAtomically = outcome == InboundTextCommit.Committed
-                            if (!committedAtomically) {
-                                if (outcome == InboundTextCommit.Unsupported) {
+                            var archivedControlOutcome: InboundTextCommit = InboundTextCommit.Unsupported
+                            if (outcome == InboundTextCommit.Unsupported) {
+                                archivedControlOutcome = commitInboundArchivedControl(
+                                    deliver = deliver,
+                                    conversationId = conversationId,
+                                    senderPubKeyHex = senderPubKeyHex,
+                                    ciphertext = ciphertext,
+                                    plaintext = recovered.plaintext,
+                                    advancedState = recovered.advancedState,
+                                    stateTarget = phantom.core.storage.InboundStateTarget.Archive(
+                                        recovered.archive.id,
+                                        recovered.archive.revision,
+                                        activate = !localReplay,
+                                    ),
+                                )
+                                controlCommittedAtomically = archivedControlOutcome == InboundTextCommit.Committed
+                            }
+                            if (!committedAtomically && !controlCommittedAtomically) {
+                                if (outcome == InboundTextCommit.Unsupported &&
+                                    archivedControlOutcome == InboundTextCommit.Unsupported
+                                ) {
                                     holdForRetry(deliver, conversationId, senderPubKeyHex, wireFrame, "unsupported")
                                 }
                                 return@withLock null
@@ -5053,6 +5075,7 @@ class DefaultMessagingService(
                     conversationId = conversationId,
                     senderPubKeyHex = senderPubKeyHex,
                     payloadType = payload.type,
+                    alreadyCommittedAtomically = controlCommittedAtomically,
                     fallback = { messageRepository.deleteMessage(payload.targetMessageId) },
                 )
                 _incomingMessages.emit(
@@ -5077,6 +5100,7 @@ class DefaultMessagingService(
                     conversationId = conversationId,
                     senderPubKeyHex = senderPubKeyHex,
                     payloadType = payload.type,
+                    alreadyCommittedAtomically = controlCommittedAtomically,
                     fallback = {
                         messageRepository.updateMessageText(
                             payload.targetMessageId, payload.text,
@@ -5109,6 +5133,7 @@ class DefaultMessagingService(
                         conversationId = conversationId,
                         senderPubKeyHex = senderPubKeyHex,
                         payloadType = payload.type,
+                        alreadyCommittedAtomically = controlCommittedAtomically,
                         fallback = {
                             conversationRepository.setDisappearingTimer(conversationId, secs)
                         },
@@ -5163,7 +5188,11 @@ class DefaultMessagingService(
                     transport.sendDeliveryAck(deliver.messageId)
                     return@runCatching
                 }
-                if (controlEventCommitRepository == null && reactionRepo == null) {
+                if (
+                    !controlCommittedAtomically &&
+                    controlEventCommitRepository == null &&
+                    reactionRepo == null
+                ) {
                     // No way to apply the reaction at all. Settle the
                     // envelope anyway rather than ack an unrecorded one.
                     settleIgnoredControlEvent(
@@ -5195,6 +5224,7 @@ class DefaultMessagingService(
                     conversationId = conversationId,
                     senderPubKeyHex = senderPubKeyHex,
                     payloadType = payload.type,
+                    alreadyCommittedAtomically = controlCommittedAtomically,
                     // Reached only when the commit repository is absent
                     // AND reactionRepository is present — the guard above
                     // returns for every other combination, so the
@@ -5233,6 +5263,7 @@ class DefaultMessagingService(
                     conversationId = conversationId,
                     senderPubKeyHex = senderPubKeyHex,
                     payloadType = payload.type,
+                    alreadyCommittedAtomically = controlCommittedAtomically,
                     fallback = {
                         messageRepository.pinMessage(
                             messageId = payload.targetMessageId,
@@ -5272,6 +5303,7 @@ class DefaultMessagingService(
                     conversationId = conversationId,
                     senderPubKeyHex = senderPubKeyHex,
                     payloadType = payload.type,
+                    alreadyCommittedAtomically = controlCommittedAtomically,
                     fallback = {
                         messageRepository.updateStatus(
                             payload.targetMessageId, MessageStatus.READ,
@@ -6063,6 +6095,118 @@ class DefaultMessagingService(
         } else {
             holdForRetry(deliver, conversationId, senderPubKeyHex,
                 heldWireFrame(ciphertext), "commit")
+            InboundTextCommit.Rejected(outcome)
+        }
+    }
+
+    private fun atomicControlAction(
+        payload: MessagePayload,
+        conversationId: String,
+        senderPubKeyHex: String,
+        nowMs: Long,
+    ): ControlEventCommitRepository.Action? = when (payload.type) {
+        MessagePayload.TYPE_DELETE -> payload.targetMessageId.takeIf { it.isNotEmpty() }?.let {
+            ControlEventCommitRepository.Action.DeleteMessage(it)
+        }
+        MessagePayload.TYPE_EDIT -> payload.targetMessageId.takeIf { it.isNotEmpty() }?.let {
+            ControlEventCommitRepository.Action.EditMessageText(it, payload.text)
+        }
+        MessagePayload.TYPE_DISAPPEARING_TIMER ->
+            payload.disappearingTimerSecs?.takeIf { it > 0L }?.let {
+                ControlEventCommitRepository.Action.SetDisappearingTimer(conversationId, it)
+            }
+        MessagePayload.TYPE_REACTION -> {
+            val target = payload.targetMessageId.takeIf { it.isNotEmpty() }
+            val emoji = payload.emoji
+            if (target == null || emoji == null) null
+            else if (emoji.isEmpty()) {
+                ControlEventCommitRepository.Action.DeleteReaction(target, senderPubKeyHex)
+            } else {
+                ControlEventCommitRepository.Action.UpsertReaction(
+                    messageId = target,
+                    senderKeyHex = senderPubKeyHex,
+                    emoji = emoji,
+                    createdAtMs = nowMs,
+                )
+            }
+        }
+        MessagePayload.TYPE_PIN -> payload.targetMessageId.takeIf { it.isNotEmpty() }?.let {
+            val pinned = payload.pinned ?: false
+            ControlEventCommitRepository.Action.PinMessage(
+                messageId = it,
+                pinned = pinned,
+                pinnedByPubkeyHex = if (pinned) senderPubKeyHex else null,
+            )
+        }
+        MessagePayload.TYPE_READ_RECEIPT -> payload.targetMessageId.takeIf { it.isNotEmpty() }?.let {
+            ControlEventCommitRepository.Action.MarkRead(it)
+        }
+        else -> null
+    }
+
+    private suspend fun commitInboundArchivedControl(
+        deliver: RelayMessage.Deliver,
+        conversationId: String,
+        senderPubKeyHex: String,
+        ciphertext: ByteArray,
+        plaintext: ByteArray,
+        advancedState: phantom.core.crypto.RatchetState,
+        stateTarget: phantom.core.storage.InboundStateTarget.Archive,
+    ): InboundTextCommit {
+        val sessionTx = sessionTransactionRepository ?: return InboundTextCommit.Unsupported
+        val payload = runCatching {
+            json.decodeFromString<MessagePayload>(plaintext.decodeToString())
+        }.getOrNull() ?: return InboundTextCommit.Unsupported
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        val action = atomicControlAction(payload, conversationId, senderPubKeyHex, nowMs)
+            ?: return InboundTextCommit.Unsupported
+
+        val outcome = runCatching {
+            sessionTx.commitInboundControlEvent(
+                conversationId = conversationId,
+                envelopeId = deliver.messageId,
+                senderPubKeyHex = senderPubKeyHex,
+                payloadType = payload.type,
+                nowMs = nowMs,
+                action = action,
+                advancedStateBlob = json.encodeToString(
+                    phantom.core.crypto.RatchetState.serializer(),
+                    advancedState,
+                ),
+                stateTarget = stateTarget,
+            )
+        }.getOrElse { cause ->
+            if (cause is kotlinx.coroutines.CancellationException) throw cause
+            messagingLog(
+                MessagingLogLevel.WARN,
+                "DECRYPT_TRACE inbound_control_commit_failed msgId=${deliver.messageId.take(8)} " +
+                    "type=${payload.type} errorClass=${cause::class.simpleName}",
+            )
+            holdForRetry(
+                deliver,
+                conversationId,
+                senderPubKeyHex,
+                heldWireFrame(ciphertext),
+                "commit",
+            )
+            throw InboundCommitFailed(cause)
+        }
+        messagingLog(
+            MessagingLogLevel.INFO,
+            "DECRYPT_TRACE inbound_control_commit msgId=${deliver.messageId.take(8)} " +
+                "type=${payload.type} outcome=$outcome target=${inboundTargetLabel(stateTarget)}",
+        )
+        return if (outcome == phantom.core.storage.InboundCommitOutcome.Committed) {
+            heldReplay?.request()
+            InboundTextCommit.Committed
+        } else {
+            holdForRetry(
+                deliver,
+                conversationId,
+                senderPubKeyHex,
+                heldWireFrame(ciphertext),
+                "commit",
+            )
             InboundTextCommit.Rejected(outcome)
         }
     }
