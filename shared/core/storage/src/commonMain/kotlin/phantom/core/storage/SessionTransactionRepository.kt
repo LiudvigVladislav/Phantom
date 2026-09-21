@@ -361,6 +361,30 @@ interface SessionTransactionRepository {
             "commitInboundMessage is not implemented by ${this::class.simpleName}; " +
                 "a receive path must be wired to a repository that commits atomically",
         )
+
+    /**
+     * The control-event counterpart of [commitInboundMessage].
+     *
+     * Commits the advanced receive state, the control action, the processed
+     * envelope row and held-envelope cleanup in one transaction. This is
+     * required when a control frame decrypts against a receive archive: an
+     * archive advance without the action loses the event after a crash, while
+     * an action without the advance makes redelivery fail MAC verification.
+     */
+    suspend fun commitInboundControlEvent(
+        conversationId: String,
+        envelopeId: String,
+        senderPubKeyHex: String,
+        payloadType: String,
+        nowMs: Long,
+        action: ControlEventCommitRepository.Action,
+        advancedStateBlob: String,
+        stateTarget: InboundStateTarget,
+    ): InboundCommitOutcome =
+        throw UnsupportedOperationException(
+            "commitInboundControlEvent is not implemented by ${this::class.simpleName}; " +
+                "an archived control receive must be committed atomically",
+        )
 }
 
 /** Result of [SessionTransactionRepository.commitInboundMessage]. */

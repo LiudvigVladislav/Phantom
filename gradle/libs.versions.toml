@@ -93,9 +93,9 @@ camerax = "1.4.1"
 mlkit-barcode = "17.3.0"
 
 # Android
-android-compileSdk = "35"
+android-compileSdk = "36"
 android-minSdk = "26"
-android-targetSdk = "35"
+android-targetSdk = "36"
 
 # AndroidX Test (Apache-2.0) — needed for androidInstrumentedTest on Android emulator.
 # Used by shared/core/crypto to run libsodium-backed tests on the real Android

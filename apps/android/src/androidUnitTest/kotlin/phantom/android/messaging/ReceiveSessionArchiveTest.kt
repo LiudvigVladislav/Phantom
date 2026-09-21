@@ -101,6 +101,79 @@ class ReceiveSessionArchiveTest {
         assertTrue(archives().isEmpty())
     }
 
+    @Test fun archived_read_receipt_advances_chain_marks_read_and_settles_envelope_atomically() = withStore {
+        messages.insertMessage(
+            MessageEntity(
+                id = "outgoing",
+                conversationId = "conv",
+                ciphertext = byteArrayOf(7),
+                plaintextCache = "sent",
+                sent = true,
+                status = MessageStatus.SENT,
+                createdAt = now,
+            ),
+        )
+        active.upsertRatchetState("conv", "old")
+        assertEquals(InboundCommitOutcome.Committed, commit("new", "current", InboundStateTarget.ReplaceActive))
+        val old = archives().single()
+
+        assertEquals(
+            InboundCommitOutcome.Committed,
+            tx.commitInboundControlEvent(
+                conversationId = "conv",
+                envelopeId = "receipt",
+                senderPubKeyHex = "sender",
+                payloadType = "read_receipt",
+                nowMs = now,
+                action = ControlEventCommitRepository.Action.MarkRead("outgoing"),
+                advancedStateBlob = "old-advanced",
+                stateTarget = InboundStateTarget.Archive(old.id, old.revision),
+            ),
+        )
+
+        assertEquals(MessageStatus.READ, messages.getMessageById("outgoing")?.status)
+        assertTrue(processed.exists("receipt"))
+        assertEquals("current", active.getRatchetState("conv"))
+        assertEquals("old-advanced", archives().single().stateBlob)
+        assertEquals(old.revision + 1L, archives().single().revision)
+    }
+
+    @Test fun archived_control_failure_rolls_back_chain_action_and_completion_ledger() = withStore {
+        messages.insertMessage(
+            MessageEntity(
+                id = "outgoing",
+                conversationId = "conv",
+                ciphertext = byteArrayOf(7),
+                plaintextCache = "sent",
+                sent = true,
+                status = MessageStatus.SENT,
+                createdAt = now,
+            ),
+        )
+        active.upsertRatchetState("conv", "old")
+        commit("new", "current", InboundStateTarget.ReplaceActive)
+        val old = archives().single()
+        failAt = "after_control"
+
+        assertFailsWith<IllegalStateException> {
+            tx.commitInboundControlEvent(
+                conversationId = "conv",
+                envelopeId = "receipt",
+                senderPubKeyHex = "sender",
+                payloadType = "read_receipt",
+                nowMs = now,
+                action = ControlEventCommitRepository.Action.MarkRead("outgoing"),
+                advancedStateBlob = "must-roll-back",
+                stateTarget = InboundStateTarget.Archive(old.id, old.revision),
+            )
+        }
+
+        assertEquals(MessageStatus.SENT, messages.getMessageById("outgoing")?.status)
+        assertFalse(processed.exists("receipt"))
+        assertEquals(old, archives().single())
+        assertEquals("current", active.getRatchetState("conv"))
+    }
+
     @Test fun archive_commits_reject_wrong_conversation_stale_revision_and_expiry() = withStore {
         active.upsertRatchetState("conv", "old")
         commit("new", "current", InboundStateTarget.ReplaceActive)
