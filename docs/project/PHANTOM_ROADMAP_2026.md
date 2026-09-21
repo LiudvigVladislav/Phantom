@@ -1,5 +1,12 @@
 # PHANTOM — 12-Month Strategic Roadmap
 
+> **Historical planning baseline.** This dated plan is preserved because it
+> records the assumptions used in April 2026. It is not the current execution
+> queue: several security and transport items landed earlier or differently than
+> forecast, and calendar estimates below have not been silently rewritten.
+> Current direction lives in [`../../ROADMAP.md`](../../ROADMAP.md); the measured
+> September state is [`STATUS_2026_09_21.md`](STATUS_2026_09_21.md).
+
 **Дата:** 28 апреля 2026
 **Период:** Май 2026 — Апрель 2027
 **Темп работы:** Full-time (35-40 ч/нед = ~1700 часов на год)

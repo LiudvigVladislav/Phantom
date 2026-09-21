@@ -15,6 +15,7 @@ This directory holds the **public-facing** project planning artefacts for PHANTO
 | [`DECISIONS_LOG.md`](DECISIONS_LOG.md) | Append-only governance log: every product / architectural decision with date, rationale, and cross-references to ADRs / PRs / commits. |
 | [`ARCHITECTURAL_DECISIONS_TODO.md`](ARCHITECTURAL_DECISIONS_TODO.md) | Queue of pending architectural decisions and the ADR template. Discipline-level documentation, not scratchpad. |
 | [`PROJECT_STATUS_SNAPSHOT_2026_05_09.md`](PROJECT_STATUS_SNAPSHOT_2026_05_09.md) | Point-in-time status snapshot (May 2026). Preserved as a historical baseline. |
+| [`STATUS_2026_09_21.md`](STATUS_2026_09_21.md) | Current measured status after residual N1 and Android release-readiness work. |
 
 ## Related docs elsewhere in the repo
 

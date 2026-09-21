@@ -55,6 +55,13 @@ size, authenticated sessions, and delivery destinations.
 - **Per-user signed-challenge authentication**, encrypted Android storage
   (SQLDelight + SQLCipher), store-and-forward delivery, disappearing messages,
   message edit/delete, and conversation mute/pin.
+- **Crash- and reconnect-safe outbound recovery:** queued ciphertext is replayed
+  in deterministic order, ratchet settlement is fail-closed before new
+  encryption, and supported control events commit atomically with archived
+  session advancement.
+- **Current Android release baseline:** target API 36, fail-closed production
+  signing, and verified 16 KiB ELF alignment for every bundled 64-bit native
+  library.
 
 ### Honest Alpha boundaries
 
@@ -65,9 +72,10 @@ size, authenticated sessions, and delivery destinations.
 
 ### Roadmap by horizon
 
-- **Next:** Direct/REST stability hardening across carrier changes, faster first
-  contact bootstrap, stable groups, and encrypted photo/file attachments using
-  the existing media pipeline.
+- **Next:** finish Android design parity and a new signed Alpha candidate,
+  broaden Direct/REST field validation, deploy the durable relay queue already
+  merged on `master`, reduce first-contact latency, stabilize groups, and add
+  encrypted photo/file attachments using the existing media pipeline.
 - **Beta:** harden 1:1 voice/video calls over Direct/REALITY, add a desktop
   client, expand pluggable transports, and design linked-device identity.
 - **v1.0:** iOS client, public channels, a rate-limited username directory,
@@ -152,7 +160,7 @@ on Alpha software for a high-risk use case.
 ### Prerequisites
 
 - JDK 21
-- Android Studio Narwhal (2026.1) or later and Android SDK 35
+- Android Studio Narwhal (2026.1) or later and Android SDK 36
 - Rust 1.83+ for the relay
 - Git
 

@@ -1,7 +1,7 @@
 # PHANTOM — Known Issues
 
-**Last updated:** 2026-07-19
-**Build:** `master` at `ea66889f` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, and [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates.
+**Last updated:** 2026-09-21
+**Build:** `master` at `88bf5ed` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates, and [`docs/project/STATUS_2026_09_21.md`](docs/project/STATUS_2026_09_21.md) records the current reconciliation.
 **Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Irkutsk Oblast (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
 
 ---
@@ -12,6 +12,15 @@
 - One-to-one text, prekeys, ratchet sessions, and encrypted local state are the stable core.
 - Direct WSS, REALITY, Tor text-only fallback, and REST polling are implemented.
 - Encrypted voice messages have shipped through the media pipeline and are no longer future work.
+- Residual N1 recovery is merged: queued ciphertext replay, settle-before-encrypt
+  barriers, deterministic outbox ordering, and process/network recovery are in
+  the current client.
+- Android release builds target API 36 and have been verified for 16 KiB native
+  page-size compatibility. Production signing now fails closed when credentials
+  are absent.
+- Durable relay queue code is merged, but the production relay image predates
+  that merge. Until production rotation is complete, a container restart can
+  still discard delivered-but-unacknowledged envelopes.
 - Calls remain experimental, groups are partial, and receiver-side media cancellation is still missing.
 - Carrier behavior and first-contact bootstrap remain active reliability work.
 - The custom cryptographic implementation has not received an independent audit.
@@ -129,7 +138,7 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 
 ---
 
-### ISSUE-006: No retry feedback when a message fails to send  ⚠️ PARTIALLY ADDRESSED
+### ISSUE-006: Message status and retry feedback  ⚠️ PARTIALLY ADDRESSED
 
 **Original symptom:** When the WebSocket is disconnected and the user sends a message, the message appears in the chat with no visual indication that it is pending. There is no "Sending..." spinner or pending icon. The message just sits there until reconnect.
 
@@ -138,9 +147,14 @@ After identity creation in onboarding, `MainActivity.PhantomApp` now re-triggers
 - **Cancellable upload shipped by PR-MEDIA-UPLOAD-CANCEL2.1** (PR #198 part 3, master `b117dcb9`): the X glyph on the uploading bubble now actually stops the upload via `MessagingService.cancelVoiceUpload(conversationId, localMsgId)`, propagates `CancellationException` cleanly through the upload coroutine, tears down the local row, and the bubble disappears from the LazyColumn. End-to-end log chain: `MEDIA_UI upload_cancel_tap` → `MEDIA_TX upload_cancel_requested` → `upload_cancel_dispatched` → `upload_cancelled_by_user manifestSent=false` → `upload_cancel_joined`.
 - **Sender row flips UPLOADING → SENT** as soon as the M2e early manifest envelope leaves the device, while the upload tail continues in background and the bubble counter keeps ticking — the user gets the "it's leaving" signal without waiting for the full upload.
 
-**Still open for text messages:**
-- The pending icon (clock) / single check / double check pattern in the original symptom has not been implemented yet for text messages. Text bubbles still appear immediately with no per-message status indicator.
-- Tracked in `docs/PROJECT_LOG.md → Open follow-ups` under "UI polish — per-message status icons", queued behind the doc-honesty pass and the durationMs / empty-voice follow-ups.
+**Current text behavior (2026-09-21):**
+- `QUEUED`, `SENT`, `RELAYED` / `DELIVERED`, and `READ` now render distinct
+  status glyphs. Read-receipt projection was exercised on both a physical
+  Android 12 device and an API 37 emulator during release finalization.
+- The GitHub issue remains open until the active design-parity pass verifies the
+  final colors, icon geometry, reduced-motion behavior, and the offline
+  `Sending -> Sent -> Delivered -> Read` presentation against its full visual
+  acceptance criteria.
 
 ---
 
