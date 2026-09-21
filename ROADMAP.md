@@ -20,7 +20,10 @@ The current public surface is deliberately narrow:
   WebSocket delivery;
 - encrypted voice messages over the media pipeline;
 - X3DH-style prekeys, Double Ratchet sessions, authentication, and encrypted
-  local storage.
+  local storage;
+- ordered outbound recovery across process and network interruptions, including
+  fail-closed settlement before every production encryption path;
+- Android API 36 release builds with verified 16 KiB native-library alignment.
 
 The boundaries matter: the cryptographic protocol code is custom and has not
 received an independent audit; groups and calls are not production-ready; Tor
@@ -29,8 +32,13 @@ and dates rather than every network or future DPI policy.
 
 ## Next
 
-- Improve Direct/REST stability across carrier and network changes.
+- Finish the current Android design-parity pass and cut a new signed Alpha
+  candidate from the resulting integrated tree.
+- Broaden device and network validation of the Direct/REST recovery behavior
+  already present on `master`.
 - Reduce first-contact bootstrap latency and failure modes.
+- Deploy the durable relay queue already implemented on `master`, replacing the
+  older production image whose accepted-envelope queue is process-local.
 - Make encrypted groups stable enough for public Alpha use.
 - Ship encrypted attachments through the media pipeline.
 

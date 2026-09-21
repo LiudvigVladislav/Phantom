@@ -24,17 +24,35 @@
 
 ---
 
+### 2026-09-21 · Residual N1 and Android release-readiness baseline
+
+- **Merged:** PR #411 outbound recovery, PR #412 Android 16 KiB page-size
+  support, and PR #413 API 36 release finalization.
+- **Runtime validation:** clean installs on a physical Android 12 phone and an
+  API 37 / 16 KiB emulator; onboarding, contact setup, bidirectional text, and
+  read receipts passed.
+- **Release validation:** signed APK/AAB, production certificate, Bundletool,
+  APK signature, zip alignment, and all 64-bit ELF load alignment checks passed.
+- **Still active:** Android design parity, production relay rotation to the
+  already-merged durable queue, expanded capability smoke, and a final signed
+  presentation candidate.
+- **Scope boundary:** this entry does not claim groups or calls are
+  production-ready and does not claim an external cryptographic audit.
+
+See [`project/STATUS_2026_09_21.md`](project/STATUS_2026_09_21.md) for the
+current concise snapshot.
+
 ## Current state
 
-**Released:** `v0.1.0-alpha.1` (tag → commit `0246b50f`, GitHub Release published)
-**Branch state:** `master` is the integration target; short-lived feature / canary / docs branches are created per track and deleted after merge. Latest commit at the time of writing: `e601cf3b` (PR #328 R3.6 sticky-per-route Fast REST degradation, 2026-06-21).
-**Production:** Round 14 paced padded poll LIVE on `relay.phntm.pro` since 2026-06-16 (`RELAY_POLL_CHUNKED_FLUSH=1` deployed; `chunked_flush=true` confirmed in live traffic). Exact deployed relay commit not pinned here — verify against the VPS startup log if a tie-back is needed. `phntm.pro/terms` and `/privacy` serving themed HTML in EN + RU.
+**Released:** `v0.1.0-alpha.2` remains the latest tagged historical pre-release.
+**Branch state:** `master` is the integration target; current reconciled baseline is `88bf5ed` after PRs #411-#413.
+**Production:** `relay.phntm.pro` serves the current Alpha deployment, but its running relay image predates the durable-queue merge in PR #397. Rotate and attest the image before treating restart persistence as a production property. `phntm.pro/terms` and `/privacy` serve themed HTML in EN + RU.
 **Licensing:** AGPL-3.0-or-later established as the formal project
 licence (LICENSE + NOTICE + SPDX headers on every .kt and .rs file +
 README §License — all shipped in the four-commit licence-hygiene
 patch on 2026-04-27).
 
-### What works today (master `e601cf3b`, 2026-06-21)
+### What works today (master `88bf5ed`, 2026-09-21)
 
 This block summarizes capabilities present on `master`; production activation is stated per item. Coverage spans the Trek 2 Stage 1.x → 2A → 2B-A → 2B-B → 2B-D long-poll backbone delivery, the Sprint 2b OPK lifecycle + pending/active session work, the T2 carrier-ceiling prekey-publish bug close, the voice transport-independent confirmation, the DWS-UX telemetry baseline + ADR-011 honesty pass, and the R3.6 sticky-per-route Fast REST degradation. Capabilities added or hardened since the 2026-05-21 baseline below:
 

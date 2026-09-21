@@ -1,76 +1,45 @@
-# Roadmap 2.0 → Execution Map
+# Roadmap 2.0 -> Execution Map
 
-Этот файл связывает текущий roadmap PHANTOM с практической последовательностью инженерного старта.
+This file translates the public roadmap into the current engineering order. The
+original Alpha-0 startup sequence is complete and is preserved in git history;
+it is no longer an active checklist.
 
-## Что уже хорошо определено в roadmap
+## Current baseline - 2026-09-21
 
-Roadmap уже задает:
-- позиционирование продукта;
-- стек клиента: KMP + Compose;
-- криптографическую базу: Signal Protocol / Double Ratchet / X3DH;
-- encrypted local storage;
-- transport portfolio;
-- relay / bootstrap / discovery roles;
-- phased delivery от ядра к расширению.
+The following foundations are on `master`:
 
-## Что нужно добавить до активной разработки
+- Android/KMP application, Rust relay, CI, threat model, doctrine, and ADR set;
+- encrypted 1:1 text and voice notes;
+- Direct WSS, REALITY, Tor text fallback, and REST delivery fallback;
+- encrypted local state, prekey bootstrap, Double Ratchet, and Sealed Sender;
+- residual N1 recovery, including deterministic queued replay and a common
+  settle-before-encrypt barrier;
+- API 36 release configuration, fail-closed signing, and 16 KiB native-library
+  alignment.
 
-Roadmap — это стратегическая карта.
-Перед кодом нужны операционные документы:
+See [`STATUS_2026_09_21.md`](STATUS_2026_09_21.md) for the measured snapshot.
 
-1. Product Doctrine
-2. Threat Model
-3. ADR set
-4. Monorepo structure
-5. Alpha-0 milestone
-6. Task templates for agents
+## Active delivery sequence
 
-## Mapping phases
+1. Finish Android design parity in its isolated worktree.
+2. Rotate production relay to the durable-queue implementation already merged
+   on `master`; remove the completed heartbeat-echo diagnostic flag.
+3. Run the expanded two-device capability smoke: text and receipts, voice,
+   Standard/Private/Ghost, network and process recovery, and supported call
+   behavior.
+4. Integrate design, run CI, build a signed APK/AAB, perform a clean install,
+   and rehearse the exact presentation path.
+5. Publish a new Alpha candidate only after those gates pass.
 
-### Roadmap phase: Preparation
-Практически означает:
-- freeze doctrine;
-- freeze ADRs;
-- create repo skeleton;
-- setup CI;
-- setup local test harness.
+## Work that does not block the presentation candidate
 
-### Roadmap phase: Crypto core
-Практически означает:
-- identity model;
-- session orchestration;
-- crypto adapter boundary;
-- secure storage;
-- local encrypted DB.
+- first-contact bootstrap latency reduction;
+- production-stable encrypted groups;
+- photo/file attachments through the media pipeline;
+- calls leaving experimental status;
+- desktop/iOS clients and linked-device identity;
+- independent cryptographic audit and the offline-verification tooling that
+  supports it.
 
-### Roadmap phase: Discovery + P2P
-Практически на старте должно быть сужено до:
-- invite links;
-- QR add flow;
-- basic username lookup.
-
-Сложный discovery лучше отложить.
-
-### Roadmap phase: Apps
-Практически означает:
-- onboarding;
-- chat list;
-- chat screen;
-- message state rendering;
-- restart persistence;
-- settings minimal.
-
-### Roadmap phase: Obfuscation / Offline / Mesh
-Не должны блокировать Alpha-0.
-Их правильно начинать после появления стабильного secure messaging core.
-
-## Recommended order of execution
-
-1. Docs freeze
-2. Repo + tooling
-3. Identity + storage + crypto boundaries
-4. Fake transport + relay service
-5. First 1:1 text vertical slice
-6. Username lookup
-7. Hardening / retry / policy basics
-8. Only then advanced transports and offline modes
+These remain product work. They are not prerequisites for an honestly scoped
+demo of 1:1 text, receipts, voice notes, and privacy modes.
