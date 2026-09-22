@@ -173,6 +173,36 @@ class AppContainerInitLifecycleWiringTest {
     }
 
     @Test
+    fun transport_capabilities_are_published_from_the_mode_emitted_by_the_collector() {
+        val code = containerSource
+        assertTrue(
+            "hybrid.stateMachine.state.collect { restMode ->" in code,
+            "the capability collector must name the mode it actually received",
+        )
+        assertTrue(
+            "recomputeCapabilities(restMode = restMode)" in code,
+            "discarding the emitted mode and re-reading hybridTransport opens a stale-snapshot race",
+        )
+    }
+
+    @Test
+    fun chat_actions_read_the_live_capability_snapshot_when_invoked() {
+        val chatSource = java.io.File(
+            "src/androidMain/kotlin/phantom/android/screens/chat/ChatScreen.kt",
+        ).readText()
+        assertEquals(
+            2,
+            Regex(Regex.escape("container.transportCapabilities.value")).findAll(chatSource).count(),
+            "call and voice actions must each read StateFlow.value at invocation time; " +
+                "a captured Compose snapshot can remain stale inside a subcomposed callback",
+        )
+        assertTrue(
+            "val liveCapabilities = container.transportCapabilities.value" in chatSource,
+            "the live snapshot must be named explicitly before applying the policy guard",
+        )
+    }
+
+    @Test
     fun a_handed_over_tor_obligation_blocks_the_deferred_settlement() {
         val code = containerSource
         assertTrue(

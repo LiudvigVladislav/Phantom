@@ -260,6 +260,14 @@ internal class AndroidNativeOkHttpRestFallbackTransport(
         decode(response, AckDeliverResponse.serializer())
     }
 
+    override suspend fun turnCredentials(
+        url: String,
+        token: String,
+    ): RestFallbackResponse<TurnCredentialsResponse> = withContext(Dispatchers.IO) {
+        val response = get(url = url, token = token, op = "turn_credentials")
+        decode(response, TurnCredentialsResponse.serializer())
+    }
+
     // ── Internal HTTP plumbing ───────────────────────────────────────────────
 
     /** Holder for raw response data captured INSIDE the OkHttp `.use { }` block. */

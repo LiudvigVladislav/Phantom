@@ -55,10 +55,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 actual fun createHttpClientFactory(): (socksProxyPort: Int?) -> HttpClient = { socksProxyPort ->
     val builder = OkHttpClient.Builder()
         // PR-H1c (2026-05-13) / PR-H1e (2026-05-14): WebSocket-protocol
-        // Ping ENABLED at 15 s. Since PR-H1e the app-level RelayMessage.Ping
-        // loop is suppressed (RelayTransportConfig.APP_LEVEL_PING_ENABLED
-        // = false), so this is now the sole heartbeat sourced by the
-        // client. OkHttp closes the WebSocket with SocketTimeoutException
+        // Ping ENABLED at 15 s. Since PR-H1e the periodic application-level
+        // RelayMessage.Ping loop is suppressed. The transport now permits one
+        // correlated candidate-proof probe per session, but this remains the
+        // sole recurring heartbeat sourced by the client. OkHttp closes the
+        // WebSocket with SocketTimeoutException
         // if no Pong arrives within `pingInterval` ms — that path is what
         // the in-process dead-socket watchdog (DEAD_SOCKET_TIMEOUT_MS,
         // ~60 s) recovers from. (PR-R0.4a: AlarmManager no longer calls

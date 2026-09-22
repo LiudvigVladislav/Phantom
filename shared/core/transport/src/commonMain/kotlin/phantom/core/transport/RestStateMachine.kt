@@ -453,6 +453,7 @@ class RestStateMachine(
                         is Event.NetworkChanged -> onNetworkChanged(event)
                         is Event.WsOutboundAckReceived -> onWsOutboundAck(event)
                         is Event.WsPongReceived -> onWsPong(event)
+                        is Event.WsCandidateProbeRoundTrip -> onWsCandidateProbeRoundTrip(event)
                         is Event.WsAliveTickElapsed -> onAliveTick(event)
                         is Event.ActiveOutboundAckTimeout -> onActiveOutboundAckTimeout(event)
                         is Event.InboundIdleTimeout -> onInboundIdleTimeout(event)
@@ -964,6 +965,20 @@ class RestStateMachine(
         isLive(event.sessionEpoch, kind = "Pong")
     }
 
+    private fun onWsCandidateProbeRoundTrip(event: Event.WsCandidateProbeRoundTrip) {
+        if (!isLive(event.sessionEpoch, kind = "CandidateProof")) return
+        if (current != RestMode.WsCandidate) return
+        val proving = candidate ?: return
+        if (proving.sessionEpoch != event.sessionEpoch || proving != liveSession) return
+
+        // The transport correlated this reply with the one probe sent for
+        // this exact session. It proves bidirectional application traffic,
+        // but it does not waive the stability dwell: onAliveTick remains the
+        // only path that commits a quiet candidate after CANDIDATE_COMMIT_MS.
+        candidateHasFrame = true
+        log("REST_TRACE candidate_probe_round_trip epoch=${event.sessionEpoch}")
+    }
+
     private suspend fun onAliveTick(event: Event.WsAliveTickElapsed) {
         if (current != RestMode.WsCandidate) return
         val proving = candidate ?: return
@@ -1390,6 +1405,14 @@ class RestStateMachine(
 
         /** An application-level pong on [sessionEpoch]. Liveness only; never proof. */
         data class WsPongReceived(val sessionEpoch: Long) : Event()
+
+        /**
+         * The correlated response to the transport's single candidate probe
+         * on [sessionEpoch]. Unlike an unsolicited pong, this proves the
+         * candidate's bidirectional application data plane. The normal
+         * candidate dwell is still required before promotion.
+         */
+        data class WsCandidateProbeRoundTrip(val sessionEpoch: Long) : Event()
 
         /**
          * Periodic timer tick (driven by the orchestrator's tick loop) for

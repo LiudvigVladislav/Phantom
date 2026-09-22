@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
+import phantom.android.calls.startCallBeforeNavigation
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -62,8 +63,16 @@ fun CallsScreen(
         val conv = pendingCallConv ?: return@rememberLauncherForActivityResult
         pendingCallConv = null
         if (granted) {
-            scope.launch { container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername) }
-            onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
+            scope.launch {
+                val callManager = container.callManager ?: return@launch
+                startCallBeforeNavigation(
+                    startCall = {
+                        callManager.startCall(conv.theirPublicKeyHex, conv.theirUsername)
+                    },
+                    hasActiveCall = { callManager.activeCall.value != null },
+                    navigate = { onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername)) },
+                )
+            }
         } else {
             Toast.makeText(context, "Нужно разрешение на микрофон", Toast.LENGTH_SHORT).show()
         }
@@ -155,9 +164,24 @@ fun CallsScreen(
                                 ) == android.content.pm.PackageManager.PERMISSION_GRANTED
                                 if (hasPermission) {
                                     scope.launch {
-                                        container.callManager?.startCall(conv.theirPublicKeyHex, conv.theirUsername)
+                                        val callManager = container.callManager ?: return@launch
+                                        startCallBeforeNavigation(
+                                            startCall = {
+                                                callManager.startCall(
+                                                    conv.theirPublicKeyHex,
+                                                    conv.theirUsername,
+                                                )
+                                            },
+                                            hasActiveCall = {
+                                                callManager.activeCall.value != null
+                                            },
+                                            navigate = {
+                                                onNavigate(
+                                                    Screen.ActiveCall(conv.id, conv.theirUsername),
+                                                )
+                                            },
+                                        )
                                     }
-                                    onNavigate(Screen.ActiveCall(conv.id, conv.theirUsername))
                                 } else {
                                     pendingCallConv = conv
                                     micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)

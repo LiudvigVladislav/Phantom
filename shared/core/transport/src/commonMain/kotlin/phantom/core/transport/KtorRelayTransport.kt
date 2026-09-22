@@ -146,6 +146,20 @@ sealed interface WsSessionLifecycleEvent : WsSessionSignal {
     }
 }
 
+/**
+ * Atomic identity of the WebSocket session that is connected right now.
+ *
+ * The Android REST orchestrator can become active after the socket handshake
+ * has already completed. In that ordering the channel's original Connected
+ * event has legitimately been consumed before the state machine was ready.
+ * This snapshot lets the owner replay only the current in-memory lifecycle
+ * fact; it contains no credentials, addresses, or persisted state.
+ */
+data class WsConnectedSessionSnapshot(
+    val sessionEpoch: Long,
+    val connectionGeneration: Long,
+)
+
 /** Returns the session epoch of any lifecycle event, or "unknown" for new variants. */
 fun WsSessionLifecycleEvent.epochOrUnknown(): String = when (this) {
     is WsSessionLifecycleEvent.Connected -> sessionEpoch.toString()
@@ -388,6 +402,13 @@ class KtorRelayTransport(
     // it only affects the encrypt-order vs wire-order invariant, which
     // pings/acks do not participate in.
     private val outboundSendMutex = Mutex()
+
+    // One application-level candidate probe is allowed per WS session epoch.
+    // The two values live behind one mutex so a stale reader can never clear
+    // a newer session's outstanding proof while reconnects overlap.
+    private val candidateProbeMutex = Mutex()
+    private var candidateProbeAttemptedEpoch: Long? = null
+    private var candidateProbeOutstandingEpoch: Long? = null
 
     // Pong timestamp tracking — drives the heartbeat / dead-peer detection.
     // Updated every time the relay emits a Pong frame. If the gap exceeds
@@ -934,6 +955,9 @@ class KtorRelayTransport(
     // gen=3 s=7, the log line `[gen=3 s=5]` reveals the zombie precisely.
     @Volatile private var wsSessionEpoch: Long = 0L
 
+    @Volatile
+    private var connectedSessionSnapshot: WsConnectedSessionSnapshot? = null
+
     // ── QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §7 (L-13.3.9) ────────
     //
     // One-shot latch for [debugForceMode2Synthetic]. Stores the
@@ -1004,6 +1028,10 @@ class KtorRelayTransport(
      */
     val currentSessionEpoch: Long?
         get() = if (_state.value is TransportState.Connected) wsSessionEpoch else null
+
+    /** Current connected session identity for late lifecycle consumers. */
+    val currentConnectedSessionSnapshot: WsConnectedSessionSnapshot?
+        get() = if (_state.value is TransportState.Connected) connectedSessionSnapshot else null
 
     /**
      * QUIESCENCE-VALIDATION-L1-SYNTHETIC-MINI-LOCK §6 + §7 + §13.3.9
@@ -1283,13 +1311,11 @@ class KtorRelayTransport(
         // historical runs; this new `ws_ping_timeout_diag` line carries
         // the diagnostic fields the design note locked.
         //
-        // Findings A/B/C of the design note audit established that
-        // `stats.pingsSent` / `stats.pongsReceived` / `lastPongMark`
-        // are structurally dead — they would increment only via an
-        // app-level RelayMessage.Ping/Pong loop whose sender was
-        // removed in PR-H1e. The values are kept on the line for
-        // continuity, but `app_level_dead_counter=true` is the
-        // explicit warning so future readers don't chase the zeros.
+        // Findings A/B/C of the design note audit established that these
+        // counters were dead after the periodic app-level heartbeat sender
+        // was removed in PR-H1e. They now count only the single candidate
+        // proof attempt and its reply; they still do not represent the
+        // recurring OkHttp protocol ping/pong heartbeat.
         //
         // `okhttp_successful_ping_pongs` is the only non-lying
         // ping/pong number currently available client-side: the
@@ -1319,7 +1345,8 @@ class KtorRelayTransport(
                 "okhttp_throwable_class=$okhttpThrowableClass " +
                 "app_level_ping_sent=${stats.pingsSent} " +
                 "app_level_pong_received=${stats.pongsReceived} " +
-                "app_level_dead_counter=true " +
+                "app_level_dead_counter=false " +
+                "app_level_probe_mode=bounded_candidate_and_idle " +
                 "inbound_frames=${stats.inboundFrames} " +
                 "acks_received=${stats.acksReceived} " +
                 "since_last_inbound_ms=$sinceLastInboundMs " +
@@ -1652,6 +1679,10 @@ class KtorRelayTransport(
                         startedAtMs = Clock.System.now().toEpochMilliseconds(),
                     )
                     currentSessionStats = stats
+                    connectedSessionSnapshot = WsConnectedSessionSnapshot(
+                        sessionEpoch = mySession,
+                        connectionGeneration = ownerGeneration,
+                    )
                     sessionStats = stats
                     _state.value = TransportState.Connected
                     relayLog(RelayLogLevel.INFO, "${genTag(mySession)} WebSocket connected successfully")
@@ -1678,6 +1709,7 @@ class KtorRelayTransport(
                     generationScope = transportScope
                     scope = transportScope
                     startIdleWatchdog(transportScope, mySession)
+                    startCandidateProofProbe(transportScope, mySession)
                     startAckWatchdog(transportScope, generationClient, mySession)
 
                     // PR-H2a: merge every still-unacknowledged envelope from
@@ -1802,6 +1834,10 @@ class KtorRelayTransport(
                             sessionEpoch = mySession,
                         )
                     )
+
+                if (connectedSessionSnapshot?.sessionEpoch == mySession) {
+                    connectedSessionSnapshot = null
+                }
 
                 if (currentSessionStats === sessionStats) {
                     currentSessionStats = null
@@ -1949,15 +1985,7 @@ class KtorRelayTransport(
     private fun startIdleWatchdog(scope: CoroutineScope, mySession: Long) {
         pingJob = scope.launch {
             var lastLoggedAt = TimeSource.Monotonic.markNow()
-            // PR-RECV-DIAG1 v1.6 — emit-once flag per session. The
-            // half-dead-inbound condition is sticky: once we cross the
-            // threshold we want to fire ONE `WsSessionSignal.Stalled` and let
-            // the state machine handle it. If we kept emitting every
-            // 10 s, the state machine would log redundant transitions
-            // and the REST poll loop would get noisier than necessary.
-            // Re-armed automatically when a new session calls
-            // startIdleWatchdog because pingJob is replaced.
-            var inboundStallEmitted = false
+            val livenessGate = IdleLivenessProbeGate()
             while (isActive) {
                 delay(RelayTransportConfig.PING_INTERVAL_MS)  // 10 s poll cadence
                 val sinceLastInbound = lastInboundFrameMark.elapsedNow().inWholeMilliseconds
@@ -1977,39 +2005,123 @@ class KtorRelayTransport(
                     )
                 }
 
-                // PR-RECV-DIAG1 v1.6 — fire the stall signal once per
-                // session when the read loop has not seen any Frame.Text
-                // for INBOUND_STALL_THRESHOLD_MS. This is the real
-                // production-class trigger that test #84.7 isolated:
-                // WS open, outbound works, but inbound silently dropped.
-                // The orchestrator forwards this into the state machine.
-                if (!inboundStallEmitted &&
-                    sinceLastInbound >= RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS
-                ) {
-                    inboundStallEmitted = true
-                    relayLog(
-                        RelayLogLevel.WARN,
-                        "${genTag(mySession)} inbound_stall_detected " +
-                            "sinceLastInbound=${sinceLastInbound}ms — emitting " +
-                            "WsSessionSignal.Stalled (REST fallback should activate)",
-                    )
-                    enqueueSignal(WsSessionSignal.Stalled(WsSessionId(mySession), sinceLastInbound))
-                }
-
-                // Reset emit flag if traffic resumes mid-session (e.g. WS
-                // recovers without a session-end + reconnect). Lets us
-                // re-fire on the next stall window if the WS goes
-                // half-dead again later.
-                if (inboundStallEmitted &&
-                    sinceLastInbound < RelayTransportConfig.INBOUND_STALL_THRESHOLD_MS / 2
-                ) {
-                    inboundStallEmitted = false
+                when (livenessGate.next(sinceLastInbound)) {
+                    IdleLivenessProbeGate.Action.SendProbe -> {
+                        val sent = sendRaw(RelayMessage.Ping)
+                        currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
+                            if (sent) {
+                                stats.pingsSent += 1
+                                stats.lastPingAtMs = Clock.System.now().toEpochMilliseconds()
+                            } else {
+                                stats.pingSendFailures += 1
+                            }
+                        }
+                        relayLog(
+                            if (sent) RelayLogLevel.INFO else RelayLogLevel.WARN,
+                            "${genTag(mySession)} idle_proof_probe_${if (sent) "sent" else "send_failed"} " +
+                                "sinceLastInbound=${sinceLastInbound}ms",
+                        )
+                    }
+                    IdleLivenessProbeGate.Action.EmitStall -> {
+                        relayLog(
+                            RelayLogLevel.WARN,
+                            "${genTag(mySession)} inbound_stall_detected " +
+                                "sinceLastInbound=${sinceLastInbound}ms — emitting " +
+                                "WsSessionSignal.Stalled (REST fallback should activate)",
+                        )
+                        enqueueSignal(WsSessionSignal.Stalled(WsSessionId(mySession), sinceLastInbound))
+                    }
+                    IdleLivenessProbeGate.Action.None -> Unit
                 }
                 // No forceReconnect here. OkHttp Ping onFailure handles real
                 // dead sockets. ACK watchdog handles the pending-ack timeout.
             }
         }
     }
+
+    /**
+     * Send one, and only one, application-level probe for this session.
+     *
+     * The old app-level heartbeat loop sent repeatedly and reduced observed
+     * socket lifetime. This probe is a different contract: one frame late in
+     * candidate probation, correlated to the session epoch, and no retry. The
+     * existing OkHttp protocol ping remains the ongoing heartbeat. Quiet
+     * active sessions use a separate bounded pre-stall proof.
+     */
+    private fun startCandidateProofProbe(scope: CoroutineScope, mySession: Long) {
+        scope.launch(CoroutineName("ws-candidate-proof-$mySession")) {
+            runCandidateProofProbe(
+                mySession = mySession,
+                wait = { delay(it) },
+                isCurrentSession = {
+                    wsSessionEpoch == mySession && currentSessionStats?.sessionEpoch == mySession
+                },
+                sender = { sendRaw(RelayMessage.Ping) },
+            )
+        }
+    }
+
+    private suspend fun runCandidateProofProbe(
+        mySession: Long,
+        wait: suspend (Long) -> Unit,
+        isCurrentSession: () -> Boolean,
+        sender: suspend () -> Boolean,
+    ) {
+        val reserved = candidateProbeMutex.withLock {
+            if (candidateProbeAttemptedEpoch == mySession) {
+                false
+            } else {
+                candidateProbeAttemptedEpoch = mySession
+                true
+            }
+        }
+        if (!reserved) return
+
+        wait(RelayTransportConfig.CANDIDATE_PROOF_PROBE_DELAY_MS)
+        if (!isCurrentSession()) return
+
+        candidateProbeMutex.withLock {
+            candidateProbeOutstandingEpoch = mySession
+        }
+        val sent = sender()
+        if (!sent) {
+            candidateProbeMutex.withLock {
+                if (candidateProbeOutstandingEpoch == mySession) {
+                    candidateProbeOutstandingEpoch = null
+                }
+            }
+            currentSessionStats?.takeIf { it.sessionEpoch == mySession }
+                ?.let { it.pingSendFailures += 1 }
+            relayLog(RelayLogLevel.WARN, "${genTag(mySession)} candidate_probe_send_failed")
+            return
+        }
+
+        currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
+            stats.pingsSent += 1
+            stats.lastPingAtMs = Clock.System.now().toEpochMilliseconds()
+        }
+        relayLog(RelayLogLevel.INFO, "${genTag(mySession)} candidate_probe_sent")
+    }
+
+    private suspend fun classifyPongActivity(mySession: Long): WsSessionSignal.ActivityKind =
+        candidateProbeMutex.withLock {
+            if (candidateProbeOutstandingEpoch == mySession) {
+                candidateProbeOutstandingEpoch = null
+                WsSessionSignal.ActivityKind.CandidateProof
+            } else {
+                WsSessionSignal.ActivityKind.Pong
+            }
+        }
+
+    internal suspend fun runCandidateProofProbeForTest(
+        mySession: Long,
+        wait: suspend (Long) -> Unit,
+        isCurrentSession: () -> Boolean,
+        sender: suspend () -> Boolean,
+    ) = runCandidateProofProbe(mySession, wait, isCurrentSession, sender)
+
+    internal suspend fun classifyPongActivityForTest(mySession: Long): WsSessionSignal.ActivityKind =
+        classifyPongActivity(mySession)
 
     private fun startAckWatchdog(scope: CoroutineScope, generationClient: HttpClient, mySession: Long) {
         ackWatchdogJob = scope.launch {
@@ -2204,9 +2316,13 @@ class KtorRelayTransport(
                             // ping_send, frames are arriving on a stale
                             // generation's reader.
                             lastPongMark = timeSource.markNow()
-                            // Liveness only: the state machine never promotes on a pong.
+                            // An ordinary pong is liveness only. The one pong
+                            // correlated with this session's candidate probe
+                            // is a distinct proof signal; duplicate or stale
+                            // pongs remain ordinary liveness.
+                            val activityKind = classifyPongActivity(mySession)
                             enqueueSignal(
-                                WsSessionSignal.Activity(WsSessionId(mySession), WsSessionSignal.ActivityKind.Pong),
+                                WsSessionSignal.Activity(WsSessionId(mySession), activityKind),
                             )
                             currentSessionStats?.takeIf { it.sessionEpoch == mySession }?.let { stats ->
                                 stats.pongsReceived += 1
@@ -2214,7 +2330,7 @@ class KtorRelayTransport(
                             }
                             relayLog(
                                 RelayLogLevel.INFO,
-                                "${genTag(mySession)} pong_received",
+                                "${genTag(mySession)} pong_received kind=${activityKind.name}",
                             )
                         }
                         else -> Unit
@@ -3402,6 +3518,10 @@ class KtorRelayTransport(
     internal fun simulateSessionConnectedForTest(sessionEpoch: Long, ownerGeneration: Long = 0L) {
         require(sessionEpoch > wsSessionEpoch) { "session epochs are monotonic" }
         wsSessionEpoch = sessionEpoch
+        connectedSessionSnapshot = WsConnectedSessionSnapshot(
+            sessionEpoch = sessionEpoch,
+            connectionGeneration = ownerGeneration,
+        )
         _state.value = TransportState.Connected
         enqueueSignal(
             WsSessionLifecycleEvent.Connected(

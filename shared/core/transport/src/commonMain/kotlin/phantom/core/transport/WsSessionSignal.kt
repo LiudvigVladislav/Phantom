@@ -55,13 +55,18 @@ data class WsSessionId(val sessionEpoch: Long) : Comparable<WsSessionId> {
 sealed interface WsSessionSignal {
     val sessionId: WsSessionId
 
-    /** What a live socket did. `Pong` is liveness only, never proof. */
-    enum class ActivityKind { Frame, Ack, Pong }
+    /**
+     * What a live socket did. An ordinary [Pong] is liveness only. A
+     * [CandidateProof] is the correlated reply to the transport's single
+     * candidate probe for this exact session epoch.
+     */
+    enum class ActivityKind { Frame, Ack, Pong, CandidateProof }
 
     /**
      * The relay pushed something on this session: a `Deliver` or `Ack`
      * text frame ([ActivityKind.Frame] / [ActivityKind.Ack]) or the
-     * application-level pong ([ActivityKind.Pong]).
+     * application-level pong ([ActivityKind.Pong]), or the correlated
+     * one-shot candidate-probe reply ([ActivityKind.CandidateProof]).
      */
     data class Activity(
         override val sessionId: WsSessionId,

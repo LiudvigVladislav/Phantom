@@ -39,6 +39,74 @@ class WsSessionSignalContractTest {
     private fun newTransport(): KtorRelayTransport =
         KtorRelayTransport(httpClientFactory = { error("no network in this fixture") })
 
+    @Test
+    fun candidate_probe_is_one_shot_and_only_its_matching_pong_is_proof() = runTest {
+        val transport = newTransport()
+        var waits = 0
+        var sends = 0
+
+        suspend fun runProbe(epoch: Long, current: Boolean = true, sent: Boolean = true) {
+            transport.runCandidateProofProbeForTest(
+                mySession = epoch,
+                wait = { delayMs ->
+                    assertEquals(RelayTransportConfig.CANDIDATE_PROOF_PROBE_DELAY_MS, delayMs)
+                    waits += 1
+                },
+                isCurrentSession = { current },
+                sender = {
+                    sends += 1
+                    sent
+                },
+            )
+        }
+
+        runProbe(epoch = 7)
+        runProbe(epoch = 7)
+        assertEquals(1, waits, "a session epoch reserves at most one probe")
+        assertEquals(1, sends, "a session epoch sends at most one probe")
+        assertEquals(
+            WsSessionSignal.ActivityKind.Pong,
+            transport.classifyPongActivityForTest(6),
+            "a stale session cannot consume the live probe",
+        )
+        assertEquals(
+            WsSessionSignal.ActivityKind.CandidateProof,
+            transport.classifyPongActivityForTest(7),
+        )
+        assertEquals(
+            WsSessionSignal.ActivityKind.Pong,
+            transport.classifyPongActivityForTest(7),
+            "the correlated proof is consumed once; duplicates are liveness only",
+        )
+
+        runProbe(epoch = 8, sent = false)
+        assertEquals(WsSessionSignal.ActivityKind.Pong, transport.classifyPongActivityForTest(8))
+        runProbe(epoch = 9, current = false)
+        assertEquals(2, sends, "a session that ended during the delay must not write to its successor")
+    }
+
+    @Test
+    fun quiet_active_session_is_probed_once_before_it_is_declared_stalled() {
+        val gate = IdleLivenessProbeGate()
+
+        assertEquals(IdleLivenessProbeGate.Action.None, gate.next(40_000L))
+        assertEquals(IdleLivenessProbeGate.Action.SendProbe, gate.next(50_000L))
+        assertEquals(
+            IdleLivenessProbeGate.Action.None,
+            gate.next(55_000L),
+            "one idle window must not emit repeated application pings",
+        )
+        assertEquals(IdleLivenessProbeGate.Action.EmitStall, gate.next(60_000L))
+        assertEquals(IdleLivenessProbeGate.Action.None, gate.next(65_000L))
+
+        assertEquals(
+            IdleLivenessProbeGate.Action.None,
+            gate.next(1_000L),
+            "an inbound frame rearms the bounded proof sequence",
+        )
+        assertEquals(IdleLivenessProbeGate.Action.SendProbe, gate.next(50_000L))
+    }
+
     // ── One consumer, enforced by the transport ─────────────────────────────
 
     @Test

@@ -1102,13 +1102,22 @@ class AppContainer(private val context: Context) {
      * re-reading the lazy field if Tor has not been initialised. When
      * null, reads [_torStarted] as the guard before touching the lazy.
      */
-    private fun recomputeCapabilities(torActiveOverride: Boolean? = null) {
-        val restMode = hybridTransport?.stateMachine?.current
+    private fun recomputeCapabilities(
+        restMode: phantom.core.transport.RestMode?,
+        torActiveOverride: Boolean? = null,
+    ) {
         val torActive = torActiveOverride
             ?: (_torStarted && torService.state.value is TorState.Ready)
-        _transportCapabilities.value = TransportCapabilitiesResolver.resolve(
+        val next = TransportCapabilitiesResolver.resolve(
             restMode = restMode,
             torActive = torActive,
+        )
+        _transportCapabilities.value = next
+        android.util.Log.i(
+            "PhantomTransport",
+            "CAPABILITY_UPDATE mode=${next.restModeLabel ?: "none"} " +
+                "calls=${next.canStartCalls} voice=${next.canSendVoice} " +
+                "reason=${next.callDisabledReason?.name?.lowercase() ?: "none"}",
         )
     }
 
@@ -2870,8 +2879,8 @@ class AppContainer(private val context: Context) {
             // then updates on every subsequent transition so UI observers
             // (ChatScreen) see real-time capability changes without polling.
             appScope.launch {
-                hybrid.stateMachine.state.collect {
-                    recomputeCapabilities()
+                hybrid.stateMachine.state.collect { restMode ->
+                    recomputeCapabilities(restMode = restMode)
                 }
             }
 
@@ -2910,7 +2919,10 @@ class AppContainer(private val context: Context) {
             _torStarted = true
             appScope.launch {
                 torService.state.collect { torState ->
-                    recomputeCapabilities(torActiveOverride = torState is TorState.Ready)
+                    recomputeCapabilities(
+                        restMode = hybridTransport?.stateMachine?.current,
+                        torActiveOverride = torState is TorState.Ready,
+                    )
                 }
             }
         }
@@ -3311,6 +3323,7 @@ class AppContainer(private val context: Context) {
             // Single source of truth: _transportCapabilities StateFlow — same StateFlow
             // that drives the UI CALL_CAPABILITY guard in ChatScreen.
             transportCapabilitiesProvider = { _transportCapabilities.value },
+            turnCredentialsProvider = { restOrchestratorRef?.fetchTurnCredentials() },
         )
         cm.initialize()
         callManager = cm

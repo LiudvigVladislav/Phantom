@@ -21,6 +21,7 @@ pub mod seq_mac;
 pub mod state;
 pub mod t2_diag;
 pub mod diag_poll_shape;
+pub mod turn_credentials;
 
 // RC-RELAY-QUEUE-DURABILITY PR-2 M1 — shard-worker fundamentals.
 // These modules are public but not yet wired into main.rs / axum

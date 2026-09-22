@@ -7,6 +7,7 @@ use crate::envelope::Envelope;
 use crate::media::MediaStore;
 use crate::prekeys::PreKeyStore;
 use crate::rest_fallback::{IdempotencyCache, RestEnvelope, RestTokenStore, SeqCounter, SessionChallengeCache};
+use crate::turn_credentials::TurnCredentialIssuer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -179,6 +180,10 @@ pub struct AppState {
     /// per-identity counter so the two flows are independent per Q2 lock.
     pub ack_rate_limiter: RwLock<HashMap<String, RateEntry>>,
 
+    /// Short-lived coturn credential issuer. Disabled when no secret file is
+    /// configured; the authenticated endpoint then fails closed with 503.
+    pub turn_credentials: TurnCredentialIssuer,
+
     // ── Media upload store (PR-M1r) ───────────────────────────────────────────
 
     /// In-memory store for encrypted media chunks uploaded via
@@ -326,6 +331,7 @@ impl AppState {
             // Trek 2 Stage 1 long-poll
             notifiers: RwLock::new(HashMap::new()),
             ack_rate_limiter: RwLock::new(HashMap::new()),
+            turn_credentials: TurnCredentialIssuer::from_env(),
             // Media upload (PR-M1r)
             media_store: MediaStore::new(),
             state_paths,

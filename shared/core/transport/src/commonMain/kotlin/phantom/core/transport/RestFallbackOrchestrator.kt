@@ -4288,6 +4288,55 @@ class RestFallbackOrchestrator(
     suspend fun acquireOrRefreshMediaToken(reason: String, staleToken: String?): String? =
         acquireOrRefreshToken(reason = reason, staleToken = staleToken)
 
+    /**
+     * Fetch a fresh, short-lived TURN credential set. Credentials remain
+     * in-memory in the call layer and are never cached or persisted here.
+     * One 401 refresh is allowed; all other failures degrade to STUN-only.
+     */
+    suspend fun fetchTurnCredentials(): TurnCredentialsResponse? {
+        var staleToken: String? = null
+        repeat(2) { attempt ->
+            val token = acquireOrRefreshToken(
+                reason = "turn_credentials",
+                staleToken = staleToken,
+            ) ?: return null
+            val response = try {
+                egressGate.dispatch("turn_credentials") {
+                    transport.turnCredentials(
+                        url = "$baseUrl/calls/turn-credentials",
+                        token = token,
+                    )
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (error: Throwable) {
+                log("REST_TRACE turn_credentials_fail reason=${error::class.simpleName}")
+                return null
+            }
+            if (response.statusCode == 401 && attempt == 0) {
+                staleToken = token
+                return@repeat
+            }
+            val parsed = response.bodyParsed
+            val validUris = parsed?.uris
+                ?.filter { uri -> uri.startsWith("turn:") || uri.startsWith("turns:") }
+                ?.distinct()
+                .orEmpty()
+            if (response.statusCode !in 200..299 || parsed == null || validUris.isEmpty()) {
+                log("REST_TRACE turn_credentials_fail status=${response.statusCode}")
+                return null
+            }
+            val nowSeconds = now() / 1_000L
+            if (parsed.expiresAt <= nowSeconds || parsed.ttlSeconds <= 0L) {
+                log("REST_TRACE turn_credentials_fail reason=expired_response")
+                return null
+            }
+            log("REST_TRACE turn_credentials_ready uri_count=${validUris.size}")
+            return parsed.copy(uris = validUris)
+        }
+        return null
+    }
+
     private suspend fun authSessionOnce(): AuthSessionResponse? {
         log("REST_TRACE session_request identity=${identityHex.take(8)}")
         // Trek 2 Stage 2B-B (C4 review-fix round 2 P1.2) — explicit

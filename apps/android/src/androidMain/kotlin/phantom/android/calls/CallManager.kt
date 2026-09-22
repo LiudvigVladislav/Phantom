@@ -14,7 +14,9 @@ package phantom.android.calls
 
 import android.content.Context
 import android.media.AudioManager
+import android.util.Log
 import com.benasher44.uuid.uuid4
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -47,6 +49,7 @@ import phantom.core.messaging.MessagePayload.Companion.TYPE_CALL_REJECT
 import phantom.core.messaging.MessagingService
 import phantom.core.transport.CallDisabledReason
 import phantom.core.transport.TransportCapabilities
+import phantom.core.transport.TurnCredentialsResponse
 
 @Serializable
 private data class IceCandidateJson(
@@ -54,6 +57,32 @@ private data class IceCandidateJson(
     val sdpMLineIndex: Int,
     val candidate: String,
 )
+
+internal data class CallIceServerSpec(
+    val uris: List<String>,
+    val username: String? = null,
+    val credential: String? = null,
+)
+
+internal fun buildCallIceServerSpecs(
+    turnCredentials: TurnCredentialsResponse?,
+): List<CallIceServerSpec> {
+    val specs = mutableListOf(
+        CallIceServerSpec(uris = listOf("stun:turn.phntm.pro:3478")),
+    )
+    val turnUris = turnCredentials?.uris
+        ?.filter { uri -> uri.startsWith("turn:") || uri.startsWith("turns:") }
+        ?.distinct()
+        .orEmpty()
+    if (turnCredentials != null && turnUris.isNotEmpty()) {
+        specs += CallIceServerSpec(
+            uris = turnUris,
+            username = turnCredentials.username,
+            credential = turnCredentials.credential,
+        )
+    }
+    return specs
+}
 
 class CallManager(
     private val context: Context,
@@ -80,6 +109,8 @@ class CallManager(
             restModeLabel = null,
         )
     },
+    /** Fresh per-call credentials. They are kept in memory only. */
+    private val turnCredentialsProvider: suspend () -> TurnCredentialsResponse? = { null },
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -99,11 +130,6 @@ class CallManager(
     private var pendingRemoteSdp: String? = null
     private var pendingRemoteFrom: String? = null
     private var ringTimeoutJob: Job? = null
-
-    private val iceServers = listOf(
-        PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-        PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-    )
 
     fun initialize() {
         val initOptions = PeerConnectionFactory.InitializationOptions
@@ -126,6 +152,7 @@ class CallManager(
         // No state mutation occurs on early return — we never enter CALLING,
         // never touch AudioManager, never construct a PeerConnection.
         if (!checkCallCapability(transportCapabilitiesProvider())) return  // package-level helper
+        val turnCredentials = fetchTurnCredentials()
         val callId = uuid4().toString()
         pendingIceCandidates.clear()
         _activeCall.value = ActiveCall(callId, toPubKeyHex, toUsername, CallState.CALLING)
@@ -140,7 +167,7 @@ class CallManager(
             cleanupCall(CallState.ENDED)
         }
 
-        createPeerConnection(toPubKeyHex)
+        createPeerConnection(toPubKeyHex, turnCredentials)
 
         val audioSource = peerConnectionFactory?.createAudioSource(MediaConstraints())
         localAudioTrack = peerConnectionFactory?.createAudioTrack("audio0", audioSource)
@@ -208,7 +235,8 @@ class CallManager(
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         audioManager.isMicrophoneMute = false
 
-        createPeerConnection(remoteFrom)
+        val turnCredentials = fetchTurnCredentials()
+        createPeerConnection(remoteFrom, turnCredentials)
 
         val audioSource = peerConnectionFactory?.createAudioSource(MediaConstraints())
         localAudioTrack = peerConnectionFactory?.createAudioTrack("audio0", audioSource)
@@ -332,7 +360,33 @@ class CallManager(
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    private fun createPeerConnection(remotePubKeyHex: String) {
+    private suspend fun fetchTurnCredentials(): TurnCredentialsResponse? = try {
+        turnCredentialsProvider().also { credentials ->
+            Log.i(
+                LOG_TAG,
+                "turn_credentials=${if (credentials == null) "unavailable" else "available"} " +
+                    "uri_count=${credentials?.uris?.size ?: 0}",
+            )
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (error: Throwable) {
+        Log.w(LOG_TAG, "turn_credentials=unavailable reason=${error::class.simpleName}")
+        null
+    }
+
+    private fun createPeerConnection(
+        remotePubKeyHex: String,
+        turnCredentials: TurnCredentialsResponse?,
+    ) {
+        val iceServers = buildCallIceServerSpecs(turnCredentials).map { spec ->
+            PeerConnection.IceServer.builder(spec.uris).apply {
+                if (spec.username != null && spec.credential != null) {
+                    setUsername(spec.username)
+                    setPassword(spec.credential)
+                }
+            }.createIceServer()
+        }
         val config = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
@@ -361,9 +415,15 @@ class CallManager(
                 }
 
                 override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
+                    Log.i(LOG_TAG, "peer_connection_state=$state")
                     when (state) {
-                        PeerConnection.PeerConnectionState.CONNECTED ->
+                        PeerConnection.PeerConnectionState.CONNECTED -> {
                             _activeCall.value = _activeCall.value?.copy(state = CallState.IN_CALL)
+                            scope.launch {
+                                delay(1_000)
+                                logSelectedCandidatePath()
+                            }
+                        }
                         PeerConnection.PeerConnectionState.DISCONNECTED,
                         PeerConnection.PeerConnectionState.FAILED ->
                             cleanupCall(CallState.ENDED)
@@ -373,17 +433,53 @@ class CallManager(
 
                 // Unused callbacks — required by interface
                 override fun onSignalingChange(p0: PeerConnection.SignalingState?) {}
-                override fun onIceConnectionChange(p0: PeerConnection.IceConnectionState?) {}
+                override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+                    Log.i(LOG_TAG, "ice_connection_state=$state")
+                }
                 override fun onIceConnectionReceivingChange(p0: Boolean) {}
-                override fun onIceGatheringChange(p0: PeerConnection.IceGatheringState?) {}
+                override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+                    Log.i(LOG_TAG, "ice_gathering_state=$state")
+                }
                 override fun onIceCandidatesRemoved(p0: Array<out IceCandidate>?) {}
                 override fun onAddStream(p0: MediaStream?) {}
                 override fun onRemoveStream(p0: MediaStream?) {}
                 override fun onDataChannel(p0: DataChannel?) {}
                 override fun onRenegotiationNeeded() {}
-                override fun onAddTrack(p0: RtpReceiver?, p1: Array<out MediaStream>?) {}
+                override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
+                    Log.i(LOG_TAG, "remote_track_added kind=${receiver?.track()?.kind() ?: "unknown"}")
+                }
             }
         )
+    }
+
+    private fun logSelectedCandidatePath() {
+        val connection = peerConnection ?: return
+        connection.getStats { report ->
+            val stats = report.statsMap
+            val pair = stats.values.firstOrNull { stat ->
+                if (stat.type != "candidate-pair") return@firstOrNull false
+                val state = stat.members["state"] as? String
+                val nominated = stat.members["nominated"] as? Boolean ?: false
+                val selected = stat.members["selected"] as? Boolean ?: false
+                state == "succeeded" && (nominated || selected)
+            }
+            val localId = pair?.members?.get("localCandidateId") as? String
+            val remoteId = pair?.members?.get("remoteCandidateId") as? String
+            val local = localId?.let(stats::get)
+            val remote = remoteId?.let(stats::get)
+            val localType = local?.members?.get("candidateType") as? String ?: "unknown"
+            val remoteType = remote?.members?.get("candidateType") as? String ?: "unknown"
+            val protocol = local?.members?.get("protocol") as? String ?: "unknown"
+            Log.i(
+                LOG_TAG,
+                "selected_ice_path local_type=$localType remote_type=$remoteType " +
+                    "protocol=$protocol relayed=${localType == "relay" || remoteType == "relay"}",
+            )
+        }
+    }
+
+    private companion object {
+        const val LOG_TAG = "PhantomCall"
     }
 
     private suspend fun sendSignal(to: String, payload: MessagePayload) {
