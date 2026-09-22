@@ -178,7 +178,11 @@ git pull
 docker compose -f deploy/docker-compose.yml up -d --build relay
 ```
 
-Caddy doesn't restart — only the relay container rebuilds. In-memory queue is lost on restart, but that is by design: envelopes not yet delivered are the client's responsibility to retry.
+Caddy does not restart; only the relay container rebuilds. Before and after the
+update, verify the relay health endpoint and the durable-queue startup summary.
+Accepted envelopes are persisted under `RELAY_STATE_DIR` and replayed after a
+process or container restart. Do not delete or replace that state directory as
+part of a routine deployment.
 
 ---
 

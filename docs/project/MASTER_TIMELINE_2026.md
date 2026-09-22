@@ -10,10 +10,11 @@
 > out. Every recorded run, including the failures, is listed in
 > [`docs/field-tests/TEST_MATRIX.md`](../field-tests/TEST_MATRIX.md).
 
-**Last updated:** 2026-09-21 — residual N1 and Android release-readiness are
-merged through master `88bf5ed` (PRs #411-#413). The concise current state and
-remaining presentation-candidate gates live in
-[`STATUS_2026_09_21.md`](STATUS_2026_09_21.md). The long entries below are an
+**Last updated:** 2026-09-22 — production relay rotation, authenticated TURN
+fallback, and realtime call proofing are reflected through master `73e24d3`
+(PRs #411-#415). The concise current state and remaining
+presentation-candidate gates live in
+[`STATUS_2026_09_22.md`](STATUS_2026_09_22.md). The long entries below are an
 append-only historical timeline; their embedded “next” pointers describe their
 own date and do not override the current snapshot.
 

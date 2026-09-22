@@ -4,7 +4,7 @@ This file translates the public roadmap into the current engineering order. The
 original Alpha-0 startup sequence is complete and is preserved in git history;
 it is no longer an active checklist.
 
-## Current baseline - 2026-09-21
+## Current baseline - 2026-09-22
 
 The following foundations are on `master`:
 
@@ -14,16 +14,19 @@ The following foundations are on `master`:
 - encrypted local state, prekey bootstrap, Double Ratchet, and Sealed Sender;
 - residual N1 recovery, including deterministic queued replay and a common
   settle-before-encrypt barrier;
+- durable production relay storage with restart replay and heartbeat echo
+  disabled;
+- authenticated, short-lived TURN fallback for one-to-one audio calls;
 - API 36 release configuration, fail-closed signing, and 16 KiB native-library
   alignment.
 
-See [`STATUS_2026_09_21.md`](STATUS_2026_09_21.md) for the measured snapshot.
+See [`STATUS_2026_09_22.md`](STATUS_2026_09_22.md) for the measured snapshot.
 
 ## Active delivery sequence
 
 1. Finish Android design parity in its isolated worktree.
-2. Rotate production relay to the durable-queue implementation already merged
-   on `master`; remove the completed heartbeat-echo diagnostic flag.
+2. Repeat authenticated TURN calls on two physical phones over independent
+   networks and resolve or bound the phone-side audio crackle.
 3. Run the expanded two-device capability smoke: text and receipts, voice,
    Standard/Private/Ghost, network and process recovery, and supported call
    behavior.

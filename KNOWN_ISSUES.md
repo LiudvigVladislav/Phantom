@@ -1,8 +1,8 @@
 # PHANTOM — Known Issues
 
-**Last updated:** 2026-09-21
-**Build:** `master` at `88bf5ed` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates, and [`docs/project/STATUS_2026_09_21.md`](docs/project/STATUS_2026_09_21.md) records the current reconciliation.
-**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS — Wi-Fi only since 2026-05-14, no SIM card; Pixel emulators API 35 on Windows dev machine), Tele2 LTE Irkutsk Oblast (real-device, second SIM phone pending), MTS Wi-Fi (real-device, no SIM cellular path) Hetzner VPS relay (`relay.phntm.pro`).
+**Last updated:** 2026-09-22
+**Build:** `master` at `73e24d3` — current Alpha 2 development baseline. The latest tagged pre-release, `v0.1.0-alpha.2`, is a historical snapshot; development on `master` has moved substantially beyond it. Earlier Alpha 1 investigation remains in this document as historical context. The [README](README.md) is the source of truth for the current public feature surface, [ROADMAP.md](ROADMAP.md) describes direction without fixed release dates, and [`docs/project/STATUS_2026_09_22.md`](docs/project/STATUS_2026_09_22.md) records the current reconciliation.
+**Tested platforms:** Android (Tecno Spark Go 2023 / Android 12 HiOS; Pixel emulators API 35 and API 37), Tele2 and Yota LTE in Irkutsk Oblast, MTS Wi-Fi, Hetzner production relay (`relay.phntm.pro`), and the dedicated TURN service (`turn.phntm.pro`).
 
 ---
 
@@ -18,10 +18,13 @@
 - Android release builds target API 36 and have been verified for 16 KiB native
   page-size compatibility. Production signing now fails closed when credentials
   are absent.
-- Durable relay queue code is merged, but the production relay image predates
-  that merge. Until production rotation is complete, a container restart can
-  still discard delivered-but-unacknowledged envelopes.
-- Calls remain experimental, groups are partial, and receiver-side media cancellation is still missing.
+- The durable relay queue is deployed in production and restart recovery has
+  been exercised. The completed heartbeat-echo diagnostic is disabled.
+- Authenticated, short-lived TURN fallback is deployed. A 6m18s physical-phone
+  LTE to emulator Wi-Fi call used the relayed path with intelligible audio in
+  both directions and a clean hangup.
+- Calls remain experimental pending two-physical-phone and wider network/audio
+  validation; groups are partial, and receiver-side media cancellation is still missing.
 - Carrier behavior and first-contact bootstrap remain active reliability work.
 - The custom cryptographic implementation has not received an independent audit.
 
@@ -282,43 +285,52 @@ The `feat/tor-unified-push-transport` branch retained as historical research art
 
 ---
 
-### ISSUE-014: Calls — experimental feature, unproven on Russian mobile carriers
+### ISSUE-014: Calls — authenticated TURN works; production acceptance remains open
 
-**Status (refreshed 2026-05-21 post-pivot).** WebRTC voice calls remain **experimental**. Core text messaging is production-quality across the Standard / Private / REST-fallback stack; voice messages are production-quality on the encrypted media-upload path (M1w → M2). Calls are an entirely separate transport problem — they cannot ride the REST fallback (no realtime UDP through short-poll) and have not been validated on a Russian mobile carrier since the 2026-05-15 strategic pivot demoted Tor to text-only.
+**Status (refreshed 2026-09-22).** WebRTC one-to-one audio calls remain
+**experimental**, but the principal cross-network connectivity blocker is now
+closed. PR #415 added authenticated, short-lived TURN credentials, fixed the
+call-launch lifetime and realtime-capability races, and kept direct ICE as the
+preferred path. TURN is a media fallback; REST polling and Tor remain unsuitable
+for realtime calls.
 
-**Strategic pivot context (2026-05-14 / 2026-05-15).** The earlier "Tor + UnifiedPush hybrid" answer (ADR-016) was retired and Tor was demoted to a text-only emergency fallback after Test #42 on Tele2 LTE showed Reality probe failures dropping straight through to Tor. Tor cannot carry WebRTC (no UDP through onion, latency too high, bandwidth insufficient). Reality is now the load-bearing mobile transport for both voice notes and the call path — but call-over-Reality has not had a production-quality test yet on RU LTE. The C-track (PR-C1 capabilities / PR-C2 Reality endpoint pool + realistic probe / PR-C3 TURN-over-TLS or Opus-over-Reality) is the queued architectural answer.
+**Current field proof.** A physical phone on LTE/Yota called an emulator on
+Wi-Fi for 6m18s. The phone selected the TURN relay path, the emulator selected a
+relayed peer path, audio was intelligible in both directions, and hangup released
+the call cleanly. The production relay and TURN services remained healthy with
+the heartbeat-echo diagnostic disabled.
 
-**What works (verified 2026-05-02 on Tecno Spark Go ↔ Pixel 8 Pro emulator):**
+The field proof is deliberately bounded. It uses one physical phone and one
+emulator, not two physical phones on independent networks. The phone side also
+had intermittent crackle; emulator audio, host routing, and acoustic feedback
+make that result insufficient for an audio-quality verdict.
 
-- Outgoing and incoming call signalling (offer / answer / ICE / reject / hangup)
-- Username displayed correctly on incoming call (F-07 fix)
-- Sequential calls do not carry stale ICE between sessions (F-10 fix)
-- 60-second ring timeout on unanswered outgoing calls (F-03 fix)
-- Mic permission requested at call start (caller) and call answer (callee)
-- `AudioManager.MODE_IN_COMMUNICATION` set during the call, restored on cleanup
-- Mute and Speaker buttons toggle and reflect state in UI
-- Black screen after `cleanupCall` no longer occurs — the route navigates back to chat list when the call state goes null (PR #30)
+**What is implemented and covered by automated tests:**
 
-**Known limitations on Tecno HiOS — not fixed in Alpha:**
+- outgoing and incoming offer, answer, ICE, reject, and hangup signalling;
+- one authenticated TURN credential fetch per call, held in memory only;
+- rejection of expired or malformed TURN responses with STUN-only fallback;
+- direct ICE preference with TURN available when direct connectivity fails;
+- call startup that survives disposal of the originating Compose scope;
+- current transport-capability checks at user invocation time;
+- bounded WSS proofing and recovery without a recurring application heartbeat;
+- clean call teardown and audio-mode restoration.
 
-1. **Asymmetric audio.** Phone caller's mic → emulator callee's speaker works (callee hears caller). Emulator callee's mic → phone caller's speaker is silent (caller does not hear callee), regardless of speakerphone toggle. Likely cause: HiOS-specific audio focus or default `AudioDeviceModule` initialization not coping with this routing. Not investigated to root cause; deferred to PR 2.6 post-Alpha.
-2. **Crash possible mid-call.** If the 30-second transport reconnect cycle (ISSUE-013) fires while a WebRTC session is establishing or in progress, the app may crash with a native WebRTC fault and auto-restart via the foreground-service contract. Reproduces ~1 in 5 sustained calls on Tecno; not observed on stock-Android emulator.
-3. **State desync between participants during establishment.** When transport reconnect fires between `call_offer` and `call_answer`, one side may show "in call / counting timer" while the other still shows "calling…" until ICE catches up. Self-resolves when the next signalling envelope arrives, typically within 1–3 s.
-4. **Speaker / earpiece routing varies.** On the phone, default routing is the earpiece (small speaker near the top, intended for holding to ear). Speaker toggle works but is a separate user action. On emulator there is no earpiece concept; default routes to the host audio device.
+**Remaining acceptance work:**
 
-**Root cause is architectural, not a localised bug.** WebRTC voice calls expect a stable persistent network session. PHANTOM's transport on aggressive-OEM Android cycles through reconnects every ~30 seconds (ISSUE-013). Each reconnect can disrupt ICE, DTLS-SRTP setup, or the foreground service hosting the WebRTC native code. The original "fix this via push-based wakeup" plan was retired during the 2026-05-14 pivot (no UnifiedPush, no FCM). The current path forward for calls on restrictive networks is the dedicated calls track (PR-C2 Reality endpoint pool + realistic probe, PR-C3 TURN-over-TLS or Opus-over-Reality) — separate work, not bundled with the messaging-transport stack.
+1. Repeat calls between two physical phones on independent Wi-Fi and cellular
+   networks, including at least one restrictive carrier path.
+2. Determine whether the observed crackle belongs to the phone audio path,
+   emulator/host audio, or acoustic feedback, then retest after any required fix.
+3. Exercise incoming/outgoing calls, reject, timeout, reconnect, background and
+   foreground transitions, mute, speaker, and repeated-call cleanup across the
+   physical-device matrix.
+4. Keep calls labelled experimental until that matrix is recorded without a
+   new crash, one-way-audio, or state-desynchronisation blocker.
 
-**Recommendation for Alpha users:**
-
-- Use **text** and **encrypted voice messages** for important communication. These deliver reliably on the validated current paths.
-- Calls are best-effort — work well between two stock-Android devices on Wi-Fi, less reliable when one side is an aggressive-OEM phone.
-
-**Real fix path:**
-
-- **Call audio hardening (no fixed date):** explicit `JavaAudioDeviceModule`, `AudioFocus` request, and default-on speakerphone for testing. The earlier proposal to suppress `forceReconnect()` during a call is obsolete because stale-inbound recovery no longer invokes `forceReconnect`; calls instead require dedicated transport hardening.
-- **Calls track (PR-C2 / PR-C3):** Reality endpoint pool with a realistic probe (the current `/health` probe does not catch Tele2's silent WS-drop pattern), then a transport that can carry WebRTC on restrictive networks — candidates include TURN-over-TLS on port 443 or a custom Opus-over-Reality envelope. This is the architectural answer that replaces the retired push-based-wakeup plan.
-
-**Scope decision rationale.** PRs #29 and #30 closed the user-visible call-UX bugs that were definitively fixable above the transport layer. Further iteration would require Tecno-specific WebRTC ADM debugging with diminishing returns. Development therefore shifted to the now-shipped encrypted voice-message path, which serves the same async-voice need at much higher reliability and is independent of WebRTC.
+**Recommendation for Alpha users:** use text and encrypted voice messages for
+important communication. Calls are available for testing, not yet a
+production-ready release promise.
 
 ---
 

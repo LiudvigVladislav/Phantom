@@ -5,7 +5,7 @@
 > queue: several security and transport items landed earlier or differently than
 > forecast, and calendar estimates below have not been silently rewritten.
 > Current direction lives in [`../../ROADMAP.md`](../../ROADMAP.md); the measured
-> September state is [`STATUS_2026_09_21.md`](STATUS_2026_09_21.md).
+> September state is [`STATUS_2026_09_22.md`](STATUS_2026_09_22.md).
 
 **Дата:** 28 апреля 2026
 **Период:** Май 2026 — Апрель 2027
