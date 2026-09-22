@@ -586,6 +586,12 @@ class HybridRelayTransport(
                         submitStateEvent(RestStateMachine.Event.WsOutboundAckReceived(signal.sessionId.sessionEpoch))
                     WsSessionSignal.ActivityKind.Pong ->
                         submitStateEvent(RestStateMachine.Event.WsPongReceived(signal.sessionId.sessionEpoch))
+                    WsSessionSignal.ActivityKind.CandidateProof ->
+                        submitStateEvent(
+                            RestStateMachine.Event.WsCandidateProbeRoundTrip(
+                                signal.sessionId.sessionEpoch,
+                            ),
+                        )
                 }
                 is WsSessionSignal.Stalled -> onInboundStalled(signal)
                 is WsSessionSignal.AckDeadlineExpired -> onAckDeadlineExpired(signal)
@@ -860,6 +866,27 @@ class HybridRelayTransport(
                 // Flip flag AFTER the inbound collector is registered
                 // so any event already in flight is processed correctly.
                 restCapabilityActive = true
+                // The socket may have connected before REST bootstrap
+                // completed. Its ordered Connected event was still consumed
+                // by the passthrough collector, but submitStateEvent correctly
+                // ignored it while REST was inactive. Replay the current
+                // in-memory session identity now so the state machine can run
+                // the normal candidate-proof ladder. A concurrently delivered
+                // original event is harmless: session epochs are monotonic and
+                // duplicate Connected events are ignored by RestStateMachine.
+                wsTransport.currentConnectedSessionSnapshot?.let { connected ->
+                    submitStateEvent(
+                        RestStateMachine.Event.WsSessionConnected(
+                            sessionEpoch = connected.sessionEpoch,
+                            connectionGeneration = connected.connectionGeneration,
+                        ),
+                    )
+                    Log.i(
+                        TAG,
+                        "REST_TRACE active_ws_session_replayed " +
+                            "epoch=${connected.sessionEpoch} owner=${connected.connectionGeneration}",
+                    )
+                }
             } catch (t: Throwable) {
                 // Rollback the half-launched collector under
                 // `NonCancellable` so even a `CancellationException` on
@@ -880,6 +907,7 @@ class HybridRelayTransport(
                     // Defensive: in case `orchestrator.start()` had
                     // partially armed itself before throwing.
                     orchestrator.stop()
+                    restCapabilityActive = false
                 }
                 // Re-throw (CE included) so the caller observes the
                 // original failure after rollback completes.

@@ -107,6 +107,10 @@ services:
       # in-sync. See `docs/tracks/rc-relay-state-dir-repair.md` §5.2 and
       # §7.2.
       - phantom-reports:/var/phantom
+      # Short-lived TURN credentials are derived from this operator-owned
+      # shared secret. The bind source lives outside the repository and is
+      # mounted read-only; clients never receive the shared secret itself.
+      - /home/phantom/.secrets/phantom-turn-shared-secret:/run/secrets/turn_shared_secret:ro
     # Default ntfy URL inside the docker network — overridable via .env if
     # the operator runs ntfy outside the compose stack.
     environment:
@@ -116,6 +120,9 @@ services:
       # prekeys.jsonl to. MUST match the volume target above. See
       # `docs/tracks/rc-relay-state-dir-repair.md` §5.2.
       RELAY_STATE_DIR: /var/phantom
+      RELAY_TURN_SECRET_FILE: /run/secrets/turn_shared_secret
+      RELAY_TURN_URLS: "turn:turn.phntm.pro:3478?transport=udp,turn:turn.phntm.pro:3478?transport=tcp,turns:turn.phntm.pro:443?transport=tcp"
+      RELAY_TURN_CREDENTIAL_TTL_SECS: "900"
       # RC-RELAY-QUEUE-DURABILITY PR-2 M6-1: RAM-budget defaults pinned
       # explicitly rather than left to code defaults. Value 83886080
       # (80 MiB) calibrated by PR-2 M5b Mac/Docker benchmark under the

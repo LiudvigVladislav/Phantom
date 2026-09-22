@@ -59,6 +59,11 @@ lru = "0.12"
 # sha2 transitively; declaring it explicitly here keeps the dep audit honest.
 sha2 = "0.10"
 
+# HMAC-SHA-1 is required by the coturn TURN REST credential protocol.
+# It signs short-lived usernames only; message and media cryptography stays
+# on the existing modern primitives.
+sha1 = "0.10"
+
 # HMAC-SHA-256 for Stage 1.x `seq_mac` integrity tag on `/relay/poll` envelopes.
 # Pairs with the existing `sha2 = "0.10"` dep; same `digest = "0.10"` trait
 # family, no version conflict. Used in two places: (i) per-identity verify-key

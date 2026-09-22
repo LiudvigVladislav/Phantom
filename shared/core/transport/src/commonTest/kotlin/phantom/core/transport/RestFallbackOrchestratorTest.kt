@@ -64,6 +64,9 @@ class RestFallbackOrchestratorTest {
         val sendCalls: MutableList<SendCall> = mutableListOf()
         val pollCalls: MutableList<Long?> = mutableListOf()
         val ackCalls: MutableList<String> = mutableListOf()
+        val turnCalls: MutableList<String> = mutableListOf()
+        val turnScripts:
+            ArrayDeque<(String) -> RestFallbackResponse<TurnCredentialsResponse>> = ArrayDeque()
 
         override suspend fun authSession(
             url: String,
@@ -113,6 +116,27 @@ class RestFallbackOrchestratorTest {
         ): RestFallbackResponse<AckDeliverResponse> {
             ackCalls += body.id
             return RestFallbackResponse(200, AckDeliverResponse(1), "{}", 1L)
+        }
+
+        override suspend fun turnCredentials(
+            url: String,
+            token: String,
+        ): RestFallbackResponse<TurnCredentialsResponse> {
+            turnCalls += token
+            val script = turnScripts.removeFirstOrNull()
+                ?: return RestFallbackResponse(
+                    200,
+                    TurnCredentialsResponse(
+                        username = "1900:opaque",
+                        credential = "credential",
+                        expiresAt = 1_900,
+                        ttlSeconds = 900,
+                        uris = listOf("turn:turn.phntm.pro:3478?transport=udp"),
+                    ),
+                    "{}",
+                    1L,
+                )
+            return script(token)
         }
     }
 
@@ -373,6 +397,112 @@ class RestFallbackOrchestratorTest {
         val outcome = orch.ackInbound("env-x")
         assertIs<AckOutcome.Acked>(outcome)
         assertEquals(listOf("env-x"), transport.ackCalls)
+    }
+
+    @Test
+    fun turn_credentials_use_cached_auth_and_filter_invalid_uris() = runTest {
+        val auth = CountingAuth()
+        val transport = FakeTransport().apply { sessionScript = auth.script }
+        transport.turnScripts.addLast { _ ->
+            RestFallbackResponse(
+                200,
+                TurnCredentialsResponse(
+                    username = "1900:opaque",
+                    credential = "credential",
+                    expiresAt = 1_900,
+                    ttlSeconds = 900,
+                    uris = listOf(
+                        "https://invalid.example",
+                        "turn:turn.phntm.pro:3478?transport=udp",
+                        "turn:turn.phntm.pro:3478?transport=udp",
+                        "turns:turn.phntm.pro:443?transport=tcp",
+                    ),
+                ),
+                "{}",
+                1L,
+            )
+        }
+        val orch = orchestrator(transport)
+        orch.bootstrap()
+
+        val credentials = orch.fetchTurnCredentials()
+
+        assertEquals(1, auth.count, "TURN fetch should reuse the cached REST token")
+        assertEquals(listOf("T1"), transport.turnCalls)
+        assertEquals(
+            listOf(
+                "turn:turn.phntm.pro:3478?transport=udp",
+                "turns:turn.phntm.pro:443?transport=tcp",
+            ),
+            credentials?.uris,
+        )
+    }
+
+    @Test
+    fun turn_credentials_refresh_once_after_401() = runTest {
+        val auth = CountingAuth()
+        val transport = FakeTransport().apply { sessionScript = auth.script }
+        transport.turnScripts.addLast { _ -> RestFallbackResponse(401, null, "unauth", 1L) }
+        transport.turnScripts.addLast { _ ->
+            RestFallbackResponse(
+                200,
+                TurnCredentialsResponse(
+                    username = "1900:opaque",
+                    credential = "credential",
+                    expiresAt = 1_900,
+                    ttlSeconds = 900,
+                    uris = listOf("turn:turn.phntm.pro:3478?transport=tcp"),
+                ),
+                "{}",
+                1L,
+            )
+        }
+        val orch = orchestrator(transport)
+        orch.bootstrap()
+
+        val credentials = orch.fetchTurnCredentials()
+
+        assertEquals("1900:opaque", credentials?.username)
+        assertEquals(2, auth.count)
+        assertEquals(listOf("T1", "T2"), transport.turnCalls)
+    }
+
+    @Test
+    fun expired_or_non_turn_credentials_fail_closed() = runTest {
+        val transport = FakeTransport()
+        transport.turnScripts.addLast { _ ->
+            RestFallbackResponse(
+                200,
+                TurnCredentialsResponse(
+                    username = "expired",
+                    credential = "credential",
+                    expiresAt = 99,
+                    ttlSeconds = 900,
+                    uris = listOf("turn:turn.phntm.pro:3478"),
+                ),
+                "{}",
+                1L,
+            )
+        }
+        val expired = orchestrator(transport, clockMs = { 100_000L })
+        assertEquals(null, expired.fetchTurnCredentials())
+
+        val invalidTransport = FakeTransport()
+        invalidTransport.turnScripts.addLast { _ ->
+            RestFallbackResponse(
+                200,
+                TurnCredentialsResponse(
+                    username = "valid-time",
+                    credential = "credential",
+                    expiresAt = 1_900,
+                    ttlSeconds = 900,
+                    uris = listOf("https://not-turn.example"),
+                ),
+                "{}",
+                1L,
+            )
+        }
+        assertEquals(null, orchestrator(invalidTransport).fetchTurnCredentials())
     }
 
     @Test

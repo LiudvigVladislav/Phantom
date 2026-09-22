@@ -6,12 +6,26 @@ package phantom.core.transport
 object RelayTransportConfig {
     // Poll cadence for the in-process idle watchdog in
     // KtorRelayTransport.startIdleWatchdog. Since PR-H1e the loop no longer
-    // emits app-level RelayMessage.Ping frames (APP_LEVEL_PING_ENABLED = false)
-    // and since PR-R0.4b it no longer triggers forceReconnect — it only logs
-    // a passive idle_watchdog diagnostic line at ~60 s intervals. 10 s is
-    // kept so the 60 s log cadence can be achieved via a simple modulo on
-    // the local lastLoggedAt mark without measurable CPU/wakeup overhead.
+    // emits app-level Ping on a fixed cadence. It now sends at most one
+    // demand-driven proof late in each quiet inbound window, before the
+    // fail-closed stall threshold. 10 s is the watchdog poll cadence, not a
+    // heartbeat cadence.
     const val PING_INTERVAL_MS = 10_000L
+
+    // A quiet WSS candidate otherwise has no application frame with which to
+    // prove the return path: outbound traffic still routes through REST and
+    // REST polling can consume inbound envelopes first. Send exactly one
+    // existing RelayMessage.Ping late in each session's probation window.
+    // Its correlated Pong proves bidirectional application traffic; the state
+    // machine still waits for the 55 s candidate dwell before promotion.
+    // This is deliberately not the old periodic app-level heartbeat loop.
+    const val CANDIDATE_PROOF_PROBE_DELAY_MS = 40_000L
+
+    // A quiet WsActive session gets one application-level proof before the
+    // text-frame stall detector fires. With a 10 s watchdog poll this is sent
+    // at roughly 50 s, leaving one poll interval for Pong before 60 s. A Pong
+    // resets the inbound mark; a missing Pong preserves the existing fallback.
+    const val INBOUND_STALL_PROBE_THRESHOLD_MS = 45_000L
 
     // If no Pong reply arrives within this window after an OkHttp WS Ping, OkHttp
     // closes the socket and fires onFailure — the legitimate dead-socket trigger.
@@ -175,9 +189,10 @@ object RelayTransportConfig {
     //     network layer (Tecno Wi-Fi NAT / ISP / Cloudflare timeout).
     //     The fix is connectivity / proxy, not relay code.
     //
-    // This is a diagnostic toggle — when we know which side is at fault,
-    // we'll either keep app-level Ping as the production heartbeat OR
-    // switch back to WS-protocol Ping with the routing fix.
+    // Historical diagnostic toggle. No production sender consumes it. The
+    // current application-level pings are separately bounded proofs: one
+    // candidate proof per session and at most one pre-stall proof per quiet
+    // inbound window. OkHttp protocol ping remains the recurring heartbeat.
     const val APP_LEVEL_PING_ENABLED = true
 
     // ── PR-WS-HEALTH-STATE1 Commit 3.2a — telemetry-only constants ───────────

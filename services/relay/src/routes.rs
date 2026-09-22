@@ -15,6 +15,7 @@ use crate::{
     },
     push::wake_offline_recipient,
     rest_fallback::{rest_ack_deliver, rest_poll, rest_send, rest_session},
+    turn_credentials::issue_turn_credentials,
     state::{
         append_block_to_disk, append_push_token_to_disk, append_report_to_disk,
         AbuseReport, AppState, PushTokenRecord, RateEntry,
@@ -89,6 +90,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // token obtained from POST /auth/session (except /auth/challenge
         // which is already mounted above and shared with the WS path).
         .route("/auth/session",      post(rest_session))
+        .route("/calls/turn-credentials", get(issue_turn_credentials))
         .route("/relay/send",        post(rest_send))
         // Trek 2 Stage 1 Q3 — `/relay/poll` is intentionally NOT mounted
         // here. It is mounted separately below (after the 30 s TimeoutLayer

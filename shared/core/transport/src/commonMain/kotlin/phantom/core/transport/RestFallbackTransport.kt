@@ -128,6 +128,21 @@ interface RestFallbackTransport {
         token: String,
         body: AckDeliverRequest,
     ): RestFallbackResponse<AckDeliverResponse>
+
+    /**
+     * Fetch short-lived TURN credentials using the existing authenticated
+     * relay session. A default fail-closed response keeps older platform
+     * implementations and test fakes source-compatible.
+     */
+    suspend fun turnCredentials(
+        url: String,
+        token: String,
+    ): RestFallbackResponse<TurnCredentialsResponse> = RestFallbackResponse(
+        statusCode = 501,
+        bodyParsed = null,
+        rawBody = "",
+        elapsedMs = 0,
+    )
 }
 
 /**
@@ -377,6 +392,16 @@ data class AckDeliverRequest(
 @Serializable
 data class AckDeliverResponse(
     @SerialName("ok") val ok: Int,
+)
+
+/** Ephemeral coturn TURN REST credentials. Never persist or log these fields. */
+@Serializable
+data class TurnCredentialsResponse(
+    @SerialName("username") val username: String,
+    @SerialName("credential") val credential: String,
+    @SerialName("expires_at") val expiresAt: Long,
+    @SerialName("ttl_seconds") val ttlSeconds: Long,
+    @SerialName("uris") val uris: List<String> = emptyList(),
 )
 
 // ── Capability model ─────────────────────────────────────────────────────────

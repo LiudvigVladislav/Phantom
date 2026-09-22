@@ -233,4 +233,31 @@ class HybridSessionSignalOwnershipTest {
         hybrid.closeAndJoin()
         orchestrator.close()
     }
+
+    @Test
+    fun rest_activation_replays_a_socket_that_connected_before_bootstrap() = runBlocking {
+        val ws = KtorRelayTransport(httpClientFactory = { error("no network") })
+        val orchestrator = newOrchestrator()
+        val hybrid = HybridRelayTransport(ws, orchestrator, null, newScope())
+
+        hybrid.startWsPassthroughCollectors()
+        ws.simulateSessionConnected(sessionEpoch = 7L, ownerGeneration = 3L)
+
+        // The consumer is alive, but REST has not been activated yet, so the
+        // original event cannot mutate the dormant state machine.
+        delay(100)
+        assertEquals(null, hybrid.stateMachine.liveSessionEpoch)
+
+        hybrid.bootstrapAndStart()
+        val replayed = withTimeoutOrNull(5_000) {
+            while (hybrid.stateMachine.liveSessionEpoch != 7L) delay(5)
+            true
+        }
+        assertEquals(true, replayed, "activation must adopt the already-live socket")
+        assertEquals(RestMode.WsCandidate, hybrid.stateMachine.current)
+        assertEquals(7L, hybrid.stateMachine.snapshot.value.candidateEpoch)
+
+        hybrid.closeAndJoin()
+        orchestrator.close()
+    }
 }

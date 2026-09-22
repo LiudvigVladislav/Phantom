@@ -103,6 +103,7 @@ import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.ReactionEntry
 import phantom.core.transport.CallDisabledReason
+import phantom.android.calls.startCallBeforeNavigation
 import phantom.core.transport.TransportState
 
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
@@ -360,11 +361,6 @@ fun ChatScreen(
             while (recordingAmplitudes.size > 64) recordingAmplitudes.removeAt(0)
         }
     }
-
-    // PR-C1 (2026-05-17): capability snapshot — single source of truth for
-    // call / voice gating. Replaces the inline `hybridTransport?.stateMachine`
-    // reads that were scattered across onVoiceCall and onMicClick handlers.
-    val capabilities by container.transportCapabilities.collectAsState()
 
     var showMenu by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
@@ -866,14 +862,17 @@ fun ChatScreen(
                         // gets an honest, actionable message rather than the single
                         // "Limited realtime" string used in PR-D2a.
                         // CallManager.startCall has the same gate as a second layer.
-                        if (!capabilities.canStartCalls) {
+                        // Read at invocation time. Scaffold subcomposition can retain
+                        // a callback that captured the pre-promotion candidate snapshot.
+                        val liveCapabilities = container.transportCapabilities.value
+                        if (!liveCapabilities.canStartCalls) {
                             Log.w(
                                 "PhantomTransport",
                                 "CALL_CAPABILITY disabled " +
-                                    "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
+                                    "reason=${liveCapabilities.callDisabledReason?.name?.lowercase()} " +
                                     "source=ui",
                             )
-                            val msg = when (capabilities.callDisabledReason) {
+                            val msg = when (liveCapabilities.callDisabledReason) {
                                 CallDisabledReason.LIMITED_REALTIME ->
                                     context.getString(R.string.c1_call_blocked_limited_realtime)
                                 CallDisabledReason.TOR_TRANSPORT ->
@@ -893,9 +892,15 @@ fun ChatScreen(
                             return@ChatTopBar
                         }
                         scope.launch {
-                            container.callManager?.startCall(theirPublicKeyHex, theirUsername)
+                            val callManager = container.callManager ?: return@launch
+                            startCallBeforeNavigation(
+                                startCall = {
+                                    callManager.startCall(theirPublicKeyHex, theirUsername)
+                                },
+                                hasActiveCall = { callManager.activeCall.value != null },
+                                navigate = onStartVoiceCall,
+                            )
                         }
-                        onStartVoiceCall()
                     }
                 },
                 onMoreMenu = { showMenu = true },
@@ -1044,11 +1049,12 @@ fun ChatScreen(
                         //    capability-disabled branch, including the in-
                         //    flight tear-down for a mid-recording capability
                         //    drop).
-                        if (!capabilities.canSendVoice) {
+                        val liveCapabilities = container.transportCapabilities.value
+                        if (!liveCapabilities.canSendVoice) {
                             Log.w(
                                 "PhantomTransport",
                                 "VOICE_CAPABILITY disabled " +
-                                    "reason=${capabilities.callDisabledReason?.name?.lowercase()} " +
+                                    "reason=${liveCapabilities.callDisabledReason?.name?.lowercase()} " +
                                     "source=ui recording_state=${recordingState?.name ?: "idle"}",
                             )
                             if (recordingState != null) {

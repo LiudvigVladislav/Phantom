@@ -64,6 +64,8 @@ class RestStateMachineTest {
     private fun frame(epoch: Long) = RestStateMachine.Event.WsFrameTextReceived(epoch)
     private fun ack(epoch: Long) = RestStateMachine.Event.WsOutboundAckReceived(epoch)
     private fun pong(epoch: Long) = RestStateMachine.Event.WsPongReceived(epoch)
+    private fun candidateProof(epoch: Long) =
+        RestStateMachine.Event.WsCandidateProbeRoundTrip(epoch)
     private fun tick(epoch: Long) = RestStateMachine.Event.WsAliveTickElapsed(epoch)
     private fun stalled(epoch: Long, sinceMs: Long = 60_000L) =
         RestStateMachine.Event.InboundIdleTimeout(sessionEpoch = epoch, sinceLastInboundMs = sinceMs)
@@ -269,6 +271,41 @@ class RestStateMachineTest {
         clock.advance(RestStateMachine.CANDIDATE_COMMIT_MS)
         sm.onEvent(tick(2))
         assertEquals(RestMode.WsCandidate, sm.current, "a pong must not stand in for a frame")
+    }
+
+    @Test
+    fun a_correlated_candidate_probe_round_trip_proves_only_after_the_dwell() = runTest {
+        val clock = FakeClock()
+        val sm = build(clock)
+        sm.driveToRestActive(1)
+        sm.onEvent(connected(2))
+
+        clock.advance(RestStateMachine.CANDIDATE_COMMIT_MS - 10_000L)
+        sm.onEvent(candidateProof(2))
+        assertEquals(
+            RestMode.WsCandidate,
+            sm.current,
+            "the one-shot round trip proves bidirectional traffic, not the dwell",
+        )
+
+        clock.advance(10_000L)
+        sm.onEvent(tick(2))
+        assertEquals(RestMode.WsActive, sm.current)
+        assertEquals(2L, sm.provenSessionEpoch)
+    }
+
+    @Test
+    fun a_candidate_probe_round_trip_from_a_stale_session_is_ignored() = runTest {
+        val clock = FakeClock()
+        val sm = build(clock)
+        sm.driveToRestActive(1)
+        sm.onEvent(connected(2))
+        sm.onEvent(connected(3))
+        sm.onEvent(candidateProof(2))
+        clock.advance(RestStateMachine.CANDIDATE_COMMIT_MS)
+        sm.onEvent(tick(3))
+        assertEquals(RestMode.WsCandidate, sm.current)
+        assertNull(sm.provenSessionEpoch)
     }
 
     @Test
