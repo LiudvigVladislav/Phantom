@@ -23,12 +23,17 @@ The current public surface is deliberately narrow:
   local storage;
 - ordered outbound recovery across process and network interruptions, including
   fail-closed settlement before every production encryption path;
+- a durable production relay queue that survives relay process and container
+  restarts, with the completed heartbeat-echo diagnostic disabled;
+- authenticated, short-lived TURN fallback for one-to-one audio calls when
+  direct ICE cannot connect the peers;
 - Android API 36 release builds with verified 16 KiB native-library alignment.
 
 The boundaries matter: the cryptographic protocol code is custom and has not
-received an independent audit; groups and calls are not production-ready; Tor
-is text-only; and field validation covers specific devices, carriers, routes,
-and dates rather than every network or future DPI policy.
+received an independent audit; groups and calls are not production-ready; the
+TURN field proof used one physical phone and one emulator, not two physical
+phones; Tor is text-only; and field validation covers specific devices,
+carriers, routes, and dates rather than every network or future DPI policy.
 
 ## Next
 
@@ -36,15 +41,16 @@ and dates rather than every network or future DPI policy.
   candidate from the resulting integrated tree.
 - Broaden device and network validation of the Direct/REST recovery behavior
   already present on `master`.
+- Repeat authenticated TURN calls between two physical phones on independent
+  networks, investigate the intermittent phone-side crackle, and validate audio
+  routing without emulator or acoustic-feedback ambiguity.
 - Reduce first-contact bootstrap latency and failure modes.
-- Deploy the durable relay queue already implemented on `master`, replacing the
-  older production image whose accepted-envelope queue is process-local.
 - Make encrypted groups stable enough for public Alpha use.
 - Ship encrypted attachments through the media pipeline.
 
 ## Beta horizon
 
-- Harden one-to-one calls over Direct and REALITY transports.
+- Harden one-to-one calls across direct and TURN-assisted network paths.
 - Deliver a desktop client with practical text and media parity.
 - Expand the pluggable-transport surface without weakening metadata policy.
 - Add linked-device identity and explicit cross-device trust.

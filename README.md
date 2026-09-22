@@ -42,6 +42,11 @@ substantially beyond it. Both Alpha releases remain on the [Releases page](https
 service that stores and forwards encrypted envelopes. It can still observe timing,
 size, authenticated sessions, and delivery destinations.
 
+**Call relay:** `turn.phntm.pro`, a dedicated coturn service used only when
+direct ICE cannot connect the peers. The application obtains short-lived TURN
+credentials through an authenticated relay session; the long-lived operator
+secret is not shipped to clients.
+
 ### Working on current `master`
 
 - **End-to-end encrypted 1:1 text** with prekey bootstrap, X3DH, Double Ratchet,
@@ -59,6 +64,12 @@ size, authenticated sessions, and delivery destinations.
   in deterministic order, ratchet settlement is fail-closed before new
   encryption, and supported control events commit atomically with archived
   session advancement.
+- **Durable production relay queue:** accepted envelopes survive relay process
+  and container restarts. The completed heartbeat-echo diagnostic is disabled
+  in production.
+- **Authenticated TURN fallback for 1:1 audio calls:** direct ICE remains the
+  preferred media path; a physical phone on LTE and an emulator on Wi-Fi
+  sustained a 6m18s relayed call with intelligible audio in both directions.
 - **Current Android release baseline:** target API 36, fail-closed production
   signing, and verified 16 KiB ELF alignment for every bundled 64-bit native
   library.
@@ -66,18 +77,21 @@ size, authenticated sessions, and delivery destinations.
 ### Honest Alpha boundaries
 
 - The custom cryptographic protocol composition is not independently audited.
-- Groups and calls have code and UI surfaces, but are not yet production-ready release features.
+- Groups and calls have code and UI surfaces, but are not yet production-ready
+  release features. Calls still need a two-physical-phone network matrix and
+  audio-quality validation without emulator or acoustic-feedback ambiguity.
 - Tor is an emergency text path, not a media or realtime-call transport.
 - Field validation proves specific devices, carriers, routes, and dates—not every carrier or future DPI policy.
 
 ### Roadmap by horizon
 
 - **Next:** finish Android design parity and a new signed Alpha candidate,
-  broaden Direct/REST field validation, deploy the durable relay queue already
-  merged on `master`, reduce first-contact latency, stabilize groups, and add
-  encrypted photo/file attachments using the existing media pipeline.
-- **Beta:** harden 1:1 voice/video calls over Direct/REALITY, add a desktop
-  client, expand pluggable transports, and design linked-device identity.
+  broaden Direct/REST field validation, complete two-physical-phone call and
+  audio-quality validation, reduce first-contact latency, stabilize groups,
+  and add encrypted photo/file attachments using the existing media pipeline.
+- **Beta:** harden 1:1 voice/video calls across direct and TURN-assisted network
+  paths, add a desktop client, expand pluggable transports, and design
+  linked-device identity.
 - **v1.0:** iOS client, public channels, a rate-limited username directory,
   supported self-hosted relay packaging, and an independent security audit.
 - **Post-v1 research:** BLE/Wi-Fi Direct mesh, Kademlia DHT routing,
