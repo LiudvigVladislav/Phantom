@@ -254,6 +254,39 @@ All diagnostic gates use a strict `"1"` parse: any other value (including `"true
 
 ---
 
+## TURN credentials
+
+The relay issues short-lived coturn credentials to authenticated clients. The
+long-lived shared secret stays in an operator-owned file mounted read-only into
+the relay container; it is never returned by the API.
+
+| env var | default | brief |
+|---------|--------:|-------|
+| `RELAY_TURN_SECRET_FILE` | none (TURN disabled) | Absolute path to the coturn shared-secret file. |
+| `RELAY_TURN_URLS` | empty | Comma-separated public `turn:` / `turns:` URIs returned to clients. |
+| `RELAY_TURN_CREDENTIAL_TTL_SECS` | 900 | Lifetime of issued credentials, clamped to 300–3600 seconds. |
+
+### `RELAY_TURN_SECRET_FILE`
+
+- **Shape:** absolute filesystem path. The first line is read once at startup and must contain at least 32 bytes. An unreadable file, relative path, or short secret aborts startup. Unset disables TURN credential issuance.
+- **Effect:** supplies the shared HMAC secret used to derive standard coturn REST credentials. Only expiring credentials with an opaque identity tag leave the relay.
+- **Operations:** mount the file read-only and keep it outside the repository. Rotate the coturn copy and relay mount together.
+- **Cross-refs:** `services/relay/src/turn_credentials.rs`, `deploy/docker-compose.yml`.
+
+### `RELAY_TURN_URLS`
+
+- **Shape:** comma-separated URI list. Only entries beginning with `turn:` or `turns:` are retained. Configuring a secret without at least one accepted URI aborts startup.
+- **Effect:** the accepted list is returned with each short-lived credential response. Production publishes UDP and TCP on 3478 plus TLS-over-TCP on 443.
+- **Re-tune trigger:** TURN hostname, listener, or transport policy changes.
+
+### `RELAY_TURN_CREDENTIAL_TTL_SECS`
+
+- **Shape:** decimal seconds. Absent or malformed uses 900; values are clamped to 300–3600.
+- **Effect:** controls the expiry timestamp embedded in the coturn username. Clients fetch a fresh credential set for each call setup and keep it in memory only.
+- **Re-tune trigger:** call setup routinely outlives the credential window, or incident response requires a shorter exposure window.
+
+---
+
 ## Secrets
 
 | env var | default | brief |

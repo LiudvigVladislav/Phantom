@@ -162,6 +162,8 @@ jobs:
         # reads this list back out of the file.
         run: |
           ./gradlew :apps:android:testDebugUnitTest \
+            --tests "phantom.android.calls.CallIceServerSpecTest" \
+            --tests "phantom.android.calls.CallLaunchCoordinatorTest" \
             --tests "phantom.android.calls.CallManagerGuardTest" \
             --tests "phantom.android.di.AppContainerCommitWiringTest" \
             --tests "phantom.android.di.AppContainerInitLifecycleWiringTest" \
@@ -410,6 +412,8 @@ jobs:
           #   - COMPOSE_UI -> android-compose-ui.strategy.matrix.test-class
           #   - PAPARAZZI  -> android-paparazzi.steps (--tests list)
           MANIFEST = """
+          phantom.android.calls.CallIceServerSpecTest
+          phantom.android.calls.CallLaunchCoordinatorTest
           phantom.android.calls.CallManagerGuardTest
           phantom.android.di.AppContainerCommitWiringTest
           phantom.android.di.AppContainerInitLifecycleWiringTest
