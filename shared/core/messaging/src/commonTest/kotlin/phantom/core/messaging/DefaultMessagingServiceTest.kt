@@ -7750,6 +7750,113 @@ class DefaultMessagingServiceTest {
         )
     }
 
+    @OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+    @Test
+    fun groupAudio_routesThroughSenderKey_andPersistsBeforeAssembly() = runTest {
+        LibsodiumInitializer.initialize()
+        val messages = FakeMessageRepository()
+        val chunks = FakeVoiceChunkLedger()
+        val groups = FakeGroupRepository()
+        val senderKeys = FakeSenderKeyRepository()
+        val messaging = buildService(this, msgRepo = messages)
+        val service = DefaultGroupMessagingService(
+            myPubKeyHex = "aabb",
+            myUsername = "alice",
+            groupRepo = groups,
+            senderKeyRepo = senderKeys,
+            messageRepo = messages,
+            messagingService = messaging,
+            voiceChunkRepository = chunks,
+            json = json,
+        )
+
+        val groupId = "group-audio-route"
+        val senderPubKey = "ccdd"
+        val chunkId = "voice-route"
+        val original = ByteArray(4_000) { (it % 251).toByte() }
+        var senderBundle = phantom.core.crypto.SenderKey.generate()
+        senderKeys.upsert(
+            phantom.core.storage.SenderKeyEntity(
+                groupId,
+                senderPubKey,
+                senderBundle.chainKeyHex,
+                senderBundle.iteration.toLong(),
+            )
+        )
+
+        suspend fun deliver(index: Int, bytes: ByteArray) {
+            val inner = MessagePayload(
+                type = MessagePayload.TYPE_AUDIO_CHUNK,
+                groupId = groupId,
+                audioChunkId = chunkId,
+                audioChunkIndex = index,
+                audioChunkTotal = 2,
+                audioChunkB64 = kotlin.io.encoding.Base64.encode(bytes),
+                audioDurationMs = 5_000L,
+                audioMimeType = "audio/ogg",
+            )
+            val beforeEncrypt = senderBundle
+            val encrypted = phantom.core.crypto.SenderKey.encrypt(
+                json.encodeToString(MessagePayload.serializer(), inner).encodeToByteArray(),
+                beforeEncrypt,
+            )
+            assertNotNull(
+                phantom.core.crypto.SenderKey.decrypt(encrypted.second, beforeEncrypt),
+                "SenderKey fixture must decrypt before exercising group routing",
+            )
+            senderBundle = encrypted.first
+            service.handleIncoming(
+                MessagePayload(
+                    type = MessagePayload.TYPE_GROUP_MESSAGE,
+                    groupId = groupId,
+                    groupCiphertextB64 = kotlin.io.encoding.Base64.encode(encrypted.second),
+                ),
+                senderPubKey,
+            )
+        }
+
+        deliver(0, original.copyOfRange(0, DefaultMessagingService.AUDIO_CHUNK_BYTES))
+        val voiceId = GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX +
+            "$groupId:$senderPubKey:$chunkId"
+        assertEquals(1, chunks.countChunks(voiceId), "first chunk must be durable")
+        assertTrue(messages.messages.isEmpty(), "partial audio must not create a bubble")
+
+        deliver(1, original.copyOfRange(DefaultMessagingService.AUDIO_CHUNK_BYTES, original.size))
+        assertEquals(0, chunks.countChunks(voiceId), "assembled chunks must be cleaned up")
+        val stored = messages.getMessageById(voiceId)
+        assertNotNull(stored)
+        val encoded = stored.plaintextCache!!.removePrefix("[AUDIO:").removeSuffix("]")
+        val decoded = kotlin.io.encoding.Base64.decode(encoded)
+        assertTrue(decoded.contentEquals(original), "group audio bytes must survive SenderKey route")
+    }
+
+    @Test
+    fun groupAudio_resumePendingAudio_finishesCompleteDurableSet() = runTest {
+        val messages = FakeMessageRepository()
+        val chunks = FakeVoiceChunkLedger()
+        val groups = FakeGroupRepository()
+        val messaging = buildService(this, msgRepo = messages)
+        val voiceId = GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX + "restart"
+        val now = Clock.System.now().toEpochMilliseconds()
+        chunks.insertChunk(voiceId, 0, 2, "group-restart", "ccdd", "audio/ogg", 5_000, byteArrayOf(1, 2), now)
+        chunks.insertChunk(voiceId, 1, 2, "group-restart", "ccdd", "audio/ogg", 5_000, byteArrayOf(3, 4), now)
+        val service = DefaultGroupMessagingService(
+            myPubKeyHex = "aabb",
+            myUsername = "alice",
+            groupRepo = groups,
+            senderKeyRepo = FakeSenderKeyRepository(),
+            messageRepo = messages,
+            messagingService = messaging,
+            voiceChunkRepository = chunks,
+            json = json,
+        )
+
+        service.resumePendingAudio()
+
+        assertNotNull(messages.getMessageById(voiceId))
+        assertEquals(0, chunks.countChunks(voiceId))
+    }
+
     private class InboundRepairRig(
         val convId: String,
         val bobMsgRepo: FakeMessageRepository,
@@ -8026,6 +8133,49 @@ private class FakeVoiceChunkLedger : phantom.core.storage.VoiceChunkRepository {
     override suspend fun deleteAll() {
         store.clear()
     }
+}
+
+private class FakeGroupRepository : phantom.core.storage.GroupRepository {
+    private val groups = mutableMapOf<String, phantom.core.storage.GroupEntity>()
+    private val members = mutableListOf<phantom.core.storage.GroupMemberEntity>()
+    val previews = mutableMapOf<String, String>()
+
+    override suspend fun insertGroup(entity: phantom.core.storage.GroupEntity) {
+        groups[entity.id] = entity
+    }
+    override suspend fun getGroups() = groups.values.toList()
+    override suspend fun getGroup(groupId: String) = groups[groupId]
+    override suspend fun deleteGroup(groupId: String) {
+        groups.remove(groupId)
+        members.removeAll { it.groupId == groupId }
+    }
+    override suspend fun updateLastMessage(groupId: String, preview: String, at: Long) {
+        previews[groupId] = preview
+    }
+    override suspend fun resetUnread(groupId: String) = Unit
+    override suspend fun insertMember(member: phantom.core.storage.GroupMemberEntity) {
+        members.removeAll { it.groupId == member.groupId && it.pubkeyHex == member.pubkeyHex }
+        members += member
+    }
+    override suspend fun getMembers(groupId: String) = members.filter { it.groupId == groupId }
+    override suspend fun getMemberCount(groupId: String) = members.count { it.groupId == groupId }.toLong()
+    override suspend fun deleteMember(groupId: String, pubkeyHex: String) {
+        members.removeAll { it.groupId == groupId && it.pubkeyHex == pubkeyHex }
+    }
+}
+
+private class FakeSenderKeyRepository : phantom.core.storage.SenderKeyRepository {
+    private val rows = mutableMapOf<Pair<String, String>, phantom.core.storage.SenderKeyEntity>()
+
+    override suspend fun get(groupId: String, memberPubkeyHex: String) =
+        rows[groupId to memberPubkeyHex]
+    override suspend fun upsert(entity: phantom.core.storage.SenderKeyEntity) {
+        rows[entity.groupId to entity.memberPubkeyHex] = entity
+    }
+    override suspend fun deleteForGroup(groupId: String) {
+        rows.keys.removeAll { it.first == groupId }
+    }
+    override suspend fun deleteAll() = rows.clear()
 }
 
 // ═════════════════════════════════════════════════════════════════════════

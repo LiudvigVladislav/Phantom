@@ -4,6 +4,7 @@
 package phantom.core.messaging
 
 import kotlinx.coroutines.flow.Flow
+import phantom.core.storage.GroupEnvelopeMetadata
 
 enum class GroupRecipientOutcome {
     SUBMITTED,
@@ -131,7 +132,7 @@ interface GroupMessagingService {
     suspend fun sendGroupMessage(groupId: String, text: String)
 
     /**
-     * Chunk [audioBytes] into 64 KB envelopes and fan-out each chunk to every member.
+     * Chunk [audioBytes] into bounded envelopes and fan-out each chunk to every member.
      * Signature accepts raw bytes (not base64) so the chunking logic in
      * [DefaultGroupMessagingService] controls slice sizes — callers no longer
      * pre-encode, which avoids the ~33 % base64 expansion before the size cap check.
@@ -168,5 +169,17 @@ interface GroupMessagingService {
      * Called by [DefaultMessagingService.handleDeliver] after decryption, when
      * [MessagePayload.type] is in [MessagePayload.GROUP_TYPES].
      */
-    suspend fun handleIncoming(payload: MessagePayload, fromPubKeyHex: String)
+    suspend fun handleIncoming(
+        payload: MessagePayload,
+        fromPubKeyHex: String,
+        envelope: GroupEnvelopeMetadata? = null,
+    ): Boolean
+
+    /** Finish durable group-audio assemblies left complete by a prior process. */
+    suspend fun resumePendingAudio() = Unit
+
+    companion object {
+        /** Namespace group audio rows inside the shared durable voice chunk table. */
+        const val GROUP_AUDIO_VOICE_PREFIX = "group-audio:"
+    }
 }

@@ -99,6 +99,7 @@ import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.messaging.MediaProgressBus
 import phantom.core.messaging.OutgoingMessage
 import phantom.core.messaging.SafetyReportCategory
+import phantom.core.messaging.VoiceMediaPolicy
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.ReactionEntry
@@ -108,6 +109,9 @@ import phantom.core.transport.TransportState
 
 private const val PROFILE_MSG_PREFIX = "\u200B__PHANTOM_PROFILE__\u200B"
 private const val PREFS_NAME = "phantom_prefs"
+private const val VOICE_AUTO_FINALIZE_HEADROOM_MS = 500L
+private const val VOICE_AUTO_FINALIZE_MS =
+    VoiceMediaPolicy.MAX_DURATION_MS - VOICE_AUTO_FINALIZE_HEADROOM_MS
 
 /**
  * residual N1 / F1 (2026-09-18) — where "scroll to the newest message" is.
@@ -495,9 +499,15 @@ fun ChatScreen(
                     // edge cases). Emit which source was used so future tests
                     // can attribute any remaining miscount unambiguously.
                     val metadataDurationMs = readAudioDurationMs(file)
-                    val finalDurationMs = metadataDurationMs ?: tickerDurationMsAtFinalize
-                    val durationSource =
-                        if (metadataDurationMs != null) "metadata" else "ticker_fallback"
+                    val finalDurationMs = VoiceMediaPolicy.resolveDurationMs(
+                        metadataDurationMs = metadataDurationMs,
+                        tickerDurationMs = tickerDurationMsAtFinalize,
+                    )
+                    val durationSource = if (metadataDurationMs == finalDurationMs) {
+                        "metadata"
+                    } else {
+                        "ticker_sanity_fallback"
+                    }
 
                     // PR-UI-REC-FOLLOWUP — empty/too-short safety gate. The
                     // gesture-layer 700 ms gate already drops releases the
@@ -526,6 +536,7 @@ fun ChatScreen(
                     android.util.Log.i(
                         "PhantomMedia",
                         "VOICE_REC complete durationMs=$finalDurationMs " +
+                            "metadataMs=${metadataDurationMs ?: -1L} " +
                             "tickerMs=$tickerDurationMsAtFinalize source=$durationSource " +
                             "bytes=${bytes.size} bytesPerSec=$bytesPerSec mime=$mimeType"
                     )
@@ -561,6 +572,21 @@ fun ChatScreen(
             voiceSendInProgress = false
         }
         audioFile = null
+    }
+
+    // Stop just before the hard send-layer limit. MediaRecorder timestamps can
+    // run a little ahead of the 100 ms UI ticker, so the small headroom keeps
+    // an automatically-finalised five-minute note inside the validated bound.
+    LaunchedEffect(recordingDurationMs, recordingState) {
+        val isCapturing = recordingState == RecordingPanelState.Recording ||
+            recordingState == RecordingPanelState.Locked
+        if (isCapturing && recordingDurationMs >= VOICE_AUTO_FINALIZE_MS) {
+            Log.i(
+                "PhantomMedia",
+                "VOICE_REC auto_finalize durationMs=$recordingDurationMs limitMs=${VoiceMediaPolicy.MAX_DURATION_MS}",
+            )
+            finalizeAndSendVoice()
+        }
     }
 
     LaunchedEffect(conversationId) {

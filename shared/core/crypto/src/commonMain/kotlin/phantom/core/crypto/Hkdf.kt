@@ -3,8 +3,6 @@
 
 package phantom.core.crypto
 
-import com.ionspin.kotlin.crypto.auth.Auth
-
 /**
  * RFC 5869 HKDF using SHA-256, exposed as a shared utility for crypto modules
  * that need a standard KDF primitive (X3DH root-key derivation, SenderKey
@@ -15,6 +13,8 @@ import com.ionspin.kotlin.crypto.auth.Auth
  * both Extract and Expand phases.
  */
 object Hkdf {
+    private const val LIBSODIUM_HMAC_SHA256_KEY_BYTES = 32
+
     /**
      * HKDF-SHA256 with output length L = 32 (single Expand block).
      *
@@ -24,18 +24,28 @@ object Hkdf {
      * For L ≤ 32 bytes the Expand stage is a single HMAC call with counter
      * byte 0x01.
      */
-    @OptIn(ExperimentalUnsignedTypes::class)
     fun sha256L32(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
-        val prk = Auth.authHmacSha256(
-            message = ikm.toUByteArray(),
-            key     = salt.toUByteArray(),
-        ).toByteArray()
+        // The ionspin wrapper calls libsodium's fixed-width
+        // crypto_auth_hmacsha256 primitive without passing a key length.
+        // HMAC itself right-pads short keys with zeroes, so doing that here
+        // preserves RFC 2104/5869 semantics while ensuring native code always
+        // receives the 32 bytes it will read. Longer salts are rejected
+        // explicitly instead of being silently truncated or read unsafely.
+        require(salt.size <= LIBSODIUM_HMAC_SHA256_KEY_BYTES) {
+            "HKDF-SHA256 salt exceeds the supported 32-byte HMAC key width"
+        }
+        val fixedSalt = ByteArray(LIBSODIUM_HMAC_SHA256_KEY_BYTES)
+        salt.copyInto(fixedSalt)
+        val prk = try {
+            Hmac.sha256(key = fixedSalt, message = ikm)
+        } finally {
+            fixedSalt.zeroize()
+        }
         val expandInput = info + byteArrayOf(0x01)
-        val okm = Auth.authHmacSha256(
-            message = expandInput.toUByteArray(),
-            key     = prk.toUByteArray(),
-        ).toByteArray()
-        prk.zeroize()
-        return okm
+        return try {
+            Hmac.sha256(key = prk, message = expandInput)
+        } finally {
+            prk.zeroize()
+        }
     }
 }

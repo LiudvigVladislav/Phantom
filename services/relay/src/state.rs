@@ -186,9 +186,9 @@ pub struct AppState {
 
     // ── Media upload store (PR-M1r) ───────────────────────────────────────────
 
-    /// In-memory store for encrypted media chunks uploaded via
-    /// POST /media/upload-chunk. Keyed by opaque `media_id` capability token.
-    /// Relay never inspects ciphertext content — only stores and serves blobs.
+    /// Restart-durable store for opaque encrypted media chunks uploaded via
+    /// POST /media/upload-chunk. The in-memory index is reconstructed from
+    /// atomic records beneath `state_dir/media-v1` during startup.
     pub media_store: MediaStore,
 
     // ── State-file paths (RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1) ───────────────
@@ -288,6 +288,16 @@ impl AppState {
         // RC-RELAY-STATE-DIR-REPAIR PR-1a §4.1: compute state-file paths
         // from the injected `state_dir` before spinning up sub-stores.
         let state_paths = StatePaths::from_state_dir(&config.state_dir);
+        let media_store = MediaStore::new(
+            &config.state_dir,
+            config.media_ttl_secs.saturating_mul(1_000),
+            config.max_media_chunks,
+            config.max_media_bytes,
+            config.max_media_store_bytes,
+        )
+        .unwrap_or_else(|err| {
+            panic!("FATAL: failed to initialize persistent media store: {err}")
+        });
         // Load persisted reports from disk
         let persisted = load_reports_from_disk(&state_paths.reports);
         // Load persisted blocklist from disk
@@ -333,7 +343,7 @@ impl AppState {
             ack_rate_limiter: RwLock::new(HashMap::new()),
             turn_credentials: TurnCredentialIssuer::from_env(),
             // Media upload (PR-M1r)
-            media_store: MediaStore::new(),
+            media_store,
             state_paths,
             // RC-RELAY-STATE-DIR-REPAIR PR-1b §4.2 audit-tier counters.
             reports_persist_failed: AtomicU64::new(0),

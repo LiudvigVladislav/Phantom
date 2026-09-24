@@ -15,6 +15,8 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import phantom.core.crypto.SenderKey
 import phantom.core.storage.GroupEntity
+import phantom.core.storage.GroupEnvelopeMetadata
+import phantom.core.storage.GroupMessageCommitRepository
 import phantom.core.storage.GroupMemberEntity
 import phantom.core.storage.GroupRepository
 import phantom.core.storage.MessageEntity
@@ -22,6 +24,7 @@ import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.SenderKeyEntity
 import phantom.core.storage.SenderKeyRepository
+import phantom.core.storage.VoiceChunkRepository
 
 /**
  * Default implementation of [GroupMessagingService].
@@ -49,6 +52,8 @@ class DefaultGroupMessagingService(
     private val senderKeyRepo: SenderKeyRepository,
     private val messageRepo: MessageRepository,
     private val messagingService: MessagingService,
+    private val voiceChunkRepository: VoiceChunkRepository,
+    private val groupMessageCommitRepository: GroupMessageCommitRepository? = null,
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) : GroupMessagingService {
 
@@ -123,12 +128,14 @@ class DefaultGroupMessagingService(
         durationMs: Long,
         mimeType: String,
     ): Result<GroupSendReport> {
-        if (audioBytes.size > DefaultMessagingService.MAX_AUDIO_BYTES) {
-            return Result.failure(IllegalArgumentException(
-                "Group audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap " +
-                    "(${DefaultMessagingService.MAX_AUDIO_BYTES}). Recording must be shorter."
-            ))
-        }
+        runCatching {
+            VoiceMediaPolicy.validatePlaintext(
+                durationMs = durationMs,
+                plaintextBytes = audioBytes.size,
+                chunkSizeBytes = DefaultMessagingService.AUDIO_CHUNK_BYTES,
+                ciphertextOverheadBytes = 0,
+            )
+        }.exceptionOrNull()?.let { return Result.failure(it) }
 
         val chunkId = uuid4().toString()
         val total = kotlin.math.ceil(audioBytes.size.toDouble() / DefaultMessagingService.AUDIO_CHUNK_BYTES).toInt()
@@ -246,7 +253,9 @@ class DefaultGroupMessagingService(
         @OptIn(ExperimentalEncodingApi::class)
         val ciphertextB64 = Base64.encode(cipherBytes)
         val outerPayload = MessagePayload(
-            type = MessagePayload.TYPE_AUDIO_CHUNK,
+            // The outer type must route through GroupMessagingService. The
+            // audio_chunk discriminator is inside the SenderKey ciphertext.
+            type = MessagePayload.TYPE_GROUP_MESSAGE,
             groupId = groupId,
             groupCiphertextB64 = ciphertextB64,
         )
@@ -305,15 +314,45 @@ class DefaultGroupMessagingService(
         senderKeyRepo.deleteForGroup(groupId)
     }
 
-    override suspend fun handleIncoming(payload: MessagePayload, fromPubKeyHex: String) {
-        when (payload.type) {
-            MessagePayload.TYPE_GROUP_INVITE            -> handleGroupInvite(payload, fromPubKeyHex)
-            MessagePayload.TYPE_SENDER_KEY_DISTRIBUTION -> handleSenderKeyDistribution(payload, fromPubKeyHex)
+    override suspend fun handleIncoming(
+        payload: MessagePayload,
+        fromPubKeyHex: String,
+        envelope: GroupEnvelopeMetadata?,
+    ): Boolean {
+        return when (payload.type) {
+            MessagePayload.TYPE_GROUP_INVITE -> {
+                handleGroupInvite(payload, fromPubKeyHex); false
+            }
+            MessagePayload.TYPE_SENDER_KEY_DISTRIBUTION -> {
+                handleSenderKeyDistribution(payload, fromPubKeyHex); false
+            }
             MessagePayload.TYPE_GROUP_MESSAGE,
-            MessagePayload.TYPE_CHANNEL_POST            -> handleGroupMessage(payload, fromPubKeyHex)
-            MessagePayload.TYPE_GROUP_ADD_MEMBER        -> handleAddMember(payload)
-            MessagePayload.TYPE_GROUP_LEAVE             -> handleLeave(payload, fromPubKeyHex)
+            MessagePayload.TYPE_CHANNEL_POST -> handleGroupMessage(payload, fromPubKeyHex, envelope)
+            MessagePayload.TYPE_GROUP_ADD_MEMBER -> {
+                handleAddMember(payload); false
+            }
+            MessagePayload.TYPE_GROUP_LEAVE -> {
+                handleLeave(payload, fromPubKeyHex); false
+            }
+            else -> false
         }
+    }
+
+    override suspend fun resumePendingAudio() {
+        val repo = voiceChunkRepository
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+        repo.findExpiredSummaries(nowMs - DefaultMessagingService.VOICE_CHUNK_TTL_MS)
+            .filter { it.voiceId.startsWith(GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX) }
+            .forEach { repo.deleteByVoiceId(it.voiceId) }
+        repo.findVoicesReadyToAssemble()
+            .filter { it.voiceId.startsWith(GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX) }
+            .forEach { ready ->
+                assembleGroupAudio(
+                    voiceId = ready.voiceId,
+                    groupId = ready.conversationId,
+                    nowMs = nowMs,
+                )
+            }
     }
 
     // ── Incoming handlers ─────────────────────────────────────────────────────
@@ -379,37 +418,52 @@ class DefaultGroupMessagingService(
         )
     }
 
-    private suspend fun handleGroupMessage(payload: MessagePayload, fromPubKeyHex: String) {
-        val groupId = payload.groupId ?: return
-        val ciphertextB64 = payload.groupCiphertextB64 ?: return
+    private suspend fun handleGroupMessage(
+        payload: MessagePayload,
+        fromPubKeyHex: String,
+        envelope: GroupEnvelopeMetadata?,
+    ): Boolean {
+        val groupId = payload.groupId ?: return false
+        val ciphertextB64 = payload.groupCiphertextB64 ?: return false
 
-        val keyEntity = senderKeyRepo.get(groupId, fromPubKeyHex) ?: return
+        val keyEntity = senderKeyRepo.get(groupId, fromPubKeyHex) ?: return false
         val bundle = SenderKey.Bundle(
             keyEntity.chainKeyHex, keyEntity.iteration.toInt(),
         )
 
         val cipherBytes = Base64.decode(ciphertextB64)
-        val (newBundle, plainBytes) = SenderKey.decrypt(cipherBytes, bundle) ?: return
+        val (newBundle, plainBytes) = SenderKey.decrypt(cipherBytes, bundle) ?: return false
 
-        senderKeyRepo.upsert(
-            SenderKeyEntity(
-                groupId = groupId,
-                memberPubkeyHex = fromPubKeyHex,
-                chainKeyHex = newBundle.chainKeyHex,
-                iteration = newBundle.iteration.toLong(),
-            )
+        val advancedSenderKey = SenderKeyEntity(
+            groupId = groupId,
+            memberPubkeyHex = fromPubKeyHex,
+            chainKeyHex = newBundle.chainKeyHex,
+            iteration = newBundle.iteration.toLong(),
         )
 
         val inner = runCatching {
             json.decodeFromString<MessagePayload>(plainBytes.decodeToString())
-        }.getOrNull() ?: return
+        }.getOrNull() ?: return commitGroupEffect(
+            senderKey = advancedSenderKey,
+            envelope = envelope,
+            effect = GroupMessageCommitRepository.Effect.Ignored,
+        )
+
+        if (inner.type == MessagePayload.TYPE_AUDIO_CHUNK) {
+            return handleGroupAudioChunk(
+                groupId = groupId,
+                inner = inner,
+                fromPubKeyHex = fromPubKeyHex,
+                senderKey = advancedSenderKey,
+                envelope = envelope,
+            )
+        }
 
         val text = inner.text.ifBlank { if (inner.audioDataB64 != null) "[voice]" else "" }
 
         val now = Clock.System.now().toEpochMilliseconds()
         val msgId = uuid4().toString()
-        messageRepo.insertMessage(
-            MessageEntity(
+        val message = MessageEntity(
                 id = msgId,
                 conversationId = groupId,
                 ciphertext = cipherBytes,
@@ -419,11 +473,126 @@ class DefaultGroupMessagingService(
                 createdAt = now,
                 expiresAtMs = null,
             )
-        )
-        groupRepo.updateLastMessage(groupId, text, now)
+        val committed = commitGroupEffect(
+            senderKey = advancedSenderKey,
+            envelope = envelope,
+            effect = GroupMessageCommitRepository.Effect.Message(message, text, now),
+        ) {
+            messageRepo.insertMessage(message)
+            groupRepo.updateLastMessage(groupId, text, now)
+        }
 
         _groupMessageFlow.tryEmit(groupId)
+        return committed
     }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun handleGroupAudioChunk(
+        groupId: String,
+        inner: MessagePayload,
+        fromPubKeyHex: String,
+        senderKey: SenderKeyEntity,
+        envelope: GroupEnvelopeMetadata?,
+    ): Boolean {
+        val ignored = suspend {
+            commitGroupEffect(senderKey, envelope, GroupMessageCommitRepository.Effect.Ignored)
+        }
+        val chunkId = inner.audioChunkId ?: return ignored()
+        val chunkIndex = inner.audioChunkIndex ?: return ignored()
+        val chunkTotal = inner.audioChunkTotal ?: return ignored()
+        val chunkB64 = inner.audioChunkB64 ?: return ignored()
+        if (
+            chunkTotal !in 1..VoiceMediaPolicy.MAX_CHUNKS ||
+            chunkIndex !in 0 until chunkTotal ||
+            (inner.audioDurationMs ?: 0L) !in 1..VoiceMediaPolicy.MAX_DURATION_MS
+        ) return ignored()
+        val chunkBytes = runCatching { Base64.decode(chunkB64) }.getOrNull() ?: return ignored()
+        if (chunkBytes.isEmpty() || chunkBytes.size > DefaultMessagingService.AUDIO_CHUNK_BYTES) return ignored()
+        val repo = voiceChunkRepository
+        val voiceId = buildGroupAudioVoiceId(groupId, fromPubKeyHex, chunkId)
+        val nowMs = Clock.System.now().toEpochMilliseconds()
+
+        repo.findExpiredSummaries(nowMs - DefaultMessagingService.VOICE_CHUNK_TTL_MS)
+            .filter { it.voiceId.startsWith(GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX) }
+            .forEach { repo.deleteByVoiceId(it.voiceId) }
+        val effect = GroupMessageCommitRepository.Effect.AudioChunk(
+            voiceId, chunkIndex, chunkTotal, groupId, fromPubKeyHex,
+            inner.audioMimeType ?: "audio/mp4", inner.audioDurationMs ?: 0L,
+            chunkBytes, nowMs,
+        )
+        val committed = commitGroupEffect(senderKey, envelope, effect) {
+            repo.insertChunk(
+                voiceId, chunkIndex, chunkTotal, groupId, fromPubKeyHex,
+                inner.audioMimeType ?: "audio/mp4", inner.audioDurationMs ?: 0L,
+                chunkBytes, nowMs,
+            )
+        }
+        if (repo.countChunks(voiceId) == chunkTotal) {
+            assembleGroupAudio(voiceId = voiceId, groupId = groupId, nowMs = nowMs)
+        }
+        return committed
+    }
+
+    private suspend fun commitGroupEffect(
+        senderKey: SenderKeyEntity,
+        envelope: GroupEnvelopeMetadata?,
+        effect: GroupMessageCommitRepository.Effect,
+        fallback: suspend () -> Unit = {},
+    ): Boolean {
+        val commitRepository = groupMessageCommitRepository
+        if (commitRepository != null && envelope != null) {
+            commitRepository.commit(senderKey, effect, envelope)
+            return true
+        }
+        senderKeyRepo.upsert(senderKey)
+        fallback()
+        return false
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun assembleGroupAudio(
+        voiceId: String,
+        groupId: String,
+        nowMs: Long,
+    ) {
+        val repo = voiceChunkRepository
+        if (messageRepo.getMessageById(voiceId) != null) {
+            groupRepo.updateLastMessage(groupId, "[voice]", nowMs)
+            repo.deleteByVoiceId(voiceId)
+            _groupMessageFlow.tryEmit(groupId)
+            return
+        }
+        val chunks = repo.findOrderedChunks(voiceId)
+        if (chunks.isEmpty()) return
+        val audioBytes = ByteArray(chunks.sumOf { it.size })
+        var offset = 0
+        chunks.forEach { chunk ->
+            chunk.copyInto(audioBytes, destinationOffset = offset)
+            offset += chunk.size
+        }
+        messageRepo.insertMessage(
+            MessageEntity(
+                id = voiceId,
+                conversationId = groupId,
+                ciphertext = ByteArray(0),
+                plaintextCache = "[AUDIO:${Base64.encode(audioBytes)}]",
+                sent = false,
+                status = MessageStatus.DELIVERED,
+                createdAt = nowMs,
+                expiresAtMs = null,
+            )
+        )
+        groupRepo.updateLastMessage(groupId, "[voice]", nowMs)
+        repo.deleteByVoiceId(voiceId)
+        _groupMessageFlow.tryEmit(groupId)
+    }
+
+    private fun buildGroupAudioVoiceId(
+        groupId: String,
+        senderPubKeyHex: String,
+        chunkId: String,
+    ): String = GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX +
+        "$groupId:$senderPubKeyHex:$chunkId"
 
     private suspend fun handleAddMember(payload: MessagePayload) {
         val groupId = payload.groupId ?: return
