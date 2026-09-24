@@ -12,7 +12,7 @@ class VoiceMediaPolicyTest {
 
     @Test
     fun measuredFiveThirtyAndOneTwentySecondNotesFitRelayBounds() {
-        listOf(5 to 7, 30 to 42, 120 to 168).forEach { (seconds, expectedChunks) ->
+        listOf(5 to 4, 30 to 20, 120 to 77).forEach { (seconds, expectedChunks) ->
             val bytes = measuredEncodedBytesPerSecond * seconds
             VoiceMediaPolicy.validatePlaintext(seconds * 1_000L, bytes)
             assertEquals(
@@ -29,7 +29,10 @@ class VoiceMediaPolicyTest {
     fun measuredFiveMinuteNoteFitsWithoutChangingCodecQuality() {
         val bytes = measuredEncodedBytesPerSecond * 300
         VoiceMediaPolicy.validatePlaintext(VoiceMediaPolicy.MAX_DURATION_MS, bytes)
-        assertEquals(420, VoiceMediaPolicy.chunkCount(bytes + 16, 3_200))
+        assertEquals(
+            192,
+            VoiceMediaPolicy.chunkCount(bytes + 16, MediaChunker.TARGET_RAW_CHUNK_BYTES),
+        )
     }
 
     @Test

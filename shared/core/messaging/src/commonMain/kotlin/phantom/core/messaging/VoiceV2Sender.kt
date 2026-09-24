@@ -4,8 +4,15 @@
 package phantom.core.messaging
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlin.coroutines.coroutineContext
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
@@ -55,7 +62,7 @@ class VoiceV2Sender(
      * PR-M2f.1 (debug probe) — runtime chunk size override.
      *
      * Production-default returns [MediaChunker.TARGET_RAW_CHUNK_BYTES]
-     * (3200 after PR-M2f.2; was 1700).
+     * (7000 after the physical LTE request-count validation; was 3200).
      * Android debug builds wire a SharedPreferences-backed provider so
      * Settings → Diagnostics can select 1700 / 2200 / 2300 / 2400 / 2600
      * across consecutive voice sends without rebuilding the APK. The provider
@@ -161,54 +168,71 @@ class VoiceV2Sender(
         // fixed `EARLY_MANIFEST_AFTER_CHUNKS = 3` was tuned for 1700-byte
         // chunks (3 × 1700 = 5100 bytes of proof-of-life before the
         // receiver is told to start downloading). Now that production
-        // `TARGET_RAW_CHUNK_BYTES = 3200` and the debug selector can push
-        // up to 3500, a fixed-3 threshold would delay the receiver to
-        // 9600+ bytes — almost double the original budget — and weaken
-        // the M2e upload/download overlap. Switching to a byte budget
-        // recovers the original M2e timing across all chunk sizes:
+        // `TARGET_RAW_CHUNK_BYTES = 7000`, a fixed-3 threshold would delay
+        // the receiver to 21 KB. Switching to a byte budget preserves the
+        // original intent while the explicit two-chunk floor prevents a
+        // receiver from being announced after only one stored chunk:
         //   1700 → 3 chunks   2400 → 3 chunks
-        //   3200 → 2 chunks   3500 → 2 chunks
+        //   3200 → 2 chunks   3500 → 2 chunks   7000 → 2 chunks
         val earlyAt = max(
-            1,
+            2,
             ceil(EARLY_MANIFEST_AFTER_BYTES.toDouble() / selectedChunkSize).toInt(),
         ).coerceAtMost(total)
         var earlyManifestSent = false
 
-        // Step 3: upload loop (sequential, one chunk at a time).
+        // Step 3: upload with bounded parallelism. Relay storage is keyed by
+        // (mediaId, idx), so chunks are independent and idempotent; order is
+        // reconstructed from idx on download. Four workers hide LTE handshake
+        // latency without creating an unbounded connection fan-out.
         //
         // PR-MEDIA-UPLOAD-CANCEL1 — `ensureActive()` checkpoints before and
         // after each chunk upload give the X-tap cancel path a chance to
         // stop the loop without waiting for the next network operation to
         // throw. Without these the upload would continue chunk-by-chunk
         // even after `cancelVoiceUpload(...)` cancelled the parent Job.
-        for (idx in 0 until total) {
-            coroutineContext.ensureActive()
-            uploadChunkWithRefresh(
-                mediaId = enc.mediaId,
-                idx = idx,
-                total = total,
-                chunkBytes = chunks[idx],
-            )
-            coroutineContext.ensureActive()
-            // uploadChunkWithRefresh throws on terminal failure.
-            val sent = idx + 1
-            log(
-                "MEDIA_TX upload_progress mediaId=${enc.mediaId.take(8)} " +
-                    "sent=$sent total=$total",
-            )
-            onChunkUploaded?.invoke(sent, total)
+        val uploadSemaphore = Semaphore(MAX_PARALLEL_UPLOADS)
+        val progressMutex = Mutex()
+        var sentCount = 0
+        coroutineScope {
+            chunks.mapIndexed { idx, chunkBytes ->
+                async {
+                    uploadSemaphore.withPermit {
+                        coroutineContext.ensureActive()
+                        uploadChunkWithRefresh(
+                            mediaId = enc.mediaId,
+                            idx = idx,
+                            total = total,
+                            chunkBytes = chunkBytes,
+                        )
+                        coroutineContext.ensureActive()
+                    }
 
-            // PR-M2e — fire the early-manifest callback exactly once, after
-            // the first K chunks have committed on the relay. Callback may
-            // suspend (it goes through the Double Ratchet + transport.send).
-            if (!earlyManifestSent && sent >= earlyAt && onEarlyManifest != null) {
-                earlyManifestSent = true
-                log(
-                    "MEDIA_TX early_manifest_sent mediaId=${enc.mediaId.take(8)} " +
-                        "afterChunks=$sent total=$total",
-                )
-                onEarlyManifest.invoke(manifest)
-            }
+                    // Progress and the one-shot early-manifest decision share
+                    // one mutex. The network callback runs outside the lock so
+                    // other completed uploads can publish their progress.
+                    val shouldSendEarlyManifest = progressMutex.withLock {
+                        sentCount += 1
+                        log(
+                            "MEDIA_TX upload_progress mediaId=${enc.mediaId.take(8)} " +
+                                "sent=$sentCount total=$total idx=$idx",
+                        )
+                        onChunkUploaded?.invoke(sentCount, total)
+                        if (!earlyManifestSent && sentCount >= earlyAt && onEarlyManifest != null) {
+                            earlyManifestSent = true
+                            log(
+                                "MEDIA_TX early_manifest_sent mediaId=${enc.mediaId.take(8)} " +
+                                    "afterChunks=$sentCount total=$total",
+                            )
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (shouldSendEarlyManifest) {
+                        onEarlyManifest!!.invoke(manifest)
+                    }
+                }
+            }.awaitAll()
         }
         log("MEDIA_TX upload_complete mediaId=${enc.mediaId.take(8)} chunks=$total")
 
@@ -310,6 +334,9 @@ class VoiceV2Sender(
         private const val MAX_NETWORK_ATTEMPTS = 5
         private val NETWORK_RETRY_DELAYS_MS = longArrayOf(1_000L, 3_000L, 8_000L, 20_000L, 60_000L)
 
+        /** Bounded fan-out: enough to hide LTE RTT without flooding the relay. */
+        private const val MAX_PARALLEL_UPLOADS = 4
+
         // PR-M2e — byte budget the sender uploads before sending the
         // manifest envelope (was a fixed chunk count until PR-M2f.2).
         //
@@ -317,11 +344,11 @@ class VoiceV2Sender(
         // M2e overlap timing is identical at the 1700 baseline and degrades
         // gracefully on larger chunks — relay has proof of life before the
         // receiver is told to start downloading, but we don't accidentally
-        // postpone the manifest by ~9.6 KB once chunks grow to 3200.
+        // postpone the manifest by 21 KB once chunks grow to 7000.
         //
         // Per chunk size the threshold becomes:
-        //   `max(1, ceil(5100.0 / chunkSize)).coerceAtMost(total)`
-        //   1700 → 3   2400 → 3   3200 → 2   3500 → 2
+        //   `max(2, ceil(5100.0 / chunkSize)).coerceAtMost(total)`
+        //   1700 → 3   2400 → 3   3200 → 2   3500 → 2   7000 → 2
         //
         // Vladislav 2026-05-19 locked policy: never K=1; the relay must
         // have a couple of chunks stored before the receiver is told to
