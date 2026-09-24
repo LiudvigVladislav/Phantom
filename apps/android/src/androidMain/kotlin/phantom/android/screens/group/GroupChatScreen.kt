@@ -43,8 +43,13 @@ import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.messaging.VoiceMediaPolicy
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
+
+private const val GROUP_VOICE_AUTO_FINALIZE_HEADROOM_MS = 500L
+private const val GROUP_VOICE_AUTO_FINALIZE_MS =
+    VoiceMediaPolicy.MAX_DURATION_MS - GROUP_VOICE_AUTO_FINALIZE_HEADROOM_MS
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -98,6 +103,50 @@ fun GroupChatScreen(
         messages = container.messageRepo.getMessages(groupId)
     }
 
+    fun finalizeAndSendGroupVoice() {
+        if (!isRecording) return
+
+        runCatching { mediaRecorder?.stop() }
+        mediaRecorder?.release()
+        mediaRecorder = null
+        isRecording = false
+
+        val file = audioFile
+        val durationMs = recordingDurationMs
+        audioFile = null
+        if (file == null || !file.exists()) return
+
+        scope.launch {
+            val bytes = runCatching { file.readBytes() }.getOrNull() ?: return@launch
+            val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
+            val result = container.groupMessagingService?.sendGroupAudio(
+                groupId, bytes, durationMs, mimeType
+            )
+            if (result != null && result.isFailure) {
+                val message = if (result.exceptionOrNull() is IllegalArgumentException) {
+                    "Голосовое сообщение слишком длинное"
+                } else {
+                    "Не удалось отправить голосовое сообщение"
+                }
+                android.widget.Toast.makeText(
+                    context,
+                    message,
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            } else {
+                reloadMessages()
+                val report = result?.getOrNull()
+                if (report != null && report.incompleteCount > 0) {
+                    android.widget.Toast.makeText(
+                        context,
+                        "Отправлено ${report.submitted} из ${report.recipientCount}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
     LaunchedEffect(groupId) {
         reloadMessages()
         memberCount = container.groupRepo.getMemberCount(groupId).toInt()
@@ -122,6 +171,17 @@ fun GroupChatScreen(
                 delay(100)
                 recordingDurationMs += 100
             }
+        }
+    }
+
+    LaunchedEffect(recordingDurationMs, isRecording) {
+        if (isRecording && recordingDurationMs >= GROUP_VOICE_AUTO_FINALIZE_MS) {
+            android.util.Log.i(
+                "PhantomMedia",
+                "VOICE_REC auto_finalize durationMs=$recordingDurationMs " +
+                    "limitMs=${VoiceMediaPolicy.MAX_DURATION_MS} scope=group",
+            )
+            finalizeAndSendGroupVoice()
         }
     }
 
@@ -176,44 +236,7 @@ fun GroupChatScreen(
                     },
                     onMicClick = {
                         if (isRecording) {
-                            // Stop recording and send as chunks
-                            runCatching { mediaRecorder?.stop() }
-                            mediaRecorder?.release()
-                            mediaRecorder = null
-                            isRecording = false
-                            val file = audioFile
-                            if (file != null && file.exists()) {
-                                scope.launch {
-                                    val bytes = runCatching { file.readBytes() }.getOrNull() ?: return@launch
-                                    val mimeType = if (android.os.Build.VERSION.SDK_INT >= 29) "audio/ogg" else "audio/m4a"
-                                    val result = container.groupMessagingService?.sendGroupAudio(
-                                        groupId, bytes, recordingDurationMs, mimeType
-                                    )
-                                    if (result != null && result.isFailure) {
-                                        val message = if (result.exceptionOrNull() is IllegalArgumentException) {
-                                            "Голосовое сообщение слишком длинное"
-                                        } else {
-                                            "Не удалось отправить голосовое сообщение"
-                                        }
-                                        android.widget.Toast.makeText(
-                                            context,
-                                            message,
-                                            android.widget.Toast.LENGTH_SHORT,
-                                        ).show()
-                                    } else {
-                                        reloadMessages()
-                                        val report = result?.getOrNull()
-                                        if (report != null && report.incompleteCount > 0) {
-                                            android.widget.Toast.makeText(
-                                                context,
-                                                "Отправлено ${report.submitted} из ${report.recipientCount}",
-                                                android.widget.Toast.LENGTH_LONG,
-                                            ).show()
-                                        }
-                                    }
-                                }
-                            }
-                            audioFile = null
+                            finalizeAndSendGroupVoice()
                         } else {
                             // Start recording — request permission first
                             val hasPermission = ContextCompat.checkSelfPermission(

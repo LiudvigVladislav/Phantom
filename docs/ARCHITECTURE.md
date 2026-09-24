@@ -172,10 +172,12 @@ Voice notes use a separate encrypted-media pipeline:
    verifies the plaintext digest, and stores the local result.
 
 The relay receives an opaque media identifier, chunk indices, sizes, timing,
-and ciphertext. Media chunks are TTL-bounded and held in memory; this is not
-durable object storage. On current `master`, the REST fallback and encrypted
-media work together on the tested Tele2 LTE path. Tor remains intentionally
-text-only.
+and ciphertext. Media chunks are TTL-bounded and persisted as atomic opaque
+records under the relay state volume before an upload is acknowledged. Startup
+replay rebuilds the bounded in-memory index and rejects incomplete, corrupt,
+expired, or over-budget records. On current `master`, the REST fallback and
+encrypted media work together on the tested Tele2 LTE path. Tor remains
+intentionally text-only.
 
 ---
 
@@ -218,10 +220,12 @@ Android client
 
 The relay exposes health, authenticated WebSocket, prekey, REST delivery,
 push-registration, and encrypted-media endpoints. Message queues, REST
-sessions, idempotency caches, and media chunks are bounded in-memory state.
+sessions, and idempotency caches are bounded in-memory state. Encrypted media
+chunks use bounded atomic records under `media-v1` in the configured relay
+state directory; the relay still has no media plaintext or decryption key.
 Prekey bundles and limited operational records (push registrations, abuse
-reports, and blocklist state) use append-only files under the configured relay
-state directory.
+reports, and blocklist state) use append-only files under the same state
+directory.
 
 The operator can observe service and network metadata and can deny service.
 The design goal is that the operator cannot decrypt correctly formed message

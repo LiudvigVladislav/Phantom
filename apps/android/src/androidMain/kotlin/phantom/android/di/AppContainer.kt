@@ -504,6 +504,8 @@ class AppContainer(private val context: Context) {
      */
     val controlEventCommitRepo =
         phantom.core.storage.SqlDelightControlEventCommitRepository(dbHolder.database)
+    val groupMessageCommitRepo =
+        phantom.core.storage.SqlDelightGroupMessageCommitRepository(dbHolder.database)
 
     /**
      * PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — durable hold
@@ -3180,10 +3182,16 @@ class AppContainer(private val context: Context) {
             senderKeyRepo = senderKeyRepo,
             messageRepo = messageRepo,
             messagingService = service,
+            voiceChunkRepository = voiceChunkRepo,
+            groupMessageCommitRepository = groupMessageCommitRepo,
             json = json,
         )
         service.groupMessagingService = groupService
         groupMessagingService = groupService
+        appScope.launch {
+            runCatching { groupService.resumePendingAudio() }
+                .onFailure { android.util.Log.e("GroupVoice", "resumePendingAudio failed", it) }
+        }
 
         // PR C-followup-3: pending-bundle retry sweep. Messages that
         // tried to send while the peer had no published bundle on the

@@ -66,13 +66,17 @@ pub struct RelayConfig {
 
     // ── Media upload (PR-M1r) ─────────────────────────────────────────────────
 
-    /// Hard cap on POST /media/upload-chunk body in bytes. Client targets ≤2600;
-    /// relay enforces 3072. Different from `/relay/send`'s 4096 cap.
+    /// Hard cap on POST /media/upload-chunk body in bytes. The production
+    /// binary-v3 client uses 3200-byte chunks; 9000 retains headroom for the
+    /// legacy JSON/Base64 path. Different from `/relay/send`'s 4096 cap.
     pub max_media_upload_body_bytes: usize,
     /// Maximum number of chunks permitted per media object.
     pub max_media_chunks: u32,
-    /// Maximum cumulative ciphertext bytes stored per `media_id` (1 MiB).
+    /// Maximum cumulative ciphertext bytes stored per `media_id` (4 MiB).
     pub max_media_bytes: u64,
+    /// Maximum cumulative durable-media budget, charging at least one 4 KiB
+    /// filesystem allocation unit per chunk to bound inode and RAM-index growth.
+    pub max_media_store_bytes: u64,
     /// How long media chunks are retained before the sweeper removes them
     /// (seconds). Default 7 days.
     pub media_ttl_secs: u64,
@@ -423,6 +427,7 @@ impl RelayConfig {
             max_media_upload_body_bytes: crate::media::MAX_MEDIA_UPLOAD_BODY_BYTES,
             max_media_chunks: crate::media::MAX_MEDIA_CHUNKS,
             max_media_bytes: crate::media::MAX_MEDIA_BYTES,
+            max_media_store_bytes: crate::media::MAX_MEDIA_STORE_BYTES,
             media_ttl_secs: 7 * 24 * 3600,
             // Arm D heartbeat echo is off in tests by default; tests that
             // exercise the echo handler construct a config with this flipped
@@ -543,6 +548,10 @@ impl RelayConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::media::MAX_MEDIA_BYTES),
+            max_media_store_bytes: std::env::var("RELAY_MAX_MEDIA_STORE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::media::MAX_MEDIA_STORE_BYTES),
             media_ttl_secs: std::env::var("RELAY_MEDIA_TTL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -754,6 +763,7 @@ impl std::fmt::Debug for RelayConfig {
             .field("max_media_upload_body_bytes", &self.max_media_upload_body_bytes)
             .field("max_media_chunks", &self.max_media_chunks)
             .field("max_media_bytes", &self.max_media_bytes)
+            .field("max_media_store_bytes", &self.max_media_store_bytes)
             .field("media_ttl_secs", &self.media_ttl_secs)
             .field("heartbeat_echo_enabled", &self.heartbeat_echo_enabled)
             .field("slow_post_diag_enabled", &self.slow_post_diag_enabled)

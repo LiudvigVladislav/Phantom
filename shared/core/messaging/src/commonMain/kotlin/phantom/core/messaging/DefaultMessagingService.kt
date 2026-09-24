@@ -786,7 +786,7 @@ class DefaultMessagingService(
          */
         const val HELD_ENVELOPE_TTL_MS = 24L * 60L * 60L * 1_000L
 
-        const val MAX_AUDIO_BYTES = 10 * 1024 * 1024   // 10 MB hard cap on raw audio bytes
+        const val MAX_AUDIO_BYTES = VoiceMediaPolicy.MAX_PLAINTEXT_BYTES
         // PR-D2b.1 (2026-05-17): shrunk from 8 KB → 3 KB so envelopes pass
         // the REST short-poll body cap. Background: D1c+D1d turned REST
         // into a first-class transport for text on Tele2 LTE; D2a closed
@@ -2209,12 +2209,9 @@ class DefaultMessagingService(
         durationMs: Long,
         mimeType: String,
     ): Result<Unit> {
-        if (audioBytes.size > MAX_AUDIO_BYTES) {
-            return Result.failure(IllegalArgumentException(
-                "Audio payload ${audioBytes.size} bytes exceeds MAX_AUDIO_BYTES cap ($MAX_AUDIO_BYTES). " +
-                    "Recording must be shorter."
-            ))
-        }
+        runCatching {
+            VoiceMediaPolicy.validatePlaintext(durationMs, audioBytes.size)
+        }.exceptionOrNull()?.let { return Result.failure(it) }
 
         // PR-D2a — send-layer guard. UI button is gated separately, but a
         // gesture / callback / retry path can still call here; this guard
@@ -2752,7 +2749,9 @@ class DefaultMessagingService(
             val nowMs = Clock.System.now().toEpochMilliseconds()
             val cutoffMs = nowMs - VOICE_CHUNK_TTL_MS
             sweepExpiredVoiceChunks(repo, cutoffMs, nowMs)
-            val ready = repo.findVoicesReadyToAssemble()
+            val ready = repo.findVoicesReadyToAssemble().filterNot {
+                it.voiceId.startsWith(GroupMessagingService.GROUP_AUDIO_VOICE_PREFIX)
+            }
             if (ready.isNotEmpty()) {
                 messagingLog(
                     MessagingLogLevel.INFO,
@@ -4652,13 +4651,15 @@ class DefaultMessagingService(
             // N1-F1b R-N1.12: the six types in
             // [ATOMICALLY_SETTLED_CONTROL_TYPES] are excluded — they now
             // settle their action and their ledger entry together, in one
-            // transaction, further down. What is left here is the set
-            // that CANNOT do that yet, each for a stated reason recorded
-            // in ControlEventCommitRepository's kdoc: group messages
-            // advance a ratcheting sender key, call signalling has no
+            // transaction, further down. Group messages and channel posts
+            // are excluded separately because their handler atomically
+            // commits the advanced SenderKey, decoded effect and ledger.
+            // What is left here is the set that CANNOT do that yet, each
+            // for a stated reason recorded in
+            // ControlEventCommitRepository's kdoc: call signalling has no
             // durable state and duplicates are not benign, key rotation
-            // also deletes a session, and audio chunks are durable only
-            // in the 1:1 configuration.
+            // also deletes a session, and non-group audio chunks follow
+            // their existing durable receive path.
             //
             // For the types that remain, this write is still AHEAD of the
             // handler that acts on it, and that is the open half of
@@ -4670,6 +4671,8 @@ class DefaultMessagingService(
             // the reasons listed above.
             if (
                 payload.type != MessagePayload.TYPE_MESSAGE &&
+                payload.type != MessagePayload.TYPE_GROUP_MESSAGE &&
+                payload.type != MessagePayload.TYPE_CHANNEL_POST &&
                 payload.type !in ATOMICALLY_SETTLED_CONTROL_TYPES
             ) {
                 processedEnvelopeRepository?.markProcessed(
@@ -4684,7 +4687,31 @@ class DefaultMessagingService(
 
             // Route group-related messages to GroupMessagingService before 1:1 handling.
             if (payload.type in MessagePayload.GROUP_TYPES) {
-                groupMessagingService?.handleIncoming(payload, senderPubKeyHex)
+                val settledAtomically = groupMessagingService?.handleIncoming(
+                    payload = payload,
+                    fromPubKeyHex = senderPubKeyHex,
+                    envelope = phantom.core.storage.GroupEnvelopeMetadata(
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                    ),
+                ) ?: false
+                if (
+                    !settledAtomically &&
+                    (payload.type == MessagePayload.TYPE_GROUP_MESSAGE ||
+                        payload.type == MessagePayload.TYPE_CHANNEL_POST)
+                ) {
+                    processedEnvelopeRepository?.markProcessed(
+                        envelopeId = deliver.messageId,
+                        conversationId = conversationId,
+                        senderPubKeyHex = senderPubKeyHex,
+                        payloadType = payload.type,
+                        status = ProcessedEnvelopeRepository.Status.PROCESSED,
+                        nowMs = Clock.System.now().toEpochMilliseconds(),
+                    )
+                }
                 transport.sendDeliveryAck(deliver.messageId)
                 return@runCatching
             }
@@ -7099,8 +7126,11 @@ class DefaultMessagingService(
         if (runCatching { Base64.decode(m.mediaKey) }.getOrNull()?.size != 32) return "mediaKey"
         if (runCatching { Base64.decode(m.nonce) }.getOrNull()?.size != 24) return "nonce"
         if (runCatching { Base64.decode(m.sha256) }.getOrNull()?.size != 32) return "sha256"
-        if (m.chunkCount !in 1..256) return "chunkCount"
-        if (m.encryptedSizeBytes <= 0) return "encryptedSizeBytes"
+        VoiceMediaPolicy.manifestBoundsFailure(
+            durationMs = m.durationMs,
+            encryptedSizeBytes = m.encryptedSizeBytes,
+            chunkCount = m.chunkCount,
+        )?.let { return it }
         if (m.alg != VoiceManifestV2.ALG) return "alg"
         return null
     }

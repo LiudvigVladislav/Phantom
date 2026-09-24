@@ -379,7 +379,7 @@ async fn main() {
     });
 
     // Background task: sweep expired media chunks every hour (PR-M1r).
-    // TTL is per-media-entry: if the earliest chunk is older than media_ttl_secs,
+    // TTL is per-media-entry: if the newest chunk is older than media_ttl_secs,
     // the entire entry is removed. Relay never touches content; only metadata
     // (media_id prefix, chunk count, age) is logged.
     let media_sweep_state = Arc::clone(&app_state);

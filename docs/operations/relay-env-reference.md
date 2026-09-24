@@ -149,10 +149,11 @@ Enforce that the mounted state-dir matches the container user's uid/gid/mode. An
 |---------|--------:|-------|
 | `RELAY_ENVELOPE_TTL_SECS` | 604_800 (7 d) | Absolute server-imposed envelope TTL. |
 | `RELAY_MAX_PAYLOAD_BYTES` | 65_536 | Per-envelope payload byte cap. |
-| `RELAY_MEDIA_TTL_SECS` | 604_800 (7 d) | Media object TTL. |
-| `RELAY_MAX_MEDIA_BYTES` | 1_048_576 (1 MiB) | Per-`media_id` byte cap. No global media-store cap today. |
-| `RELAY_MAX_MEDIA_CHUNKS` | 256 | Max chunks per media upload. |
-| `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` | 3_072 | Per-request media upload body cap. |
+| `RELAY_MEDIA_TTL_SECS` | 604_800 (7 d) | Media object TTL, refreshed by each committed chunk. |
+| `RELAY_MAX_MEDIA_BYTES` | 4_194_304 (4 MiB) | Per-`media_id` ciphertext byte cap. |
+| `RELAY_MAX_MEDIA_CHUNKS` | 1_024 | Max chunks per media upload. |
+| `RELAY_MAX_MEDIA_STORE_BYTES` | 268_435_456 (256 MiB) | Global durable-media budget. Each chunk is charged at least 4 KiB to bound file-count and RAM-index growth. |
+| `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` | 9_000 | Per-request media upload body cap. |
 
 ### `RELAY_ENVELOPE_TTL_SECS`
 
@@ -166,17 +167,17 @@ Enforce that the mounted state-dir matches the container user's uid/gid/mode. An
 - **Effect:** per-`Send` payload cap. 64 KiB matches the sealed-sender ciphertext ceiling the client stack targets. `Send` above the cap → `SendError::Serialize` → HTTP 400.
 - **Re-tune trigger:** client stack changes maximum ciphertext size.
 
-### `RELAY_MEDIA_TTL_SECS` / `RELAY_MAX_MEDIA_BYTES` / `RELAY_MAX_MEDIA_CHUNKS`
+### `RELAY_MEDIA_TTL_SECS` / `RELAY_MAX_MEDIA_BYTES` / `RELAY_MAX_MEDIA_CHUNKS` / `RELAY_MAX_MEDIA_STORE_BYTES`
 
-- **Shape:** `u64` seconds / `u64` bytes / `u32` count. All `parse().unwrap_or(<crate::media::CONST>)`.
-- **Effect:** media retention window plus per-`media_id` byte and chunk caps -- `MAX_MEDIA_BYTES` and `MAX_MEDIA_CHUNKS` bound the total ciphertext and chunk count belonging to a SINGLE media object, not the whole media store. **There is no global cap on the in-memory media store today.** The media upload handlers do NOT consult the `/relay/send` rate limiter (`AppState::rate_limiter`) either -- they carry their own per-request body-size cap via `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` and the middleware, but no bytes-per-store or objects-per-store ceiling. A well-behaved client is bounded by TTL-driven reclamation; a hostile client uploading many small distinct `media_id`s can grow the in-memory store until the container's RAM cap (`--memory 512m` in production compose) trips. Tracked as a follow-up out of PR-2 scope; the ADR-027 re-calibration triggers do NOT cover this shape.
-- **Re-tune trigger:** operator wants to admit larger single media objects or more chunks per object. A global cap needs its own tracked change.
-- **Cross-refs:** `services/relay/src/media.rs` (`sum(chunks.ciphertext.len()) <= MAX_MEDIA_BYTES`, `chunks.len() <= MAX_MEDIA_CHUNKS`).
+- **Shape:** `u64` seconds / `u64` bytes / `u32` count / `u64` bytes. All use `parse().unwrap_or(<crate::media::CONST>)`.
+- **Effect:** ciphertext chunks are atomically committed beneath `RELAY_STATE_DIR/media-v1` before upload acknowledgement and replayed on restart. `MAX_MEDIA_BYTES` and `MAX_MEDIA_CHUNKS` bound one media object; `MAX_MEDIA_STORE_BYTES` bounds the whole store using the larger of each record's logical size and a 4 KiB allocation charge. Empty ciphertext is rejected. Together those rules bound durable bytes, file count, and the high-cardinality in-memory index. TTL is measured from the newest committed chunk so an active multi-chunk upload is not expired using its oldest chunk. Uploads beyond the per-object budget fail with HTTP 413; uploads beyond the global persistent budget fail closed with HTTP 507. The relay stores the SHA-256 digest of the opaque `media_id`, not the capability token itself. Media requests do not use the `/relay/send` request-rate limiter because one long voice legitimately spans hundreds of chunks; the global persistent-byte cap is the hard resource bound until a separately measured media byte-rate policy exists.
+- **Re-tune trigger:** operator changes the five-minute voice-note policy, chunk size, state-volume budget, or container memory limit. Keep the global store cap comfortably below the container limit because the durable store also maintains an in-memory index; production pins 256 MiB under a 512 MiB container limit.
+- **Cross-refs:** `services/relay/src/media.rs`, `deploy/docker-compose.yml`.
 
 ### `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES`
 
-- **Shape:** `usize`, `parse().unwrap_or(3_072)`.
-- **Effect:** per-request body-size ceiling for media uploads (small because uploads are chunked; each request carries one chunk plus envelope overhead).
+- **Shape:** `usize`, `parse().unwrap_or(9_000)`.
+- **Effect:** per-request body-size ceiling for media uploads. The binary v3 path sends one 3200-byte ciphertext chunk per request; 9000 bytes also leaves room for the legacy JSON/Base64 representation.
 - **Re-tune trigger:** chunk framing changes.
 
 ---

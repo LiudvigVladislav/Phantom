@@ -29,17 +29,20 @@ object Hmac {
     /**
      * Compute `HMAC-SHA-256(key, message)`.
      *
-     * @param key   the HMAC key. Width is unconstrained at the
-     *   primitive boundary (RFC 2104 allows any key length and pads
-     *   internally); callers that need a specific width must enforce
-     *   it themselves.
+     * @param key the raw 32-byte key required by libsodium's
+     *   `crypto_auth_hmacsha256` primitive. Callers implementing protocols
+     *   with shorter RFC 2104 keys must right-pad them before this boundary.
      * @param message the message bytes to authenticate.
      * @return the 32-byte HMAC-SHA-256 output.
      */
     @OptIn(ExperimentalUnsignedTypes::class)
-    fun sha256(key: ByteArray, message: ByteArray): ByteArray =
-        Auth.authHmacSha256(
+    fun sha256(key: ByteArray, message: ByteArray): ByteArray {
+        require(key.size == SHA256_OUTPUT_BYTES) {
+            "HMAC-SHA-256 key must be exactly $SHA256_OUTPUT_BYTES bytes; was ${key.size}"
+        }
+        return Auth.authHmacSha256(
             message = message.toUByteArray(),
             key     = key.toUByteArray(),
         ).toByteArray()
+    }
 }

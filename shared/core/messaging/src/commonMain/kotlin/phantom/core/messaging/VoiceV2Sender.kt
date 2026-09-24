@@ -123,6 +123,7 @@ class VoiceV2Sender(
         // SharedPreferences read returning a stale or out-of-range value.
         val selectedChunkSize = chunkSizeProvider()
             .coerceIn(MIN_PROBE_CHUNK_BYTES, MAX_PROBE_CHUNK_BYTES)
+        VoiceMediaPolicy.validateCiphertext(enc.ciphertext.size, selectedChunkSize)
         log(
             "MEDIA_TX chunk_size_selected mediaId=${enc.mediaId.take(8)} " +
                 "bytes=$selectedChunkSize source=provider",

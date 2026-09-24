@@ -8,9 +8,9 @@
 //!   1. Upload + fetch happy path: POST chunks 0/1/2 → 201 each; GET → 200.
 //!   2. Idempotent retry: same idx + same body → 200 duplicate.
 //!   3. Conflict: same (media_id, idx), different ciphertext → 409.
-//!   4. Body too large: body > 3072 → 413 body_too_large.
-//!   5. Too many chunks: total=257 → 413 too_many_chunks.
-//!   6. Media quota exceeded: chunks summing to > 1 MiB → 413.
+//!   4. Body too large: body > configured cap → 413 body_too_large.
+//!   5. Too many chunks: total > configured cap → 413 too_many_chunks.
+//!   6. Media quota exceeded: chunks summing beyond the configured cap → 413.
 //!   7. GET 404: non-existent (media_id, idx) → 404.
 //!   8. Auth: POST/GET without Bearer → 401.
 //!   9. idx out of range: idx >= total → 400.
@@ -222,6 +222,74 @@ async fn test_upload_and_fetch_happy_path() {
     assert_eq!(v["total"], 3);
 }
 
+#[tokio::test]
+async fn test_v2_media_id_rejects_non_base64url_without_panicking() {
+    let app = build_app();
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x31);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let (app, status, body) = upload_chunk(
+        app,
+        &token,
+        "voice-💥",
+        0,
+        1,
+        &b64(b"ciphertext"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/media/chunk/voice-%F0%9F%92%A5/0")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_v3_media_id_rejects_non_base64url_without_panicking() {
+    let app = build_app();
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x32);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/media/v3/voice-%F0%9F%92%A5/0?total=1")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/octet-stream")
+                .body(Body::from("ciphertext"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::BAD_REQUEST);
+
+    let download = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/media/v3/voice-%F0%9F%92%A5/0")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(download.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Test 2: idempotent retry ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -291,11 +359,8 @@ async fn test_body_too_large() {
 
     let (app, token) = obtain_token(app, &identity, &signing_kp).await;
 
-    // Build a ciphertext_b64 whose JSON body will exceed 3072 bytes.
-    // The JSON wrapper is roughly 120 bytes; we need ciphertext_b64 to push it over.
-    // 3072 - 120 = 2952 bytes of base64 → a raw byte sequence of ~2214 bytes
-    // encodes to ~2952 base64 chars. Use 2300 raw bytes to be comfortably over.
-    let big_ct = b64(&vec![0xAB_u8; 2300]);
+    // Build a ciphertext_b64 whose JSON body exceeds the default 9000-byte cap.
+    let big_ct = b64(&vec![0xAB_u8; 7000]);
     let idem_key = format!("{}:0", mid);
     let req_body = json!({
         "media_id":        mid,
@@ -306,8 +371,8 @@ async fn test_body_too_large() {
     });
     let body_str = req_body.to_string();
     assert!(
-        body_str.len() > 3072,
-        "test setup: body must be > 3072 bytes, got {}",
+        body_str.len() > 9_000,
+        "test setup: body must be > 9000 bytes, got {}",
         body_str.len()
     );
 
@@ -344,8 +409,8 @@ async fn test_too_many_chunks() {
     let (app, token) = obtain_token(app, &identity, &signing_kp).await;
 
     let ct = b64(b"small-chunk");
-    // total=257 exceeds the 256-chunk cap.
-    let (_app, status, v) = upload_chunk(app, &token, &mid, 0, 257, &ct).await;
+    // total=1025 exceeds the default 1024-chunk cap.
+    let (_app, status, v) = upload_chunk(app, &token, &mid, 0, 1_025, &ct).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{:?}", v);
     assert_eq!(v["error"], "too_many_chunks", "{:?}", v);
 }
@@ -367,7 +432,7 @@ async fn test_media_quota_exceeded() {
 
     let (app, token) = obtain_token(app, &identity, &signing_kp).await;
 
-    // 400 raw bytes → ~536 base64 chars; JSON body well under 3072.
+    // 400 raw bytes → ~536 base64 chars; JSON body well under the cap.
     let chunk_raw = vec![0xCD_u8; 400];
     let chunk_b64 = b64(&chunk_raw);
 
@@ -538,18 +603,18 @@ async fn test_total_mismatch_conflict() {
 
 #[tokio::test]
 async fn test_http_layer_body_limit() {
-    // B2: the route-level DefaultBodyLimit::max(3072) must reject oversized
+    // B2: the route-level DefaultBodyLimit must reject oversized
     // bodies at the HTTP framing layer, BEFORE the handler buffers them.
     // The HTTP-layer 413 has no JSON body (it is produced by axum's extractor
     // middleware, not by the handler), so we only assert the status code.
     // This is distinct from the in-handler 413 (which carries {"error":"body_too_large"}).
     //
-    // We send a raw body of 3073 bytes (exactly 1 byte over the limit) with a
+    // We send a raw body of 9001 bytes (exactly 1 byte over the limit) with a
     // valid-ish content-type but NO auth header — the body limit layer runs
     // before auth. The response must be 413 regardless of auth state.
     let app = build_app();
 
-    let oversized_body = vec![b'X'; 3073];
+    let oversized_body = vec![b'X'; 9_001];
 
     let res = app
         .oneshot(
@@ -567,7 +632,7 @@ async fn test_http_layer_body_limit() {
     assert_eq!(
         res.status(),
         StatusCode::PAYLOAD_TOO_LARGE,
-        "HTTP-layer body limit must fire for bodies > 3072 bytes",
+        "HTTP-layer body limit must fire for bodies > 9000 bytes",
     );
     // The HTTP-layer rejection does NOT produce JSON — confirm the body is
     // NOT the in-handler JSON error so we know the layer fired, not the handler.
@@ -590,7 +655,7 @@ async fn test_http_layer_body_limit() {
 /// so the env var `RELAY_MAX_MEDIA_UPLOAD_BODY_BYTES` actually moves the ceiling.
 ///
 /// Before the PR-M2c.0 fix, the axum layer was hard-coded to the constant
-/// `MAX_MEDIA_UPLOAD_BODY_BYTES = 3072`, silently overriding any env override.
+/// `MAX_MEDIA_UPLOAD_BODY_BYTES`, silently overriding any env override.
 /// PR-M2c.0 cap probe (Test #66, 2026-05-18) caught this: env was set to 9000,
 /// the in-handler check accepted bodies up to 9000, but the axum layer still
 /// rejected them at 3072. The fix routes both layers through the same config
@@ -602,7 +667,7 @@ async fn test_http_body_limit_respects_config_override() {
     cfg.max_media_upload_body_bytes = 9_000;
     let app = build_app_with_config(cfg);
 
-    // 5500-byte body — would have failed under the old hard-coded 3072 layer,
+    // 5500-byte body — failed under the historical hard-coded 3072 layer,
     // must now reach the handler (which will then 400/401 for auth/format,
     // but the key point is: NOT 413 PAYLOAD_TOO_LARGE).
     let payload = vec![b'X'; 5_500];
@@ -1009,7 +1074,7 @@ async fn test_v3_auth_required() {
 
 #[tokio::test]
 async fn test_v3_v2_share_storage_v2_get_after_v3_upload() {
-    // Confirms additive design: v3 and v2 are two doors to the same in-memory store.
+    // Confirms additive design: v3 and v2 are two doors to the same durable store.
     let app = build_app();
     let kp = SigningKey::generate(&mut OsRng);
     let id = identity_hex(0x45);
@@ -1028,6 +1093,119 @@ async fn test_v3_v2_share_storage_v2_get_after_v3_upload() {
         .decode(b64_payload)
         .expect("decode base64");
     assert_eq!(decoded, payload, "v2 GET must return the same ciphertext bytes");
+}
+
+#[tokio::test]
+async fn test_media_chunk_survives_fresh_app_state_on_same_volume() {
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let mid = media_id(0x51);
+    let payload = vec![0xA5_u8; 3_200];
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x51);
+
+    {
+        let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+        cfg.state_dir = state_dir.path().to_path_buf();
+        let app = build_app_with_config(cfg);
+        let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+        let (_app, status, _, _, _) =
+            upload_chunk_v3(app, &token, &mid, 0, 1, &payload).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    // Construct a wholly fresh AppState. No in-memory MediaStore object from
+    // the first scope remains reachable; the chunk must be replayed from disk.
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.state_dir = state_dir.path().to_path_buf();
+    let app = build_app_with_config(cfg);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+    let (_app, status, _, _, body) = download_chunk_v3(app, &token, &mid, 0).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload, "fresh AppState must replay ciphertext from volume");
+}
+
+#[tokio::test]
+async fn test_media_boot_removes_incomplete_or_corrupt_record() {
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let media_dir = state_dir.path().join("media-v1").join("a".repeat(64));
+    std::fs::create_dir_all(&media_dir).expect("create corrupt record dir");
+    let corrupt_path = media_dir.join("00000000.chunk");
+    std::fs::write(&corrupt_path, b"partial-write").expect("write corrupt fixture");
+
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.state_dir = state_dir.path().to_path_buf();
+    let app = build_app_with_config(cfg);
+
+    assert!(
+        !corrupt_path.exists(),
+        "startup replay must remove a truncated record instead of indexing it",
+    );
+    drop(app);
+}
+
+#[tokio::test]
+async fn test_global_durable_media_budget_fails_closed() {
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.max_media_store_bytes = 5_000;
+    let app = build_app_with_config(cfg);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x52);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let first = media_id(0x52);
+    let (app, first_status, _, _, _) =
+        upload_chunk_v3(app, &token, &first, 0, 1, &vec![1_u8; 300]).await;
+    assert_eq!(first_status, StatusCode::NO_CONTENT);
+
+    let second = media_id(0x53);
+    let (_app, second_status, _, _, body) =
+        upload_chunk_v3(app, &token, &second, 0, 1, &vec![2_u8; 300]).await;
+    assert_eq!(second_status, StatusCode::INSUFFICIENT_STORAGE);
+    let json: Value = serde_json::from_slice(&body).expect("quota response json");
+    assert_eq!(json["error"], "media_store_full");
+}
+
+#[tokio::test]
+async fn test_global_durable_media_budget_counts_record_overhead() {
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    // A tiny ciphertext is charged one 4 KiB allocation unit. The second
+    // object must therefore exceed this single-record store budget.
+    cfg.max_media_store_bytes = 4_096;
+    let app = build_app_with_config(cfg);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x54);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let first = media_id(0x54);
+    let (app, first_status, _, _, _) =
+        upload_chunk_v3(app, &token, &first, 0, 1, &[1]).await;
+    assert_eq!(first_status, StatusCode::NO_CONTENT);
+
+    let second = media_id(0x55);
+    let (_app, second_status, _, _, body) =
+        upload_chunk_v3(app, &token, &second, 0, 1, &[2]).await;
+    assert_eq!(second_status, StatusCode::INSUFFICIENT_STORAGE);
+    let json: Value = serde_json::from_slice(&body).expect("quota response json");
+    assert_eq!(json["error"], "media_store_full");
+}
+
+#[tokio::test]
+async fn test_empty_ciphertext_is_rejected_without_allocating_a_record() {
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let mut cfg = phantom_relay::config::RelayConfig::from_env_for_test();
+    cfg.state_dir = state_dir.path().to_path_buf();
+    let app = build_app_with_config(cfg);
+    let signing_kp = SigningKey::generate(&mut OsRng);
+    let identity = identity_hex(0x56);
+    let (app, token) = obtain_token(app, &identity, &signing_kp).await;
+
+    let mid = media_id(0x56);
+    let (_app, status, _, _, body) = upload_chunk_v3(app, &token, &mid, 0, 1, &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: Value = serde_json::from_slice(&body).expect("empty response json");
+    assert_eq!(json["error"], "ciphertext must not be empty");
+    let media_root = state_dir.path().join("media-v1");
+    assert_eq!(std::fs::read_dir(media_root).expect("media root").count(), 0);
 }
 
 #[tokio::test]

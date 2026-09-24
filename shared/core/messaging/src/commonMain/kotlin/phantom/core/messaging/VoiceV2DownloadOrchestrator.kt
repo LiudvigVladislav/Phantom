@@ -276,7 +276,7 @@ class VoiceV2DownloadOrchestrator(
         // 60 s + 10 retries × 2 s would false-fail the tail of a 107-chunk
         // voice on Tele2 LTE (~78 s upload). The window scales with chunk
         // count so long voice notes have enough slack while pathological
-        // requests (chunkCount = 256 max from manifest) are still capped.
+        // requests (chunkCount capped by VoiceMediaPolicy) are still bounded.
         private const val FRESH_TASK_MIN_WINDOW_MS = 120_000L   // 2 min floor
         private const val FRESH_TASK_PER_CHUNK_MS  = 1_500L     // ≈ measured per-chunk upload
         private const val FRESH_TASK_MAX_WINDOW_MS = 300_000L   // 5 min cap
