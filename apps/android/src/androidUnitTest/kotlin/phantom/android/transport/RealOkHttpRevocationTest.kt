@@ -89,7 +89,13 @@ class RealOkHttpRevocationTest {
             readTimeoutMs = 120_000L,
             writeTimeoutMs = 120_000L,
             callRegistry = registry,
-        )
+        ).also {
+            // This test proves revocation of the long-lived fresh fallback.
+            // The speculative pooled path has an intentional 3-second ceiling,
+            // so leaving it enabled would make the 5-second non-vacuity control
+            // complete naturally before the configured 120-second timeouts.
+            it.setUploadPoolEnabled(false)
+        }
 
     private suspend fun awaitRegistered(registry: EgressCallRegistry): Boolean =
         withTimeoutOrNull(10_000L) {

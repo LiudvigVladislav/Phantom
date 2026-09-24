@@ -49,7 +49,7 @@ object ChunkSizeProbe {
      * body envelope. 2600 was originally seeded as a borderline negative
      * control and surprisingly passed full roundtrip.
      *
-     * Last four (2800 / 3000 / 3200 / 3500) — Test #70.1 extended probe
+     * 2800 / 3000 / 3200 / 3500 — Test #70.1 extended probe
      * (PR-M2f.1b, this commit). Vladislav locked path B 2026-05-19:
      * find the real v3 ceiling instead of shipping 2400 by old margin.
      * Production policy stays "do not ship the maximum that passed once":
@@ -57,10 +57,14 @@ object ChunkSizeProbe {
      *   3000 stable, 3200 unstable → ship 3000
      *   3200 stable, 3500 unstable → ship 3000
      *   3500 stable → max 3200 after retest, never 3500 from one session
+     *
+     * 7000 — the later binary-v3 production probe. Unlike the legacy JSON
+     * path, its body is raw ciphertext and remains 2000 bytes below the relay
+     * request-body ceiling.
      */
     val CANDIDATES: List<Int> = listOf(
         1700, 2200, 2300, 2400, 2600,
-        2800, 3000, 3200, 3500,
+        2800, 3000, 3200, 3500, 7000,
     )
 
     /** Selector visible only on debug builds. */

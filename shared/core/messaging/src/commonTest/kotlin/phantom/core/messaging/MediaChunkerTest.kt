@@ -12,6 +12,12 @@ import kotlin.test.assertTrue
 class MediaChunkerTest {
 
     @Test
+    fun productionTarget_keepsTwoKilobyteMarginBelowRelayLimit() {
+        assertEquals(7_000, MediaChunker.TARGET_RAW_CHUNK_BYTES)
+        assertEquals(2_000, 9_000 - MediaChunker.TARGET_RAW_CHUNK_BYTES)
+    }
+
+    @Test
     fun chunk_38KbBlob_producesExpectedChunksOfTargetSizeExceptLast() {
         val inputSize = 38 * 1024  // 38 KB
         val blob = ByteArray(inputSize) { it.toByte() }
