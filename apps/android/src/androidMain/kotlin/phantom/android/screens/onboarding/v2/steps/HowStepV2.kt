@@ -79,10 +79,8 @@ internal const val HOW_STEP_ROOT_TEST_TAG: String = "how_step_root"
  *     "Every message is encrypted before it leaves you. Relays forward
  *      ciphertext they cannot read."
  *
- *   Card 3 "You control visibility" (UNCHANGED from handoff — UX claim,
- *     not security claim):
- *     "Presence, read receipts, and discovery are switches — not defaults
- *      you have to fight."
+ *   Card 3 describes the implemented Privacy Mode route and read-receipt
+ *     policy. Presence, last-seen, and Nearby are not controlled by it.
  */
 @Composable
 fun HowStepV2(

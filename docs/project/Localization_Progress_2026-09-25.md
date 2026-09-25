@@ -20,8 +20,8 @@ added to a release until the complete-flow gates in
   The request count uses a plural resource, and chat-list dates use the active
   locale rather than a fixed US locale. This is extraction, not translation.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
-  finale, permissions, shared step chrome, startup-error and repair-error copy
-  has been extracted. Privacy-level, pricing and terms copy remains.
+  finale, privacy mode, permissions, shared step chrome, startup-error and
+  repair-error copy has been extracted. Pricing and terms copy remains.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -64,10 +64,10 @@ phone and emulator. The current branch does not meet that gate.
 
 ## Copy correctness found during extraction
 
-`HowStepV2` says presence, read receipts and discovery are separate switches,
-while the Settings audit found no separate Last Seen control and shows read
-receipts as a consequence of Privacy Mode. `PrivacyLevelStepV2` still describes
-last-seen visibility and Nearby discoverability per tier. These claims need
-verification against production behavior and correction before translation;
-moving English text into a resource would not make them true. No product
-semantics or transport behavior changed in this extraction pass.
+The onboarding-v2 How and privacy-tier copy now describes the implemented
+transport chains and read-receipt policy. The previous presence, last-seen,
+and Nearby-per-tier promises were unsupported: Settings has no separate
+last-seen control, and Nearby's discoverable toggle currently stores a local
+preference without running mesh discovery. The pricing sheet and legacy
+onboarding still contain aspirational claims; they require product review
+before translation. No transport or privacy-mode behavior changed here.

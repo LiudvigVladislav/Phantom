@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -103,7 +104,7 @@ internal fun PrivacyTierCard(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = tier.name,
+                        text = stringResource(tier.nameRes),
                         color = DesignV2Tokens.Colors.TextPrimary,
                         style = TextStyle(
                             fontFamily = DesignV2FontDisplay,
@@ -111,11 +112,11 @@ internal fun PrivacyTierCard(
                             fontWeight = FontWeight.SemiBold,
                         ),
                     )
-                    TierTagPill(text = tier.tag, locked = tier.locked)
+                    TierTagPill(text = stringResource(tier.tagRes), locked = tier.locked)
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = tier.description,
+                    text = stringResource(tier.descriptionRes),
                     color = DesignV2Tokens.Colors.TextTertiary,
                     style = TextStyle(
                         fontFamily = DesignV2FontBody,
@@ -135,8 +136,8 @@ internal fun PrivacyTierCard(
         )
         Spacer(Modifier.height(6.dp))
 
-        tier.bullets.forEach { bullet ->
-            PrivacyTierBullet(text = bullet)
+        tier.bulletRes.forEach { bulletRes ->
+            PrivacyTierBullet(text = stringResource(bulletRes))
         }
 
         if (tier.locked) {
@@ -229,6 +230,7 @@ private fun PrivacyTierBullet(text: String) {
 
 @Composable
 private fun UnlockWithPhantomProCta(onClick: () -> Unit) {
+    val label = stringResource(R.string.onboarding_privacy_unlock_pro)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -237,7 +239,7 @@ private fun UnlockWithPhantomProCta(onClick: () -> Unit) {
             .background(DesignV2Tokens.Colors.Cyan)
             .clickable(
                 role = Role.Button,
-                onClickLabel = "Unlock with Phantom Pro",
+                onClickLabel = label,
                 onClick = onClick,
             ),
         verticalAlignment = Alignment.CenterVertically,
@@ -253,7 +255,7 @@ private fun UnlockWithPhantomProCta(onClick: () -> Unit) {
         )
         Spacer(Modifier.width(8.dp))
         Text(
-            text = "Unlock with Phantom Pro",
+            text = label,
             color = Color(0xFF04222B),
             style = TextStyle(
                 fontFamily = DesignV2FontBody,

@@ -34,6 +34,24 @@ class OnboardingV2PrivacyDialSemanticsTest {
     @get:Rule
     val composeTestRule = createComposeRule()
 
+    @Test
+    fun privacy_tier_copy_describes_routes_and_receipts_without_presence_claims() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+                formState = OnboardingFormStateV2(),
+                dotsIndex = 2,
+                onFormStateChange = {},
+                onContinueClick = {},
+                onGhostLockClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("REALITY and Tor fallback").assertExists()
+        composeTestRule.onNodeWithText("Read receipts enabled").assertExists()
+        composeTestRule.onAllNodesWithText("last seen", substring = true, ignoreCase = true).assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Nearby", substring = true, ignoreCase = true).assertCountEquals(0)
+    }
+
     // ── Commit 4 · Privacy dial semantics ──────────────────────────────
 
     @Test
