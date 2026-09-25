@@ -42,6 +42,10 @@
     -->
     <string name="m1w_voice_still_uploading">A voice message is still uploading. Please wait.</string>
 
+    <string name="nearby_title">Nearby</string>
+    <string name="nearby_unavailable_title">Local discovery is not available yet</string>
+    <string name="nearby_unavailable_body">Bluetooth and Wi-Fi Direct discovery are planned. This device is not scanning or broadcasting.</string>
+
     <string name="settings_title">Settings</string>
     <string name="settings_account">Account</string>
     <string name="settings_profile">Profile</string>
@@ -105,6 +109,9 @@
     <string name="privacy_mode_private_description">Skip direct WSS entirely. The relay never sees your source IP. Read receipts suppressed. Connect can take up to 30 seconds for Reality, longer if it falls back to Tor.</string>
     <string name="privacy_mode_ghost_tagline">Tor onion only — no fallback</string>
     <string name="privacy_mode_ghost_description">Maximum unlinkability. If Tor cannot bootstrap on your network the app will show \"Cannot reach relay\" rather than silently downgrading to a less-private path. Read receipts suppressed. First-connect can take several minutes on censored networks while bridges bootstrap.</string>
+    <string name="privacy_mode_ghost_locked_tagline">PRO · NOT AVAILABLE YET</string>
+    <string name="privacy_mode_ghost_locked_description">Ghost requires a Pro subscription. Subscriptions are not available in this build.</string>
+    <string name="privacy_mode_ghost_saved_locked">Ghost was selected in an earlier build. It will not silently switch to another route, but it cannot connect without a Pro subscription. Choose Standard or Private to reconnect.</string>
     <string name="privacy_mode_transport_note">The active transport is visible in the foreground notification (\"Online via Reality · Standard\"). Mode switches reset the active connection and walk the new chain.</string>
     <string name="privacy_mode_active">ACTIVE</string>
 
@@ -218,6 +225,7 @@
     <string name="service_channel_name">PHANTOM Messaging</string>
     <string name="service_channel_description">Keeps the connection available for encrypted messages</string>
     <string name="service_status_starting">Starting encrypted connection</string>
+    <string name="service_status_ghost_requires_pro">Ghost requires Pro. Choose Standard or Private to connect.</string>
     <string name="service_status_idle">Waiting for connection · %1$s</string>
     <string name="service_status_probing">Connecting via %1$s… · %2$s</string>
     <string name="service_status_connected">Online via %1$s · %2$s</string>

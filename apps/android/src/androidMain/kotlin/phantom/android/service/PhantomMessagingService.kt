@@ -264,7 +264,14 @@ class PhantomMessagingService : Service() {
                 // place the user actually looks.
                 val effectiveMode = container.privacyModeCoordinator.state.value.effective
                 val mode = effectiveMode.name
-                val text = foregroundTransportStatus(this@PhantomMessagingService, state, effectiveMode)
+                val text = if (!phantom.android.premium.SubscriptionAccess.permits(
+                        container.privacyModeCoordinator.state.value.requested,
+                    )
+                ) {
+                    getString(R.string.service_status_ghost_requires_pro)
+                } else {
+                    foregroundTransportStatus(this@PhantomMessagingService, state, effectiveMode)
+                }
                 Log.i(
                     TAG,
                     "TransportManager state → ${state::class.simpleName} mode=$mode text=\"$text\"",
@@ -1240,6 +1247,16 @@ class PhantomMessagingService : Service() {
                 // The authority already holds the right mode in memory; this
                 // only makes it durable.
                 container.migratePrivacyModeIfNeeded()
+                // A previously saved Ghost selection stays intact. Refuse
+                // startup instead of silently routing it over a weaker mode.
+                if (!phantom.android.premium.SubscriptionAccess.permits(
+                        container.privacyModeCoordinator.state.value.requested,
+                    )
+                ) {
+                    pushNotificationText(getString(R.string.service_status_ghost_requires_pro))
+                    Log.w("PhantomMessaging", "service_start_blocked reason=ghost_entitlement_missing")
+                    return@serviceStartupOrNull null
+                }
                 val unlock = DeviceUnlockGate(applicationContext)
                 val publicKeyHex = unlock.readWhenUnlocked {
                     container.identityRepo.loadIdentity()?.publicKeyHex

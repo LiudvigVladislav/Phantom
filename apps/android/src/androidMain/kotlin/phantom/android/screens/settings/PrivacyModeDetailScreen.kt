@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.premium.SubscriptionAccess
 import phantom.android.R
 import phantom.android.service.PhantomMessagingService
 import phantom.android.ui.*
@@ -50,12 +51,14 @@ import phantom.core.transport.PrivacyMode
 fun PrivacyModeDetailScreen(
     container: AppContainer,
     onBack: () -> Unit,
+    onModeApplied: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var selected by remember { mutableStateOf(container.transportPreferences.privacyMode) }
     var pendingGhost by remember { mutableStateOf(false) }
+    val ghostAvailable = SubscriptionAccess.hasVerifiedPro()
 
     // Wait-time disclaimer surfaced on every mode switch. The chain walk
     // can take 30 s for Reality init alone; falling all the way through
@@ -91,7 +94,10 @@ fun PrivacyModeDetailScreen(
                     pendingGhost = false
                     selected = PrivacyMode.Ghost
                     snackForMode(PrivacyMode.Ghost)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Ghost) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Ghost)
+                        onModeApplied()
+                    }
                 }) { Text(stringResource(R.string.privacy_mode_switch_button), color = CyanAccent) }
             },
             dismissButton = {
@@ -175,7 +181,10 @@ fun PrivacyModeDetailScreen(
                     if (selected == PrivacyMode.Standard) return@ModeCard
                     selected = PrivacyMode.Standard
                     snackForMode(PrivacyMode.Standard)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Standard) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Standard)
+                        onModeApplied()
+                    }
                 },
             )
             Spacer(Modifier.height(10.dp))
@@ -188,15 +197,29 @@ fun PrivacyModeDetailScreen(
                     if (selected == PrivacyMode.Private) return@ModeCard
                     selected = PrivacyMode.Private
                     snackForMode(PrivacyMode.Private)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Private) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Private)
+                        onModeApplied()
+                    }
                 },
             )
             Spacer(Modifier.height(10.dp))
             ModeCard(
                 title = stringResource(R.string.settings_privacy_ghost),
-                tagline = stringResource(R.string.privacy_mode_ghost_tagline),
-                description = stringResource(R.string.privacy_mode_ghost_description),
+                tagline = if (ghostAvailable) {
+                    stringResource(R.string.privacy_mode_ghost_tagline)
+                } else {
+                    stringResource(R.string.privacy_mode_ghost_locked_tagline)
+                },
+                description = if (ghostAvailable) {
+                    stringResource(R.string.privacy_mode_ghost_description)
+                } else if (selected == PrivacyMode.Ghost) {
+                    stringResource(R.string.privacy_mode_ghost_saved_locked)
+                } else {
+                    stringResource(R.string.privacy_mode_ghost_locked_description)
+                },
                 active = selected == PrivacyMode.Ghost,
+                enabled = ghostAvailable,
                 onClick = {
                     if (selected == PrivacyMode.Ghost) return@ModeCard
                     pendingGhost = true
@@ -222,6 +245,7 @@ private fun ModeCard(
     tagline: String,
     description: String,
     active: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Column(
@@ -234,7 +258,7 @@ private fun ModeCard(
                 color = if (active) CyanAccent else BorderSubtle,
                 shape = RoundedCornerShape(12.dp),
             )
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {

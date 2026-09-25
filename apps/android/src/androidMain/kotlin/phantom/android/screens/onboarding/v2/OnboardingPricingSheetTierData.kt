@@ -48,7 +48,7 @@ internal val PRICING_TIERS: List<PricingTierV2> = listOf(
         price = "$4.99",
         sub = "More control.",
         iconRes = R.drawable.ic_dv2_tier_plus,
-        cta = "Upgrade to Plus",
+        cta = "Plus coming soon",
         features = listOf(
             "Everything in Free",
             "Larger groups up to 64 members",
@@ -63,7 +63,7 @@ internal val PRICING_TIERS: List<PricingTierV2> = listOf(
         price = "$9.99",
         sub = "Full control.",
         iconRes = R.drawable.ic_dv2_tier_pro,
-        cta = "Upgrade to Pro",
+        cta = "Pro coming soon",
         recommended = true,
         calloutTitle = "GHOST MODE",
         calloutBody = "Route every message through the Tor network with no silent downgrade to WSS or REALITY. Additional invisibility controls arrive in a future Pro release.",
@@ -81,7 +81,7 @@ internal val PRICING_TIERS: List<PricingTierV2> = listOf(
         price = "$19.99",
         sub = "For teams & organizations.",
         iconRes = R.drawable.ic_dv2_tier_business,
-        cta = "Upgrade to Business",
+        cta = "Business coming soon",
         features = listOf(
             "Everything in Pro",
             "Centralized admin console",

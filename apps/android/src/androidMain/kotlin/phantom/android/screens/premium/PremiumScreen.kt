@@ -36,8 +36,7 @@ import phantom.android.ui.theme.*
  *    from the card edge) and a Ghost Mode inset block (surfaceDeep ·
  *    borderSubtle · 10dp radius).
  *
- * D-18 (2026-05-09): all CTAs visually enabled, but tap surfaces a
- * "Coming soon" snackbar — payment integration is deferred to Beta.
+ * Plans are previews until payment and entitlement verification exist.
  */
 @Composable
 fun PremiumScreen(
@@ -50,7 +49,7 @@ fun PremiumScreen(
     fun showComingSoon() {
         scope.launch {
             snackbarHostState.currentSnackbarData?.dismiss()
-            snackbarHostState.showSnackbar("Coming soon — payment integration lands in Beta")
+            snackbarHostState.showSnackbar("Subscriptions are not available yet")
         }
     }
 
@@ -112,7 +111,7 @@ fun PremiumScreen(
             // density restrained and lets the plan card carry the visual
             // weight.
             Text(
-                text = "More control. Same PHANTOM.",
+                text = "Planned plans and prices. Subscriptions are not available yet.",
                 color = TextDim.copy(alpha = 0.85f),
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -134,7 +133,7 @@ fun PremiumScreen(
             Spacer(Modifier.height(20.dp))
 
             Text(
-                text = "Cancel any time. No data sold, ever.",
+                text = "Preview only. No purchase is available in this build.",
                 color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
@@ -233,7 +232,7 @@ private fun PlusPlanCard(onCta: () -> Unit) {
             "Priority message routing",
             "Premium typeface (PP Neue Montreal)",
         ),
-        ctaLabel = "Upgrade to Plus",
+        ctaLabel = "Plus coming soon",
         ctaVariant = CtaVariant.Secondary,
         ghostInset = false,
         onCta = onCta,
@@ -256,7 +255,7 @@ private fun ProPlanCard(onCta: () -> Unit) {
             "Self-hosted relay support",
             "Advanced sealed sender",
         ),
-        ctaLabel = "Upgrade to Pro",
+        ctaLabel = "Pro coming soon",
         ctaVariant = CtaVariant.Primary,
         ghostInset = true,
         onCta = onCta,

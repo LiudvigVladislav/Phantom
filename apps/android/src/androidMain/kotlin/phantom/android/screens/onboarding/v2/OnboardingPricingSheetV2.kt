@@ -89,7 +89,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *       - Pro tier  — $9.99 · "Full control." — recommended, with
  *         GHOST MODE callout box.
  *       - Business tier — $19.99 · "For teams & organizations."
- *   - Footer: "Cancel any time. No data sold, ever." centered, 11.5 sp,
+ *   - Footer: preview availability note centered, 11.5 sp,
  *     TextQuaternary.
  *
  * Handoff visual features implemented in round-3 (was carved out
@@ -137,7 +137,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * Accessibility: backdrop is a Role.Button with click-action label
  * "Close pricing"; grab-strip is a separate Role.Button with the
  * same label; close-X is a Role.Button with label "Close pricing".
- * Tier CTAs each carry Role.Button + text "Upgrade to Plus/Pro/Business".
+ * Tier CTAs carry Role.Button + a coming-soon label.
  * Decorative bits (tier hex icons, feature check rondels, close-X
  * path, grab-strip handle) are cleared via
  * `Modifier.clearAndSetSemantics { }`.

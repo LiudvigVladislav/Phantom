@@ -212,9 +212,10 @@ The product-claim pass in
 [`Localization_Copy_Audit_2026-09-26.md`](Localization_Copy_Audit_2026-09-26.md)
 classifies five disputed surfaces by actual route reachability and measured
 behavior. The owner selected a $4.99 Plus display price for both onboarding
-and Settings, resolving their earlier mismatch; neither screen offers a
-working purchase. Nearby is a normal destination but
-its discoverability toggle does not start discovery. Create Channel has no
+and Settings and approved preliminary-plan copy; neither screen offers a
+working purchase. Ghost is locked without a verified Pro subscription, and
+the old discoverability toggle/radar were removed from Nearby in favor of an
+honest unavailable state. Create Channel has no
 ordinary UI entry even though its route can be restored, and the migration
 screen remains conditional and copy-locked by its ADR. These findings are
 not translations or owner-approved product decisions.

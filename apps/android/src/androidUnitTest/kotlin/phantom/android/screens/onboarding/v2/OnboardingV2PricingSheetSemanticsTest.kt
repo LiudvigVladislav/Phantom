@@ -59,9 +59,9 @@ class OnboardingV2PricingSheetSemanticsTest {
         }
         composeTestRule.waitForIdle()
         // Zero UI when closed — CTA labels absent.
-        composeTestRule.onAllNodesWithText("Upgrade to Plus").assertCountEquals(0)
-        composeTestRule.onAllNodesWithText("Upgrade to Pro").assertCountEquals(0)
-        composeTestRule.onAllNodesWithText("Upgrade to Business").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Plus coming soon").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Pro coming soon").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Business coming soon").assertCountEquals(0)
     }
 
     @Test
@@ -81,9 +81,11 @@ class OnboardingV2PricingSheetSemanticsTest {
         composeTestRule.onAllNodesWithText("$3.99").assertCountEquals(0)
         composeTestRule.onNodeWithText("Pro").assertExists()
         composeTestRule.onNodeWithText("Business").assertExists()
-        composeTestRule.onNodeWithText("Upgrade to Plus").assertExists()
-        composeTestRule.onNodeWithText("Upgrade to Pro").assertExists()
-        composeTestRule.onNodeWithText("Upgrade to Business").assertExists()
+        composeTestRule.onNodeWithText("Plus coming soon").assertExists()
+        composeTestRule.onNodeWithText("Pro coming soon").assertExists()
+        composeTestRule.onNodeWithText("Business coming soon").assertExists()
+        composeTestRule.onNodeWithText("Preview only. Subscriptions are not available yet.").assertExists()
+        composeTestRule.onNodeWithText("Planned prices and features. Subscriptions are not available yet.").assertExists()
     }
 
     @Test
@@ -103,16 +105,16 @@ class OnboardingV2PricingSheetSemanticsTest {
         // moment the test runs, and coordinate hit-testing then misses
         // the CTA even though the semantics node exists. Direct action
         // invocation exercises the OnClick contract regardless.
-        composeTestRule.onNodeWithText("Upgrade to Plus")
+        composeTestRule.onNodeWithText("Plus coming soon")
             .performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("Upgrade to Pro")
+        composeTestRule.onNodeWithText("Pro coming soon")
             .performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("Upgrade to Business")
+        composeTestRule.onNodeWithText("Business coming soon")
             .performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        assert(ctaLog == listOf("Upgrade to Plus", "Upgrade to Pro", "Upgrade to Business")) {
+        assert(ctaLog == listOf("Plus coming soon", "Pro coming soon", "Business coming soon")) {
             "Expected three CTA taps in Plus/Pro/Business order; got $ctaLog."
         }
     }
@@ -272,8 +274,8 @@ class OnboardingV2PricingSheetSemanticsTest {
         }
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("Business").assertExists()
-        composeTestRule.onNodeWithText("Upgrade to Business").assertExists()
-        composeTestRule.onNodeWithText("Cancel any time. No data sold, ever.")
+        composeTestRule.onNodeWithText("Business coming soon").assertExists()
+        composeTestRule.onNodeWithText("Planned prices and features. Subscriptions are not available yet.")
             .assertExists()
     }
 

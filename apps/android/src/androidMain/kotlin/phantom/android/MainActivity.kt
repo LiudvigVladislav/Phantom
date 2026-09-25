@@ -388,11 +388,19 @@ private fun PhantomApp(
         startupInFlight = true
         startupCompleted = false
         try {
+            val repairMarker = runCatching {
+                phantom.android.screens.onboarding.v2.IdentityRepairMarker
+                    .isRepairRequired(startupContext)
+            }
+            if (phantom.android.premium.SubscriptionAccess.requiresModeChoice(
+                    container.privacyModeCoordinator.state.value.requested,
+                    repairMarker.getOrNull(),
+                )) {
+                currentScreen = Screen.PrivacyModeDetail
+                return@LaunchedEffect
+            }
             val decision = phantom.android.screens.onboarding.v2.decideStartupRoute(
-                markerRead = {
-                    phantom.android.screens.onboarding.v2.IdentityRepairMarker
-                        .isRepairRequired(startupContext)
-                },
+                markerRead = { repairMarker.getOrThrow() },
                 loadIdentity = { container.identityRepo.loadIdentity() },
                 initMessaging = {
                     // Round-8 pin: return true on success, false
@@ -679,9 +687,7 @@ private fun PhantomApp(
             onProfile = { currentScreen = Screen.Profile },
         )
         is Screen.Nearby -> phantom.android.screens.nearby.NearbyScreen(
-            container = container,
             onNavigate = { currentScreen = it },
-            onProfile = { currentScreen = Screen.Profile },
         )
         is Screen.Premium -> phantom.android.screens.premium.PremiumScreen(
             onBack = { currentScreen = Screen.Settings },
@@ -699,6 +705,7 @@ private fun PhantomApp(
         is Screen.PrivacyModeDetail -> phantom.android.screens.settings.PrivacyModeDetailScreen(
             container = container,
             onBack = { currentScreen = Screen.Settings },
+            onModeApplied = { if (!startupCompleted) retryTick += 1 },
         )
         is Screen.Profile -> ProfileScreen(
             container = container,

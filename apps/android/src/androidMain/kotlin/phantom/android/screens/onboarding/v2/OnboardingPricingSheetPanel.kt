@@ -80,7 +80,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *   - [TierList]        — scrollable stack of `PricingTierCard`s
  *                          (round-3 §P1-3 `Int.MAX_VALUE` initial
  *                          scroll for the showcase golden).
- *   - [Footer]          — "Cancel any time" bottom text.
+ *   - [Footer]          — pricing-preview availability note.
  */
 
 @Composable
@@ -232,6 +232,15 @@ internal fun Panel(
                 reboundScope = reboundScope,
             )
             HeaderRow(onDismiss = onDismiss)
+            Text(
+                text = "Preview only. Subscriptions are not available yet.",
+                color = DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontBody,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                ),
+            )
             Spacer(Modifier.height(14.dp))
             TierList(
                 onCtaSelected = onCtaSelected,
@@ -354,10 +363,8 @@ private fun ColumnScope.TierList(
 
 @Composable
 private fun Footer() {
-    // "Cancel any time. No data sold, ever." per handoff — small
-    // centered text under the tier stack.
     Text(
-        text = "Cancel any time. No data sold, ever.",
+        text = "Planned prices and features. Subscriptions are not available yet.",
         color = DesignV2Tokens.Colors.TextQuaternary,
         style = TextStyle(
             fontFamily = DesignV2FontBody,

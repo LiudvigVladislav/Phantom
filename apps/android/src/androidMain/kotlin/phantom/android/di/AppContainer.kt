@@ -1516,6 +1516,9 @@ class AppContainer(private val context: Context) {
     }.isSuccess
 
     suspend fun setPrivacyMode(mode: PrivacyMode): phantom.core.transport.PrivacyModeChangeResult {
+        check(phantom.android.premium.SubscriptionAccess.permits(mode)) {
+            "Ghost requires a verified Pro subscription"
+        }
         // R-N1.17: the mode is written by the AUTHORITY, inside the
         // critical section that also bumps the epoch. A direct write
         // here as well would be a second owner of the same fact - the
@@ -3372,6 +3375,11 @@ class AppContainer(private val context: Context) {
     private val initMessagingMutex = kotlinx.coroutines.sync.Mutex()
 
     suspend fun initMessagingFromStorage() {
+        check(phantom.android.premium.SubscriptionAccess.permits(
+            privacyModeCoordinator.state.value.requested,
+        )) {
+            "Ghost requires a verified Pro subscription"
+        }
         initMessagingMutex.withLock {
             if (messagingInit is MessagingInit.Ready) {
                 android.util.Log.i(
