@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -92,6 +93,7 @@ fun OnboardingTopBarV2(
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val backLabel = stringResource(R.string.onboarding_back)
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -128,7 +130,7 @@ fun OnboardingTopBarV2(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     role = Role.Button,
-                    onClickLabel = "Back",
+                    onClickLabel = backLabel,
                     onClick = onBackClick,
                 )
                 .padding(horizontal = 12.dp, vertical = 8.dp),
@@ -142,7 +144,7 @@ fun OnboardingTopBarV2(
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = "Back",
+                text = backLabel,
                 color = DesignV2Tokens.Colors.TextSecondary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -153,7 +155,7 @@ fun OnboardingTopBarV2(
         }
 
         Text(
-            text = "STEP $stepNumber OF $totalSteps",
+            text = stringResource(R.string.onboarding_step_progress, stepNumber, totalSteps),
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,

@@ -19,6 +19,9 @@ added to a release until the complete-flow gates in
   classification is typed and its resource mapping is covered by tests.
   The request count uses a plural resource, and chat-list dates use the active
   locale rather than a fixed US locale. This is extraction, not translation.
+- Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
+  finale, shared step chrome, startup-error and repair-error copy has been
+  extracted. Privacy-level, permissions, pricing and terms copy remains.
 
 ## Candidate inventory, not a completeness claim
 
@@ -39,9 +42,8 @@ High-density screen files include `ChatScreen.kt`, `ProfileScreen.kt`,
 `ContactProfileScreen.kt`, `OnboardingScreen.kt`, `AddContactScreen.kt`, and
 the onboarding-v2 flow. The chat-list route still includes untranslated linked
 screens, and the calls route still has active-call and incoming-call screens.
-The next extraction pass
-should follow complete user
-flows: cold start and onboarding; chat list, message requests, one-to-one
+The next extraction pass should follow complete user flows: cold start and
+onboarding; chat list, message requests, one-to-one
 chat and voice; profile and contact; calls; notifications and errors. Then
 audit shared UI components, non-screen Android code, accessibility labels,
 plural forms, and dynamic formatting.
@@ -53,3 +55,13 @@ classified and the English and Russian resources agree on keys and format
 arguments. Verify Android 12 and 13+ language switching, process restart,
 draft and session preservation, notification text, and screen geometry on a
 phone and emulator. The current branch does not meet that gate.
+
+## Copy correctness found during extraction
+
+`HowStepV2` says presence, read receipts and discovery are separate switches,
+while the Settings audit found no separate Last Seen control and shows read
+receipts as a consequence of Privacy Mode. `PrivacyLevelStepV2` still describes
+last-seen visibility and Nearby discoverability per tier. These claims need
+verification against production behavior and correction before translation;
+moving English text into a resource would not make them true. No product
+semantics or transport behavior changed in this extraction pass.

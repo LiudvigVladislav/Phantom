@@ -15,6 +15,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -22,6 +23,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.designv2.DesignV2FontBody
 import phantom.android.ui.designv2.DesignV2FontDisplay
 import phantom.android.ui.designv2.DesignV2Tokens
@@ -87,7 +89,7 @@ internal fun OnboardingStartupErrorScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                text = "Something went wrong",
+                text = stringResource(R.string.onboarding_startup_error_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontDisplay,
@@ -103,7 +105,7 @@ internal fun OnboardingStartupErrorScreen(
                 // stable copy that DOES NOT accuse the identity
                 // of corruption AND does not surface any
                 // internal reason label (mini-round §P2 pin).
-                text = "The app could not start. This usually clears up on a retry.",
+                text = stringResource(R.string.onboarding_startup_error_body),
                 color = DesignV2Tokens.Colors.TextSecondary,
                 textAlign = TextAlign.Center,
                 style = TextStyle(
@@ -114,7 +116,7 @@ internal fun OnboardingStartupErrorScreen(
             )
             Spacer(Modifier.height(24.dp))
             PhantomButton(
-                text = "Retry",
+                text = stringResource(R.string.onboarding_retry),
                 onClick = onRetry,
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth(),

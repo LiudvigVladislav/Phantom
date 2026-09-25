@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -107,7 +108,7 @@ fun HowStepV2(
         // now zeroed out. Wrap and visual weight are unchanged at this
         // font size.
         Text(
-            text = "How Phantom\nprotects you",
+            text = stringResource(R.string.onboarding_how_title),
             color = DesignV2Tokens.Colors.TextPrimary,
             style = TextStyle(
                 fontFamily = DesignV2FontDisplay,
@@ -121,7 +122,7 @@ fun HowStepV2(
         Spacer(Modifier.height(8.dp))
 
         Text(
-            text = "Three things work differently here. Worth thirty seconds.",
+            text = stringResource(R.string.onboarding_how_intro),
             color = DesignV2Tokens.Colors.TextTertiary,
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
@@ -140,18 +141,18 @@ fun HowStepV2(
         ) {
             HowInfoCard(
                 iconResId = R.drawable.ic_dv2_ed25519_key,
-                title = "Keys, not phone numbers",
-                body = "An Ed25519 keypair is created here. The private key stays on this device; the public key is shared for verification.",
+                title = stringResource(R.string.onboarding_how_keys_title),
+                body = stringResource(R.string.onboarding_how_keys_body),
             )
             HowInfoCard(
                 iconResId = R.drawable.ic_dv2_encrypted,
-                title = "Sealed end to end",
-                body = "Every message is encrypted before it leaves you. Relays forward ciphertext they cannot read.",
+                title = stringResource(R.string.onboarding_how_sealed_title),
+                body = stringResource(R.string.onboarding_how_sealed_body),
             )
             HowInfoCard(
                 iconResId = R.drawable.ic_dv2_ghost_signal,
-                title = "You control visibility",
-                body = "Presence, read receipts, and discovery are switches — not defaults you have to fight.",
+                title = stringResource(R.string.onboarding_how_visibility_title),
+                body = stringResource(R.string.onboarding_how_visibility_body),
             )
         }
 
@@ -165,7 +166,7 @@ fun HowStepV2(
         Spacer(Modifier.height(12.dp))
 
         PhantomButton(
-            text = "Create my identity",
+            text = stringResource(R.string.onboarding_create_identity),
             onClick = onContinueClick,
             modifier = Modifier.fillMaxWidth(),
         )
