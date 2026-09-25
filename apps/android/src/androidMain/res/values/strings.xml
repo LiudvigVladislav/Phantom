@@ -620,4 +620,5 @@
     <string name="qr_scan_permission_required">Camera permission required</string>
     <string name="qr_scan_grant_permission">Grant Permission</string>
     <string name="splash_logo">PHANTOM logo</string>
+    <string name="qr_contact_code_description">Your contact QR code</string>
 </resources>

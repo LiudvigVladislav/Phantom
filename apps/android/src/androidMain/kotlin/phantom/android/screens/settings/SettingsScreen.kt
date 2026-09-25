@@ -87,10 +87,10 @@ fun SettingsScreen(
     }
 
     // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
-    var cacheSize by remember { mutableStateOf<String?>(null) }
+    var cacheSizeBytes by remember { mutableStateOf<Long?>(null) }
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            cacheSize = formatByteSize(computeCacheSizeBytes(context))
+        cacheSizeBytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            computeCacheSizeBytes(context)
         }
     }
 
@@ -292,7 +292,7 @@ fun SettingsScreen(
                     SettingsRowItem(
                         icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_local_storage),
-                        value = cacheSize ?: "…",
+                        value = cacheSizeBytes?.let { android.text.format.Formatter.formatShortFileSize(context, it) } ?: "…",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
@@ -610,12 +610,6 @@ private fun computeCacheSizeBytes(context: android.content.Context): Long {
     val cache = walk(context.cacheDir)
     val db = walk(context.getDatabasePath("placeholder").parentFile ?: java.io.File(""))
     return cache + db
-}
-
-private fun formatByteSize(bytes: Long): String {
-    if (bytes < 1_024) return "$bytes B"
-    if (bytes < 1_024 * 1_024) return "${bytes / 1_024} KB"
-    return "%.1f MB".format(bytes / 1_048_576.0)
 }
 
 /**

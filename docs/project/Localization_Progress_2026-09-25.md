@@ -121,6 +121,15 @@ added to a release until the complete-flow gates in
   The key preview still displays only bytes from the user's own key.
 - The splash logo's TalkBack description now uses an English resource; the
   visible brand graphic and transition are unchanged.
+- The profile's QR image now has a resource-backed TalkBack description that
+  says it is the user's contact code, without speaking the key bytes. The
+  one-to-one chat recording timer uses the active app locale for numeric
+  formatting; its duration and recording behavior are unchanged.
+- Settings now keeps the measured cache size as bytes and formats its display
+  through Android's file-size formatter for the current app context. A
+  language change can therefore update the unit and number presentation
+  without recounting or altering the stored files. The debug-only chunk-size
+  probe retains its technical byte labels and is not part of release copy.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -175,6 +184,18 @@ Its `nearby_discoverable` preference does not start a beacon or scan, while
 the toggle and animated radar imply live discovery. The screen is therefore
 blocked for truthful product-copy review rather than being translated as a
 working BLE/Wi-Fi Direct feature. No Nearby behavior was changed here.
+
+A targeted scan of non-screen Android copy found that `QrCodeImage` is called
+from Profile and is active; its accessibility label is now a resource.
+`NotificationPermissionSheet`, `BackupExportSheet`, and `SearchActiveSheet`
+in `UtilitySheets.kt` have no production call sites, as do
+`ComingSoonOverlay` and `PrivacySettingsRow` in `PhantomNav.kt`; their copy is
+classified as unreachable, not translated. The backup sheet contains a past
+September 2026 date and fallback fingerprint, and must not be wired into the
+app without copy and security review. `PHANTOM` in the foreground notification
+title is a brand name, not a translation candidate. Diagnostic log strings
+and animation labels are not user-visible. This targeted scan does not prove
+that every dynamic or indirect Android string has been found.
 
 The source scan
 

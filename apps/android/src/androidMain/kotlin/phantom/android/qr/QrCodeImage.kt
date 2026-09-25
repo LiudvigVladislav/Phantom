@@ -16,11 +16,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
+import phantom.android.R
 
 fun generateQrBitmap(content: String, sizePx: Int = 512): Bitmap {
     val hints = mapOf(EncodeHintType.MARGIN to 1)
@@ -51,7 +53,7 @@ fun QrCodeImage(content: String, size: Dp = 220.dp) {
     ) {
         Image(
             bitmap = bitmap.asImageBitmap(),
-            contentDescription = "QR Code",
+            contentDescription = stringResource(R.string.qr_contact_code_description),
             modifier = Modifier.size(size),
         )
     }

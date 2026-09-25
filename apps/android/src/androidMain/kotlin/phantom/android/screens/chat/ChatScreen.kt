@@ -66,6 +66,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -4201,7 +4202,8 @@ private fun RecPanelDot(live: Boolean) {
 @Composable
 private fun RecPanelTimer(durationMs: Long, paused: Boolean) {
     val totalSeconds = (durationMs / 1000).toInt()
-    val label = "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
+    val locale = LocalConfiguration.current.locales[0]
+    val label = String.format(locale, "%d:%02d", totalSeconds / 60, totalSeconds % 60)
     Text(
         text = label,
         color = if (paused) TextDim else TextPrimary,
