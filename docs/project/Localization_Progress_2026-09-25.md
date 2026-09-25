@@ -73,10 +73,15 @@ added to a release until the complete-flow gates in
   previous fallback unconditionally unlocked on the production
   `ComponentActivity` host; `MainActivity` now supports `BiometricPrompt`,
   and missing host or unavailable device authentication fails closed. This
-  change needs a device check with enrolled credentials and with no enrolled
-  credential before release. Android 9-10 do not support the strong-biometric
-  plus-device-credential combination, so those versions use the OS credential
-  confirmation activity and unlock only on its successful result. No weaker
+  change was exercised on a read-only Android 37 emulator: with no device
+  credential it remained locked; cancel and a wrong PIN also remained locked;
+  the correct system PIN opened the app. The connected Android 12 phone still
+  needs a check on this build: its installed APK has the project release
+  signature, while this branch's debug APK has a different signature, so an
+  in-place install without clearing data is unavailable. Android 9-10 do not
+  support the strong-biometric plus-device-credential combination, so those
+  versions use the OS credential confirmation activity and unlock only on its
+  successful result. No weaker
   biometric mode is silently enabled. The legacy credential flow still needs
   interaction testing on those OS versions.
 
