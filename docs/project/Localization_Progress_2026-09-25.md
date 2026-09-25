@@ -20,8 +20,14 @@ added to a release until the complete-flow gates in
   The request count uses a plural resource, and chat-list dates use the active
   locale rather than a fixed US locale. This is extraction, not translation.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
-  finale, shared step chrome, startup-error and repair-error copy has been
-  extracted. Privacy-level, permissions, pricing and terms copy remains.
+  finale, permissions, shared step chrome, startup-error and repair-error copy
+  has been extracted. Privacy-level, pricing and terms copy remains.
+
+The full `SessionOrderFullStackTest` class was also checked independently on
+Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
+not a Paparazzi snapshot test. Snapshot verification must use the repository's
+`phantomHostTestEngine=paparazzi` mode so this long-running class is not run as
+part of a visual-only pass; regular tests still run in their own host-test lane.
 
 ## Candidate inventory, not a completeness claim
 

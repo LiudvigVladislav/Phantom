@@ -211,4 +211,18 @@
     <string name="onboarding_repair_title">Identity repair required</string>
     <string name="onboarding_repair_body">Your identity was created on disk but the signing key material is missing or malformed. This should not happen. Tap Exit onboarding to close the app; then reinstall to try again.</string>
     <string name="onboarding_exit">Exit onboarding</string>
+    <string name="onboarding_permissions_title">Almost there</string>
+    <string name="onboarding_permissions_intro">Everything below is optional and stays on your device. Skip anything you don\'t want.</string>
+    <string name="onboarding_permissions_microphone_title">Microphone</string>
+    <string name="onboarding_permissions_microphone_body">Asked when first used — for voice messages and calls.</string>
+    <string name="onboarding_permissions_nearby_title">Nearby discovery</string>
+    <string name="onboarding_permissions_nearby_body">Asked when first used — for local-mesh people search.</string>
+    <string name="onboarding_permissions_privacy_note">Phantom never uploads contacts,\nlocation, or usage analytics.</string>
+    <string name="onboarding_permissions_done">Done, let\'s go</string>
+    <string name="onboarding_permissions_notifications_manage_a11y">Notifications on — tap to manage in system settings</string>
+    <string name="onboarding_permissions_notifications_enable_a11y">Turn notifications on</string>
+    <string name="onboarding_permissions_state_on">On</string>
+    <string name="onboarding_permissions_state_off">Off</string>
+    <string name="onboarding_permissions_notifications_title">Notifications</string>
+    <string name="onboarding_permissions_notifications_body">Notifications are generated locally on this device — no push provider sees the preview.</string>
 </resources>
