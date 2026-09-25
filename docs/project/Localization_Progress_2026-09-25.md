@@ -91,6 +91,12 @@ added to a release until the complete-flow gates in
   `MainActivity` build. The phone's release-signed app was unchanged, and the
   temporary test package was uninstalled. Cancellation and wrong-PIN behavior
   remain evidenced by the emulator run, not by the phone run.
+- Archive and Saved Messages are reachable from the chat list. Their active
+  titles, empty states, menus, forward dialog, composer hints, pin-unavailable
+  toast, and icon-only Back/save actions now use English resources. Archive
+  weekday and month names and saved-note timestamps use the active app locale.
+  This pass does not change the stored saved-conversation ID or username, the
+  clipboard label, the time pattern, or the persisted forwarded-note header.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -99,6 +105,23 @@ not a Paparazzi snapshot test. Snapshot verification must use the repository's
 part of a visual-only pass; regular tests still run in their own host-test lane.
 
 ## Candidate inventory, not a completeness claim
+
+The Archive/Saved Messages pass classified every remaining string literal in
+those two screen source files after extraction:
+
+| Literal | Classification | Reason |
+| --- | --- | --- |
+| `saved_messages_local` | Internal ID | Existing repository key shared with ChatScreen; must not be translated. |
+| `Notes` | Persisted metadata | Existing saved-conversation username; changing existing rows needs a data/display decision. |
+| `note` | Clipboard label | Not screen copy; can be reviewed with platform clipboard behavior. |
+| `HH:mm`, `EEE`, `dd MMM` | Date/time patterns | Archive now formats names with the active locale; pattern policy remains for a full-flow formatting audit. |
+| `HH:mm` | Date/time pattern | Saved-note timestamps use the active app locale. |
+| `↩ from ` | Persisted message prefix | ChatScreen writes this marker and SavedMessagesScreen parses it; translating stored bytes would break recognition. The displayed header needs a separate structured-data decision. |
+
+This is a source-literal classification for two screens, not a complete app
+inventory or evidence that a Russian locale is ready. The pin menu still has
+no pin behavior; its unavailable toast is localized as UI copy, not treated
+as a completed feature.
 
 The source scan
 

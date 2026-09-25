@@ -537,4 +537,28 @@
     <string name="verify_key_unavailable">Key unavailable</string>
     <string name="verify_keys_changed">Keys changed while this screen was open. Compare the current keys again.</string>
     <string name="verify_save_failed">Could not save verification. Try again.</string>
+
+    <string name="archive_back">Back to chats</string>
+    <string name="archive_title">ARCHIVED</string>
+    <string name="archive_empty_title">No archived chats</string>
+    <string name="archive_empty_hint">Long-press a chat to archive it</string>
+    <string name="archive_unarchive">Unarchive</string>
+
+    <string name="saved_back">Back to chats</string>
+    <string name="saved_title">SAVED MESSAGES</string>
+    <string name="saved_empty_title">Your personal notes</string>
+    <string name="saved_empty_hint">Save texts, links, ideas</string>
+    <string name="saved_forward_to">Forward to…</string>
+    <string name="saved_no_conversations">No conversations yet</string>
+    <string name="saved_cancel">Cancel</string>
+    <string name="saved_pin_unavailable">Pin — coming soon</string>
+    <string name="saved_edit_hint">Edit note…</string>
+    <string name="saved_new_hint">New note…</string>
+    <string name="saved_save_note">Save note</string>
+    <string name="saved_save_changes">Save changes</string>
+    <string name="saved_forward">Forward</string>
+    <string name="saved_pin">Pin</string>
+    <string name="saved_copy">Copy</string>
+    <string name="saved_edit">Edit</string>
+    <string name="saved_delete">Delete</string>
 </resources>
