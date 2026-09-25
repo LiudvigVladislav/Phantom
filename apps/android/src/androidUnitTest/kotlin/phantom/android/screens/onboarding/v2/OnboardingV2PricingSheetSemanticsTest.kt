@@ -77,6 +77,8 @@ class OnboardingV2PricingSheetSemanticsTest {
         composeTestRule.waitForIdle()
         // Names, prices, and CTAs all present.
         composeTestRule.onNodeWithText("Plus").assertExists()
+        composeTestRule.onNodeWithText("$4.99").assertExists()
+        composeTestRule.onAllNodesWithText("$3.99").assertCountEquals(0)
         composeTestRule.onNodeWithText("Pro").assertExists()
         composeTestRule.onNodeWithText("Business").assertExists()
         composeTestRule.onNodeWithText("Upgrade to Plus").assertExists()

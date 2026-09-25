@@ -45,7 +45,7 @@ internal data class PricingTierV2(
 internal val PRICING_TIERS: List<PricingTierV2> = listOf(
     PricingTierV2(
         name = "Plus",
-        price = "$3.99",
+        price = "$4.99",
         sub = "More control.",
         iconRes = R.drawable.ic_dv2_tier_plus,
         cta = "Upgrade to Plus",

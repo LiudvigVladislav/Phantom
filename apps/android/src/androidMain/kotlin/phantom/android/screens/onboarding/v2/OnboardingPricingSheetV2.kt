@@ -85,7 +85,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *     tracking / TextQuaternary) on the left, circular 30 dp close-X
  *     button on the right.
  *   - Content is a vertical scroll region up to ~56 vh:
- *       - Plus tier — $3.99 · "More control."
+ *       - Plus tier — $4.99 · "More control."
  *       - Pro tier  — $9.99 · "Full control." — recommended, with
  *         GHOST MODE callout box.
  *       - Business tier — $19.99 · "For teams & organizations."
