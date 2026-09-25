@@ -446,12 +446,12 @@ fun SettingsRowItem(
     icon: @Composable () -> Unit,
     label: String,
     value: String? = null,
-    onClick: () -> Unit = {},
+    onClick: (() -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -478,7 +478,9 @@ fun SettingsRowItem(
                 fontSize = 13.sp,
             )
         }
-        PhIconChevron(color = TextDim, size = 14.dp)
+        if (onClick != null) {
+            PhIconChevron(color = TextDim, size = 14.dp)
+        }
     }
 }
 

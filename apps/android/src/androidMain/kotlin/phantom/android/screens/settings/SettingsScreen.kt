@@ -28,6 +28,7 @@ import kotlinx.coroutines.launch
 import phantom.android.BuildConfig
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
+import phantom.android.screens.onboarding.v2.openMessageChannelSettings
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
@@ -40,7 +41,7 @@ import phantom.android.ui.theme.PhantomFontMono
  * Structure (top → bottom):
  *   1. Profile card (avatar + name + tier badge + chevron → ProfileScreen)
  *   2. Account            — Profile, Username, Plan
- *   3. Privacy & Security — Encryption Protocol, Privacy Mode, Read Receipts,
+ *   3. Privacy & Security — Identity Signing, Privacy Mode, Read Receipts,
  *                           Last Seen, Screenshot Protection
  *   4. Notifications      — Message Alerts, Call Alerts, Sound
  *   5. Appearance         — Theme (Locked), Language
@@ -70,22 +71,13 @@ fun SettingsScreen(
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
     val selfAvatarImage = remember(selfAvatarBitmap) { selfAvatarBitmap?.asImageBitmap() }
 
-    // Toggle state — backed by `phantom_prefs` so the value survives the
-    // Settings round-trip (re-entry sees the last toggle position).
-    val prefs = remember {
-        context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
-    }
-    var readReceipts by remember { mutableStateOf(prefs.getBoolean("read_receipts", true)) }
-    var screenshotProtection by remember { mutableStateOf(prefs.getBoolean("screenshot_protection", false)) }
-    var callAlerts by remember { mutableStateOf(prefs.getBoolean("call_alerts", true)) }
-
     // Privacy Mode value displayed in the row (no inline picker — that's a
     // separate detail screen now per ADR-020 Phase 3 spec).
     // R-N1.17: the EFFECTIVE mode, not the stored one. Showing the
     // requested mode here would announce Ghost while a Direct socket
     // from the previous posture was still up.
-    val privacyModeLabel = container.privacyModeCoordinator
-        .state.collectAsState().value.effective.name
+    val privacyState by container.privacyModeCoordinator.state.collectAsState()
+    val privacyModeLabel = privacyState.effective.name
 
     // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
     var cacheSize by remember { mutableStateOf<String?>(null) }
@@ -199,9 +191,8 @@ fun SettingsScreen(
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
-                        label = "Encryption Protocol",
-                        value = "ED25519",
-                        onClick = { showComingSoon() },
+                        label = "Identity signing",
+                        value = "Ed25519",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
@@ -211,32 +202,23 @@ fun SettingsScreen(
                         onClick = { onNavigate(Screen.PrivacyModeDetail) },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsToggleRow(
+                    SettingsRowItem(
                         icon = { PhIconDoubleCheck(color = CyanAccent, size = 16.dp) },
                         label = "Read Receipts",
-                        checked = readReceipts,
-                        onCheckedChange = {
-                            readReceipts = it
-                            prefs.edit().putBoolean("read_receipts", it).apply()
-                        },
+                        value = if (privacyState.maySendReadReceipts) "On" else "Off",
+                        onClick = { onNavigate(Screen.PrivacyModeDetail) },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconClock(color = CyanAccent, size = 16.dp) },
                         label = "Last Seen",
-                        value = "Contacts only",
-                        onClick = { showComingSoon() },
+                        value = "No separate setting",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsToggleRow(
+                    SettingsRowItem(
                         icon = { PhIconCamera(color = CyanAccent, size = 16.dp) },
                         label = "Screenshot Protection",
-                        checked = screenshotProtection,
-                        onCheckedChange = {
-                            screenshotProtection = it
-                            prefs.edit().putBoolean("screenshot_protection", it).apply()
-                        },
-                        proBadge = true, // D-18: visible badge, control still functional
+                        value = "On this device",
                     )
                 }
             }
@@ -251,21 +233,25 @@ fun SettingsScreen(
                         }
                     })
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsToggleRow(
+                    SettingsRowItem(
                         icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
                         label = "Call Alerts",
-                        checked = callAlerts,
-                        onCheckedChange = {
-                            callAlerts = it
-                            prefs.edit().putBoolean("call_alerts", it).apply()
-                        },
+                        value = "No separate alert",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
-                        label = "Sound",
-                        value = "Default",
-                        onClick = { showComingSoon() },
+                        label = "Message sound",
+                        value = "System settings",
+                        onClick = {
+                            try {
+                                openMessageChannelSettings(context)
+                            } catch (_: Exception) {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Could not open message sound settings")
+                                }
+                            }
+                        },
                     )
                 }
             }
@@ -298,9 +284,8 @@ fun SettingsScreen(
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
-                        label = "Storage & Cache",
+                        label = "Local storage",
                         value = cacheSize ?: "…",
-                        onClick = { showComingSoon() },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
@@ -333,7 +318,6 @@ fun SettingsScreen(
                         icon = { PhIconInfo(color = CyanAccent, size = 16.dp) },
                         label = "Version",
                         value = BuildConfig.VERSION_NAME,
-                        onClick = { /* read-only */ },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
