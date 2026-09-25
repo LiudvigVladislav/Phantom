@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.locale.AppLanguageStore
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -60,6 +61,10 @@ import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
 class MainActivity : ComponentActivity() {
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguageStore.localizedBaseContext(newBase))
+    }
 
     /**
      * Parses a `phantom://invite/{base64url(username:pubkeyHex)}` URI from an incoming Intent.
