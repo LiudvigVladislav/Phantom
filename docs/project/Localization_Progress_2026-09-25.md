@@ -48,6 +48,15 @@ added to a release until the complete-flow gates in
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
+- Incoming-call and active-call screens now take status and action copy from
+  English resources. Icon-only call controls have accessible action names that
+  reflect mute and speaker state. The `RINGING` label describes an incoming
+  call awaiting an answer, not an established connection. Signaling, audio,
+  and WebRTC behavior are unchanged. The message-notification channel and
+  quick-reply labels also use resources; the channel ID stays stable. Call
+  notifications and device-level call interaction checks remain outstanding.
+  The system channel's displayed name after an in-app language switch has not
+  yet been verified on an existing installation.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -63,7 +72,7 @@ The source scan
 rg -n 'Text\(|contentDescription\s*=|showSnackbar\(|label\s*=\s*"|body\s*=\s*"' apps/android/src/androidMain/kotlin/phantom/android/screens
 ```
 
-currently finds 634 anchor lines in 40 screen source files. An anchor may
+currently finds 612 anchor lines in 40 screen source files. An anchor may
 contain no literal, several literals, or a dynamic value. A second scan finds
 22 additional Android source files outside `screens` with text, accessibility,
 snackbar, notification, or toast candidates. Neither scan covers every
@@ -72,9 +81,8 @@ message. Do not use these counts as translation coverage.
 
 High-density screen files include `ChatScreen.kt`, `ProfileScreen.kt`,
 `ContactProfileScreen.kt`, `OnboardingScreen.kt`, `AddContactScreen.kt`, and
-the onboarding-v2 flow. The chat-list route still includes untranslated linked
-screens, including chat and contact profiles; the calls route still has
-active-call and incoming-call screens.
+the onboarding-v2 flow. Screens reached from chat and call routes still need
+a complete-flow audit; extraction of individual screens is not that audit.
 The next extraction pass should follow complete user flows: cold start and
 onboarding; chat list, message requests, one-to-one
 chat and voice; profile and contact; calls; notifications and errors. Then

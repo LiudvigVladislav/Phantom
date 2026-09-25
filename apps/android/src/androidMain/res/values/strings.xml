@@ -197,6 +197,24 @@
     <string name="calls_outgoing">Outgoing</string>
     <string name="calls_missed">Missed</string>
     <string name="calls_call_action">Call</string>
+    <string name="call_incoming_status">Incoming call…</string>
+    <string name="call_decline">Decline</string>
+    <string name="call_accept">Accept</string>
+    <string name="call_connected">Connected</string>
+    <string name="call_calling">CALLING…</string>
+    <string name="call_ringing">INCOMING CALL</string>
+    <string name="call_ended">CALL ENDED</string>
+    <string name="call_rejected">CALL DECLINED</string>
+    <string name="call_back_to_chat">Back to chat</string>
+    <string name="call_mute_microphone">Mute microphone</string>
+    <string name="call_unmute_microphone">Unmute microphone</string>
+    <string name="call_end">End call</string>
+    <string name="call_speaker_on">Turn on speaker</string>
+    <string name="call_speaker_off">Turn off speaker</string>
+    <string name="notification_messages_channel_name">Messages</string>
+    <string name="notification_messages_channel_description">Incoming PHANTOM messages</string>
+    <string name="notification_reply_hint">Reply…</string>
+    <string name="notification_reply_action">Reply</string>
 
     <string name="onboarding_welcome_tagline">Private communication, built to last.</string>
     <string name="onboarding_welcome_identity_note">Your identity is created on this device.\nNo phone number required.</string>
