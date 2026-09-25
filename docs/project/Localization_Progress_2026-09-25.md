@@ -36,6 +36,10 @@ added to a release until the complete-flow gates in
   translated labels; existing preference keys and the MM.DD.YYYY stored date
   format are unchanged. Member-since uses the active locale. The unused legacy
   connection card is not part of this pass.
+- The contact-profile screen now gets its dialogs, report categories and
+  outcomes, key and note labels, verification fallback, and disappearing-timer
+  labels from English resources. Report category IDs and timer durations stay
+  stable. The separate production verification screen is not covered here.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
@@ -97,3 +101,15 @@ local effect and warns that this device cannot read future messages to that iden
 The existing UPGRADE control has a no-op handler and needs separate product
 work before it can be presented as functional. Date-of-birth input still uses
 MM.DD.YYYY; changing its stored semantics requires a separate data decision.
+
+The contact profile previously drew a permanent online dot and "Last seen
+recently" without presence data. Its key card labelled an X25519 key as
+Ed25519, printed today's date as if verification had happened then, and used a
+fabricated key preview/copy value while loading. The static presence claim and
+fabricated key are gone; verification now requires a real unchanged key, and
+the fallback confirmation waits until both keys are loaded. The
+report dialog now describes the public-key metadata actually sent to the relay,
+without promising human review. Two contact settings rows had no handlers and
+claimed notification and Wi-Fi download policies that were not implemented;
+they are hidden until real controls exist. The working disappearing-message
+timer remains. Device-level visual and interaction checks are still required.
