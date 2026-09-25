@@ -19,6 +19,12 @@ added to a release until the complete-flow gates in
   classification is typed and its resource mapping is covered by tests.
   The request count uses a plural resource, and chat-list dates use the active
   locale rather than a fixed US locale. This is extraction, not translation.
+- The message-requests inbox now gets its title, empty state, block dialog,
+  commands, and Back accessibility label from English resources. Peer names
+  and message previews remain user content and are not translated.
+- The Add Contact dialog now gets its instructions, validation copy, actions,
+  and field accessibility labels from English resources. Pasted keys, aliases,
+  and peer names remain untouched user content.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
@@ -47,7 +53,8 @@ message. Do not use these counts as translation coverage.
 High-density screen files include `ChatScreen.kt`, `ProfileScreen.kt`,
 `ContactProfileScreen.kt`, `OnboardingScreen.kt`, `AddContactScreen.kt`, and
 the onboarding-v2 flow. The chat-list route still includes untranslated linked
-screens, and the calls route still has active-call and incoming-call screens.
+screens, including chat and contact profiles; the calls route still has
+active-call and incoming-call screens.
 The next extraction pass should follow complete user flows: cold start and
 onboarding; chat list, message requests, one-to-one
 chat and voice; profile and contact; calls; notifications and errors. Then

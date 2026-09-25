@@ -16,11 +16,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -35,6 +38,7 @@ fun MessageRequestsScreen(
     onBack: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val backLabel = stringResource(R.string.requests_back)
     var requests by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
     // Block requires confirmation — single-tap on Block button without
     // a dialog was leading to accidental permanent blocks during QA.
@@ -52,11 +56,15 @@ fun MessageRequestsScreen(
         AlertDialog(
             onDismissRequest = { blockTarget = null },
             containerColor = Surface,
-            title = { Text("Block @${target.theirUsername}?", color = TextPrimary) },
+            title = {
+                Text(
+                    stringResource(R.string.requests_block_confirm_title, target.theirUsername),
+                    color = TextPrimary,
+                )
+            },
             text = {
                 Text(
-                    "They will no longer be able to message you. " +
-                        "You can unblock them later from the contact profile.",
+                    stringResource(R.string.requests_block_confirm_body),
                     color = TextDim,
                     fontSize = 14.sp,
                 )
@@ -69,11 +77,11 @@ fun MessageRequestsScreen(
                         container.conversationRepo.blockConversation(toBlock.id)
                         reload()
                     }
-                }) { Text("Block", color = Danger) }
+                }) { Text(stringResource(R.string.requests_block), color = Danger) }
             },
             dismissButton = {
                 TextButton(onClick = { blockTarget = null }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.requests_cancel), color = TextDim)
                 }
             },
         )
@@ -98,11 +106,14 @@ fun MessageRequestsScreen(
                     .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier.size(32.dp).semantics { contentDescription = backLabel },
+                ) {
                     PhIconBack(color = TextPrimary, size = 20.dp)
                 }
                 Text(
-                    text = "REQUESTS",
+                    text = stringResource(R.string.requests_title),
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center,
                     color = TextDim,
@@ -120,7 +131,7 @@ fun MessageRequestsScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("No pending requests", color = TextDim, fontSize = 14.sp)
+                Text(stringResource(R.string.requests_empty), color = TextDim, fontSize = 14.sp)
             }
         } else {
             LazyColumn(
@@ -201,7 +212,7 @@ private fun RequestCard(
                     .clickable(onClick = onBlock),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Block", color = Danger, fontSize = 14.sp,
+                Text(stringResource(R.string.requests_block), color = Danger, fontSize = 14.sp,
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
             }
             Box(
@@ -213,7 +224,7 @@ private fun RequestCard(
                     .clickable(onClick = onAccept),
                 contentAlignment = Alignment.Center,
             ) {
-                Text("Accept", color = BgDeep, fontSize = 14.sp,
+                Text(stringResource(R.string.requests_accept), color = BgDeep, fontSize = 14.sp,
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)
             }
         }

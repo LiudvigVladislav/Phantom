@@ -131,6 +131,28 @@
     <string name="chat_list_unmute">Unmute</string>
     <string name="chat_list_mute_notifications">Mute notifications</string>
 
+    <string name="requests_back">Back</string>
+    <string name="requests_title">REQUESTS</string>
+    <string name="requests_empty">No pending requests</string>
+    <string name="requests_block_confirm_title">Block @%1$s?</string>
+    <string name="requests_block_confirm_body">They will no longer be able to message you. You can unblock them later from the contact profile.</string>
+    <string name="requests_block">Block</string>
+    <string name="requests_cancel">Cancel</string>
+    <string name="requests_accept">Accept</string>
+
+    <string name="add_contact_title">Add contact</string>
+    <string name="add_contact_key_instruction">Paste their key (from Profile → Share my key)</string>
+    <string name="add_contact_key_label">Contact key</string>
+    <string name="add_contact_key_placeholder">username:key or key…</string>
+    <string name="add_contact_name_recognized">✓\u0020\u0020@%1$s</string>
+    <string name="add_contact_key_recognized">✓  Key recognised</string>
+    <string name="add_contact_key_invalid">Must be 64 hex characters</string>
+    <string name="add_contact_nickname_label">Local nickname (optional)</string>
+    <string name="add_contact_name_placeholder">@%1$s</string>
+    <string name="add_contact_nickname_placeholder">Leave blank to use their name</string>
+    <string name="add_contact_add">Add</string>
+    <string name="add_contact_cancel">Cancel</string>
+
     <string name="empty_chats_title">No conversations yet</string>
     <string name="empty_chats_description">Add a contact to start a private, encrypted conversation.</string>
     <string name="empty_chats_action">Add contact</string>
