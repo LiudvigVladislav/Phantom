@@ -208,6 +208,16 @@ recovery, and account identifiers have not been validated against current
 implementation and policy. Do not translate them into Russian as approved
 legal copy or expose a Russian Terms gate until that review is complete.
 
+The product-claim pass in
+[`Localization_Copy_Audit_2026-09-26.md`](Localization_Copy_Audit_2026-09-26.md)
+classifies five disputed surfaces by actual route reachability and measured
+behavior. Onboarding and Settings currently disagree on the Plus price;
+neither screen offers a working purchase. Nearby is a normal destination but
+its discoverability toggle does not start discovery. Create Channel has no
+ordinary UI entry even though its route can be restored, and the migration
+screen remains conditional and copy-locked by its ADR. These findings are
+not translations or owner-approved product decisions.
+
 The source scan
 
 ```sh
