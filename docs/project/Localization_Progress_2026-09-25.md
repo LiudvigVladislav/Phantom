@@ -97,6 +97,22 @@ added to a release until the complete-flow gates in
   weekday and month names and saved-note timestamps use the active app locale.
   This pass does not change the stored saved-conversation ID or username, the
   clipboard label, the time pattern, or the persisted forwarded-note header.
+- Create Group now takes its title, input label/hint, action, empty state, and
+  Back accessibility label from English resources. Its selected-member count
+  uses a plural resource, and section headings uppercase with the active app
+  locale. Contact names, public keys, and the user-entered group name stay
+  untouched.
+- Group Chat now takes its voice error/submission toast, read-only banner,
+  encryption note, member placeholder, header/menu labels, message composer,
+  recording status, and icon actions from English resources. Member counts use
+  plurals; visible dates, times and playback speeds use the active app locale.
+  The prior Russian partial-audio toast said messages were sent. Its new copy
+  describes transport submission only, matching `GroupSendReport`; it does
+  not claim relay acceptance, delivery, decryption, or ACK. Group IDs, role
+  codes, audio markers, MIME names, and user content remain unchanged.
+  The old `IllegalArgumentException` toast said the recording was too long,
+  though media validation also rejects size and chunk-count bounds; the
+  resource now reports preparation failure without guessing which bound failed.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -122,6 +138,18 @@ This is a source-literal classification for two screens, not a complete app
 inventory or evidence that a Russian locale is ready. The pin menu still has
 no pin behavior; its unavailable toast is localized as UI copy, not treated
 as a completed feature.
+
+Create Group has no remaining user-visible hard-coded English strings in its
+screen source after this pass. The adjacent Create Channel screen is still
+unreviewed for translation: its explanation promises subscriber reactions,
+but no reaction action is present in GroupChatScreen. That claim and the
+channel membership flow need product review before translating the text as-is.
+
+Group Chat still contains technical literals for media formats, logging,
+list keys, role IDs, audio storage/markers, and fixed numeric display formats;
+they are not translatable screen copy. The `Member` label is a localized
+fallback, not a verified sender identity. The group-audio result path still
+needs device-level checks; resource extraction is not evidence of delivery.
 
 The source scan
 

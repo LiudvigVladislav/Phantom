@@ -561,4 +561,42 @@
     <string name="saved_copy">Copy</string>
     <string name="saved_edit">Edit</string>
     <string name="saved_delete">Delete</string>
+
+    <string name="create_group_back">Back to chats</string>
+    <string name="create_group_title">New Group</string>
+    <string name="create_group_action">Create Group</string>
+    <string name="create_group_name">Group Name</string>
+    <string name="create_group_name_hint">Enter group name…</string>
+    <string name="create_group_no_contacts">No contacts yet.\nAdd contacts from the chat list first.</string>
+    <plurals name="create_group_selected_members">
+        <item quantity="one">Add Members (%d selected)</item>
+        <item quantity="other">Add Members (%d selected)</item>
+    </plurals>
+
+    <string name="group_voice_invalid">Voice message could not be prepared</string>
+    <string name="group_voice_send_failed">Could not submit voice message</string>
+    <string name="group_voice_submitted">Submitted to transport for %1$d of %2$d recipients</string>
+    <string name="group_read_only_channel">Read-only channel</string>
+    <string name="group_channel_note">channel — messages broadcast by admins</string>
+    <string name="group_encryption_note">group · end-to-end encrypted</string>
+    <string name="group_member">Member</string>
+    <string name="group_voice_pause">Pause voice message</string>
+    <string name="group_voice_play">Play voice message</string>
+    <string name="group_voice_speed">Change playback speed</string>
+    <string name="group_back">Back to chats</string>
+    <string name="group_more_options">More group options</string>
+    <string name="group_more_channel_options">More channel options</string>
+    <string name="group_channel_label">Channel</string>
+    <plurals name="group_members">
+        <item quantity="one">%d member</item>
+        <item quantity="other">%d members</item>
+    </plurals>
+    <string name="group_add_member">Add Member</string>
+    <string name="group_leave_channel">Leave Channel</string>
+    <string name="group_leave_group">Leave Group</string>
+    <string name="group_send">Send message</string>
+    <string name="group_voice_finish">Finish and submit voice message</string>
+    <string name="group_voice_record">Record voice message</string>
+    <string name="group_message_hint">Message…</string>
+    <string name="group_recording">Recording %1$d:%2$02d</string>
 </resources>
