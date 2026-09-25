@@ -30,6 +30,12 @@ added to a release until the complete-flow gates in
   voice labels, and block/report dialog copy from English resources. Older
   date separators use the app's active locale. Stored forwarded/saved message
   text, peer names, message bodies, and raw failure details are not rewritten.
+- The active own-profile screen now gets its field labels, QR/key explanation,
+  account details, share/avatar/edit actions, and deletion confirmation from
+  English resources. Editing selects stable field identifiers rather than
+  translated labels; existing preference keys and the MM.DD.YYYY stored date
+  format are unchanged. Member-since uses the active locale. The unused legacy
+  connection card is not part of this pass.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
@@ -83,3 +89,11 @@ last-seen control, and Nearby's discoverable toggle currently stores a local
 preference without running mesh discovery. The pricing sheet and legacy
 onboarding still contain aspirational claims; they require product review
 before translation. No transport or privacy-mode behavior changed here.
+
+The own-profile deletion text previously claimed that contacts would see an
+"Account deleted by user" event. The action only deletes the local identity
+and keystore key; no notification is sent. The extracted copy now states the
+local effect and warns that this device cannot read future messages to that identity.
+The existing UPGRADE control has a no-op handler and needs separate product
+work before it can be presented as functional. Date-of-birth input still uses
+MM.DD.YYYY; changing its stored semantics requires a separate data decision.
