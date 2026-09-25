@@ -13,8 +13,10 @@ added to a release until the complete-flow gates in
 - Tests cover explicit English versus System, Russian resource context, reset
   to the real system locale after an app override, unsupported stored tags,
   Android 13+ selection, and migration precedence.
-- Settings, Privacy Mode detail, chat-list copy, shared empty states, and the
-  common top bar and bottom navigation have been moved to English resources.
+- Settings, Privacy Mode detail, chat-list and Calls copy, shared empty states,
+  the connection banner, and the common top bar and bottom navigation have
+  been moved to English resources. The connection banner's error
+  classification is typed and its resource mapping is covered by tests.
   The request count uses a plural resource, and chat-list dates use the active
   locale rather than a fixed US locale. This is extraction, not translation.
 
@@ -35,8 +37,9 @@ message. Do not use these counts as translation coverage.
 
 High-density screen files include `ChatScreen.kt`, `ProfileScreen.kt`,
 `ContactProfileScreen.kt`, `OnboardingScreen.kt`, `AddContactScreen.kt`, and
-the onboarding-v2 flow. The chat-list route still includes untranslated shared
-connection-banner copy and other linked screens. The next extraction pass
+the onboarding-v2 flow. The chat-list route still includes untranslated linked
+screens, and the calls route still has active-call and incoming-call screens.
+The next extraction pass
 should follow complete user
 flows: cold start and onboarding; chat list, message requests, one-to-one
 chat and voice; profile and contact; calls; notifications and errors. Then

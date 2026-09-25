@@ -3,6 +3,7 @@
 
 package phantom.android.ui
 
+import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -26,11 +27,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import phantom.android.R
 import phantom.android.ui.theme.BgDeep
 import phantom.android.ui.theme.BorderSubtle
 import phantom.android.ui.theme.Danger
@@ -61,8 +64,8 @@ import phantom.android.transport.ConnectionUiState
 private const val DELAYED_SHOW_MS = 1_500L
 
 /**
- * DWS-UX.1 (2026-06-17): map a [ConnectionUiState.Error] cause to a
- * user-facing banner label. Socket / network / IO throwables keep the
+ * DWS-UX.1 (2026-06-17): classify a [ConnectionUiState.Error] cause for the
+ * user-facing banner. Socket / network / IO throwables keep the
  * historical `"Offline — reconnecting"` promise — the reconnect loop
  * really is iterating and the underlying class is transient enough
  * that the wording is honest. Any other Throwable class — typically
@@ -72,22 +75,27 @@ private const val DELAYED_SHOW_MS = 1_500L
  * reconnect promise.
  *
  * The mapping lives at file-level (not inside the composable's
- * `when` arm) so [ConnectionBannerErrorLabelTest] calls the actual
+ * `when` arm) so ConnectionBannerErrorLabelTest calls the actual
  * production code instead of a hand-copied mirror. A future refactor
  * that changes the discriminator now fails the test directly.
  *
  * Behaviour-preserving: the existing reconnect loop continues
  * unchanged regardless of which label is shown.
  */
-internal fun connectionErrorLabel(cause: Throwable): String =
+internal enum class ConnectionErrorKind(@StringRes val labelRes: Int) {
+    RECONNECTING(R.string.connection_offline_reconnecting),
+    CHECK_SETUP(R.string.connection_check_setup),
+}
+
+internal fun connectionErrorKind(cause: Throwable): ConnectionErrorKind =
     when (cause::class.simpleName) {
         "SocketTimeoutException",
         "SocketException",
         "ConnectException",
         "UnknownHostException",
         "IOException",
-        -> "Offline — reconnecting"
-        else -> "Cannot connect — please check setup"
+        -> ConnectionErrorKind.RECONNECTING
+        else -> ConnectionErrorKind.CHECK_SETUP
     }
 
 @Composable
@@ -130,7 +138,7 @@ fun ConnectionBanner(
     val dotColor: Color
     when (uiState) {
         is ConnectionUiState.Online -> {
-            label = "Online"
+            label = stringResource(R.string.connection_online)
             dotColor = Success
         }
         is ConnectionUiState.LimitedRealtime -> {
@@ -139,7 +147,7 @@ fun ConnectionBanner(
             // just without realtime WS guarantees. Success dot so the row
             // does not look alarming. Phrasing matches the notification
             // shade overlay at PhantomMessagingService.kt:256.
-            label = "Online · Limited realtime"
+            label = stringResource(R.string.connection_limited_realtime)
             dotColor = Success
         }
         is ConnectionUiState.Recovering -> {
@@ -147,11 +155,11 @@ fun ConnectionBanner(
             // is still in WsCandidate (60 s uptime OR outbound ACK round-trip
             // not yet observed). REST polling continues until promotion.
             // Amber so the user knows it is transitional, not fully stable.
-            label = "Online · Verifying realtime"
+            label = stringResource(R.string.connection_verifying_realtime)
             dotColor = Warning
         }
         is ConnectionUiState.Connecting -> {
-            label = "Connecting…"
+            label = stringResource(R.string.connection_connecting)
             dotColor = Warning
         }
         is ConnectionUiState.Reconnecting -> {
@@ -161,11 +169,11 @@ fun ConnectionBanner(
             // at all) and Error (terminal). Outbound sends still queue and
             // flush once the new session lands — nothing is lost. Soft amber
             // + "in flight" wording so the user does not think the app is broken.
-            label = "Reconnecting…"
+            label = stringResource(R.string.connection_reconnecting)
             dotColor = Warning
         }
         is ConnectionUiState.Offline -> {
-            label = "Offline — messages queued"
+            label = stringResource(R.string.connection_offline_queued)
             dotColor = Danger
         }
         is ConnectionUiState.Error -> {
@@ -176,7 +184,7 @@ fun ConnectionBanner(
             // reconnect loop will eventually succeed and the
             // promise is honest) or a more terminal failure class
             // (where nothing the user can wait for is happening).
-            // The discriminator lives in [connectionErrorLabel] so
+            // The discriminator lives in [connectionErrorKind] so
             // the unit test calls the production mapping directly;
             // copying the `when` arm into the test was caught at
             // PR-review time as a false-confidence shape. No
@@ -187,7 +195,7 @@ fun ConnectionBanner(
             // delegated property (`by stateFlow`) and the compiler
             // cannot smart-cast it across the lambda boundary.
             val errorState = uiState as ConnectionUiState.Error
-            label = connectionErrorLabel(errorState.cause)
+            label = stringResource(connectionErrorKind(errorState.cause).labelRes)
             dotColor = Danger
         }
     }
