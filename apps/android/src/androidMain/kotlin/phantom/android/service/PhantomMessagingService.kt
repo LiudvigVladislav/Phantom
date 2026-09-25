@@ -37,6 +37,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import phantom.android.BuildConfig
 import phantom.android.PhantomApplication
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.security.DeviceUnlockGate
 import phantom.android.transport.RecoveryActivity
@@ -213,7 +214,7 @@ class PhantomMessagingService : Service() {
         // tag is exact-match invisible to that filter.
         Log.i("PhantomMessaging", "RECV_DIAG service_onCreate pid=${android.os.Process.myPid()}")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification(DEFAULT_STATUS_TEXT))
+        startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.service_status_starting)))
         acquireKeepAliveLocks()
         // ADR-020 Phase 2: subscribe to TransportManager state for live
         // foreground-notification text. This replaces the old per-subsystem
@@ -261,53 +262,9 @@ class PhantomMessagingService : Service() {
                 // Ghost as active while a Direct socket from the previous
                 // posture was still up - the silent downgrade in the one
                 // place the user actually looks.
-                val mode = container.privacyModeCoordinator.state.value.effective.name
-                val text = when (state) {
-                    is ManagerState.Idle ->
-                        "$DEFAULT_STATUS_TEXT · $mode"
-                    is ManagerState.Probing ->
-                        // For Tor: surface the time-based bootstrap stage,
-                        // current percent, current bridge profile, and the
-                        // 1-based "(N/total)" rotation index so the user
-                        // can see what's happening during the multi-minute
-                        // bridge negotiation instead of a silent
-                        // "Connecting via Tor…" (PR-B + PR-C). For
-                        // Direct / Reality: keep the original short text —
-                        // those probes are sub-second and the staged copy
-                        // would only flicker.
-                        state.torStatus?.let { tor ->
-                            "${tor.stage.userText} ${tor.percent}% " +
-                                "· ${tor.bridgeProfile.displayName} (${tor.attempt}/${tor.totalAttempts}) " +
-                                "· $mode"
-                        } ?: "Connecting via ${state.kind}… · $mode"
-                    is ManagerState.Connected ->
-                        "Online via ${state.kind} · $mode"
-                    is ManagerState.AllFailed ->
-                        // Bug #3 fix: drop the misleading "Tap to retry" — the
-                        // notification body has no PendingIntent for it, so
-                        // tapping does nothing. Real retry path is the Privacy
-                        // Mode selector in Settings (which calls
-                        // setPrivacyMode → release → fresh chain walk).
-                        //
-                        // PR-D (2026-05-12): give Ghost-mode users a concrete
-                        // next step instead of a dead-end "Cannot reach". On
-                        // some censored networks (notably МТС RU without VPN)
-                        // every Tor bridge profile times out — telling the
-                        // user to try Private/Reality or enable a VPN turns
-                        // a frustrating wall into actionable advice. Standard
-                        // and Private already keep the original copy because
-                        // a Direct/Reality failure usually means the relay
-                        // itself is unreachable, not a censorship layer.
-                        if (state.attempts.any {
-                                it.kind == phantom.core.transport.TransportKind.Tor
-                            }
-                        ) {
-                            "Tor is blocked or slowed by this network. " +
-                                "Try Private/Reality or enable a VPN. · $mode"
-                        } else {
-                            "Cannot reach relay (tried ${state.attempts.size}) · $mode"
-                        }
-                }
+                val effectiveMode = container.privacyModeCoordinator.state.value.effective
+                val mode = effectiveMode.name
+                val text = foregroundTransportStatus(this@PhantomMessagingService, state, effectiveMode)
                 Log.i(
                     TAG,
                     "TransportManager state → ${state::class.simpleName} mode=$mode text=\"$text\"",
@@ -330,8 +287,7 @@ class PhantomMessagingService : Service() {
             // requested preference, so the overlay cannot claim a mode that
             // the coordinator has not actually granted.
             container.connectionUiState.collect { presentation ->
-                val modeLabel =
-                    container.privacyModeCoordinator.state.value.effective.name
+                val effectiveMode = container.privacyModeCoordinator.state.value.effective
                 // DWS-UX.1 (2026-06-17): read the currently-connected outer
                 // transport kind instead of hardcoding "Direct". The
                 // earlier text "Online via Direct · …" was a factual lie
@@ -346,9 +302,9 @@ class PhantomMessagingService : Service() {
                 )
                 val text = when (presentation) {
                     phantom.android.transport.ConnectionUiState.LimitedRealtime ->
-                        "Online via $transportName · Limited realtime · $modeLabel"
+                        foregroundRestStatus(this@PhantomMessagingService, transportName, effectiveMode, false)
                     phantom.android.transport.ConnectionUiState.Recovering ->
-                        "Online via $transportName · Verifying realtime · $modeLabel"
+                        foregroundRestStatus(this@PhantomMessagingService, transportName, effectiveMode, true)
                     else ->
                         null // Let the TransportManager state collector reassert
                 }
@@ -1948,10 +1904,10 @@ class PhantomMessagingService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "PHANTOM Messaging",
+            getString(R.string.service_channel_name),
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Keeps encrypted connection active"
+            description = getString(R.string.service_channel_description)
             setShowBadge(false)
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -2195,11 +2151,6 @@ class PhantomMessagingService : Service() {
 
         /** Optional string extra: where the nudge came from, for log attribution. */
         const val EXTRA_RETRY_NUDGE_SOURCE = "phantom.retry_nudge_source"
-        // Default text when TransportManager is Idle (pre-connect) or has no
-        // useful state to surface; the notification updater overwrites this
-        // as soon as the manager transitions to Probing / Connected / AllFailed.
-        private const val DEFAULT_STATUS_TEXT = "Encrypted connection active"
-
         // ADR-020 Phase 2: outer-subsystem start/stop timeouts moved into
         // [TransportManager] (PER_ATTEMPT_TIMEOUT_MS = 5 s). The service only
         // bounds the synchronous tear-down in onDestroy.

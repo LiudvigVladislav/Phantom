@@ -215,6 +215,26 @@
     <string name="notification_messages_channel_description">Incoming PHANTOM messages</string>
     <string name="notification_reply_hint">Reply…</string>
     <string name="notification_reply_action">Reply</string>
+    <string name="service_channel_name">PHANTOM Messaging</string>
+    <string name="service_channel_description">Keeps the connection available for encrypted messages</string>
+    <string name="service_status_starting">Starting encrypted connection</string>
+    <string name="service_status_idle">Waiting for connection · %1$s</string>
+    <string name="service_status_probing">Connecting via %1$s… · %2$s</string>
+    <string name="service_status_connected">Online via %1$s · %2$s</string>
+    <string name="service_status_tor_progress">%1$s %2$d%% · %3$s (%4$d/%5$d) · %6$s</string>
+    <string name="service_tor_initial">Connecting to Tor network…</string>
+    <string name="service_tor_negotiating">Negotiating censorship-resistant bridge…</string>
+    <string name="service_tor_searching">Searching for a reachable route…</string>
+    <string name="service_tor_slow">This network is slowing Tor connections…</string>
+    <string name="service_tor_throttled">Tor is heavily throttled on this network. VPN may improve connection speed.</string>
+    <string name="service_status_tor_failed">Tor could not connect on this network. Try another network or a VPN. · %1$s</string>
+    <string name="service_status_all_failed">Cannot reach relay (tried %1$d) · %2$s</string>
+    <string name="service_transport_relay">relay</string>
+    <string name="service_transport_direct">Direct</string>
+    <string name="service_transport_reality">Reality</string>
+    <string name="service_transport_tor">Tor</string>
+    <string name="service_status_limited_realtime">Online via %1$s · Limited realtime · %2$s</string>
+    <string name="service_status_verifying_realtime">Online via %1$s · Verifying realtime · %2$s</string>
 
     <string name="onboarding_welcome_tagline">Private communication, built to last.</string>
     <string name="onboarding_welcome_identity_note">Your identity is created on this device.\nNo phone number required.</string>

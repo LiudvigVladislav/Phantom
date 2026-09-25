@@ -55,8 +55,18 @@ added to a release until the complete-flow gates in
   and WebRTC behavior are unchanged. The message-notification channel and
   quick-reply labels also use resources; the channel ID stays stable. Call
   notifications and device-level call interaction checks remain outstanding.
+  The Android source currently has no separate incoming-call notification
+  publisher; adding one is product work, not string extraction.
   The system channel's displayed name after an in-app language switch has not
   yet been verified on an existing installation.
+- The foreground connection notification now gets its channel and dynamic
+  status copy from resources, including effective privacy mode, Tor bootstrap
+  stage and progress, and REST fallback. Transport labels have resource keys;
+  bridge-profile identifiers remain technical names. The old startup text
+  implied a connection existed before one was established; it now says the
+  connection is starting. A Tor failure no longer asserts that censorship has
+  been diagnosed. Connection
+  routing and the existing notification channel ID are unchanged.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
