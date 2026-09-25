@@ -9,7 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -23,10 +23,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.locale.AppLanguageStore
@@ -60,7 +62,13 @@ import phantom.android.screens.group.GroupChatScreen
 import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
-class MainActivity : ComponentActivity() {
+internal fun startupErrorResource(error: Throwable): Int = when (error) {
+    is SecurityException -> R.string.startup_keys_unavailable
+    is android.database.sqlite.SQLiteException -> R.string.startup_database_unavailable
+    else -> R.string.startup_unknown_error
+}
+
+class MainActivity : FragmentActivity() {
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppLanguageStore.localizedBaseContext(newBase))
@@ -163,7 +171,7 @@ class MainActivity : ComponentActivity() {
         )
         // Block screenshots, screen recording, and the recents-thumbnail preview.
         // FLAG_SECURE on the only Activity in the app is sufficient — there are
-        // no other Activity classes (one ComponentActivity, all screens are
+        // no other Activity classes (one FragmentActivity, all screens are
         // Compose). Windows that don't belong to MainActivity (system dialogs,
         // BiometricPrompt, IME, OS notifications) are governed by the OS, not us.
         window.setFlags(
@@ -231,7 +239,7 @@ class MainActivity : ComponentActivity() {
                     AppLockScreen(onUnlocked = { isLockedState.value = false })
                 } else {
                     var container by remember { mutableStateOf<AppContainer?>(null) }
-                    var initError by remember { mutableStateOf<String?>(null) }
+                    var initError by remember { mutableStateOf<Int?>(null) }
 
                     LaunchedEffect(Unit) {
                         Log.d("PHANTOM_INIT", "MainActivity: awaiting ready…")
@@ -241,19 +249,14 @@ class MainActivity : ComponentActivity() {
                                 container = app.container
                             }
                             .onFailure { t ->
+                                if (t is CancellationException) throw t
                                 Log.e("PHANTOM_INIT", "MainActivity: init failed: ${t.message}", t)
-                                initError = when (t) {
-                                    is SecurityException ->
-                                        "Encryption keys could not be unlocked.\nTry restarting the app."
-                                    is android.database.sqlite.SQLiteException ->
-                                        "Database error. Please reinstall the app."
-                                    else ->
-                                        "Startup failed. Please restart."
-                                }
+                                initError = startupErrorResource(t)
                             }
                     }
 
                     val c = container
+                    val errorRes = initError
                     when {
                         c != null -> PhantomApp(
                             container              = c,
@@ -263,12 +266,15 @@ class MainActivity : ComponentActivity() {
                             pendingNotificationChat = pendingNotificationChat,
                         )
 
-                        initError != null -> Box(
+                        errorRes != null -> Box(
                             modifier = Modifier.fillMaxSize().background(BgDeep).padding(24.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                text = "Startup error:\n\n$initError",
+                                text = stringResource(
+                                    R.string.startup_error_detail,
+                                    stringResource(errorRes),
+                                ),
                                 color = Danger,
                                 fontSize = 13.sp,
                                 textAlign = TextAlign.Center,

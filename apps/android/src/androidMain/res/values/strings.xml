@@ -235,6 +235,17 @@
     <string name="service_transport_tor">Tor</string>
     <string name="service_status_limited_realtime">Online via %1$s · Limited realtime · %2$s</string>
     <string name="service_status_verifying_realtime">Online via %1$s · Verifying realtime · %2$s</string>
+    <string name="startup_keys_unavailable">Encryption keys could not be unlocked. Unlock your device and restart the app.</string>
+    <string name="startup_database_unavailable">Could not open local data. Restart the app. Do not clear app data.</string>
+    <string name="startup_unknown_error">Startup failed. Restart the app.</string>
+    <string name="startup_error_detail">Startup error:\n\n%1$s</string>
+    <string name="lock_unlock">Unlock</string>
+    <string name="lock_verify_identity">Verify your identity</string>
+    <string name="lock_try_again">Tap Unlock to try again.</string>
+    <string name="lock_authentication_failed">Authentication failed. Try again.</string>
+    <string name="lock_authentication_unavailable">Device authentication is unavailable. Set up a screen lock or check device security settings, then try again.</string>
+    <string name="lock_strong_biometric_required">On Android 9 and 10, App Lock requires a strong biometric. Set one up in device settings and try again.</string>
+    <string name="lock_cancel">Cancel</string>
 
     <string name="onboarding_welcome_tagline">Private communication, built to last.</string>
     <string name="onboarding_welcome_identity_note">Your identity is created on this device.\nNo phone number required.</string>

@@ -67,6 +67,18 @@ added to a release until the complete-flow gates in
   connection is starting. A Tor failure no longer asserts that censorship has
   been diagnosed. Connection
   routing and the existing notification channel ID are unchanged.
+- The main startup-error screen and app-lock prompt now use resource-backed
+  text. Startup errors are classified by type without exposing exception
+  messages or advising an app-data-clearing reinstall. The lock screen's
+  previous fallback unconditionally unlocked on the production
+  `ComponentActivity` host; `MainActivity` now supports `BiometricPrompt`,
+  and missing host or unavailable device authentication fails closed. This
+  change needs a device check with enrolled credentials and with no enrolled
+  credential before release. Android 9-10 do not support the strong-biometric
+  plus-device-credential combination, so those versions use the OS credential
+  confirmation activity and unlock only on its successful result. No weaker
+  biometric mode is silently enabled. The legacy credential flow still needs
+  interaction testing on those OS versions.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -106,6 +118,13 @@ classified and the English and Russian resources agree on keys and format
 arguments. Verify Android 12 and 13+ language switching, process restart,
 draft and session preservation, notification text, and screen geometry on a
 phone and emulator. The current branch does not meet that gate.
+
+The Alpha 1 to Alpha 2 migration screen is a separate copy-review blocker.
+Its source marks copy as locked by `Alpha2_Migration.md` and ADR-009, while
+the current UI still includes a past July 2026 promise, shows truncated raw
+exception messages on failure, and advises reinstalling after missing local
+identity. Those are not safe strings to translate verbatim. Review the
+migration contract and recovery policy before changing or releasing that copy.
 
 ## Copy correctness found during extraction
 

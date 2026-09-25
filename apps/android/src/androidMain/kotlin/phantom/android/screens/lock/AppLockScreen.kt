@@ -3,7 +3,14 @@
 
 package phantom.android.screens.lock
 
+import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.Intent
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.Canvas
@@ -22,23 +29,42 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import phantom.android.R
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
 @Composable
 fun AppLockScreen(onUnlocked: () -> Unit) {
     val context = LocalContext.current
-    var errorMsg by remember { mutableStateOf("") }
+    var errorRes by remember { mutableIntStateOf(0) }
+    val credentialLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (credentialResultUnlocks(result.resultCode)) onUnlocked()
+        else errorRes = R.string.lock_try_again
+    }
 
-    // Trigger biometric prompt automatically when the screen first appears.
+    val requestUnlock = {
+        errorRes = 0
+        if (usesLegacyCredentialPrompt(Build.VERSION.SDK_INT)) {
+            val intent = legacyCredentialIntent(context)
+            if (intent != null) credentialLauncher.launch(intent)
+            else errorRes = R.string.lock_authentication_unavailable
+        } else {
+            showBiometricPrompt(context, onSuccess = onUnlocked, onError = { errorRes = it })
+        }
+    }
+
+    // Trigger the supported system authentication prompt when the screen first appears.
     LaunchedEffect(Unit) {
-        showBiometricPrompt(context, onSuccess = onUnlocked, onError = { errorMsg = it })
+        requestUnlock()
     }
 
     Box(
@@ -94,9 +120,9 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                 )
             }
 
-            if (errorMsg.isNotEmpty()) {
+            if (errorRes != 0) {
                 Text(
-                    text = errorMsg,
+                    text = stringResource(errorRes),
                     color = Danger,
                     fontSize = 12.sp,
                     fontFamily = PhantomFontMono,
@@ -110,17 +136,13 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
                     .clip(RoundedCornerShape(9999.dp))
                     .background(CyanAccent)
                     .clickable {
-                        showBiometricPrompt(
-                            context,
-                            onSuccess = onUnlocked,
-                            onError = { errorMsg = it },
-                        )
+                        requestUnlock()
                     }
                     .padding(horizontal = 32.dp, vertical = 12.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "Unlock",
+                    text = stringResource(R.string.lock_unlock),
                     color = BgDeep,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
@@ -130,25 +152,53 @@ fun AppLockScreen(onUnlocked: () -> Unit) {
     }
 }
 
-private fun showBiometricPrompt(
+internal fun findLockHost(context: Context): FragmentActivity? {
+    var current: Context? = context
+    while (current != null) {
+        if (current is FragmentActivity) return current
+        current = (current as? ContextWrapper)?.baseContext
+    }
+    return null
+}
+
+internal fun appLockAuthenticators(apiLevel: Int): Int =
+    if (apiLevel in 28..29) BiometricManager.Authenticators.BIOMETRIC_STRONG
+    else BiometricManager.Authenticators.BIOMETRIC_STRONG or
+        BiometricManager.Authenticators.DEVICE_CREDENTIAL
+
+internal fun usesLegacyCredentialPrompt(apiLevel: Int): Boolean = apiLevel in 28..29
+
+internal fun credentialResultUnlocks(resultCode: Int): Boolean = resultCode == Activity.RESULT_OK
+
+@Suppress("DEPRECATION")
+internal fun legacyCredentialIntent(context: Context): Intent? {
+    val keyguard = context.getSystemService(KeyguardManager::class.java) ?: return null
+    if (!keyguard.isDeviceSecure) return null
+    return keyguard.createConfirmDeviceCredentialIntent(
+        context.getString(R.string.lock_unlock),
+        context.getString(R.string.lock_verify_identity),
+    )
+}
+
+internal fun showBiometricPrompt(
     context: Context,
     onSuccess: () -> Unit,
-    onError: (String) -> Unit,
+    onError: (Int) -> Unit,
 ) {
-    val activity = context as? FragmentActivity ?: run {
-        // Not a FragmentActivity — skip lock gracefully
-        onSuccess()
+    val activity = findLockHost(context) ?: run {
+        onError(R.string.lock_authentication_unavailable)
         return
     }
 
     val biometricManager = BiometricManager.from(context)
-    val canAuth = biometricManager.canAuthenticate(
-        BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-    )
+    val strongOnly = Build.VERSION.SDK_INT in 28..29
+    val authenticators = appLockAuthenticators(Build.VERSION.SDK_INT)
+    val canAuth = biometricManager.canAuthenticate(authenticators)
     if (canAuth != BiometricManager.BIOMETRIC_SUCCESS) {
-        // No biometric or PIN is enrolled — unlock directly so the app is not stuck
-        onSuccess()
+        onError(
+            if (strongOnly) R.string.lock_strong_biometric_required
+            else R.string.lock_authentication_unavailable,
+        )
         return
     }
 
@@ -163,25 +213,23 @@ private fun showBiometricPrompt(
                 errorCode == BiometricPrompt.ERROR_USER_CANCELED ||
                 errorCode == BiometricPrompt.ERROR_NEGATIVE_BUTTON
             ) {
-                onError("Tap UNLOCK to try again")
+                onError(R.string.lock_try_again)
             } else {
-                onError(errString.toString())
+                onError(R.string.lock_authentication_failed)
             }
         }
 
         override fun onAuthenticationFailed() {
-            onError("Authentication failed — try again")
+            onError(R.string.lock_authentication_failed)
         }
     }
 
     val prompt = BiometricPrompt(activity, executor, callback)
-    val info = BiometricPrompt.PromptInfo.Builder()
+    val infoBuilder = BiometricPrompt.PromptInfo.Builder()
         .setTitle("PHANTOM")
-        .setSubtitle("Verify your identity")
-        .setAllowedAuthenticators(
-            BiometricManager.Authenticators.BIOMETRIC_STRONG or
-                    BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-        )
-        .build()
+        .setSubtitle(context.getString(R.string.lock_verify_identity))
+        .setAllowedAuthenticators(authenticators)
+    if (strongOnly) infoBuilder.setNegativeButtonText(context.getString(R.string.lock_cancel))
+    val info = infoBuilder.build()
     prompt.authenticate(info)
 }
