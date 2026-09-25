@@ -70,7 +70,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
 /**
  * OnboardingPricingSheetV2 — Bottom sheet with Plus / Pro / Business
  * pricing tier cards. Opens when the user taps the Ghost Mode
- * segment on Step 3 (Privacy) or the "Unlock with Phantom Pro" CTA
+ * segment on Step 3 (Privacy) or the "Preview Phantom Pro" CTA
  * inside the Ghost tier card.
  *
  * Layout matches handoff `Onboarding.dc.html` §buildPricing lines

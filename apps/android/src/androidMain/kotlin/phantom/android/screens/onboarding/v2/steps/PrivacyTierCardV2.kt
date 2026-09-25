@@ -267,7 +267,7 @@ private fun UnlockWithPhantomProCta(onClick: () -> Unit) {
             // clearAndSetSemantics — its content merges upward into
             // the parent Row's clickable node so screen readers +
             // Compose test matchers can locate the button by its
-            // "Unlock with Phantom Pro" text (same shape as
+            // "Preview Phantom Pro" text (same shape as
             // PhantomButton). The `onClickLabel` on the Row is
             // redundant belt-and-braces for TalkBack; the tree looks
             // like one merged Role.Button with Text + OnClick.

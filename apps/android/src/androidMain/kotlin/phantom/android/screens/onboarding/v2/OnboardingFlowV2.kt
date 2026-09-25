@@ -52,6 +52,7 @@ import android.util.Log
 import kotlinx.coroutines.launch
 import phantom.android.R
 import phantom.android.di.AppContainer
+import phantom.android.premium.SubscriptionAccess
 import phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2
 import phantom.android.screens.onboarding.v2.steps.HowStepV2
 import phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2
@@ -518,6 +519,11 @@ internal fun OnboardingFlowV2Internal(
         if (finalizeHolder.state is OnboardingFinalizeState.InFlight &&
             controller.state is FinalizeState.Idle
         ) {
+            if (!SubscriptionAccess.permits(formState.privacyMode)) {
+                finalizeHolder.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+                navigationStep = OnboardingStepV2.Privacy
+                return@LaunchedEffect
+            }
             val outcome = runFinalize(
                 controller = controller,
                 username = formState.username,
@@ -822,7 +828,7 @@ internal fun OnboardingFlowV2Internal(
                     // Commit 4: Ghost Mode tap opens the Pricing sheet
                     // instead of firing a toast. The controller in the
                     // step composable BOTH intercepts the Ghost
-                    // segment tap AND the "Unlock with Phantom Pro"
+                    // segment tap AND the "Preview Phantom Pro"
                     // CTA inside the Ghost tier card — both surfaces
                     // funnel through this callback.
                     onGhostLockClick = {
@@ -974,7 +980,11 @@ internal fun OnboardingFlowV2Internal(
                                     .openMessageChannelSettings(currentContext)
                         }
                     },
-                    onDoneClick = {
+                    onDoneClick = done@{
+                        if (!SubscriptionAccess.permits(formState.privacyMode)) {
+                            navigationStep = OnboardingStepV2.Privacy
+                            return@done
+                        }
                         // C6-a: kick off the atomic finalize.
                         //   1. `finalizeHolder.markInFlight` — single
                         //      write, sealed slot flips to InFlight.

@@ -111,7 +111,7 @@ class OnboardingV2StateTest {
     }
 
     @Test
-    fun privacy_always_advances() {
+    fun privacy_advances_for_standard() {
         assertTrue(
             canAdvanceFromV2(
                 OnboardingStepV2.Privacy,
@@ -266,15 +266,13 @@ class OnboardingV2StateTest {
     }
 
     @Test
-    fun privacy_step_always_advances_regardless_of_selection() {
-        // Commit 4: even the initial Standard selection is enough to
-        // continue — no "you must pick something" gate on Privacy.
-        // Commit 5 will keep the same shape for Permissions.
+    fun privacy_step_rejects_a_saved_ghost_choice_without_pro() {
         for (mode in PrivacyMode.entries) {
             val state = OnboardingFormStateV2(privacyMode = mode)
-            assertTrue(
+            assertEquals(
+                mode != PrivacyMode.Ghost,
                 canAdvanceFromV2(OnboardingStepV2.Privacy, state),
-                "canAdvance must return true from Privacy regardless of mode; got false for $mode",
+                "Privacy advance must follow the current entitlement for $mode",
             )
         }
     }

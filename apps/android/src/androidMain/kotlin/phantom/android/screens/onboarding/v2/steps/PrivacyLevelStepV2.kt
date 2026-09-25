@@ -91,7 +91,7 @@ import phantom.core.transport.PrivacyMode
  * "Not selected". The `onClickLabel` on `clickable` provides an
  * additional action description ("Select Standard privacy" /
  * "Select Private privacy" / "Ghost Mode requires Phantom Pro").
- * The Unlock CTA is Role.Button labelled "Unlock with Phantom Pro".
+ * The locked-tier preview CTA is Role.Button labelled "Preview Phantom Pro".
  * Decorative dots on the segment bar, tier icons, and bullet
  * rondels are cleared via `clearAndSetSemantics { }` — screen
  * readers surface the segment / CTA labels only.
@@ -177,10 +177,19 @@ fun PrivacyLevelStepV2(
         ) {
             OnboardingStepDotsV2(dotsIndex = dotsIndex)
             Spacer(Modifier.height(12.dp))
+            if (!phantom.android.premium.SubscriptionAccess.permits(formState.privacyMode)) {
+                Text(
+                    text = stringResource(R.string.onboarding_privacy_ghost_unavailable),
+                    color = DesignV2Tokens.Colors.TextSecondary,
+                    fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                )
+            }
             PhantomButton(
                 text = stringResource(R.string.onboarding_continue),
                 onClick = onContinueClick,
-                enabled = true,
+                enabled = phantom.android.premium.SubscriptionAccess.permits(formState.privacyMode),
                 modifier = Modifier.fillMaxWidth(),
             )
         }

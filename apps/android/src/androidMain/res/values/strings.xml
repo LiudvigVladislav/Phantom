@@ -310,7 +310,8 @@
     <string name="onboarding_privacy_not_selected">Not selected</string>
     <string name="onboarding_privacy_pro_required">%1$s, Phantom Pro required</string>
     <string name="onboarding_privacy_pro_tag">PRO</string>
-    <string name="onboarding_privacy_unlock_pro">Unlock with Phantom Pro</string>
+    <string name="onboarding_privacy_unlock_pro">Preview Phantom Pro</string>
+    <string name="onboarding_privacy_ghost_unavailable">Ghost requires Pro. Choose Standard or Private to continue.</string>
     <string name="onboarding_privacy_standard_name">Standard</string>
     <string name="onboarding_privacy_standard_short">STANDARD</string>
     <string name="onboarding_privacy_standard_a11y">Select Standard privacy</string>
