@@ -599,4 +599,25 @@
     <string name="group_voice_record">Record voice message</string>
     <string name="group_message_hint">Message…</string>
     <string name="group_recording">Recording %1$d:%2$02d</string>
+
+    <string name="add_contact_screen_back">Back to chats</string>
+    <string name="add_contact_screen_title">Add contact</string>
+    <string name="add_contact_screen_search_unavailable">Username search is not available</string>
+    <string name="add_contact_screen_search_alternative">Add a contact by QR code or public key.</string>
+    <string name="add_contact_screen_scan_qr">Scan QR code</string>
+    <string name="add_contact_screen_scan_qr_hint">Scan a contact\'s public key</string>
+    <string name="add_contact_screen_add_by_key">Add by key</string>
+    <string name="add_contact_screen_add_by_key_hint">Paste username:key or just the key</string>
+    <string name="add_contact_screen_suggestions">PEOPLE YOU MAY KNOW</string>
+    <string name="add_contact_screen_no_suggestions">No suggestions yet. Scan a QR code or add by key.</string>
+    <string name="add_contact_screen_own_username">YOUR USERNAME</string>
+    <string name="add_contact_screen_username_unavailable">Username unavailable</string>
+    <string name="add_contact_screen_key_preview">key: %1$s…</string>
+
+    <string name="qr_scan_back">Back to chats</string>
+    <string name="qr_scan_title">Scan QR code</string>
+    <string name="qr_scan_instruction">Point at the Phantom QR code</string>
+    <string name="qr_scan_permission_required">Camera permission required</string>
+    <string name="qr_scan_grant_permission">Grant Permission</string>
+    <string name="splash_logo">PHANTOM logo</string>
 </resources>

@@ -113,6 +113,14 @@ added to a release until the complete-flow gates in
   The old `IllegalArgumentException` toast said the recording was too long,
   though media validation also rejects size and chunk-count bounds; the
   resource now reports preparation failure without guessing which bound failed.
+- The reachable Add Contact entry and QR scanner now use English resources
+  for their headings, instructions, permission UI, own-key preview, and Back
+  accessibility labels. The entry no longer advertises a past July 2026
+  username-search date or describes QR scanning as a completed handshake.
+  With no local identity loaded, it no longer shows a fabricated `@yourname`.
+  The key preview still displays only bytes from the user's own key.
+- The splash logo's TalkBack description now uses an English resource; the
+  visible brand graphic and transition are unchanged.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
@@ -150,6 +158,23 @@ list keys, role IDs, audio storage/markers, and fixed numeric display formats;
 they are not translatable screen copy. The `Member` label is a localized
 fallback, not a verified sender identity. The group-audio result path still
 needs device-level checks; resource extraction is not evidence of delivery.
+
+AddContactScreen starts in Search state. Its only transition to Found is the
+`onSuggestedTap` callback, which SearchState never invokes; Connected is
+reachable only from Found. Both mock states are therefore unreachable from
+the current UI. They still contain invented fingerprint bytes and a button
+that only advances local UI state, not a real handshake or verification.
+They are classified as unreachable and are not translated or presented as a
+working security flow. Before enabling suggestions or username search, remove
+those mocks or replace them with a verified identity lookup and real handshake.
+The QR scanner's remaining hard-coded strings are diagnostic log messages,
+not visible UI.
+
+Nearby is an active navigation destination but not a working discovery flow.
+Its `nearby_discoverable` preference does not start a beacon or scan, while
+the toggle and animated radar imply live discovery. The screen is therefore
+blocked for truthful product-copy review rather than being translated as a
+working BLE/Wi-Fi Direct feature. No Nearby behavior was changed here.
 
 The source scan
 
