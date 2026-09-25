@@ -107,4 +107,52 @@
     <string name="privacy_mode_ghost_description">Maximum unlinkability. If Tor cannot bootstrap on your network the app will show \"Cannot reach relay\" rather than silently downgrading to a less-private path. Read receipts suppressed. First-connect can take several minutes on censored networks while bridges bootstrap.</string>
     <string name="privacy_mode_transport_note">The active transport is visible in the foreground notification (\"Online via Reality · Standard\"). Mode switches reset the active connection and walk the new chain.</string>
     <string name="privacy_mode_active">ACTIVE</string>
+
+    <string name="chat_list_search_hint">Search messages, contacts</string>
+    <string name="chat_list_pinned">Pinned</string>
+    <string name="chat_list_message_requests">Message requests</string>
+    <plurals name="chat_list_unverified_requests">
+        <item quantity="one">%d new from an unverified peer</item>
+        <item quantity="other">%d new from unverified peers</item>
+    </plurals>
+    <string name="chat_list_chats">Chats</string>
+    <string name="chat_list_no_results">No results for \"%1$s\"</string>
+    <string name="chat_list_groups">Groups</string>
+    <string name="chat_list_channels">Channels</string>
+    <string name="chat_list_channel">Channel</string>
+    <string name="chat_list_group">Group</string>
+    <string name="chat_list_voice_message">🎤 Voice message</string>
+    <string name="chat_list_personal_notes">Personal notes &amp; saved</string>
+    <string name="chat_list_private_space">Your private space</string>
+    <string name="chat_list_pinned_tag">PINNED</string>
+    <string name="chat_list_archive">Archive</string>
+    <string name="chat_list_unpin">Unpin</string>
+    <string name="chat_list_pin_to_top">Pin to top</string>
+    <string name="chat_list_unmute">Unmute</string>
+    <string name="chat_list_mute_notifications">Mute notifications</string>
+
+    <string name="empty_chats_title">No conversations yet</string>
+    <string name="empty_chats_description">Add a contact to start a private, encrypted conversation.</string>
+    <string name="empty_chats_action">Add contact</string>
+    <string name="empty_calls_title">No call history</string>
+    <string name="empty_calls_description">All calls are end-to-end encrypted. No record is stored.</string>
+    <string name="empty_contacts_title">No contacts yet</string>
+    <string name="empty_contacts_description">Search for a username or scan a QR code to connect.</string>
+    <string name="empty_contacts_action">Find people</string>
+    <string name="empty_search_title">No results</string>
+    <string name="empty_search_description">Try a different username or check your spelling.</string>
+
+    <string name="nav_messages">Messages</string>
+    <string name="nav_filter_unread">Filter unread</string>
+    <string name="nav_select_chats">Select chats</string>
+    <string name="nav_profile">Profile</string>
+    <string name="nav_create_group">Create group</string>
+    <string name="nav_create_channel">Create channel</string>
+    <string name="nav_scan_qr">Scan QR code</string>
+    <string name="nav_add_by_key">Add by key</string>
+    <string name="nav_soon">SOON</string>
+    <string name="nav_calls">Calls</string>
+    <string name="nav_chats">Chats</string>
+    <string name="nav_nearby">Nearby</string>
+    <string name="nav_settings">Settings</string>
 </resources>

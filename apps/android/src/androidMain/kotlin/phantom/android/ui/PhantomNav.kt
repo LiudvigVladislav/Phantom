@@ -18,11 +18,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
@@ -31,7 +33,7 @@ enum class NavTab { CALLS, CHATS, NEARBY, SETTINGS }
 @Composable
 fun PhantomTopBar(
     userName: String = "",
-    title: String = "Messages",
+    title: String? = null,
     /** When true the [title] is rendered as a centered wordmark — used by
      *  the home (chat list) screen so the PHANTOM brand mark sits
      *  symmetrically between the avatar and the compose action, per
@@ -46,12 +48,12 @@ fun PhantomTopBar(
         // Default: chat-list flavour menu.
         DropdownMenuItem(
             leadingIcon = { PhIconFunnel(color = TextDim, size = 15.dp) },
-            text = { Text("Filter unread", fontSize = 14.sp) },
+            text = { Text(stringResource(R.string.nav_filter_unread), fontSize = 14.sp) },
             onClick = { close() },
         )
         DropdownMenuItem(
             leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
-            text = { Text("Select chats", fontSize = 14.sp) },
+            text = { Text(stringResource(R.string.nav_select_chats), fontSize = 14.sp) },
             onClick = { close() },
         )
         HorizontalDivider()
@@ -59,7 +61,7 @@ fun PhantomTopBar(
             leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
             text = {
                 Text(
-                    "Profile",
+                    stringResource(R.string.nav_profile),
                     color = CyanAccent,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
@@ -85,7 +87,7 @@ fun PhantomTopBar(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Text("Create group", fontSize = 14.sp)
+                            Text(stringResource(R.string.nav_create_group), fontSize = 14.sp)
                             SoonBadge()
                         }
                     },
@@ -97,7 +99,7 @@ fun PhantomTopBar(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Text("Create channel", fontSize = 14.sp)
+                            Text(stringResource(R.string.nav_create_channel), fontSize = 14.sp)
                             SoonBadge()
                         }
                     },
@@ -105,11 +107,11 @@ fun PhantomTopBar(
                 )
                 HorizontalDivider()
                 DropdownMenuItem(
-                    text = { Text("Scan QR code", fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.nav_scan_qr), fontSize = 14.sp) },
                     onClick = { showComposeMenu = false; onScanQr() },
                 )
                 DropdownMenuItem(
-                    text = { Text("Add by key", fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.nav_add_by_key), fontSize = 14.sp) },
                     onClick = { showComposeMenu = false; onAddContact() },
                 )
             }
@@ -117,6 +119,7 @@ fun PhantomTopBar(
     },
 ) {
     var showAvatarMenu by remember { mutableStateOf(false) }
+    val displayTitle = title ?: stringResource(R.string.nav_messages)
     val context = LocalContext.current
     val gradientBrush = remember(userName) {
         val prefs = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
@@ -181,7 +184,7 @@ fun PhantomTopBar(
                 if (!centerTitle) {
                     Box(modifier = Modifier.weight(1f).padding(start = 12.dp)) {
                         Text(
-                            text = title,
+                            text = displayTitle,
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Medium,
                             letterSpacing = (-0.20).sp,
@@ -202,7 +205,7 @@ fun PhantomTopBar(
             // independent of the avatar / trailing widths.
             if (centerTitle) {
                 Text(
-                    text = title,
+                    text = displayTitle,
                     fontSize = 17.sp,
                     fontWeight = FontWeight.Medium,
                     letterSpacing = (-0.10).sp,
@@ -232,7 +235,7 @@ fun SoonBadge() {
             .padding(horizontal = 6.dp, vertical = 3.dp),
     ) {
         Text(
-            text = "SOON",
+            text = stringResource(R.string.nav_soon),
             fontFamily = PhantomFontMono,
             fontSize = 8.5.sp,
             letterSpacing = 1.5.sp,
@@ -287,25 +290,25 @@ fun BottomNavPill(
             ) {
             NavPillItem(
                 icon = { color -> PhIconPhone(color = color, size = 22.dp) },
-                label = "Calls",
+                label = stringResource(R.string.nav_calls),
                 active = activeTab == NavTab.CALLS,
                 onClick = { onTabSelected(NavTab.CALLS) },
             )
             NavPillItem(
                 icon = { color -> PhIconMessage(color = color, size = 22.dp) },
-                label = "Chats",
+                label = stringResource(R.string.nav_chats),
                 active = activeTab == NavTab.CHATS,
                 onClick = { onTabSelected(NavTab.CHATS) },
             )
             NavPillItem(
                 icon = { color -> PhIconRadar(color = color, size = 22.dp) },
-                label = "Nearby",
+                label = stringResource(R.string.nav_nearby),
                 active = activeTab == NavTab.NEARBY,
                 onClick = { onTabSelected(NavTab.NEARBY) },
             )
             NavPillItem(
                 icon = { color -> PhIconGear(color = color, size = 22.dp) },
-                label = "Settings",
+                label = stringResource(R.string.nav_settings),
                 active = activeTab == NavTab.SETTINGS,
                 onClick = { onTabSelected(NavTab.SETTINGS) },
             )
