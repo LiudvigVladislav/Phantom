@@ -81,9 +81,16 @@ added to a release until the complete-flow gates in
   in-place install without clearing data is unavailable. Android 9-10 do not
   support the strong-biometric plus-device-credential combination, so those
   versions use the OS credential confirmation activity and unlock only on its
-  successful result. No weaker
-  biometric mode is silently enabled. The legacy credential flow still needs
-  interaction testing on those OS versions.
+  successful result. No weaker biometric mode is silently enabled. The legacy
+  credential flow still needs interaction testing on those OS versions.
+  A separate `phantom.android.lockqa` build with the same `AppLockScreen`, a
+  `FragmentActivity` host, and no Internet permission was then tested on the
+  connected Android 12 phone. HiOS displayed its system authentication prompt;
+  the correct device PIN opened the test screen. This checks the prompt and
+  Compose callback on that phone, not installation of the full production
+  `MainActivity` build. The phone's release-signed app was unchanged, and the
+  temporary test package was uninstalled. Cancellation and wrong-PIN behavior
+  remain evidenced by the emulator run, not by the phone run.
 
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
