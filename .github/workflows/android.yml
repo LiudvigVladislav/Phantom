@@ -283,6 +283,7 @@ jobs:
         test-class:
           # L1
           - phantom.android.ui.designv2.PhantomComponentsSemanticsTest
+          - phantom.android.ui.SettingsRowItemSemanticsTest
           # L2
           - phantom.android.ui.designv2.components.PhantomSegmentedControlTouchTargetBoundsTest
           - phantom.android.screens.onboarding.v2.OnboardingScreenV2GateTest
@@ -535,6 +536,7 @@ jobs:
           phantom.android.transport.WsSessionLifecycleContractTest
           phantom.android.transport.WsSessionLifecycleDispatcherSequentialOrderTest
           phantom.android.ui.ConnectionBannerErrorLabelTest
+          phantom.android.ui.SettingsRowItemSemanticsTest
           phantom.android.ui.designv2.OnboardingV2RecoverySnapshotTest
           phantom.android.ui.designv2.OnboardingV2ResponsiveMatrixTest
           phantom.android.ui.designv2.OnboardingV2SnapshotTest
