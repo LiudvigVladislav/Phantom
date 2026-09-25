@@ -39,7 +39,12 @@ added to a release until the complete-flow gates in
 - The contact-profile screen now gets its dialogs, report categories and
   outcomes, key and note labels, verification fallback, and disappearing-timer
   labels from English resources. Report category IDs and timer durations stay
-  stable. The separate production verification screen is not covered here.
+  stable. The separate production verification screen now gets its compare,
+  confirmed, mismatch, fingerprint, and action copy from English resources.
+  Confirmation is disabled without two valid keys and checks that the
+  displayed keys still match repository values before writing the verified
+  flag. The unimplemented Report action is no longer shown as a working
+  button. A phone/emulator interaction check remains outstanding.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
@@ -113,3 +118,12 @@ without promising human review. Two contact settings rows had no handlers and
 claimed notification and Wi-Fi download policies that were not implemented;
 they are hidden until real controls exist. The working disappearing-message
 timer remains. Device-level visual and interaction checks are still required.
+
+The full-screen verification screen previously allowed a verified write while
+the key blocks still showed a loading placeholder. It also implied that a
+local key comparison proves a person's real-world identity and that future
+delivery is restricted to one key. Its English copy now describes only the
+current key check. The screen rejects missing or malformed keys and re-reads
+both keys before confirmation; a concurrent key change between that read and
+the repository writes is not proven impossible by this UI guard. The separate
+Report action was a no-op and has been removed from the mismatch state.

@@ -15,11 +15,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.GradientAvatar
 import phantom.android.ui.PhIconBack
@@ -39,15 +41,26 @@ import phantom.android.ui.theme.*
  *              dim danger ghost "Something doesn't match".
  *   Verified — success-tinted block borders, "Verified ✓" bridge, a
  *              single cyan primary "Back to chat" CTA.
- *   Mismatch — danger-tinted block (border 0.25, hex 0.70 alpha, block
- *              opacity 0.70). Bridge "Mismatch ×" danger. CTAs:
- *              "Go back" ghost + "Report" danger ghost.
+ *   Mismatch — danger-tinted fingerprint and a return-to-comparison action.
  *
- * The trust write-through is identical to the previous sheet: on a
- * Compare→Verified transition we mark the conversation verified and
- * clear the identity-key-changed timestamp.
+ * Confirmation requires both displayed keys to remain available and unchanged.
  */
 private enum class VerifyState { Compare, Verified, Mismatch }
+
+internal fun verificationKeyIsValid(key: String): Boolean =
+    key.length == 64 && key.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+
+internal fun verificationKeysReady(myKey: String, theirKey: String): Boolean =
+    verificationKeyIsValid(myKey) && verificationKeyIsValid(theirKey)
+
+internal fun verificationSnapshotStillCurrent(
+    displayedMyKey: String,
+    displayedTheirKey: String,
+    currentMyKey: String,
+    currentTheirKey: String,
+): Boolean = verificationKeysReady(displayedMyKey, displayedTheirKey) &&
+    displayedMyKey.equals(currentMyKey, ignoreCase = true) &&
+    displayedTheirKey.equals(currentTheirKey, ignoreCase = true)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,26 +71,42 @@ fun VerifyScreen(
     onBack: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
-    // Resolve own + their pubkey hex once when the screen mounts. Both
-    // FingerprintBlocks render "loading…" until ready.
-    var myPubKeyHex by remember { mutableStateOf("") }
-    var theirPubKeyHex by remember { mutableStateOf("") }
-    var initialVerified by remember { mutableStateOf(false) }
+    // Resolve both keys when the screen mounts; unavailable keys cannot be confirmed.
+    var myPubKeyHex by remember(conversationId) { mutableStateOf("") }
+    var theirPubKeyHex by remember(conversationId) { mutableStateOf("") }
+    var initialVerified by remember(conversationId) { mutableStateOf(false) }
+    var keysLoaded by remember(conversationId) { mutableStateOf(false) }
+    var confirmInFlight by remember(conversationId) { mutableStateOf(false) }
+    val snackbarHostState = remember(conversationId) { SnackbarHostState() }
 
     LaunchedEffect(conversationId) {
-        myPubKeyHex = container.identityRepo.loadIdentity()?.publicKeyHex.orEmpty()
-        val conv = container.conversationRepo.getConversation(conversationId)
-        theirPubKeyHex = conv?.theirPublicKeyHex.orEmpty()
-        initialVerified = conv?.isVerified == true
+        try {
+            myPubKeyHex = container.identityRepo.loadIdentity()?.publicKeyHex.orEmpty()
+            val conv = container.conversationRepo.getConversation(conversationId)
+            theirPubKeyHex = conv?.theirPublicKeyHex.orEmpty()
+            initialVerified = conv?.let { it.isVerified && it.identityKeyChangedAt == null } == true &&
+                verificationKeysReady(myPubKeyHex, theirPubKeyHex)
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            myPubKeyHex = ""
+            theirPubKeyHex = ""
+            initialVerified = false
+        } finally {
+            keysLoaded = true
+        }
     }
 
-    var verifyState by remember(initialVerified) {
+    val keysReady = verificationKeysReady(myPubKeyHex, theirPubKeyHex)
+
+    var verifyState by remember(conversationId, initialVerified) {
         mutableStateOf(if (initialVerified) VerifyState.Verified else VerifyState.Compare)
     }
 
     Scaffold(
         containerColor = PhantomTokens.Colors.SurfaceDeep,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column(
                 modifier = Modifier
@@ -97,7 +126,7 @@ fun VerifyScreen(
                     }
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        text = "Verify @$theirUsername",
+                        text = stringResource(R.string.verify_title, theirUsername),
                         color = TextPrimary,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Medium,
@@ -128,9 +157,9 @@ fun VerifyScreen(
                 }
                 Text(
                     text = when (verifyState) {
-                        VerifyState.Compare -> "VERIFY @${theirUsername.uppercase()}"
-                        VerifyState.Verified -> "IDENTITY CONFIRMED"
-                        VerifyState.Mismatch -> "KEYS DO NOT MATCH"
+                        VerifyState.Compare -> stringResource(R.string.verify_compare_status, theirUsername.uppercase(java.util.Locale.ROOT))
+                        VerifyState.Verified -> stringResource(R.string.verify_confirmed_status)
+                        VerifyState.Mismatch -> stringResource(R.string.verify_mismatch_status)
                     },
                     color = when (verifyState) {
                         VerifyState.Verified -> Success
@@ -146,9 +175,9 @@ fun VerifyScreen(
             // Display headline — Geist 24sp Light, varies by state.
             Text(
                 text = when (verifyState) {
-                    VerifyState.Compare -> "Compare these keys side by side."
-                    VerifyState.Verified -> "$theirUsername is who they say they are."
-                    VerifyState.Mismatch -> "Something doesn't match."
+                    VerifyState.Compare -> stringResource(R.string.verify_compare_headline)
+                    VerifyState.Verified -> stringResource(R.string.verify_confirmed_headline, theirUsername)
+                    VerifyState.Mismatch -> stringResource(R.string.verify_mismatch_headline)
                 },
                 color = TextPrimary,
                 fontSize = 24.sp,
@@ -159,9 +188,9 @@ fun VerifyScreen(
 
             Text(
                 text = when (verifyState) {
-                    VerifyState.Compare -> "Read all 8 groups out loud, or compare visually in person, with @$theirUsername."
-                    VerifyState.Verified -> "Future messages will only arrive on this key. We'll warn you if it changes."
-                    VerifyState.Mismatch -> "Do not trust this conversation until you re-verify in person or on a trusted call."
+                    VerifyState.Compare -> stringResource(R.string.verify_compare_instruction, theirUsername)
+                    VerifyState.Verified -> stringResource(R.string.verify_confirmed_instruction)
+                    VerifyState.Mismatch -> stringResource(R.string.verify_mismatch_instruction)
                 },
                 color = TextDim,
                 fontSize = 14.sp,
@@ -171,10 +200,11 @@ fun VerifyScreen(
             Spacer(Modifier.height(4.dp))
 
             FingerprintBlock(
-                ownerLabel = "Your key",
-                name = "You",
+                ownerLabel = stringResource(R.string.verify_your_key),
+                name = stringResource(R.string.verify_you),
                 publicKeyHex = myPubKeyHex,
                 accent = VerifyState.Compare,
+                keysLoaded = keysLoaded,
             )
 
             // Axis bridge — neutral / success / danger tint per state.
@@ -196,9 +226,9 @@ fun VerifyScreen(
                 )
                 Text(
                     text = when (verifyState) {
-                        VerifyState.Compare -> "Compare ↕"
-                        VerifyState.Verified -> "Verified ✓"
-                        VerifyState.Mismatch -> "Mismatch ×"
+                        VerifyState.Compare -> stringResource(R.string.verify_compare_bridge)
+                        VerifyState.Verified -> stringResource(R.string.verify_confirmed_bridge)
+                        VerifyState.Mismatch -> stringResource(R.string.verify_mismatch_bridge)
                     },
                     color = when (verifyState) {
                         VerifyState.Verified -> Success
@@ -218,16 +248,20 @@ fun VerifyScreen(
             }
 
             FingerprintBlock(
-                ownerLabel = "@$theirUsername's key",
+                ownerLabel = stringResource(R.string.verify_peers_key, theirUsername),
                 name = theirUsername,
                 publicKeyHex = theirPubKeyHex,
                 accent = verifyState,
+                keysLoaded = keysLoaded,
             )
 
             // Read-aloud safety number — same digits on both devices.
-            if (myPubKeyHex.isNotEmpty() && theirPubKeyHex.isNotEmpty()) {
+            if (keysReady) {
                 val safetyNumber = remember(myPubKeyHex, theirPubKeyHex) {
-                    phantom.core.crypto.SafetyNumber.compute(myPubKeyHex, theirPubKeyHex)
+                    phantom.core.crypto.SafetyNumber.compute(
+                        myPubKeyHex.lowercase(java.util.Locale.ROOT),
+                        theirPubKeyHex.lowercase(java.util.Locale.ROOT),
+                    )
                 }
                 Column(
                     modifier = Modifier
@@ -237,7 +271,7 @@ fun VerifyScreen(
                         .padding(horizontal = 14.dp, vertical = 12.dp),
                 ) {
                     Text(
-                        text = "OR READ ALOUD · 60 DIGITS",
+                        text = stringResource(R.string.verify_read_aloud),
                         color = TextDim,
                         fontSize = 9.sp,
                         fontFamily = PhantomFontMono,
@@ -264,12 +298,35 @@ fun VerifyScreen(
                 ) {
                     Button(
                         onClick = {
+                            if (confirmInFlight || !keysReady) return@Button
+                            val displayedMyKey = myPubKeyHex
+                            val displayedTheirKey = theirPubKeyHex
+                            confirmInFlight = true
                             scope.launch {
-                                container.conversationRepo.setVerified(conversationId, true)
-                                container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
-                                verifyState = VerifyState.Verified
+                                try {
+                                    val currentMyKey = container.identityRepo.loadIdentity()?.publicKeyHex.orEmpty()
+                                    val currentTheirKey = container.conversationRepo
+                                        .getConversation(conversationId)?.theirPublicKeyHex.orEmpty()
+                                    if (!verificationSnapshotStillCurrent(
+                                            displayedMyKey, displayedTheirKey, currentMyKey, currentTheirKey,
+                                        )) {
+                                        myPubKeyHex = currentMyKey
+                                        theirPubKeyHex = currentTheirKey
+                                        verifyState = VerifyState.Compare
+                                        snackbarHostState.showSnackbar(context.getString(R.string.verify_keys_changed))
+                                        return@launch
+                                    }
+                                    container.conversationRepo.setVerified(conversationId, true)
+                                    container.conversationRepo.clearIdentityKeyChangedAt(conversationId)
+                                    verifyState = VerifyState.Verified
+                                } catch (_: Exception) {
+                                    snackbarHostState.showSnackbar(context.getString(R.string.verify_save_failed))
+                                } finally {
+                                    confirmInFlight = false
+                                }
                             }
                         },
+                        enabled = keysReady && !confirmInFlight,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Color.Transparent,
                             contentColor = Success,
@@ -281,7 +338,7 @@ fun VerifyScreen(
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                     ) {
                         Text(
-                            "Keys match — Verified",
+                            stringResource(R.string.verify_keys_match),
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
                         )
@@ -299,7 +356,7 @@ fun VerifyScreen(
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                     ) {
                         Text(
-                            "Something doesn't match",
+                            stringResource(R.string.verify_keys_differ),
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium,
                         )
@@ -307,15 +364,12 @@ fun VerifyScreen(
                 }
 
                 VerifyState.Verified -> phantom.android.ui.PhantomPrimaryButton(
-                    label = "Back to chat",
+                    label = stringResource(R.string.verify_back_to_chat),
                     onClick = onBack,
                     shape = RoundedCornerShape(8.dp),
                 )
 
-                VerifyState.Mismatch -> Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
+                VerifyState.Mismatch -> {
                     Button(
                         onClick = { verifyState = VerifyState.Compare },
                         colors = ButtonDefaults.buttonColors(
@@ -324,23 +378,9 @@ fun VerifyScreen(
                         ),
                         border = androidx.compose.foundation.BorderStroke(1.dp, BorderSubtle),
                         shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.weight(1f).height(46.dp),
+                        modifier = Modifier.fillMaxWidth().height(46.dp),
                     ) {
-                        Text("Go back", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                    }
-                    Button(
-                        onClick = { /* TODO: report endpoint */ onBack() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.Transparent,
-                            contentColor = Danger.copy(alpha = 0.55f),
-                        ),
-                        border = androidx.compose.foundation.BorderStroke(
-                            1.dp, Danger.copy(alpha = 0.30f),
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        modifier = Modifier.weight(1f).height(46.dp),
-                    ) {
-                        Text("Report", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                        Text(stringResource(R.string.verify_back_to_comparison), fontSize = 13.sp, fontWeight = FontWeight.Medium)
                     }
                 }
             }
@@ -354,13 +394,12 @@ private fun FingerprintBlock(
     name: String,
     publicKeyHex: String,
     accent: VerifyState,
+    keysLoaded: Boolean,
 ) {
     val fingerprint = remember(publicKeyHex) {
-        if (publicKeyHex.length >= 32) {
-            publicKeyHex.substring(0, 32).uppercase().chunked(4).joinToString("  ")
-        } else {
-            "loading…"
-        }
+        if (verificationKeyIsValid(publicKeyHex))
+            publicKeyHex.substring(0, 32).uppercase(java.util.Locale.ROOT).chunked(4).joinToString("  ")
+        else null
     }
     val borderColor = when (accent) {
         VerifyState.Verified -> Success.copy(alpha = 0.25f)
@@ -406,7 +445,9 @@ private fun FingerprintBlock(
         }
         Spacer(Modifier.height(14.dp))
         Text(
-            text = fingerprint,
+            text = fingerprint ?: stringResource(
+                if (keysLoaded) R.string.verify_key_unavailable else R.string.verify_loading_key,
+            ),
             color = hexColor,
             fontSize = 13.sp,
             fontFamily = PhantomFontMono,

@@ -33,12 +33,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.R
+import phantom.android.screens.verify.verificationKeyIsValid
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
 internal fun contactKeyPreview(publicKeyHex: String): String? {
-    if (publicKeyHex.length != 64 || !publicKeyHex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+    if (!verificationKeyIsValid(publicKeyHex)) {
         return null
     }
     return publicKeyHex.chunked(4).take(8).joinToString("  ") + "  …"

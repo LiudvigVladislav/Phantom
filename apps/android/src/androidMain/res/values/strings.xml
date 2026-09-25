@@ -462,4 +462,30 @@
     <string name="contact_profile_back_to_chat">Back to chat</string>
     <string name="contact_profile_go_back">Go back</string>
     <string name="contact_profile_loading">loading…</string>
+
+    <string name="verify_title">Verify @%1$s</string>
+    <string name="verify_compare_status">VERIFY @%1$s</string>
+    <string name="verify_confirmed_status">KEY CONFIRMED</string>
+    <string name="verify_mismatch_status">KEYS DO NOT MATCH</string>
+    <string name="verify_compare_headline">Compare these keys side by side.</string>
+    <string name="verify_confirmed_headline">You verified @%1$s\'s current key.</string>
+    <string name="verify_mismatch_headline">Something doesn\'t match.</string>
+    <string name="verify_compare_instruction">Compare all eight groups, or the full 60-digit safety number, with @%1$s in person or on a trusted call.</string>
+    <string name="verify_confirmed_instruction">If this contact\'s key changes, Phantom will ask you to verify again.</string>
+    <string name="verify_mismatch_instruction">Do not trust this conversation until you re-verify in person or on a trusted call.</string>
+    <string name="verify_your_key">Your key</string>
+    <string name="verify_you">You</string>
+    <string name="verify_peers_key">@%1$s\'s key</string>
+    <string name="verify_compare_bridge">Compare ↕</string>
+    <string name="verify_confirmed_bridge">Verified ✓</string>
+    <string name="verify_mismatch_bridge">Mismatch ×</string>
+    <string name="verify_read_aloud">OR READ ALOUD · 60 DIGITS</string>
+    <string name="verify_keys_match">Keys match — Verified</string>
+    <string name="verify_keys_differ">Something doesn\'t match</string>
+    <string name="verify_back_to_chat">Back to chat</string>
+    <string name="verify_back_to_comparison">Back to comparison</string>
+    <string name="verify_loading_key">Loading key…</string>
+    <string name="verify_key_unavailable">Key unavailable</string>
+    <string name="verify_keys_changed">Keys changed while this screen was open. Compare the current keys again.</string>
+    <string name="verify_save_failed">Could not save verification. Try again.</string>
 </resources>
