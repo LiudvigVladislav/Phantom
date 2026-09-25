@@ -47,7 +47,11 @@ added to a release until the complete-flow gates in
   button. A phone/emulator interaction check remains outstanding.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
-  repair-error copy has been extracted. Pricing and terms copy remains.
+  repair-error copy has been extracted. The pre-flow Terms screen now uses
+  English resources for its headings, eight sections, links, scroll hint,
+  and acceptance text. Its visible wording and acceptance behavior were
+  preserved; extraction is not legal, privacy, or security approval. Pricing
+  copy remains unextracted.
 - Incoming-call and active-call screens now take status and action copy from
   English resources. Icon-only call controls have accessible action names that
   reflect mute and speaker state. The `RINGING` label describes an incoming
@@ -196,6 +200,13 @@ app without copy and security review. `PHANTOM` in the foreground notification
 title is a brand name, not a translation candidate. Diagnostic log strings
 and animation labels are not user-visible. This targeted scan does not prove
 that every dynamic or indirect Android string has been found.
+
+The Terms screen is active on first-run onboarding, and all its visible
+English prose except the PHANTOM brand wordmark is now resource-backed. Its
+claims about server access to contacts and activity, IP retention, key
+recovery, and account identifiers have not been validated against current
+implementation and policy. Do not translate them into Russian as approved
+legal copy or expose a Russian Terms gate until that review is complete.
 
 The source scan
 
