@@ -25,6 +25,11 @@ added to a release until the complete-flow gates in
 - The Add Contact dialog now gets its instructions, validation copy, actions,
   and field accessibility labels from English resources. Pasted keys, aliases,
   and peer names remain untouched user content.
+- The one-to-one chat now gets its header status, composer hint, send-failure
+  notice, message actions, pin/delete/forward dialogs, link-preview states,
+  voice labels, and block/report dialog copy from English resources. Older
+  date separators use the app's active locale. Stored forwarded/saved message
+  text, peer names, message bodies, and raw failure details are not rewritten.
 - Active onboarding-v2 welcome, explanation, identity-entry, key-preview,
   finale, privacy mode, permissions, shared step chrome, startup-error and
   repair-error copy has been extracted. Pricing and terms copy remains.
