@@ -640,19 +640,15 @@ private fun PhantomApp(
                 MigrationScreen(
                     migrationManager = mgr,
                     onMigrationComplete = {
-                        // Trigger initial bundle publish via lifecycle
-                        // service immediately — without it the user
-                        // can't receive first messages until the 24-h
-                        // ticker fires.
-                        scope.launch {
-                            runCatching {
-                                container.preKeyLifecycle?.bootstrapForNewIdentity()
-                            }
-                        }
+                        // Re-run normal startup with freshly persisted identity keys.
+                        // ChatList is reachable only after stack initialization succeeds.
+                        startupInFlight = true
+                        startupCompleted = false
+                        currentScreen = null
+                        retryTick += 1
                         context.startForegroundService(
                             Intent(context, PhantomMessagingService::class.java),
                         )
-                        currentScreen = Screen.ChatList
                     },
                     onQuit = {
                         // Activity finish() drops the user back to launcher.
@@ -662,15 +658,14 @@ private fun PhantomApp(
                     },
                 )
             } else {
-                // Edge case: container.migrationManager is null because
-                // initMessaging never ran (e.g. some race). Fall back
-                // to ChatList; the user will hit a hard send error
-                // until they restart the app.
+                // Missing migration authority is a startup error, never permission to skip it.
                 Log.w(
                     "PHANTOM_MIGRATION",
-                    "Screen.Migration with null migrationManager; falling back to ChatList",
+                    "Screen.Migration with null migrationManager",
                 )
-                currentScreen = Screen.ChatList
+                currentScreen = Screen.StartupError(
+                    phantom.android.screens.onboarding.v2.TransientReason.NeedsMigrationThrew.name,
+                )
             }
         }
         is Screen.ChatList -> ChatListScreen(

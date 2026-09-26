@@ -706,4 +706,18 @@
     <string name="premium_preview">Planned plans and prices. Subscriptions are not available yet.</string>
     <string name="premium_footer">Preview only. No purchase is available in this build.</string>
     <string name="premium_free_price">Free forever</string>
+    <string name="migration_title">Security update</string>
+    <string name="migration_explanation">This update replaces encryption sessions from an older version of PHANTOM. Conversations will need a new key exchange before messaging can resume.</string>
+    <string name="migration_data_preservation">Your identity, existing contacts and saved messages are not deleted by this update.</string>
+    <string name="migration_keep_installed">Keep PHANTOM installed and do not clear its data. If the update is interrupted, open the app again to continue.</string>
+    <string name="migration_running">Updating encryption sessions…</string>
+    <string name="migration_quit">Quit app</string>
+    <string name="migration_continue">Continue</string>
+    <string name="migration_retry">Retry</string>
+    <string name="migration_error_busy">The server is busy. Please wait a moment and retry.</string>
+    <string name="migration_error_connection">The server could not confirm the update. Check your connection and retry.</string>
+    <string name="migration_error_rejected">The server rejected the update. Keep the app installed and contact support.</string>
+    <string name="migration_error_keys">The server has different keys registered for this identity. Keep the app installed and contact support before making changes.</string>
+    <string name="migration_error_identity">The local identity could not be found. Do not reinstall or clear app data. Contact support for help.</string>
+    <string name="migration_error_generic">The update could not finish. Retry without reinstalling or clearing app data. If it keeps failing, contact support.</string>
 </resources>

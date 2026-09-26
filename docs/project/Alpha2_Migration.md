@@ -1,8 +1,21 @@
 # Alpha 1 → Alpha 2 migration
 
-**Status:** Draft, written alongside PR C (Phase 1 Week 4).
+**Status:** Historical Alpha-2 draft, with the 2026-09-26 recovery correction below.
 **Audience:** Phantom contributors, Alpha-1 testers, future auditors.
 **Owner:** `phase1/week4/sessionmanager-rewrite-migration` branch.
+
+## Current recovery and copy contract (2026-09-26)
+
+[Migration recovery correction](Migration_Recovery_2026-09-26.md) supersedes
+the trigger, screen copy, operation ordering and recovery promises below.
+In particular, signing-key presence alone is not completion; durable local
+IN_PROGRESS/COMPLETE state now guards initialization and retries. Completed and
+already-current identities must not be wiped again. The old mandatory QR re-add,
+read-only-input, July username date and unconditional foreground-retry claims
+below are historical, not the current UI or verified behavior. The current
+prekey batch is `MigrationManager.OPK_BATCH_SIZE` (40), not the draft's 100.
+Other historical protocol descriptions below are not re-audited by this narrow
+recovery change. No wire or cryptographic-format change is authorized here.
 
 This document explains everything that changes between Alpha 1 (master at
 `8fa020ae`, before PR C) and Alpha 2 (master after PR C). Read it before
@@ -387,4 +400,5 @@ CI must pass all of these on JVM target before PR C is mergeable.
 
 | Date       | Change                                          |
 |------------|-------------------------------------------------|
+| 2026-09-26 | Supersede draft recovery/copy with identity-bound durable progress and initialization exclusion; preserve historical design text explicitly as historical. |
 | 2026-04-30 | Initial draft alongside PR C work in progress.  |

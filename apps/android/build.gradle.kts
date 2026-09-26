@@ -67,6 +67,14 @@ kotlin {
     }
 
     sourceSets {
+        val androidInstrumentedTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(libs.androidx.test.runner)
+                implementation(libs.androidx.test.ext.junit)
+                implementation(libs.sqldelight.runtime)
+            }
+        }
         // JVM-based unit tests for Android-only code (android.util.Log is stubbed by AGP).
         // Runs with ./gradlew :apps:android:testDebugUnitTest (no device required).
         val androidUnitTest by getting {
@@ -177,6 +185,7 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.0.1-alpha"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {

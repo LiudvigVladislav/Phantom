@@ -1274,6 +1274,10 @@ class PhantomMessagingService : Service() {
                 onPrerequisitesReady()
                 // These operations are not retried as reads: partial setup may own work.
                 container.initMessagingFromStorage()
+                if (container.messagingInit is AppContainer.MessagingInit.AwaitingMigration) {
+                    stopSelf()
+                    return@serviceStartupOrNull null
+                }
                 container.networkChangeObserver?.register()
                 val messaging = checkNotNull(container.messagingService)
                 messaging.startReceiving()
