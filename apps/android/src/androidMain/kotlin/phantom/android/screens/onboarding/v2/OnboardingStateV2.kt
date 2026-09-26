@@ -230,7 +230,7 @@ fun validateUsernameV2(input: String): UsernameValidationV2 {
  * Called by [OnboardingFlowV2] on every render — must stay pure and cheap.
  * Steps whose implementation lands in later commits gate on the placeholder
  * shape they'll enforce then: Identity gates on username validity (Commit 3),
- * Privacy always advances (Commit 4 — user always picks something), Permissions
+ * Privacy advances only for a selectable mode, Permissions
  * always advances (Commit 5 — toggles are optional). Welcome / How always
  * advance too — they're read-only.
  *
@@ -241,7 +241,7 @@ fun canAdvanceFromV2(step: OnboardingStepV2, state: OnboardingFormStateV2): Bool
     OnboardingStepV2.Welcome            -> true
     OnboardingStepV2.How                -> true
     OnboardingStepV2.Identity           -> validateUsernameV2(state.username) == UsernameValidationV2.Valid
-    OnboardingStepV2.Privacy            -> true
+    OnboardingStepV2.Privacy            -> phantom.android.premium.SubscriptionAccess.permits(state.privacyMode)
     // C6-a round-1 REDLINE §P1 pin: Permissions has NO regular
     // forward-nav Continue button — its Done button routes through
     // the sealed [OnboardingFinalizeStateHolder]

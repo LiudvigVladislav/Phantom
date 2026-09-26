@@ -30,6 +30,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,6 +45,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
@@ -124,9 +130,9 @@ fun GroupChatScreen(
             )
             if (result != null && result.isFailure) {
                 val message = if (result.exceptionOrNull() is IllegalArgumentException) {
-                    "Голосовое сообщение слишком длинное"
+                    context.getString(R.string.group_voice_invalid)
                 } else {
-                    "Не удалось отправить голосовое сообщение"
+                    context.getString(R.string.group_voice_send_failed)
                 }
                 android.widget.Toast.makeText(
                     context,
@@ -139,7 +145,11 @@ fun GroupChatScreen(
                 if (report != null && report.incompleteCount > 0) {
                     android.widget.Toast.makeText(
                         context,
-                        "Отправлено ${report.submitted} из ${report.recipientCount}",
+                        context.getString(
+                            R.string.group_voice_submitted,
+                            report.submitted,
+                            report.recipientCount,
+                        ),
                         android.widget.Toast.LENGTH_LONG,
                     ).show()
                 }
@@ -265,7 +275,7 @@ fun GroupChatScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Read-only channel",
+                        text = stringResource(R.string.group_read_only_channel),
                         color = TextDim,
                         fontSize = 13.sp,
                         fontFamily = PhantomFontMono,
@@ -406,7 +416,7 @@ private fun GroupE2EENoteRow(isChannel: Boolean) {
                 drawCircle(color = Success, radius = r * 0.38f)
             }
             Text(
-                text = if (isChannel) "channel — messages broadcast by admins" else "group · end-to-end encrypted",
+                text = stringResource(if (isChannel) R.string.group_channel_note else R.string.group_encryption_note),
                 color = TextDim,
                 fontSize = 11.sp,
                 fontFamily = PhantomFontMono,
@@ -420,14 +430,15 @@ private fun GroupE2EENoteRow(isChannel: Boolean) {
 
 @Composable
 private fun GroupDateSep(millis: Long) {
-    val label = java.text.SimpleDateFormat("dd MMM yyyy", java.util.Locale.US)
+    val locale = LocalConfiguration.current.locales[0]
+    val label = java.text.SimpleDateFormat("dd MMM yyyy", locale)
         .format(java.util.Date(millis))
     Box(
         modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = label.uppercase(),
+            text = label.uppercase(locale),
             color = TextDim,
             fontSize = 10.sp,
             fontFamily = PhantomFontMono,
@@ -442,7 +453,8 @@ private fun GroupDateSep(millis: Long) {
 private fun GroupMessageBubble(entity: MessageEntity, context: android.content.Context) {
     val isSent = entity.sent
     val rawText = entity.plaintextCache ?: "•••"
-    val timeStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+    val locale = LocalConfiguration.current.locales[0]
+    val timeStr = java.text.SimpleDateFormat("HH:mm", locale)
         .format(java.util.Date(entity.createdAt))
 
     val isAudio = rawText.startsWith("[AUDIO:")
@@ -454,7 +466,7 @@ private fun GroupMessageBubble(entity: MessageEntity, context: android.content.C
         Column(horizontalAlignment = if (isSent) Alignment.End else Alignment.Start) {
             if (!isSent) {
                 Text(
-                    text = "Member",
+                    text = stringResource(R.string.group_member),
                     color = CyanAccent,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
@@ -538,6 +550,9 @@ private fun GroupAudioBubble(
     val speedSteps = remember { listOf(1.0f, 1.5f, 2.0f, 0.5f) }
     var speedIdx by remember { mutableIntStateOf(0) }
     val currentSpeed = speedSteps[speedIdx]
+    val locale = LocalConfiguration.current.locales[0]
+    val playLabel = stringResource(if (isPlaying) R.string.group_voice_pause else R.string.group_voice_play)
+    val speedLabel = stringResource(R.string.group_voice_speed)
 
     DisposableEffect(Unit) {
         onDispose {
@@ -548,7 +563,7 @@ private fun GroupAudioBubble(
 
     fun formatDuration(ms: Int): String {
         val s = ms / 1000
-        return "%d:%02d".format(s / 60, s % 60)
+        return String.format(locale, "%d:%02d", s / 60, s % 60)
     }
 
     Row(
@@ -590,7 +605,7 @@ private fun GroupAudioBubble(
                     }
                 }
             },
-            modifier = Modifier.size(32.dp),
+            modifier = Modifier.size(32.dp).semantics { contentDescription = playLabel },
         ) {
             val iconColor = if (isSent) BgDeep else CyanAccent
             if (isPlaying) PhIconPause(color = iconColor, size = 20.dp)
@@ -631,10 +646,11 @@ private fun GroupAudioBubble(
                                     }
                                 }
                             }
+                            .semantics { contentDescription = speedLabel }
                             .padding(horizontal = 6.dp, vertical = 1.dp),
                     ) {
                         Text(
-                            text = formatGroupSpeed(currentSpeed),
+                            text = formatGroupSpeed(currentSpeed, locale),
                             fontSize = 9.5.sp,
                             color = if (isSent) BgDeep.copy(alpha = 0.7f) else CyanAccent,
                             fontWeight = FontWeight.SemiBold,
@@ -651,12 +667,8 @@ private fun GroupAudioBubble(
     }
 }
 
-private fun formatGroupSpeed(speed: Float): String = when (speed) {
-    1.0f -> "1×"
-    2.0f -> "2×"
-    0.5f -> "0.5×"
-    else -> "${"%.1f".format(speed)}×"
-}
+private fun formatGroupSpeed(speed: Float, locale: java.util.Locale): String =
+    java.text.DecimalFormat("0.#", java.text.DecimalFormatSymbols.getInstance(locale)).format(speed) + "×"
 
 private fun playGroupAudio(
     context: android.content.Context,
@@ -688,6 +700,8 @@ private fun GroupTopBar(
     onAddMember: () -> Unit,
     onLeaveGroup: () -> Unit,
 ) {
+    val backLabel = stringResource(R.string.group_back)
+    val moreLabel = stringResource(if (isChannel) R.string.group_more_channel_options else R.string.group_more_options)
     // Phase 2 mockup parity with ChatTopBar — flat back arrow, group avatar
     // (36dp), name + member count, BorderSubtle hairline at the bottom.
     Column(
@@ -703,7 +717,7 @@ private fun GroupTopBar(
                 .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+            IconButton(onClick = onBack, modifier = Modifier.size(32.dp).semantics { contentDescription = backLabel }) {
                 PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }
             Spacer(Modifier.width(8.dp))
@@ -723,7 +737,8 @@ private fun GroupTopBar(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = if (isChannel) "Channel" else "$memberCount members",
+                    text = if (isChannel) stringResource(R.string.group_channel_label)
+                        else pluralStringResource(R.plurals.group_members, memberCount, memberCount),
                     color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.55f),
                     fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
@@ -731,7 +746,7 @@ private fun GroupTopBar(
             }
 
             Box {
-                IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp)) {
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(36.dp).semantics { contentDescription = moreLabel }) {
                     PhIconMoreVert(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                 }
                 DropdownMenu(
@@ -741,12 +756,12 @@ private fun GroupTopBar(
                 ) {
                     if (!isChannel) {
                         DropdownMenuItem(
-                            text = { Text("Add Member", color = TextPrimary, fontSize = 14.sp) },
+                            text = { Text(stringResource(R.string.group_add_member), color = TextPrimary, fontSize = 14.sp) },
                             onClick = onAddMember,
                         )
                     }
                     DropdownMenuItem(
-                        text = { Text("Leave ${if (isChannel) "Channel" else "Group"}", color = Danger, fontSize = 14.sp) },
+                        text = { Text(stringResource(if (isChannel) R.string.group_leave_channel else R.string.group_leave_group), color = Danger, fontSize = 14.sp) },
                         onClick = onLeaveGroup,
                     )
                 }
@@ -790,6 +805,9 @@ private fun GroupInputBar(
     onMicClick: () -> Unit,
 ) {
     val recordingSeconds = recordingDurationMs / 1000
+    val sendLabel = stringResource(R.string.group_send)
+    val recordLabel = stringResource(if (isRecording) R.string.group_voice_finish else R.string.group_voice_record)
+    val messageLabel = stringResource(R.string.group_message_hint)
     // Phase 2 mockup parity with ChatScreen InputBar — composer sits on
     // SurfaceElevated with a BorderSubtle hairline.
     Column(
@@ -828,7 +846,7 @@ private fun GroupInputBar(
                             drawCircle(color = Danger)
                         }
                         Text(
-                            text = "Recording %d:%02d".format(recordingSeconds / 60, recordingSeconds % 60),
+                            text = stringResource(R.string.group_recording, recordingSeconds / 60, recordingSeconds % 60),
                             color = TextPrimary,
                             fontSize = 14.sp,
                         )
@@ -838,8 +856,8 @@ private fun GroupInputBar(
                 OutlinedTextField(
                     value = text,
                     onValueChange = onTextChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message…", color = TextDim, fontSize = 14.sp) },
+                    modifier = Modifier.weight(1f).semantics { contentDescription = messageLabel },
+                    placeholder = { Text(messageLabel, color = TextDim, fontSize = 14.sp) },
                     singleLine = false,
                     maxLines = 5,
                     colors = OutlinedTextFieldDefaults.colors(
@@ -864,7 +882,8 @@ private fun GroupInputBar(
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(CyanAccent)
-                        .clickable(onClick = onSend),
+                        .clickable(onClick = onSend)
+                        .semantics { contentDescription = sendLabel },
                     contentAlignment = Alignment.Center,
                 ) {
                     Canvas(modifier = Modifier.size(20.dp)) {
@@ -883,7 +902,8 @@ private fun GroupInputBar(
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(if (isRecording) Danger else Surface2)
-                        .clickable(onClick = onMicClick),
+                        .clickable(onClick = onMicClick)
+                        .semantics { contentDescription = recordLabel },
                     contentAlignment = Alignment.Center,
                 ) {
                     PhIconMic(color = if (isRecording) Color.White else TextDim, size = 20.dp)

@@ -39,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.invisibleToUser
 import androidx.compose.ui.semantics.semantics
@@ -49,7 +50,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import android.util.Log
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
+import phantom.android.premium.SubscriptionAccess
 import phantom.android.screens.onboarding.v2.steps.FinaleConfirmationStepV2
 import phantom.android.screens.onboarding.v2.steps.HowStepV2
 import phantom.android.screens.onboarding.v2.steps.IdentityKeyStepV2
@@ -516,6 +519,11 @@ internal fun OnboardingFlowV2Internal(
         if (finalizeHolder.state is OnboardingFinalizeState.InFlight &&
             controller.state is FinalizeState.Idle
         ) {
+            if (!SubscriptionAccess.permits(formState.privacyMode)) {
+                finalizeHolder.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)
+                navigationStep = OnboardingStepV2.Privacy
+                return@LaunchedEffect
+            }
             val outcome = runFinalize(
                 controller = controller,
                 username = formState.username,
@@ -820,7 +828,7 @@ internal fun OnboardingFlowV2Internal(
                     // Commit 4: Ghost Mode tap opens the Pricing sheet
                     // instead of firing a toast. The controller in the
                     // step composable BOTH intercepts the Ghost
-                    // segment tap AND the "Unlock with Phantom Pro"
+                    // segment tap AND the "Preview Phantom Pro"
                     // CTA inside the Ghost tier card — both surfaces
                     // funnel through this callback.
                     onGhostLockClick = {
@@ -972,7 +980,11 @@ internal fun OnboardingFlowV2Internal(
                                     .openMessageChannelSettings(currentContext)
                         }
                     },
-                    onDoneClick = {
+                    onDoneClick = done@{
+                        if (!SubscriptionAccess.permits(formState.privacyMode)) {
+                            navigationStep = OnboardingStepV2.Privacy
+                            return@done
+                        }
                         // C6-a: kick off the atomic finalize.
                         //   1. `finalizeHolder.markInFlight` — single
                         //      write, sealed slot flips to InFlight.
@@ -1041,12 +1053,13 @@ internal fun OnboardingFlowV2Internal(
         // sheet closes before the toast renders (the toast is
         // subscribed via a LaunchedEffect on toastMessage which
         // handles the update on the next frame).
+        val subscriptionUnavailable = stringResource(R.string.pricing_unavailable)
         OnboardingPricingSheetV2(
             visible = pricingSheetVisible,
             onDismiss = { pricingSheetVisible = false },
-            onCtaSelected = { cta ->
+            onCtaSelected = {
                 pricingSheetVisible = false
-                toastMessage = "$cta — coming soon."
+                toastMessage = subscriptionUnavailable
             },
             onFullyDismissed = { pricingSheetPresent = false },
         )
@@ -1142,7 +1155,7 @@ internal fun OnboardingRepairRequiredScreen(onExit: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             androidx.compose.material3.Text(
-                text = "Identity repair required",
+                text = stringResource(R.string.onboarding_repair_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = androidx.compose.ui.text.TextStyle(
                     fontFamily = phantom.android.ui.designv2.DesignV2FontDisplay,
@@ -1154,9 +1167,7 @@ internal fun OnboardingRepairRequiredScreen(onExit: () -> Unit) {
                 Modifier.height(12.dp),
             )
             androidx.compose.material3.Text(
-                text = "Your identity was created on disk but the signing key material " +
-                    "is missing or malformed. This should not happen. Tap Exit onboarding " +
-                    "to close the app; then reinstall to try again.",
+                text = stringResource(R.string.onboarding_repair_body),
                 color = DesignV2Tokens.Colors.TextSecondary,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 style = androidx.compose.ui.text.TextStyle(
@@ -1169,7 +1180,7 @@ internal fun OnboardingRepairRequiredScreen(onExit: () -> Unit) {
                 Modifier.height(24.dp),
             )
             phantom.android.ui.designv2.components.PhantomButton(
-                text = "Exit onboarding",
+                text = stringResource(R.string.onboarding_exit),
                 onClick = onExit,
                 modifier = Modifier.fillMaxWidth(),
             )

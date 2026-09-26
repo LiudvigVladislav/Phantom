@@ -21,17 +21,20 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.BuildConfig
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.screens.onboarding.v2.openMessageChannelSettings
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.transport.PrivacyMode
 
 /**
  * Settings screen — rewritten 2026-05-09 to match
@@ -77,20 +80,24 @@ fun SettingsScreen(
     // requested mode here would announce Ghost while a Direct socket
     // from the previous posture was still up.
     val privacyState by container.privacyModeCoordinator.state.collectAsState()
-    val privacyModeLabel = privacyState.effective.name
+    val privacyModeLabel = when (privacyState.effective) {
+        PrivacyMode.Standard -> stringResource(R.string.settings_privacy_standard)
+        PrivacyMode.Private -> stringResource(R.string.settings_privacy_private)
+        PrivacyMode.Ghost -> stringResource(R.string.settings_privacy_ghost)
+    }
 
     // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
-    var cacheSize by remember { mutableStateOf<String?>(null) }
+    var cacheSizeBytes by remember { mutableStateOf<Long?>(null) }
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            cacheSize = formatByteSize(computeCacheSizeBytes(context))
+        cacheSizeBytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            computeCacheSizeBytes(context)
         }
     }
 
     fun showComingSoon() {
         scope.launch {
             snackbarHostState.currentSnackbarData?.dismiss()
-            snackbarHostState.showSnackbar("Coming soon — stay tuned for updates")
+            snackbarHostState.showSnackbar(context.getString(R.string.settings_coming_soon))
         }
     }
 
@@ -105,7 +112,7 @@ fun SettingsScreen(
                     shape = RoundedCornerShape(12.dp),
                     action = {
                         TextButton(onClick = { data.dismiss() }) {
-                            Text("OK", color = CyanAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text(stringResource(R.string.settings_ok), color = CyanAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     },
                 ) { Text(data.visuals.message, fontSize = 13.sp) }
@@ -128,7 +135,7 @@ fun SettingsScreen(
                     contentAlignment = Alignment.CenterStart,
                 ) {
                     Text(
-                        text = "Settings",
+                        text = stringResource(R.string.settings_title),
                         color = TextPrimary,
                         style = PhantomType.headline,
                     )
@@ -152,103 +159,103 @@ fun SettingsScreen(
                     handle = if (userName.isNotEmpty()) "@$userName" else "",
                     avatar = selfAvatarImage,
                     initials = userName.take(2).uppercase(),
-                    tierBadge = "FREE", // D-18: Pro infrastructure UI visible, no payment yet
+                    tierBadge = stringResource(R.string.settings_free_badge), // D-18: Pro infrastructure UI visible, no payment yet
                     onClick = onProfile,
                 )
             }
 
             // ── 2. Account ───────────────────────────────────────────────
-            item { SettingsGroupHeader("Account") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_account)) }
             item {
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconPerson(color = CyanAccent, size = 16.dp) },
-                        label = "Profile",
+                        label = stringResource(R.string.settings_profile),
                         value = userName,
                         onClick = onProfile,
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconKey(color = CyanAccent, size = 16.dp) },
-                        label = "Username",
+                        label = stringResource(R.string.settings_username),
                         value = if (userName.isNotEmpty()) "@$userName" else "",
                         onClick = { showComingSoon() },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItemWithBadge(
                         icon = { PhIconCreditCard(color = CyanAccent, size = 16.dp) },
-                        label = "Plan",
+                        label = stringResource(R.string.settings_plan),
                         badge = { UpgradeBadge() },
-                        value = "Free",
+                        value = stringResource(R.string.settings_free),
                         onClick = { onNavigate(Screen.Premium) },
                     )
                 }
             }
 
             // ── 3. Privacy & Security ────────────────────────────────────
-            item { SettingsGroupHeader("Privacy & Security") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_privacy_security)) }
             item {
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconShield(color = CyanAccent, size = 16.dp) },
-                        label = "Identity signing",
+                        label = stringResource(R.string.settings_identity_signing),
                         value = "Ed25519",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconEyeOff(color = CyanAccent, size = 16.dp) },
-                        label = "Privacy Mode",
+                        label = stringResource(R.string.settings_privacy_mode),
                         value = privacyModeLabel,
                         onClick = { onNavigate(Screen.PrivacyModeDetail) },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconDoubleCheck(color = CyanAccent, size = 16.dp) },
-                        label = "Read Receipts",
-                        value = if (privacyState.maySendReadReceipts) "On" else "Off",
+                        label = stringResource(R.string.settings_read_receipts),
+                        value = stringResource(if (privacyState.maySendReadReceipts) R.string.settings_on else R.string.settings_off),
                         onClick = { onNavigate(Screen.PrivacyModeDetail) },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconClock(color = CyanAccent, size = 16.dp) },
-                        label = "Last Seen",
-                        value = "No separate setting",
+                        label = stringResource(R.string.settings_last_seen),
+                        value = stringResource(R.string.settings_no_separate_setting),
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconCamera(color = CyanAccent, size = 16.dp) },
-                        label = "Screenshot Protection",
-                        value = "On this device",
+                        label = stringResource(R.string.settings_screenshot_protection),
+                        value = stringResource(R.string.settings_on_this_device),
                     )
                 }
             }
 
             // ── 4. Notifications ─────────────────────────────────────────
-            item { SettingsGroupHeader("Notifications") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_notifications)) }
             item {
                 SettingsGroupCard {
                     MessageAlertsSetting(onError = {
                         scope.launch {
-                            snackbarHostState.showSnackbar("Could not update notification settings")
+                            snackbarHostState.showSnackbar(context.getString(R.string.settings_notification_error))
                         }
                     })
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
-                        label = "Call Alerts",
-                        value = "No separate alert",
+                        label = stringResource(R.string.settings_call_alerts),
+                        value = stringResource(R.string.settings_no_separate_alert),
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
-                        label = "Message sound",
-                        value = "System settings",
+                        label = stringResource(R.string.settings_message_sound),
+                        value = stringResource(R.string.settings_system_settings),
                         onClick = {
                             try {
                                 openMessageChannelSettings(context)
                             } catch (_: Exception) {
                                 scope.launch {
-                                    snackbarHostState.showSnackbar("Could not open message sound settings")
+                                    snackbarHostState.showSnackbar(context.getString(R.string.settings_sound_error))
                                 }
                             }
                         },
@@ -257,21 +264,21 @@ fun SettingsScreen(
             }
 
             // ── 5. Appearance ────────────────────────────────────────────
-            item { SettingsGroupHeader("Appearance") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_appearance)) }
             item {
                 SettingsGroupCard {
                     SettingsRowItemWithBadge(
                         icon = { PhIconSun(color = CyanAccent, size = 16.dp) },
-                        label = "Theme",
+                        label = stringResource(R.string.settings_theme),
                         badge = { LockedBadge() },
-                        value = "Dark",
+                        value = stringResource(R.string.settings_dark),
                         onClick = { showComingSoon() },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
-                        label = "Language",
-                        value = "English",
+                        label = stringResource(R.string.settings_language),
+                        value = stringResource(R.string.settings_english),
                         onClick = { showComingSoon() },
                     )
                 }
@@ -279,18 +286,18 @@ fun SettingsScreen(
 
             // ── 6. Advanced ──────────────────────────────────────────────
             // D-17: Developer Mode toggle removed.
-            item { SettingsGroupHeader("Advanced") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_advanced)) }
             item {
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
-                        label = "Local storage",
-                        value = cacheSize ?: "…",
+                        label = stringResource(R.string.settings_local_storage),
+                        value = cacheSizeBytes?.let { android.text.format.Formatter.formatShortFileSize(context, it) } ?: "…",
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconDownload(color = CyanAccent, size = 16.dp) },
-                        label = "Export Data",
+                        label = stringResource(R.string.settings_export_data),
                         onClick = { showComingSoon() },
                     )
                 }
@@ -302,7 +309,7 @@ fun SettingsScreen(
             // across 1700 / 2200 / 2300 / 2400 / 2600. Production builds
             // strip this section entirely via `BuildConfig.DEBUG`.
             if (phantom.android.diagnostics.ChunkSizeProbe.isProbeAvailable) {
-                item { SettingsGroupHeader("Diagnostics") }
+                item { SettingsGroupHeader(stringResource(R.string.settings_diagnostics)) }
                 item {
                     SettingsGroupCard {
                         ChunkSizeProbeRow(context)
@@ -311,12 +318,12 @@ fun SettingsScreen(
             }
 
             // ── 7. About ─────────────────────────────────────────────────
-            item { SettingsGroupHeader("About") }
+            item { SettingsGroupHeader(stringResource(R.string.settings_about)) }
             item {
                 SettingsGroupCard {
                     SettingsRowItem(
                         icon = { PhIconInfo(color = CyanAccent, size = 16.dp) },
-                        label = "Version",
+                        label = stringResource(R.string.settings_version),
                         value = BuildConfig.VERSION_NAME,
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
@@ -326,15 +333,15 @@ fun SettingsScreen(
                         // renders cleanly at 16dp instead of as overlapping
                         // rings (the old Lucide-arc path did).
                         icon = { PhIconMessageCircle(color = CyanAccent, size = 16.dp) },
-                        label = "Send Feedback",
+                        label = stringResource(R.string.settings_send_feedback),
                         onClick = {
-                            context.openMailto("support@phntm.pro", subject = "PHANTOM feedback")
+                            context.openMailto("support@phntm.pro", subject = context.getString(R.string.settings_feedback_subject))
                         },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconFileText(color = CyanAccent, size = 16.dp) },
-                        label = "Privacy Policy",
+                        label = stringResource(R.string.settings_privacy_policy),
                         onClick = {
                             context.openUrl("https://phntm.pro/privacy")
                         },
@@ -538,7 +545,7 @@ private fun UpgradeBadge() {
             .padding(horizontal = 6.dp, vertical = 2.dp),
     ) {
         Text(
-            text = "UPGRADE",
+            text = stringResource(R.string.settings_upgrade),
             color = BgDeep,
             fontSize = 8.sp,
             fontFamily = PhantomFontMono,
@@ -558,7 +565,7 @@ private fun LockedBadge() {
             .padding(horizontal = 6.dp, vertical = 2.dp),
     ) {
         Text(
-            text = "LOCKED",
+            text = stringResource(R.string.settings_locked),
             color = TextDim,
             fontSize = 8.sp,
             fontFamily = PhantomFontMono,
@@ -605,12 +612,6 @@ private fun computeCacheSizeBytes(context: android.content.Context): Long {
     return cache + db
 }
 
-private fun formatByteSize(bytes: Long): String {
-    if (bytes < 1_024) return "$bytes B"
-    if (bytes < 1_024 * 1_024) return "${bytes / 1_024} KB"
-    return "%.1f MB".format(bytes / 1_048_576.0)
-}
-
 /**
  * PR-M2f.1 — debug-only row that lets the operator pick a raw-ciphertext
  * chunk size from the [phantom.android.diagnostics.ChunkSizeProbe.CANDIDATES]
@@ -626,7 +627,7 @@ private fun ChunkSizeProbeRow(context: android.content.Context) {
     Box {
         SettingsRowItem(
             icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
-            label = "Media chunk size",
+            label = stringResource(R.string.settings_media_chunk_size),
             value = "$selected B",
             onClick = { expanded = true },
         )
@@ -639,7 +640,7 @@ private fun ChunkSizeProbeRow(context: android.content.Context) {
                 DropdownMenuItem(
                     text = {
                         Text(
-                            text = "$bytes B" + if (bytes == 1700) " (baseline)" else "",
+                            text = "$bytes B" + if (bytes == 1700) " (${stringResource(R.string.settings_baseline)})" else "",
                             color = if (bytes == selected) CyanAccent else TextPrimary,
                             fontSize = 14.sp,
                         )

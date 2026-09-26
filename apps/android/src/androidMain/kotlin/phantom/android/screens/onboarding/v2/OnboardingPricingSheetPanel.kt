@@ -47,6 +47,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -80,7 +81,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *   - [TierList]        — scrollable stack of `PricingTierCard`s
  *                          (round-3 §P1-3 `Int.MAX_VALUE` initial
  *                          scroll for the showcase golden).
- *   - [Footer]          — "Cancel any time" bottom text.
+ *   - [Footer]          — pricing-preview availability note.
  */
 
 @Composable
@@ -232,6 +233,15 @@ internal fun Panel(
                 reboundScope = reboundScope,
             )
             HeaderRow(onDismiss = onDismiss)
+            Text(
+                text = stringResource(R.string.pricing_sheet_preview),
+                color = DesignV2Tokens.Colors.TextTertiary,
+                style = TextStyle(
+                    fontFamily = DesignV2FontBody,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                ),
+            )
             Spacer(Modifier.height(14.dp))
             TierList(
                 onCtaSelected = onCtaSelected,
@@ -261,7 +271,7 @@ private fun HeaderRow(onDismiss: () -> Unit) {
         // word "PHANTOM PREMIUM" breaks naturally between words.
         // User's fontScale respected — no cap.
         Text(
-            text = "PHANTOM PREMIUM",
+            text = stringResource(R.string.pricing_sheet_title),
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -288,7 +298,7 @@ private fun CloseXButton(onClick: () -> Unit) {
             .background(Color(0x0DFFFFFF)) // rgba(255,255,255,.05)
             .clickable(
                 role = Role.Button,
-                onClickLabel = "Close pricing",
+                onClickLabel = stringResource(R.string.pricing_sheet_close),
                 onClick = onClick,
             ),
         contentAlignment = Alignment.Center,
@@ -343,9 +353,10 @@ private fun ColumnScope.TierList(
             .verticalScroll(scrollState),
     ) {
         PRICING_TIERS.forEach { tier ->
+            val cta = stringResource(tier.ctaRes)
             PricingTierCard(
                 tier = tier,
-                onCtaClick = { onCtaSelected(tier.cta) },
+                onCtaClick = { onCtaSelected(cta) },
             )
             Spacer(Modifier.height(14.dp))
         }
@@ -354,10 +365,8 @@ private fun ColumnScope.TierList(
 
 @Composable
 private fun Footer() {
-    // "Cancel any time. No data sold, ever." per handoff — small
-    // centered text under the tier stack.
     Text(
-        text = "Cancel any time. No data sold, ever.",
+        text = stringResource(R.string.pricing_sheet_footer),
         color = DesignV2Tokens.Colors.TextQuaternary,
         style = TextStyle(
             fontFamily = DesignV2FontBody,

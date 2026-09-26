@@ -6,6 +6,7 @@ package phantom.android
 import android.Manifest
 import android.app.Application
 import android.app.NotificationManager
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
@@ -18,9 +19,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.locale.AppLanguageStore
 import phantom.android.notifications.PhantomNotificationManager
 
 class PhantomApplication : Application() {
+
+    override fun attachBaseContext(base: Context) {
+        super.attachBaseContext(AppLanguageStore.localizedBaseContext(base))
+    }
 
     /** Completes once libsodium is initialised and AppContainer is ready. */
     val ready = CompletableDeferred<Unit>()
@@ -32,6 +38,7 @@ class PhantomApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AppLanguageStore.migratePre33Override(this)
         // PR-RECV-DIAG1 v1.1 — confirm Application process actually
         // started on Tecno. Test #84 showed only PREKEY_TRACE on
         // Tecno-side, which could mean: (a) the app's Application

@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,9 +32,21 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.R
+import phantom.android.screens.verify.verificationKeyIsValid
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+
+internal fun contactKeyPreview(publicKeyHex: String): String? {
+    if (!verificationKeyIsValid(publicKeyHex)) {
+        return null
+    }
+    return publicKeyHex.chunked(4).take(8).joinToString("  ") + "  …"
+}
+
+internal fun contactKeyIsVerified(publicKeyHex: String, isVerified: Boolean, keyChangedAt: Long?): Boolean =
+    contactKeyPreview(publicKeyHex) != null && isVerified && keyChangedAt == null
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -78,16 +91,16 @@ fun ContactProfileScreen(
     var disappearingTimer by remember { mutableStateOf(0L) }
 
     val timerOptions = listOf(
-        0L to "Off",
-        30L to "30 seconds",
-        300L to "5 minutes",
-        3600L to "1 hour",
-        86400L to "1 day",
-        604800L to "1 week",
+        0L to stringResource(R.string.contact_profile_timer_off),
+        30L to stringResource(R.string.contact_profile_timer_30_seconds),
+        300L to stringResource(R.string.contact_profile_timer_5_minutes),
+        3600L to stringResource(R.string.contact_profile_timer_1_hour),
+        86400L to stringResource(R.string.contact_profile_timer_1_day),
+        604800L to stringResource(R.string.contact_profile_timer_1_week),
     )
 
     fun timerLabel(secs: Long): String =
-        timerOptions.firstOrNull { it.first == secs }?.second ?: "Off"
+        timerOptions.firstOrNull { it.first == secs }?.second ?: timerOptions.first().second
 
     LaunchedEffect(conversationId) {
         val conv = container.conversationRepo.getConversation(conversationId)
@@ -107,10 +120,10 @@ fun ContactProfileScreen(
         AlertDialog(
             onDismissRequest = { showDeleteDialog = false },
             containerColor = Surface,
-            title = { Text("Delete conversation?", color = TextPrimary) },
+            title = { Text(stringResource(R.string.contact_profile_delete_conversation_title), color = TextPrimary) },
             text = {
                 Text(
-                    "This removes all messages locally. Contact won't be notified.",
+                    stringResource(R.string.contact_profile_delete_explanation),
                     color = TextDim, fontSize = 14.sp,
                 )
             },
@@ -122,10 +135,10 @@ fun ContactProfileScreen(
                         container.messagingService?.removeConversationMutex(conversationId)
                         onDeleteConversation()
                     }
-                }) { Text("Delete", color = Danger) }
+                }) { Text(stringResource(R.string.contact_profile_delete), color = Danger) }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteDialog = false }) { Text("Cancel", color = TextDim) }
+                TextButton(onClick = { showDeleteDialog = false }) { Text(stringResource(R.string.contact_profile_cancel), color = TextDim) }
             },
         )
     }
@@ -134,10 +147,10 @@ fun ContactProfileScreen(
         AlertDialog(
             onDismissRequest = { showBlockDialog = false },
             containerColor = Surface,
-            title = { Text("Block @$theirUsername?", color = TextPrimary) },
+            title = { Text(stringResource(R.string.contact_profile_block_title, theirUsername), color = TextPrimary) },
             text = {
                 Text(
-                    "You will no longer receive messages from them.",
+                    stringResource(R.string.contact_profile_block_explanation),
                     color = TextDim, fontSize = 14.sp,
                 )
             },
@@ -148,10 +161,10 @@ fun ContactProfileScreen(
                         container.conversationRepo.blockConversation(conversationId)
                         onBack()
                     }
-                }) { Text("Block", color = Danger) }
+                }) { Text(stringResource(R.string.contact_profile_block), color = Danger) }
             },
             dismissButton = {
-                TextButton(onClick = { showBlockDialog = false }) { Text("Cancel", color = TextDim) }
+                TextButton(onClick = { showBlockDialog = false }) { Text(stringResource(R.string.contact_profile_cancel), color = TextDim) }
             },
         )
     }
@@ -161,20 +174,20 @@ fun ContactProfileScreen(
     if (showReportSheet) {
         var selectedCategory by remember { mutableStateOf<String?>(null) }
         val categories = listOf(
-            "spam" to "Spam or unwanted messages",
-            "harassment" to "Harassment or threats",
-            "inappropriate" to "Inappropriate content",
-            "csam" to "Child safety concern",
-            "other" to "Other",
+            "spam" to stringResource(R.string.contact_profile_report_spam),
+            "harassment" to stringResource(R.string.contact_profile_report_harassment),
+            "inappropriate" to stringResource(R.string.contact_profile_report_inappropriate),
+            "csam" to stringResource(R.string.contact_profile_report_child_safety),
+            "other" to stringResource(R.string.contact_profile_report_other),
         )
         AlertDialog(
             onDismissRequest = { showReportSheet = false },
             containerColor = Surface,
-            title = { Text("Report @$theirUsername", color = TextPrimary) },
+            title = { Text(stringResource(R.string.contact_profile_report_title, theirUsername), color = TextPrimary) },
             text = {
                 Column {
                     Text(
-                        "Select the reason. Reports are reviewed by Willen LLC; PHANTOM does not share the report content with the reported user.",
+                        stringResource(R.string.contact_profile_report_explanation),
                         color = TextDim,
                         fontSize = 13.sp,
                         lineHeight = 18.sp,
@@ -221,18 +234,17 @@ fun ContactProfileScreen(
                                 when (outcome) {
                                     is phantom.android.net.GatedAppHttp.Outcome.Ok ->
                                         if (outcome.value in 200..299) {
-                                            "Report submitted — thanks for helping keep PHANTOM safe."
+                                            context.getString(R.string.contact_profile_report_submitted)
                                         } else {
-                                            "Could not send report. Try again when online."
+                                            context.getString(R.string.contact_profile_report_failed)
                                         }
                                     phantom.android.net.GatedAppHttp.Outcome.BlockedByPrivacyMode ->
-                                        "Reporting needs a direct connection. " +
-                                            "Switch to Standard to send this report."
+                                        context.getString(R.string.contact_profile_report_requires_direct)
                                     is phantom.android.net.GatedAppHttp.Outcome
                                         .RefusedDestination ->
-                                        "Could not send report. Try again when online."
+                                        context.getString(R.string.contact_profile_report_failed)
                                     is phantom.android.net.GatedAppHttp.Outcome.Failed ->
-                                        "Could not send report. Try again when online."
+                                        context.getString(R.string.contact_profile_report_failed)
                                 },
                                 android.widget.Toast.LENGTH_SHORT,
                             ).show()
@@ -240,14 +252,14 @@ fun ContactProfileScreen(
                     },
                 ) {
                     Text(
-                        "Submit",
+                        stringResource(R.string.contact_profile_report_submit),
                         color = if (selectedCategory != null) Danger else TextDim,
                     )
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showReportSheet = false }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.contact_profile_cancel), color = TextDim)
                 }
             },
         )
@@ -279,7 +291,7 @@ fun ContactProfileScreen(
 
                     // Title — overline mono 11sp 0.08em tracked.
                     Text(
-                        text = "CONTACT",
+                        text = stringResource(R.string.contact_profile_title),
                         modifier = Modifier.weight(1f),
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         color = TextDim,
@@ -303,11 +315,11 @@ fun ContactProfileScreen(
                             containerColor = Surface2,
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                                text = { Text(stringResource(R.string.contact_profile_report), color = TextPrimary, fontSize = 14.sp) },
                                 onClick = { showMoreMenu = false; showReportSheet = true },
                             )
                             DropdownMenuItem(
-                                text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                                text = { Text(stringResource(R.string.contact_profile_block), color = Danger, fontSize = 14.sp) },
                                 onClick = { showMoreMenu = false; showBlockDialog = true },
                             )
                         }
@@ -337,13 +349,13 @@ fun ContactProfileScreen(
                     PhIconShield(color = Danger, size = 18.dp)
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Safety number changed",
+                            text = stringResource(R.string.contact_profile_safety_changed),
                             color = Danger,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
                         Text(
-                            text = "This contact may have reinstalled. Tap to re-verify.",
+                            text = stringResource(R.string.contact_profile_safety_changed_explanation),
                             color = Danger.copy(alpha = 0.8f),
                             fontSize = 11.sp,
                             lineHeight = 16.sp,
@@ -354,21 +366,7 @@ fun ContactProfileScreen(
 
             // ── Hero card ─────────────────────────────────────────────────────
             ContactCard(topPad = 24.dp, bottomPad = 20.dp) {
-                Box(contentAlignment = Alignment.Center) {
-                    GradientAvatar(name = theirUsername, size = 96.dp)
-                    // Online dot
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .offset(x = (-4).dp, y = (-4).dp)
-                            .size(18.dp)
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(Surface)
-                            .padding(3.dp)
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(Success),
-                    )
-                }
+                GradientAvatar(name = theirUsername, size = 96.dp)
 
                 Spacer(Modifier.height(14.dp))
 
@@ -379,15 +377,6 @@ fun ContactProfileScreen(
                     fontWeight = FontWeight.SemiBold,
                     letterSpacing = (-0.3).sp,
                 )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "Last seen recently",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 0.4.sp,
-                )
-
                 Spacer(Modifier.height(18.dp))
 
                 Row(
@@ -421,7 +410,7 @@ fun ContactProfileScreen(
                                 }
                                 drawPath(path, BgDeep, style = Stroke(1.6.dp.toPx(), cap = StrokeCap.Round))
                             }
-                            Text("Message", color = BgDeep, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            Text(stringResource(R.string.contact_profile_message), color = BgDeep, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
 
@@ -446,7 +435,7 @@ fun ContactProfileScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
                                 PhIconCheck(color = Success, size = 16.dp)
-                                Text("Unblock", color = Success, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                Text(stringResource(R.string.contact_profile_unblock), color = Success, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     } else {
@@ -469,7 +458,7 @@ fun ContactProfileScreen(
                                     drawCircle(Danger, radius = r, style = Stroke(sw))
                                     drawLine(Danger, androidx.compose.ui.geometry.Offset(size.width * 0.2f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.8f, size.height * 0.8f), sw, StrokeCap.Round)
                                 }
-                                Text("Block", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                Text(stringResource(R.string.contact_profile_block), color = Danger, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
@@ -477,12 +466,19 @@ fun ContactProfileScreen(
             }
 
             // ── Public key card ───────────────────────────────────────────────
+            val publicKeyPreview = contactKeyPreview(conversation.theirPublicKeyHex)
+            val keyVerified = contactKeyIsVerified(
+                conversation.theirPublicKeyHex,
+                isVerified,
+                conversation.identityKeyChangedAt,
+            )
             ContactCard {
-                CContactSectionHeader(label = "Public Key", icon = {
+                CContactSectionHeader(label = stringResource(R.string.contact_profile_public_key_heading), icon = {
                     Canvas(Modifier.size(12.dp)) {
                         val r = size.minDimension / 2f - 0.5.dp.toPx()
-                        drawCircle(Success, radius = r * 0.55f)
-                        drawCircle(Success, radius = r, style = Stroke(1.dp.toPx()))
+                        val tint = if (keyVerified) Success else TextDim
+                        drawCircle(tint, radius = r * 0.55f)
+                        drawCircle(tint, radius = r, style = Stroke(1.dp.toPx()))
                     }
                 })
 
@@ -500,7 +496,7 @@ fun ContactProfileScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             Text(
-                                "ed25519",
+                                stringResource(R.string.contact_profile_x25519),
                                 color = CyanAccent,
                                 fontSize = 9.sp,
                                 fontFamily = PhantomFontMono,
@@ -508,7 +504,7 @@ fun ContactProfileScreen(
                                 fontWeight = FontWeight.SemiBold,
                             )
                             Text(
-                                "verified · ${java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date())}",
+                                stringResource(if (keyVerified) R.string.contact_profile_verified else R.string.contact_profile_not_verified),
                                 color = TextDim,
                                 fontSize = 9.sp,
                                 fontFamily = PhantomFontMono,
@@ -516,13 +512,8 @@ fun ContactProfileScreen(
                             )
                         }
                         Spacer(Modifier.height(6.dp))
-                        val keyPreview = if (conversation.theirPublicKeyHex.isNotEmpty()) {
-                            conversation.theirPublicKeyHex.chunked(4).take(8).joinToString("  ") + "  …"
-                        } else {
-                            "9C3F  4A2B  81E7  D05C  2F1A  B6E4  77D9  …"
-                        }
                         Text(
-                            text = keyPreview,
+                            text = publicKeyPreview ?: stringResource(R.string.contact_profile_key_unavailable),
                             color = TextPrimary,
                             fontSize = 12.sp,
                             fontFamily = PhantomFontMono,
@@ -533,7 +524,7 @@ fun ContactProfileScreen(
                 }
 
                 // Copy key row
-                CKeyRow(
+                if (publicKeyPreview != null) CKeyRow(
                     icon = {
                         Canvas(Modifier.size(14.dp)) {
                             val sw = 1.4.dp.toPx()
@@ -542,11 +533,11 @@ fun ContactProfileScreen(
                             drawRoundRect(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(0f, size.height * 0.28f), size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.72f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
                         }
                     },
-                    label = "Copy key",
-                    value = "32-byte fingerprint",
+                    label = stringResource(R.string.contact_profile_copy_key),
+                    value = stringResource(R.string.contact_profile_encryption_key),
                     right = {
                         Text(
-                            text = if (keyCopied) "Copied" else "Copy",
+                            text = stringResource(if (keyCopied) R.string.contact_profile_copied else R.string.contact_profile_copy),
                             color = if (keyCopied) Success else CyanAccent,
                             fontSize = 10.sp,
                             fontFamily = PhantomFontMono,
@@ -554,9 +545,8 @@ fun ContactProfileScreen(
                         )
                     },
                     onClick = {
-                        val key = conversation.theirPublicKeyHex.ifEmpty { "ed25519:placeholder" }
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("key", key))
+                        clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.contact_profile_clipboard_key), conversation.theirPublicKeyHex))
                         keyCopied = true
                         scope.launch { delay(2000); keyCopied = false }
                     },
@@ -565,7 +555,7 @@ fun ContactProfileScreen(
                 // Verify row
                 CKeyRow(
                     icon = {
-                        if (isVerified) {
+                        if (keyVerified) {
                             PhIconShieldCheck(color = Success, size = 16.dp)
                         } else {
                             Canvas(Modifier.size(16.dp)) {
@@ -578,23 +568,31 @@ fun ContactProfileScreen(
                             }
                         }
                     },
-                    label = "Safety number",
-                    value = if (isVerified) "Verified" else "Tap to verify",
+                    label = stringResource(R.string.contact_profile_safety_number),
+                    value = when {
+                        publicKeyPreview == null -> stringResource(R.string.contact_profile_key_unavailable)
+                        keyVerified -> stringResource(R.string.contact_profile_verified)
+                        else -> stringResource(R.string.contact_profile_tap_to_verify)
+                    },
                     right = {
-                        Canvas(Modifier.size(14.dp)) {
-                            val sw = 1.4.dp.toPx()
-                            val tint = if (isVerified) Success else TextDim
-                            drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
-                            drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+                        if (publicKeyPreview != null) {
+                            Canvas(Modifier.size(14.dp)) {
+                                val sw = 1.4.dp.toPx()
+                                val tint = if (keyVerified) Success else TextDim
+                                drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.2f), androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), sw, StrokeCap.Round)
+                                drawLine(tint, androidx.compose.ui.geometry.Offset(size.width * 0.75f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.8f), sw, StrokeCap.Round)
+                            }
                         }
                     },
-                    onClick = { if (onVerify != null) onVerify() else showVerifySheet = true },
+                    onClick = if (publicKeyPreview != null) {
+                        { if (onVerify != null) onVerify() else showVerifySheet = true }
+                    } else null,
                 )
             }
 
             // ── Notes card ────────────────────────────────────────────────────
             ContactCard {
-                CContactSectionHeader(label = "Notes", icon = {
+                CContactSectionHeader(label = stringResource(R.string.contact_profile_notes), icon = {
                     Canvas(Modifier.size(12.dp)) {
                         val sw = 1.3.dp.toPx()
                         val st = Stroke(sw, cap = StrokeCap.Round)
@@ -610,7 +608,7 @@ fun ContactProfileScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .defaultMinSize(minHeight = 76.dp),
-                    placeholder = { Text("Add private notes about this contact…", color = TextDim, fontSize = 14.sp) },
+                    placeholder = { Text(stringResource(R.string.contact_profile_notes_hint), color = TextDim, fontSize = 14.sp) },
                     minLines = 3,
                     maxLines = 6,
                     colors = OutlinedTextFieldDefaults.colors(
@@ -642,7 +640,7 @@ fun ContactProfileScreen(
                             },
                         contentAlignment = Alignment.Center,
                     ) {
-                        Text("Save note", color = BgDeep, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(stringResource(R.string.contact_profile_save_note), color = BgDeep, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
 
@@ -656,7 +654,7 @@ fun ContactProfileScreen(
                         drawCircle(Success, radius = size.minDimension * 0.2f)
                     }
                     Text(
-                        "Encrypted · stored locally only",
+                        stringResource(R.string.contact_profile_notes_storage),
                         color = TextDim,
                         fontSize = 9.sp,
                         fontFamily = PhantomFontMono,
@@ -685,45 +683,10 @@ fun ContactProfileScreen(
                                 drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.6f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.9f), sw, StrokeCap.Round)
                             }
                         },
-                        label = "Disappearing messages",
+                        label = stringResource(R.string.contact_profile_disappearing_messages),
                         value = timerLabel(disappearingTimer),
                         right = { ChevronIcon() },
                         onClick = { showTimerSheet = true },
-                    )
-                    CKeyRow(
-                        icon = {
-                            Canvas(Modifier.size(16.dp)) {
-                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
-                                val path = androidx.compose.ui.graphics.Path().apply {
-                                    moveTo(size.width * 0.5f, size.height * 0.08f)
-                                    cubicTo(size.width * 0.2f, size.height * 0.08f, size.width * 0.08f, size.height * 0.35f, size.width * 0.08f, size.height * 0.58f)
-                                    cubicTo(size.width * 0.08f, size.height * 0.75f, size.width * 0.15f, size.height * 0.82f, size.width * 0.5f, size.height * 0.85f)
-                                    cubicTo(size.width * 0.85f, size.height * 0.82f, size.width * 0.92f, size.height * 0.75f, size.width * 0.92f, size.height * 0.58f)
-                                    cubicTo(size.width * 0.92f, size.height * 0.35f, size.width * 0.8f, size.height * 0.08f, size.width * 0.5f, size.height * 0.08f)
-                                    close()
-                                }
-                                drawPath(path, CyanAccent, style = st)
-                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.35f, size.height * 0.88f), androidx.compose.ui.geometry.Offset(size.width * 0.65f, size.height * 0.88f), sw, StrokeCap.Round)
-                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.88f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.98f), sw, StrokeCap.Round)
-                            }
-                        },
-                        label = "Notifications",
-                        value = "Default · with preview",
-                        right = { ChevronIcon() },
-                    )
-                    CKeyRow(
-                        icon = {
-                            Canvas(Modifier.size(16.dp)) {
-                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
-                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.1f, size.height * 0.5f), androidx.compose.ui.geometry.Offset(size.width * 0.9f, size.height * 0.5f), sw, StrokeCap.Round)
-                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.15f), androidx.compose.ui.geometry.Offset(size.width * 0.5f, size.height * 0.85f), sw, StrokeCap.Round)
-                                drawCircle(CyanAccent, radius = size.minDimension / 2f - 0.5.dp.toPx(), style = st)
-                            }
-                        },
-                        label = "Media auto-download",
-                        value = "Wi-Fi only",
-                        right = { ChevronIcon() },
-                        showTopDivider = false,
                     )
                 }
             }
@@ -755,12 +718,12 @@ fun ContactProfileScreen(
                             drawRoundRect(Danger, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.3f, size.height * 0.28f), size = androidx.compose.ui.geometry.Size(size.width * 0.4f, size.height * 0.65f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
                             drawLine(Danger, androidx.compose.ui.geometry.Offset(size.width * 0.38f, size.height * 0.12f), androidx.compose.ui.geometry.Offset(size.width * 0.62f, size.height * 0.12f), sw, StrokeCap.Round)
                         }
-                        Text("Delete conversation", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(stringResource(R.string.contact_profile_delete_conversation), color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                     }
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    text = "This removes all messages locally. Contact won't be notified.",
+                    text = stringResource(R.string.contact_profile_delete_explanation),
                     color = TextDim,
                     fontSize = 11.5.sp,
                     lineHeight = 16.sp,
@@ -775,13 +738,15 @@ fun ContactProfileScreen(
     // ── Safety-number verification sheet ─────────────────────────────────────
     // PHANTOM_FULL_COMPOSE §12: two FingerprintBlocks stacked (yours + theirs)
     // with an axis bridge between them. Each block shows 8 groups of 4 hex
-    // chars — the first 32 hex chars of the ED25519 public key.
+    // chars from the X25519 public key used by the conversation.
     if (showVerifySheet) {
         val theirPublicKeyHex = conversation.theirPublicKeyHex
 
         val myPubKeyHex by produceState(initialValue = "") {
             value = container.identityRepo.loadIdentity()?.publicKeyHex ?: ""
         }
+        val canCompareKeys = contactKeyPreview(myPubKeyHex) != null &&
+            contactKeyPreview(theirPublicKeyHex) != null
 
         // Tri-state machine per FULL_COMPOSE §12: Compare (neutral) →
         // Verified (success-tinted) | Mismatch (danger-tinted, opacity 0.70).
@@ -808,9 +773,9 @@ fun ContactProfileScreen(
                     }
                     Text(
                         text = when (verifyState) {
-                            VerifyState.Compare -> "VERIFY @${conversation.theirUsername.uppercase()}"
-                            VerifyState.Verified -> "VERIFIED · @${conversation.theirUsername.uppercase()}"
-                            VerifyState.Mismatch -> "MISMATCH · @${conversation.theirUsername.uppercase()}"
+                            VerifyState.Compare -> stringResource(R.string.contact_profile_verify_heading, conversation.theirUsername.uppercase(java.util.Locale.ROOT))
+                            VerifyState.Verified -> stringResource(R.string.contact_profile_verified_heading, conversation.theirUsername.uppercase(java.util.Locale.ROOT))
+                            VerifyState.Mismatch -> stringResource(R.string.contact_profile_mismatch_heading, conversation.theirUsername.uppercase(java.util.Locale.ROOT))
                         },
                         color = when (verifyState) {
                             VerifyState.Verified -> Success
@@ -825,9 +790,9 @@ fun ContactProfileScreen(
 
                 Text(
                     text = when (verifyState) {
-                        VerifyState.Compare -> "Match all 8 groups with @${conversation.theirUsername} in person or on a trusted call."
-                        VerifyState.Verified -> "Identity confirmed. Future messages will arrive on this key only — you'll be warned if it changes."
-                        VerifyState.Mismatch -> "These keys do not match. Do not trust this conversation until you re-verify in person."
+                        VerifyState.Compare -> stringResource(R.string.contact_profile_verify_instructions, conversation.theirUsername)
+                        VerifyState.Verified -> stringResource(R.string.contact_profile_verified_explanation)
+                        VerifyState.Mismatch -> stringResource(R.string.contact_profile_mismatch_explanation)
                     },
                     color = TextDim,
                     fontSize = 13.sp,
@@ -838,8 +803,8 @@ fun ContactProfileScreen(
                 Spacer(Modifier.height(4.dp))
 
                 FingerprintBlock(
-                    ownerLabel = "Your key",
-                    name = "You",
+                    ownerLabel = stringResource(R.string.contact_profile_your_key),
+                    name = stringResource(R.string.contact_profile_you),
                     publicKeyHex = myPubKeyHex,
                     accent = VerifyState.Compare,
                 )
@@ -863,9 +828,9 @@ fun ContactProfileScreen(
                     )
                     Text(
                         text = when (verifyState) {
-                            VerifyState.Compare -> "Compare ↕"
-                            VerifyState.Verified -> "Verified ✓"
-                            VerifyState.Mismatch -> "Mismatch ×"
+                            VerifyState.Compare -> stringResource(R.string.contact_profile_compare)
+                            VerifyState.Verified -> stringResource(R.string.contact_profile_verified_mark)
+                            VerifyState.Mismatch -> stringResource(R.string.contact_profile_mismatch_mark)
                         },
                         color = when (verifyState) {
                             VerifyState.Verified -> Success
@@ -885,7 +850,7 @@ fun ContactProfileScreen(
                 }
 
                 FingerprintBlock(
-                    ownerLabel = "@${conversation.theirUsername}'s key",
+                    ownerLabel = stringResource(R.string.contact_profile_peers_key, conversation.theirUsername),
                     name = conversation.theirUsername,
                     publicKeyHex = theirPublicKeyHex,
                     accent = verifyState,
@@ -910,7 +875,7 @@ fun ContactProfileScreen(
                             .padding(horizontal = 14.dp, vertical = 12.dp),
                     ) {
                         Text(
-                            text = "OR READ ALOUD · 60 DIGITS",
+                            text = stringResource(R.string.contact_profile_read_aloud),
                             color = TextDim,
                             fontSize = 9.sp,
                             fontFamily = PhantomFontMono,
@@ -952,6 +917,7 @@ fun ContactProfileScreen(
                                     verifyState = VerifyState.Verified
                                 }
                             },
+                            enabled = canCompareKeys,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = Color.Transparent,
                                 contentColor = Success,
@@ -961,7 +927,7 @@ fun ContactProfileScreen(
                             modifier = Modifier.fillMaxWidth().height(48.dp),
                         ) {
                             Text(
-                                text = "Keys match — Verified",
+                                text = stringResource(R.string.contact_profile_keys_match),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Medium,
                             )
@@ -977,7 +943,7 @@ fun ContactProfileScreen(
                             modifier = Modifier.fillMaxWidth().height(44.dp),
                         ) {
                             Text(
-                                text = "Something doesn't match",
+                                text = stringResource(R.string.contact_profile_keys_differ),
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Medium,
                             )
@@ -992,7 +958,7 @@ fun ContactProfileScreen(
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth().height(48.dp),
                     ) {
-                        Text("Back to chat", fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(stringResource(R.string.contact_profile_back_to_chat), fontSize = 14.sp, fontWeight = FontWeight.Medium)
                     }
                     VerifyState.Mismatch -> Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1008,7 +974,7 @@ fun ContactProfileScreen(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.weight(1f).height(46.dp),
                         ) {
-                            Text("Go back", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text(stringResource(R.string.contact_profile_go_back), fontSize = 13.sp, fontWeight = FontWeight.Medium)
                         }
                         Button(
                             onClick = {
@@ -1023,7 +989,7 @@ fun ContactProfileScreen(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier.weight(1f).height(46.dp),
                         ) {
-                            Text("Report", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text(stringResource(R.string.contact_profile_report), fontSize = 13.sp, fontWeight = FontWeight.Medium)
                         }
                     }
                 }
@@ -1043,7 +1009,7 @@ fun ContactProfileScreen(
                     .padding(bottom = 32.dp),
             ) {
                 Text(
-                    text = "DISAPPEARING MESSAGES",
+                    text = stringResource(R.string.contact_profile_disappearing_messages).uppercase(LocalContext.current.resources.configuration.locales.get(0)),
                     color = TextDim,
                     fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
@@ -1123,7 +1089,7 @@ private fun CContactSectionHeader(label: String, icon: @Composable () -> Unit) {
     ) {
         icon()
         Text(
-            text = label.uppercase(),
+            text = label.uppercase(LocalContext.current.resources.configuration.locales.get(0)),
             color = TextDim,
             fontSize = 10.sp,
             fontFamily = PhantomFontMono,
@@ -1200,7 +1166,7 @@ private enum class VerifyState { Compare, Verified, Mismatch }
 
 /**
  * PHANTOM_FULL_COMPOSE §12 FingerprintBlock — owner label + name + 8 groups
- * of 4 hex chars (first 32 hex of the ED25519 public key) on surfaceDeep,
+ * of 4 hex chars (first 32 hex of the X25519 public key) on surfaceDeep,
  * radius 12dp. Border tint and overall opacity respond to the parent
  * verify state.
  */
@@ -1215,7 +1181,7 @@ private fun FingerprintBlock(
         if (publicKeyHex.length >= 32) {
             publicKeyHex.substring(0, 32).uppercase().chunked(4).joinToString("  ")
         } else {
-            "loading…"
+            null
         }
     }
     val borderColor = when (accent) {
@@ -1266,7 +1232,7 @@ private fun FingerprintBlock(
         }
         Spacer(Modifier.height(14.dp))
         Text(
-            text = fingerprint,
+            text = fingerprint ?: stringResource(R.string.contact_profile_loading),
             color = hexColor,
             fontSize = 13.sp,
             fontFamily = PhantomFontMono,

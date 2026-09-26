@@ -29,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -90,8 +91,8 @@ internal const val KEY_PREVIEW_GLYPH_COUNT: Int = 32
 internal const val KEY_PREVIEW_IDLE_PLACEHOLDER: String = "— — — —  — — — —\n— — — —  — — — —"
 
 /**
- * Card-outer semantics tag. Used both as the merged card's
- * [contentDescription] AND as a stable test-matcher key.
+ * English card-outer semantics label retained for existing test matchers.
+ * The production description comes from a resource.
  */
 internal const val KEY_PREVIEW_CARD_A11Y_TAG: String = "Identity key preview"
 
@@ -154,9 +155,10 @@ internal fun IdentityKeyPreviewCardFrame(
     mountProgress: Float = 1f,
 ) {
     val statusText = when (phase) {
-        KeyPreviewAnimationPhase.Terminal -> "ED25519 · READY TO CREATE"
-        else -> "ED25519 · WILL BE GENERATED"
+        KeyPreviewAnimationPhase.Terminal -> stringResource(R.string.onboarding_key_ready)
+        else -> stringResource(R.string.onboarding_key_pending)
     }
+    val a11yDescription = stringResource(R.string.onboarding_key_preview_a11y)
 
     // Border colour — Idle/Running keep neutral border; Terminal
     // fades to cyan-tinted. Source L377 `.4s ease`.
@@ -219,7 +221,7 @@ internal fun IdentityKeyPreviewCardFrame(
                 // header status label + footer copy still merge
                 // into the parent's Text so TalkBack reads status
                 // + summary (contract §4.5).
-                contentDescription = KEY_PREVIEW_CARD_A11Y_TAG
+                contentDescription = a11yDescription
             },
     ) {
         Row(
@@ -279,7 +281,7 @@ internal fun IdentityKeyPreviewCardFrame(
             )
             Spacer(Modifier.height(12.dp))
             Text(
-                text = "Generated on device when you finish onboarding.",
+                text = stringResource(R.string.onboarding_key_generated_note),
                 color = DesignV2Tokens.Colors.TextQuaternary,
                 style = TextStyle(
                     fontFamily = DesignV2FontMono,

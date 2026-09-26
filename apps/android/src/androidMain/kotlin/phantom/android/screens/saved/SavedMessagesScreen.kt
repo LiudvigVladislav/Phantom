@@ -31,6 +31,10 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -40,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import com.benasher44.uuid.uuid4
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.R
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.messaging.OutgoingMessage
@@ -64,6 +69,9 @@ fun SavedMessagesScreen(
     var forwardNoteText by remember { mutableStateOf<String?>(null) }
     var conversations by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
     val listState = rememberLazyListState()
+    val backLabel = stringResource(R.string.saved_back)
+    val sendLabel = stringResource(if (editingMessageId != null) R.string.saved_save_changes else R.string.saved_save_note)
+    val pinUnavailable = stringResource(R.string.saved_pin_unavailable)
 
     suspend fun reload() {
         messages = container.messageRepo.getMessages(SAVED_CONV_ID)
@@ -96,7 +104,7 @@ fun SavedMessagesScreen(
         AlertDialog(
             onDismissRequest = { forwardNoteText = null },
             containerColor = Surface,
-            title = { Text("Forward to…", color = TextPrimary) },
+            title = { Text(stringResource(R.string.saved_forward_to), color = TextPrimary) },
             text = {
                 Column(
                     modifier = Modifier
@@ -105,7 +113,7 @@ fun SavedMessagesScreen(
                         .verticalScroll(rememberScrollState()),
                 ) {
                     if (conversations.isEmpty()) {
-                        Text("No conversations yet", color = TextDim, fontSize = 14.sp, modifier = Modifier.padding(8.dp))
+                        Text(stringResource(R.string.saved_no_conversations), color = TextDim, fontSize = 14.sp, modifier = Modifier.padding(8.dp))
                     }
                     conversations.forEach { conv ->
                         Row(
@@ -145,7 +153,7 @@ fun SavedMessagesScreen(
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { forwardNoteText = null }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.saved_cancel), color = TextDim)
                 }
             },
         )
@@ -179,11 +187,11 @@ fun SavedMessagesScreen(
                     .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                IconButton(onClick = onBack, modifier = Modifier.size(32.dp).semantics { contentDescription = backLabel }) {
                     PhIconBack(color = TextPrimary, size = 20.dp)
                 }
                 Text(
-                    text = "SAVED MESSAGES",
+                    text = stringResource(R.string.saved_title),
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center,
                     color = TextDim,
@@ -251,10 +259,10 @@ fun SavedMessagesScreen(
                             )
                         }
                         Spacer(Modifier.height(16.dp))
-                        Text("Your personal notes", color = TextDim, fontSize = 14.sp)
+                        Text(stringResource(R.string.saved_empty_title), color = TextDim, fontSize = 14.sp)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Save texts, links, ideas",
+                            stringResource(R.string.saved_empty_hint),
                             color = TextDim.copy(alpha = 0.6f),
                             fontSize = 12.sp,
                         )
@@ -290,7 +298,7 @@ fun SavedMessagesScreen(
                                 forwardNoteText = text
                             },
                             onPin = {
-                                android.widget.Toast.makeText(context, "Pin — coming soon", android.widget.Toast.LENGTH_SHORT).show()
+                                android.widget.Toast.makeText(context, pinUnavailable, android.widget.Toast.LENGTH_SHORT).show()
                             },
                         )
                     }
@@ -312,7 +320,7 @@ fun SavedMessagesScreen(
                     modifier = Modifier.weight(1f),
                     placeholder = {
                         Text(
-                            if (editingMessageId != null) "Edit note…" else "New note…",
+                            stringResource(if (editingMessageId != null) R.string.saved_edit_hint else R.string.saved_new_hint),
                             color = TextDim, fontSize = 14.sp,
                         )
                     },
@@ -372,7 +380,8 @@ fun SavedMessagesScreen(
                         modifier = Modifier
                             .size(42.dp)
                             .clip(CircleShape)
-                            .background(color = CyanAccent),
+                            .background(color = CyanAccent)
+                            .semantics { contentDescription = sendLabel },
                     ) {
                         PhIconArrowUp(color = BgDeep, size = 17.dp)
                     }
@@ -394,9 +403,10 @@ private fun SavedMessageBubble(
     onPin: () -> Unit,
 ) {
     val rawText = entity.plaintextCache ?: ""
+    val locale = LocalConfiguration.current.locales[0]
     val timeStr = run {
         val date = java.util.Date(entity.createdAt)
-        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(date)
+        java.text.SimpleDateFormat("HH:mm", locale).format(date)
     }
     var showActions by remember { mutableStateOf(false) }
     val within24h = (System.currentTimeMillis() - entity.createdAt) < 24 * 60 * 60 * 1000L
@@ -470,7 +480,7 @@ private fun SavedMessageBubble(
                             size = 16.dp,
                         )
                     },
-                    text = { Text("Forward", color = TextPrimary, fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.saved_forward), color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onForward(bodyText) },
                 )
                 DropdownMenuItem(
@@ -480,7 +490,7 @@ private fun SavedMessageBubble(
                             size = 16.dp,
                         )
                     },
-                    text = { Text("Pin", color = TextPrimary, fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.saved_pin), color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onPin() },
                 )
                 DropdownMenuItem(
@@ -490,7 +500,7 @@ private fun SavedMessageBubble(
                             size = 14.dp,
                         )
                     },
-                    text = { Text("Copy", color = TextPrimary, fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.saved_copy), color = TextPrimary, fontSize = 14.sp) },
                     onClick = { showActions = false; onCopy(bodyText) },
                 )
                 if (within24h) {
@@ -501,7 +511,7 @@ private fun SavedMessageBubble(
                                 size = 16.dp,
                             )
                         },
-                        text = { Text("Edit", color = TextPrimary, fontSize = 14.sp) },
+                        text = { Text(stringResource(R.string.saved_edit), color = TextPrimary, fontSize = 14.sp) },
                         onClick = { showActions = false; onEdit(bodyText) },
                     )
                 }
@@ -513,7 +523,7 @@ private fun SavedMessageBubble(
                             size = 15.dp,
                         )
                     },
-                    text = { Text("Delete", color = Danger, fontSize = 14.sp) },
+                    text = { Text(stringResource(R.string.saved_delete), color = Danger, fontSize = 14.sp) },
                     onClick = { showActions = false; onDelete() },
                 )
             }

@@ -9,7 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -23,12 +23,15 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.locale.AppLanguageStore
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -59,7 +62,17 @@ import phantom.android.screens.group.GroupChatScreen
 import phantom.android.screens.settings.SettingsScreen
 import phantom.android.ui.theme.*
 
-class MainActivity : ComponentActivity() {
+internal fun startupErrorResource(error: Throwable): Int = when (error) {
+    is SecurityException -> R.string.startup_keys_unavailable
+    is android.database.sqlite.SQLiteException -> R.string.startup_database_unavailable
+    else -> R.string.startup_unknown_error
+}
+
+class MainActivity : FragmentActivity() {
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguageStore.localizedBaseContext(newBase))
+    }
 
     /**
      * Parses a `phantom://invite/{base64url(username:pubkeyHex)}` URI from an incoming Intent.
@@ -158,7 +171,7 @@ class MainActivity : ComponentActivity() {
         )
         // Block screenshots, screen recording, and the recents-thumbnail preview.
         // FLAG_SECURE on the only Activity in the app is sufficient — there are
-        // no other Activity classes (one ComponentActivity, all screens are
+        // no other Activity classes (one FragmentActivity, all screens are
         // Compose). Windows that don't belong to MainActivity (system dialogs,
         // BiometricPrompt, IME, OS notifications) are governed by the OS, not us.
         window.setFlags(
@@ -226,7 +239,7 @@ class MainActivity : ComponentActivity() {
                     AppLockScreen(onUnlocked = { isLockedState.value = false })
                 } else {
                     var container by remember { mutableStateOf<AppContainer?>(null) }
-                    var initError by remember { mutableStateOf<String?>(null) }
+                    var initError by remember { mutableStateOf<Int?>(null) }
 
                     LaunchedEffect(Unit) {
                         Log.d("PHANTOM_INIT", "MainActivity: awaiting ready…")
@@ -236,19 +249,14 @@ class MainActivity : ComponentActivity() {
                                 container = app.container
                             }
                             .onFailure { t ->
+                                if (t is CancellationException) throw t
                                 Log.e("PHANTOM_INIT", "MainActivity: init failed: ${t.message}", t)
-                                initError = when (t) {
-                                    is SecurityException ->
-                                        "Encryption keys could not be unlocked.\nTry restarting the app."
-                                    is android.database.sqlite.SQLiteException ->
-                                        "Database error. Please reinstall the app."
-                                    else ->
-                                        "Startup failed. Please restart."
-                                }
+                                initError = startupErrorResource(t)
                             }
                     }
 
                     val c = container
+                    val errorRes = initError
                     when {
                         c != null -> PhantomApp(
                             container              = c,
@@ -258,12 +266,15 @@ class MainActivity : ComponentActivity() {
                             pendingNotificationChat = pendingNotificationChat,
                         )
 
-                        initError != null -> Box(
+                        errorRes != null -> Box(
                             modifier = Modifier.fillMaxSize().background(BgDeep).padding(24.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                text = "Startup error:\n\n$initError",
+                                text = stringResource(
+                                    R.string.startup_error_detail,
+                                    stringResource(errorRes),
+                                ),
                                 color = Danger,
                                 fontSize = 13.sp,
                                 textAlign = TextAlign.Center,
@@ -377,11 +388,19 @@ private fun PhantomApp(
         startupInFlight = true
         startupCompleted = false
         try {
+            val repairMarker = runCatching {
+                phantom.android.screens.onboarding.v2.IdentityRepairMarker
+                    .isRepairRequired(startupContext)
+            }
+            if (phantom.android.premium.SubscriptionAccess.requiresModeChoice(
+                    container.privacyModeCoordinator.state.value.requested,
+                    repairMarker.getOrNull(),
+                )) {
+                currentScreen = Screen.PrivacyModeDetail
+                return@LaunchedEffect
+            }
             val decision = phantom.android.screens.onboarding.v2.decideStartupRoute(
-                markerRead = {
-                    phantom.android.screens.onboarding.v2.IdentityRepairMarker
-                        .isRepairRequired(startupContext)
-                },
+                markerRead = { repairMarker.getOrThrow() },
                 loadIdentity = { container.identityRepo.loadIdentity() },
                 initMessaging = {
                     // Round-8 pin: return true on success, false
@@ -621,19 +640,15 @@ private fun PhantomApp(
                 MigrationScreen(
                     migrationManager = mgr,
                     onMigrationComplete = {
-                        // Trigger initial bundle publish via lifecycle
-                        // service immediately — without it the user
-                        // can't receive first messages until the 24-h
-                        // ticker fires.
-                        scope.launch {
-                            runCatching {
-                                container.preKeyLifecycle?.bootstrapForNewIdentity()
-                            }
-                        }
+                        // Re-run normal startup with freshly persisted identity keys.
+                        // ChatList is reachable only after stack initialization succeeds.
+                        startupInFlight = true
+                        startupCompleted = false
+                        currentScreen = null
+                        retryTick += 1
                         context.startForegroundService(
                             Intent(context, PhantomMessagingService::class.java),
                         )
-                        currentScreen = Screen.ChatList
                     },
                     onQuit = {
                         // Activity finish() drops the user back to launcher.
@@ -643,15 +658,14 @@ private fun PhantomApp(
                     },
                 )
             } else {
-                // Edge case: container.migrationManager is null because
-                // initMessaging never ran (e.g. some race). Fall back
-                // to ChatList; the user will hit a hard send error
-                // until they restart the app.
+                // Missing migration authority is a startup error, never permission to skip it.
                 Log.w(
                     "PHANTOM_MIGRATION",
-                    "Screen.Migration with null migrationManager; falling back to ChatList",
+                    "Screen.Migration with null migrationManager",
                 )
-                currentScreen = Screen.ChatList
+                currentScreen = Screen.StartupError(
+                    phantom.android.screens.onboarding.v2.TransientReason.NeedsMigrationThrew.name,
+                )
             }
         }
         is Screen.ChatList -> ChatListScreen(
@@ -668,9 +682,7 @@ private fun PhantomApp(
             onProfile = { currentScreen = Screen.Profile },
         )
         is Screen.Nearby -> phantom.android.screens.nearby.NearbyScreen(
-            container = container,
             onNavigate = { currentScreen = it },
-            onProfile = { currentScreen = Screen.Profile },
         )
         is Screen.Premium -> phantom.android.screens.premium.PremiumScreen(
             onBack = { currentScreen = Screen.Settings },
@@ -688,6 +700,7 @@ private fun PhantomApp(
         is Screen.PrivacyModeDetail -> phantom.android.screens.settings.PrivacyModeDetailScreen(
             container = container,
             onBack = { currentScreen = Screen.Settings },
+            onModeApplied = { if (!startupCompleted) retryTick += 1 },
         )
         is Screen.Profile -> ProfileScreen(
             container = container,

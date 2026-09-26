@@ -161,7 +161,8 @@ jobs:
         # Kept sorted; verified by android-test-classification-guard, which
         # reads this list back out of the file.
         run: |
-          ./gradlew :apps:android:testDebugUnitTest \
+          ./gradlew :apps:android:testDebugUnitTest -PphantomHostTestEngine=regular \
+            --tests "phantom.android.MainActivityStartupCopyTest" \
             --tests "phantom.android.calls.CallIceServerSpecTest" \
             --tests "phantom.android.calls.CallLaunchCoordinatorTest" \
             --tests "phantom.android.calls.CallManagerGuardTest" \
@@ -169,6 +170,7 @@ jobs:
             --tests "phantom.android.di.AppContainerInitLifecycleWiringTest" \
             --tests "phantom.android.di.PreKeySelfHealHookTest" \
             --tests "phantom.android.di.PrivacyModeTeardownOwnershipTest" \
+            --tests "phantom.android.locale.AppLanguageStoreTest" \
             --tests "phantom.android.diagnostic.BackgroundEventFilterTest" \
             --tests "phantom.android.diagnostic.BackgroundJournalTest" \
             --tests "phantom.android.diagnostic.DeliverFailedSchemaTest" \
@@ -208,9 +210,19 @@ jobs:
             --tests "phantom.android.navigation.ScreenSaverTest" \
             --tests "phantom.android.navigation.StartupRouteResolverTest" \
             --tests "phantom.android.notifications.NotificationsOptInMigrationTest" \
+            --tests "phantom.android.notifications.NotificationChannelCopyTest" \
+            --tests "phantom.android.premium.SubscriptionAccessTest" \
             --tests "phantom.android.proguard.GomobileJniKeepRulePinTest" \
+            --tests "phantom.android.screens.addcontact.AddContactEntryCopyTest" \
+            --tests "phantom.android.screens.calls.CallScreenCopyTest" \
             --tests "phantom.android.screens.chat.ChatScrollTargetTest" \
             --tests "phantom.android.screens.chat.ComposerSendStateTest" \
+            --tests "phantom.android.screens.chatlist.AddContactCopyTest" \
+            --tests "phantom.android.screens.contact.ContactProfileLocalizationTest" \
+            --tests "phantom.android.screens.group.GroupChatCopyTest" \
+            --tests "phantom.android.screens.lock.AppLockHostTest" \
+            --tests "phantom.android.screens.migration.AndroidMigrationProgressStoreTest" \
+            --tests "phantom.android.screens.migration.MigrationStartupTest" \
             --tests "phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingNotificationPermissionCoordinatorTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingPricingSheetDragGeometryTest" \
@@ -221,7 +233,12 @@ jobs:
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupPresentationTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StartupRouteTest" \
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StateTest" \
+            --tests "phantom.android.screens.premium.PricingResourceTest" \
+            --tests "phantom.android.screens.profile.ProfileLocalizationTest" \
+            --tests "phantom.android.screens.requests.MessageRequestsCopyTest" \
+            --tests "phantom.android.screens.verify.VerifyScreenLocalizationTest" \
             --tests "phantom.android.service.ConnectRetryWiringTest" \
+            --tests "phantom.android.service.ForegroundNotificationCopyTest" \
             --tests "phantom.android.service.ServiceStartupTest" \
             --tests "phantom.android.service.TransportNameForOverlayTest" \
             --tests "phantom.android.testing.ModelSnapshotRuleTest" \
@@ -281,6 +298,12 @@ jobs:
       fail-fast: false
       matrix:
         test-class:
+          # Locale, pricing and migration follow-up: preserve per-class isolation.
+          - phantom.android.screens.migration.MigrationLayoutTest
+          - phantom.android.screens.migration.MigrationScreenTest
+          - phantom.android.screens.nearby.NearbyUnavailableTest
+          - phantom.android.screens.onboarding.v2.PricingCtaFontScaleTest
+          - phantom.android.screens.premium.PremiumPriceTest
           # L1
           - phantom.android.ui.designv2.PhantomComponentsSemanticsTest
           - phantom.android.ui.SettingsRowItemSemanticsTest
@@ -328,7 +351,7 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
       - name: Test ${{ matrix.test-class }}
-        run: ./gradlew :apps:android:testDebugUnitTest --tests "${{ matrix.test-class }}" --stacktrace
+        run: ./gradlew :apps:android:testDebugUnitTest -PphantomHostTestEngine=regular --tests "${{ matrix.test-class }}" --stacktrace
 
   # =================================================================
   # 4. Paparazzi — windows-latest, verify-only. The GitHub `ubuntu-24.04`
@@ -356,7 +379,8 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
       - name: verifyPaparazziDebug (scoped, verify-only)
         run: |
-          ./gradlew :apps:android:verifyPaparazziDebug \
+          ./gradlew :apps:android:verifyPaparazziDebug -PphantomHostTestEngine=paparazzi \
+            --tests "phantom.android.ui.designv2.VariableFontLoadingTest" \
             --tests "phantom.android.ui.designv2.PhantomAvatarSnapshotTest" \
             --tests "phantom.android.ui.designv2.PhantomBadgeSnapshotTest" \
             --tests "phantom.android.ui.designv2.PhantomButtonSnapshotTest" \
@@ -413,6 +437,28 @@ jobs:
           #   - COMPOSE_UI -> android-compose-ui.strategy.matrix.test-class
           #   - PAPARAZZI  -> android-paparazzi.steps (--tests list)
           MANIFEST = """
+          phantom.android.MainActivityStartupCopyTest
+          phantom.android.notifications.NotificationChannelCopyTest
+          phantom.android.premium.SubscriptionAccessTest
+          phantom.android.screens.addcontact.AddContactEntryCopyTest
+          phantom.android.screens.calls.CallScreenCopyTest
+          phantom.android.screens.chatlist.AddContactCopyTest
+          phantom.android.screens.contact.ContactProfileLocalizationTest
+          phantom.android.screens.group.GroupChatCopyTest
+          phantom.android.screens.lock.AppLockHostTest
+          phantom.android.screens.migration.AndroidMigrationProgressStoreTest
+          phantom.android.screens.migration.MigrationLayoutTest
+          phantom.android.screens.migration.MigrationScreenTest
+          phantom.android.screens.migration.MigrationStartupTest
+          phantom.android.screens.nearby.NearbyUnavailableTest
+          phantom.android.screens.onboarding.v2.PricingCtaFontScaleTest
+          phantom.android.screens.premium.PremiumPriceTest
+          phantom.android.screens.premium.PricingResourceTest
+          phantom.android.screens.profile.ProfileLocalizationTest
+          phantom.android.screens.requests.MessageRequestsCopyTest
+          phantom.android.screens.verify.VerifyScreenLocalizationTest
+          phantom.android.service.ForegroundNotificationCopyTest
+          phantom.android.ui.designv2.VariableFontLoadingTest
           phantom.android.calls.CallIceServerSpecTest
           phantom.android.calls.CallLaunchCoordinatorTest
           phantom.android.calls.CallManagerGuardTest
@@ -420,6 +466,7 @@ jobs:
           phantom.android.di.AppContainerInitLifecycleWiringTest
           phantom.android.di.PreKeySelfHealHookTest
           phantom.android.di.PrivacyModeTeardownOwnershipTest
+          phantom.android.locale.AppLanguageStoreTest
           phantom.android.diagnostic.BackgroundEventFilterTest
           phantom.android.diagnostic.BackgroundJournalTest
           phantom.android.diagnostic.DeliverFailedSchemaTest
@@ -634,6 +681,9 @@ jobs:
                   print("    %s" % it)
           sys.exit(1)
           PY
+
+      - name: Test classification guard regressions
+        run: python3 -B -m unittest discover -s scripts/tests -p test_android_test_classification.py -v
 
   # =================================================================
   # 6. assembleDebug + APK artifact. Runs after all test shards succeed.

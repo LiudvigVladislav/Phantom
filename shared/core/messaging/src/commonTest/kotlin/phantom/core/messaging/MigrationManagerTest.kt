@@ -5,6 +5,10 @@ package phantom.core.messaging
 
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.yield
 import phantom.core.crypto.LibsodiumX3DH
 import phantom.core.identity.IdentityCrypto
 import phantom.core.identity.IdentityKeyPair
@@ -51,29 +55,50 @@ import kotlin.test.fail
  */
 class MigrationManagerTest {
 
+    private class InMemoryProgressStore : MigrationProgressStore {
+        val states = mutableMapOf<String, MigrationProgress>()
+        var beforeWrite: (MigrationProgress) -> Unit = {}
+        var afterWrite: (MigrationProgress) -> Unit = {}
+        var beforeRead: () -> Unit = {}
+        override suspend fun read(identityId: String): MigrationProgress {
+            beforeRead()
+            return states[identityId] ?: MigrationProgress.NOT_STARTED
+        }
+        override suspend fun write(identityId: String, progress: MigrationProgress) {
+            beforeWrite(progress)
+            states[identityId] = progress
+            afterWrite(progress)
+        }
+    }
+
     // ── Fakes ────────────────────────────────────────────────────────────────
 
     private class InMemoryIdentityRepository(seed: IdentityRecord? = null) : IdentityRepository {
         private var stored: IdentityRecord? = seed
+        var afterSave: () -> Unit = {}
         override suspend fun createIdentity(username: String): IdentityKeyPair =
             error("not used in MigrationManagerTest")
         override suspend fun loadIdentity(): IdentityRecord? = stored
-        override suspend fun saveIdentity(record: IdentityRecord) { stored = record }
+        override suspend fun saveIdentity(record: IdentityRecord) { stored = record; afterSave() }
         override suspend fun deleteIdentity() { stored = null }
     }
 
     private class InMemorySignedPreKeyRepo : LocalSignedPreKeyRepository {
+        var afterUpsert: () -> Unit = {}
         private var stored: LocalSignedPreKeyEntity? = null
         var upsertCount = 0
         override suspend fun get(): LocalSignedPreKeyEntity? = stored
         override suspend fun upsert(entity: LocalSignedPreKeyEntity) {
             stored = entity
             upsertCount++
+            afterUpsert()
         }
         override suspend fun clear() { stored = null }
     }
 
     private class InMemoryOneTimePreKeyRepo : LocalOneTimePreKeyRepository {
+        var afterInsert: () -> Unit = {}
+        var afterClear: () -> Unit = {}
         private val store = mutableMapOf<String, LocalOneTimePreKeyEntity>()
         var insertAllCalls = 0
         var clearCalls = 0
@@ -86,12 +111,14 @@ class MigrationManagerTest {
         override suspend fun insertAll(entities: List<LocalOneTimePreKeyEntity>) {
             insertAllCalls++
             entities.forEach { store[it.keyIdHex] = it }
+            afterInsert()
         }
         override suspend fun deleteByKeyId(keyIdHex: String) { store.remove(keyIdHex) }
-        override suspend fun clear() { clearCalls++; store.clear() }
+        override suspend fun clear() { clearCalls++; store.clear(); afterClear() }
     }
 
     private class InMemoryRatchetStateRepo : RatchetStateRepository {
+        var afterDelete: () -> Unit = {}
         val store = mutableMapOf<String, String>()
         var deleteAllCalls = 0
         override suspend fun getRatchetState(conversationId: String) = store[conversationId]
@@ -101,10 +128,11 @@ class MigrationManagerTest {
         override suspend fun deleteRatchetState(conversationId: String) {
             store.remove(conversationId)
         }
-        override suspend fun deleteAll() { deleteAllCalls++; store.clear() }
+        override suspend fun deleteAll() { deleteAllCalls++; store.clear(); afterDelete() }
     }
 
     private class InMemorySenderKeyRepo : SenderKeyRepository {
+        var afterDelete: () -> Unit = {}
         val store = mutableMapOf<Pair<String, String>, SenderKeyEntity>()
         var deleteAllCalls = 0
         override suspend fun get(groupId: String, memberPubkeyHex: String) =
@@ -115,10 +143,11 @@ class MigrationManagerTest {
         override suspend fun deleteForGroup(groupId: String) {
             store.entries.removeAll { it.key.first == groupId }
         }
-        override suspend fun deleteAll() { deleteAllCalls++; store.clear() }
+        override suspend fun deleteAll() { deleteAllCalls++; store.clear(); afterDelete() }
     }
 
     private class InMemoryConversationRepo : ConversationRepository {
+        var afterMark: () -> Unit = {}
         val store = mutableMapOf<String, ConversationEntity>()
         var markAllNeedsRehandshakeCalls = 0
         override suspend fun getAllConversations(): List<ConversationEntity> = store.values.toList()
@@ -152,6 +181,7 @@ class MigrationManagerTest {
             store.keys.toList().forEach { id ->
                 store[id]?.let { store[id] = it.copy(needsRehandshake = true) }
             }
+            afterMark()
         }
 
         // PR-CRYPTO-SESSION-REPAIR1 commit 2 (2026-05-29) — suspect-flag stubs.
@@ -178,6 +208,8 @@ class MigrationManagerTest {
     private class FakePreKeyApi(
         var publishResult: PublishResult = PublishResult.Stored(0),
     ) : PreKeyApi {
+        var afterPublish: () -> Unit = {}
+        var duringPublish: suspend () -> Unit = {}
         var publishCount = 0
         var lastRequest: PublishRequest? = null
         // Sprint 2b L1: PreKeyApi.publishBundle takes a factory lambda
@@ -190,6 +222,8 @@ class MigrationManagerTest {
         ): PublishResult {
             publishCount++
             lastRequest = requestProvider()
+            duringPublish()
+            afterPublish()
             return publishResult
         }
         override suspend fun fetchBundle(
@@ -238,6 +272,7 @@ class MigrationManagerTest {
         val senderKeyRepo = InMemorySenderKeyRepo()
         val convRepo = InMemoryConversationRepo()
         val preKeyApi = FakePreKeyApi(publishResult)
+        val progressStore = InMemoryProgressStore()
         val mgr = MigrationManager(
             identityManager = identityManager,
             identityCrypto = identityCrypto,
@@ -248,6 +283,7 @@ class MigrationManagerTest {
             conversationRepository = convRepo,
             preKeyApi = preKeyApi,
             x3dh = LibsodiumX3DH(),
+            progressStore = progressStore,
             nowMsProvider = { 1_700_000_000_000L },
         )
         return TestRig(
@@ -259,6 +295,7 @@ class MigrationManagerTest {
             senderKeyRepo = senderKeyRepo,
             convRepo = convRepo,
             preKeyApi = preKeyApi,
+            progressStore = progressStore,
         )
     }
 
@@ -271,6 +308,7 @@ class MigrationManagerTest {
         val senderKeyRepo: InMemorySenderKeyRepo,
         val convRepo: InMemoryConversationRepo,
         val preKeyApi: FakePreKeyApi,
+        val progressStore: InMemoryProgressStore,
     )
 
     // ── Detection ────────────────────────────────────────────────────────────
@@ -386,8 +424,11 @@ class MigrationManagerTest {
         // on regeneration.
         assertEquals(1, rig.opkRepo.insertAllCalls, "Second run must NOT regenerate OPKs")
 
-        // Publish was retried (idempotent re-publish to relay).
-        assertEquals(2, rig.preKeyApi.publishCount)
+        // Completed migration must not publish or wipe again.
+        assertEquals(1, rig.preKeyApi.publishCount)
+        assertEquals(1, rig.ratchetRepo.deleteAllCalls)
+        assertEquals(1, rig.senderKeyRepo.deleteAllCalls)
+        assertEquals(1, rig.convRepo.markAllNeedsRehandshakeCalls)
     }
 
     // ── Failure paths ────────────────────────────────────────────────────────
@@ -454,5 +495,192 @@ class MigrationManagerTest {
             req.identity_pubkey_hex != req.signing_pubkey_hex,
             "X25519 and Ed25519 keys must be distinct values",
         )
+    }
+
+    private fun TestRig.restarted(): MigrationManager {
+        val crypto = LibsodiumIdentityCrypto()
+        return MigrationManager(
+            IdentityManager(crypto, identityRepo), crypto, spkRepo, opkRepo,
+            ratchetRepo, senderKeyRepo, convRepo, preKeyApi, LibsodiumX3DH(), progressStore,
+            nowMsProvider = { 1_700_000_000_000L },
+        )
+    }
+
+    @Test
+    fun failed_publish_still_requires_migration_after_restart_and_reuses_keys() = runTest {
+        LibsodiumInitializer.initialize()
+        for (reason in listOf(PublishResult.Reason.RateLimited, PublishResult.Reason.SigningKeyMismatch)) {
+            val rig = makeManager(publishResult = PublishResult.Failure(reason, "synthetic failure"))
+            rig.ratchetRepo.upsertRatchetState("old", "session")
+            assertTrue(rig.mgr.runMigration().isFailure)
+            assertTrue(rig.restarted().needsMigration())
+            assertEquals("session", rig.ratchetRepo.getRatchetState("old"))
+            val identity = rig.identityRepo.loadIdentity()
+            val spk = rig.spkRepo.get()
+            val opks = rig.opkRepo.getAll()
+            rig.preKeyApi.publishResult = PublishResult.Stored(40)
+            rig.restarted().runMigration().getOrThrow()
+            assertEquals(identity, rig.identityRepo.loadIdentity())
+            assertEquals(spk, rig.spkRepo.get())
+            assertEquals(opks, rig.opkRepo.getAll())
+            assertFalse(rig.restarted().needsMigration())
+        }
+    }
+
+    @Test
+    fun every_persisted_boundary_resumes_after_cancellation_without_replacing_identity() = runTest {
+        LibsodiumInitializer.initialize()
+        for (boundary in 0..8) {
+            val rig = makeManager()
+            val stop: () -> Unit = { throw CancellationException("synthetic interruption") }
+            when (boundary) {
+                0 -> rig.progressStore.afterWrite = { if (it == MigrationProgress.IN_PROGRESS) stop() }
+                1 -> rig.identityRepo.afterSave = stop
+                2 -> rig.spkRepo.afterUpsert = stop
+                3 -> rig.opkRepo.afterClear = stop
+                4 -> rig.opkRepo.afterInsert = stop
+                5 -> rig.preKeyApi.afterPublish = stop
+                6 -> rig.ratchetRepo.afterDelete = stop
+                7 -> rig.senderKeyRepo.afterDelete = stop
+                8 -> rig.convRepo.afterMark = stop
+            }
+            try {
+                rig.mgr.runMigration()
+                fail("Cancellation swallowed at boundary $boundary")
+            } catch (_: CancellationException) { }
+            assertTrue(rig.restarted().needsMigration(), "boundary $boundary")
+            val signing = rig.identityRepo.loadIdentity()!!.signingPublicKeyHex
+            rig.progressStore.afterWrite = {}
+            rig.identityRepo.afterSave = {}
+            rig.spkRepo.afterUpsert = {}
+            rig.opkRepo.afterClear = {}
+            rig.opkRepo.afterInsert = {}
+            rig.preKeyApi.afterPublish = {}
+            rig.ratchetRepo.afterDelete = {}
+            rig.senderKeyRepo.afterDelete = {}
+            rig.convRepo.afterMark = {}
+            rig.restarted().runMigration().getOrThrow()
+            assertFalse(rig.restarted().needsMigration())
+            assertEquals(alpha1Record().publicKeyHex, rig.identityRepo.loadIdentity()!!.publicKeyHex)
+            assertEquals(alpha1Record().dhPrivateKeyHex, rig.identityRepo.loadIdentity()!!.dhPrivateKeyHex)
+            if (signing != null) assertEquals(signing, rig.identityRepo.loadIdentity()!!.signingPublicKeyHex)
+        }
+    }
+
+    @Test
+    fun failed_begin_write_changes_no_keys_or_sessions() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.progressStore.beforeWrite = { error("disk failure") }
+        assertTrue(rig.mgr.runMigration().isFailure)
+        assertEquals(alpha1Record(), rig.identityRepo.loadIdentity())
+        assertEquals(0, rig.spkRepo.upsertCount)
+        assertEquals(0, rig.preKeyApi.publishCount)
+        assertEquals(0, rig.ratchetRepo.deleteAllCalls)
+        assertTrue(rig.restarted().needsMigration())
+    }
+
+    @Test
+    fun failed_completion_write_keeps_pending_and_does_not_return_success() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.progressStore.beforeWrite = { if (it == MigrationProgress.COMPLETE) error("disk failure") }
+        assertTrue(rig.mgr.runMigration().isFailure)
+        assertTrue(rig.restarted().needsMigration())
+        rig.progressStore.beforeWrite = {}
+        rig.restarted().runMigration().getOrThrow()
+        assertFalse(rig.restarted().needsMigration())
+    }
+
+    @Test
+    fun healthy_existing_identity_without_marker_is_never_wiped() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager(identity = alpha2Record())
+        rig.ratchetRepo.upsertRatchetState("healthy", "keep")
+        rig.mgr.runMigration().getOrThrow()
+        assertFalse(rig.restarted().needsMigration())
+        assertEquals("keep", rig.ratchetRepo.getRatchetState("healthy"))
+        assertEquals(0, rig.preKeyApi.publishCount)
+        assertEquals(0, rig.senderKeyRepo.deleteAllCalls)
+        assertEquals(0, rig.convRepo.markAllNeedsRehandshakeCalls)
+        assertTrue(rig.progressStore.states.isEmpty())
+    }
+
+    @Test
+    fun completed_marker_does_not_affect_another_identity() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.progressStore.states["another-identity"] = MigrationProgress.COMPLETE
+        assertTrue(rig.mgr.needsMigration())
+        rig.mgr.runMigration().getOrThrow()
+        assertEquals(MigrationProgress.COMPLETE, rig.progressStore.states["id-1"])
+    }
+
+    @Test
+    fun completed_migration_preserves_sessions_created_after_it() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.mgr.runMigration().getOrThrow()
+        rig.ratchetRepo.upsertRatchetState("new", "keep")
+        rig.restarted().runMigration().getOrThrow()
+        assertEquals("keep", rig.ratchetRepo.getRatchetState("new"))
+        assertEquals(1, rig.ratchetRepo.deleteAllCalls)
+        assertEquals(1, rig.preKeyApi.publishCount)
+    }
+
+    @Test
+    fun missing_identity_returns_typed_failure_without_writes() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager(identity = null)
+        assertTrue(rig.mgr.runMigration().exceptionOrNull() is MigrationException.NoIdentity)
+        assertTrue(rig.progressStore.states.isEmpty())
+    }
+
+    @Test
+    fun concurrent_calls_share_one_migration_and_one_cleanup() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        rig.preKeyApi.duringPublish = { entered.complete(Unit); release.await() }
+        val first = async { rig.mgr.runMigration() }
+        entered.await()
+        val second = async { rig.mgr.runMigration() }
+        val detection = async { rig.mgr.needsMigration() }
+        yield()
+        assertFalse(second.isCompleted)
+        assertFalse(detection.isCompleted)
+        release.complete(Unit)
+        first.await().getOrThrow()
+        second.await().getOrThrow()
+        assertFalse(detection.await())
+        assertEquals(1, rig.preKeyApi.publishCount)
+        assertEquals(1, rig.ratchetRepo.deleteAllCalls)
+    }
+
+    @Test
+    fun interrupted_return_after_completion_does_not_wipe_again() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.progressStore.afterWrite = {
+            if (it == MigrationProgress.COMPLETE) throw CancellationException("after commit")
+        }
+        try { rig.mgr.runMigration(); fail("Cancellation swallowed") } catch (_: CancellationException) { }
+        assertFalse(rig.restarted().needsMigration())
+        rig.ratchetRepo.upsertRatchetState("new", "keep")
+        rig.restarted().runMigration().getOrThrow()
+        assertEquals("keep", rig.ratchetRepo.getRatchetState("new"))
+        assertEquals(1, rig.preKeyApi.publishCount)
+    }
+
+    @Test
+    fun unreadable_progress_fails_closed_before_mutation() = runTest {
+        LibsodiumInitializer.initialize()
+        val rig = makeManager()
+        rig.progressStore.beforeRead = { error("corrupt marker") }
+        try { rig.mgr.needsMigration(); fail("Must fail closed") } catch (_: IllegalStateException) { }
+        assertTrue(rig.mgr.runMigration().isFailure)
+        assertEquals(alpha1Record(), rig.identityRepo.loadIdentity())
+        assertEquals(0, rig.preKeyApi.publishCount)
     }
 }

@@ -3,6 +3,7 @@
 
 package phantom.android.screens.onboarding.v2.steps
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -32,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -53,7 +55,7 @@ import phantom.android.ui.designv2.components.PhantomButton
 import phantom.core.transport.PrivacyMode
 
 /**
- * PrivacyLevelStepV2 — Step 3 / "Choose your privacy level".
+ * PrivacyLevelStepV2 — Step 3 / "Choose your privacy mode".
  *
  * Handoff `Onboarding.dc.html` (STEP 3):
  *   - Title 29 sp / lineHeight 34 sp Geist SemiBold.
@@ -89,7 +91,7 @@ import phantom.core.transport.PrivacyMode
  * "Not selected". The `onClickLabel` on `clickable` provides an
  * additional action description ("Select Standard privacy" /
  * "Select Private privacy" / "Ghost Mode requires Phantom Pro").
- * The Unlock CTA is Role.Button labelled "Unlock with Phantom Pro".
+ * The locked-tier preview CTA is Role.Button labelled "Preview Phantom Pro".
  * Decorative dots on the segment bar, tier icons, and bullet
  * rondels are cleared via `clearAndSetSemantics { }` — screen
  * readers surface the segment / CTA labels only.
@@ -120,7 +122,7 @@ fun PrivacyLevelStepV2(
                 .padding(top = 4.dp),
         ) {
             Text(
-                text = "Choose your\nprivacy level",
+                text = stringResource(R.string.onboarding_privacy_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontDisplay,
@@ -134,7 +136,7 @@ fun PrivacyLevelStepV2(
             Spacer(Modifier.height(10.dp))
 
             Text(
-                text = "Slide to set how visible you are. Change it any time in Settings.",
+                text = stringResource(R.string.onboarding_privacy_intro),
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -175,10 +177,19 @@ fun PrivacyLevelStepV2(
         ) {
             OnboardingStepDotsV2(dotsIndex = dotsIndex)
             Spacer(Modifier.height(12.dp))
+            if (!phantom.android.premium.SubscriptionAccess.permits(formState.privacyMode)) {
+                Text(
+                    text = stringResource(R.string.onboarding_privacy_ghost_unavailable),
+                    color = DesignV2Tokens.Colors.TextSecondary,
+                    fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                )
+            }
             PhantomButton(
-                text = "Continue",
+                text = stringResource(R.string.onboarding_continue),
                 onClick = onContinueClick,
-                enabled = true,
+                enabled = phantom.android.premium.SubscriptionAccess.permits(formState.privacyMode),
                 modifier = Modifier.fillMaxWidth(),
             )
         }
@@ -199,8 +210,8 @@ private fun PrivacySegmentBar(
         PRIVACY_TIERS.forEachIndexed { idx, tier ->
             PrivacySegment(
                 index = idx,
-                label = tier.shortLabel,
-                a11yLabel = tier.a11yLabel,
+                label = stringResource(tier.shortLabelRes),
+                a11yLabel = stringResource(tier.a11yLabelRes),
                 filled = idx <= selectedIndex,
                 current = idx == selectedIndex,
                 onClick = { onSegmentClick(idx) },
@@ -222,6 +233,11 @@ private fun PrivacySegment(
     modifier: Modifier = Modifier,
     isPro: Boolean = false,
 ) {
+    val stateLabel = stringResource(
+        if (current) R.string.onboarding_privacy_selected
+        else R.string.onboarding_privacy_not_selected,
+    )
+    val proDescription = stringResource(R.string.onboarding_privacy_pro_required, label)
     // Round-1 REDLINE on Commit 4 §P2-2: previous shape wiped the
     // segment label's semantics via `clearAndSetSemantics { }` and
     // relied on `clickable`'s `onClickLabel` for the accessible name.
@@ -247,9 +263,9 @@ private fun PrivacySegment(
                 onClick = onClick,
             )
             .semantics {
-                contentDescription = if (isPro) "$label, Phantom Pro required" else label
+                contentDescription = if (isPro) proDescription else label
                 selected = current
-                stateDescription = if (current) "Selected" else "Not selected"
+                stateDescription = stateLabel
             },
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -314,7 +330,7 @@ private fun PrivacySegment(
                         modifier = Modifier.size(8.dp),
                     )
                     Text(
-                        text = "PRO",
+                        text = stringResource(R.string.onboarding_privacy_pro_tag),
                         color = DesignV2Tokens.Colors.Cyan,
                         style = TextStyle(
                             fontFamily = DesignV2FontMono,
@@ -332,43 +348,43 @@ private fun PrivacySegment(
 // ── Tier description card ────────────────────────────────────────────
 
 internal data class PrivacyTierV2(
-    val name: String,
-    val shortLabel: String,   // segment-bar label (uppercased)
-    val a11yLabel: String,    // click-action label (screen reader)
-    val tag: String,
-    val description: String,
+    @StringRes val nameRes: Int,
+    @StringRes val shortLabelRes: Int,
+    @StringRes val a11yLabelRes: Int,
+    @StringRes val tagRes: Int,
+    @StringRes val descriptionRes: Int,
     val iconRes: Int,
     val locked: Boolean,
-    val bullets: List<String>,
+    val bulletRes: List<Int>,
 )
 
 internal val PRIVACY_TIERS: List<PrivacyTierV2> = listOf(
     PrivacyTierV2(
-        name = "Standard",
-        shortLabel = "STANDARD",
-        a11yLabel = "Select Standard privacy",
-        tag = "BALANCED",
-        description = "Visible to your contacts. Read receipts and last seen are on.",
+        nameRes = R.string.onboarding_privacy_standard_name,
+        shortLabelRes = R.string.onboarding_privacy_standard_short,
+        a11yLabelRes = R.string.onboarding_privacy_standard_a11y,
+        tagRes = R.string.onboarding_privacy_standard_tag,
+        descriptionRes = R.string.onboarding_privacy_standard_description,
         iconRes = R.drawable.ic_dv2_standard,
         locked = false,
-        bullets = listOf(
-            "Contacts can see when you are online",
-            "Read receipts enabled",
-            "Discoverable in Nearby",
+        bulletRes = listOf(
+            R.string.onboarding_privacy_standard_bullet_route,
+            R.string.onboarding_privacy_standard_bullet_fallback,
+            R.string.onboarding_privacy_standard_bullet_receipts,
         ),
     ),
     PrivacyTierV2(
-        name = "Private",
-        shortLabel = "PRIVATE",
-        a11yLabel = "Select Private privacy",
-        tag = "RECOMMENDED",
-        description = "No read receipts. Last seen hidden from everyone.",
+        nameRes = R.string.onboarding_privacy_private_name,
+        shortLabelRes = R.string.onboarding_privacy_private_short,
+        a11yLabelRes = R.string.onboarding_privacy_private_a11y,
+        tagRes = R.string.onboarding_privacy_private_tag,
+        descriptionRes = R.string.onboarding_privacy_private_description,
         iconRes = R.drawable.ic_dv2_privacy,
         locked = false,
-        bullets = listOf(
-            "Last seen hidden from all",
-            "Read receipts disabled",
-            "Discoverable in Nearby",
+        bulletRes = listOf(
+            R.string.onboarding_privacy_private_bullet_direct,
+            R.string.onboarding_privacy_private_bullet_fallback,
+            R.string.onboarding_privacy_private_bullet_receipts,
         ),
     ),
     PrivacyTierV2(
@@ -381,17 +397,17 @@ internal val PRIVACY_TIERS: List<PrivacyTierV2> = listOf(
         // runtime does NOT enforce — Ghost does not block outbound
         // messages, does not silence presence beyond what Tor's own
         // path characteristics guarantee, and is not receive-only.
-        name = "Ghost Mode",
-        shortLabel = "GHOST",
-        a11yLabel = "Ghost Mode requires Phantom Pro",
-        tag = "PRO",
-        description = "All connections route through Tor onion. Never falls back if Tor is blocked.",
+        nameRes = R.string.onboarding_privacy_ghost_name,
+        shortLabelRes = R.string.onboarding_privacy_ghost_short,
+        a11yLabelRes = R.string.onboarding_privacy_ghost_a11y,
+        tagRes = R.string.onboarding_privacy_pro_tag,
+        descriptionRes = R.string.onboarding_privacy_ghost_description,
         iconRes = R.drawable.ic_dv2_ghost,
         locked = true,
-        bullets = listOf(
-            "Every message traverses the Tor network",
-            "No silent downgrade to direct WSS or REALITY",
-            "Connect fails visibly if Tor cannot bootstrap",
+        bulletRes = listOf(
+            R.string.onboarding_privacy_ghost_bullet_route,
+            R.string.onboarding_privacy_ghost_bullet_fallback,
+            R.string.onboarding_privacy_ghost_bullet_failure,
         ),
     ),
 )

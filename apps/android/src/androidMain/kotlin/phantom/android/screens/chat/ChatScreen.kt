@@ -66,6 +66,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import phantom.android.R
@@ -731,7 +733,7 @@ fun ChatScreen(
         AlertDialog(
             onDismissRequest = { forwardText = null },
             containerColor = Surface,
-            title = { Text("Forward to…", color = TextPrimary) },
+            title = { Text(stringResource(R.string.chat_forward_to), color = TextPrimary) },
             text = {
                 Column(
                     modifier = Modifier
@@ -781,12 +783,12 @@ fun ChatScreen(
                             }
                         }
                         Spacer(Modifier.width(12.dp))
-                        Text("Notes", color = TextPrimary, fontSize = 15.sp)
+                        Text(stringResource(R.string.chat_notes), color = TextPrimary, fontSize = 15.sp)
                     }
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
 
                     if (conversations.isEmpty()) {
-                        Text("No other conversations", color = TextDim, fontSize = 14.sp, modifier = Modifier.padding(8.dp))
+                        Text(stringResource(R.string.chat_no_other_conversations), color = TextDim, fontSize = 14.sp, modifier = Modifier.padding(8.dp))
                     }
                     conversations.forEach { fwdConv ->
                             Row(
@@ -825,7 +827,7 @@ fun ChatScreen(
             },
             confirmButton = {},
             dismissButton = {
-                TextButton(onClick = { forwardText = null }) { Text("Cancel", color = TextDim) }
+                TextButton(onClick = { forwardText = null }) { Text(stringResource(R.string.chat_cancel), color = TextDim) }
             },
         )
     }
@@ -849,7 +851,7 @@ fun ChatScreen(
             username = theirUsername,
             onReport = { _ ->
                 showReportDialog = false
-                scope.launch { snackbarHostState.showSnackbar("Report sent. Thank you.") }
+                scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.chat_report_sent)) }
             },
             onDismiss = { showReportDialog = false },
         )
@@ -962,7 +964,7 @@ fun ChatScreen(
                         Spacer(Modifier.width(10.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (reply.sent) "You" else theirUsername,
+                                text = if (reply.sent) stringResource(R.string.chat_you) else theirUsername,
                                 color = CyanAccent,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
@@ -998,7 +1000,7 @@ fun ChatScreen(
                         )
                         Spacer(Modifier.width(10.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Editing", color = CyanAccent.copy(alpha = 0.8f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                            Text(stringResource(R.string.chat_editing), color = CyanAccent.copy(alpha = 0.8f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
                             Text(editing.plaintextCache ?: "•••", color = TextDim, fontSize = 12.sp, maxLines = 1)
                         }
                         IconButton(onClick = { editingMessage = null; inputText = "" }, modifier = Modifier.size(32.dp)) {
@@ -1288,7 +1290,7 @@ fun ChatScreen(
                                                 "composer_retained=true",
                                         )
                                         snackbarHostState.showSnackbar(
-                                            "Message not sent. Your text is still here — tap send to try again.",
+                                            context.getString(R.string.chat_send_failed),
                                         )
                                     }
                                 }
@@ -1387,10 +1389,10 @@ fun ChatScreen(
                 }
                 val selfPubKey = container.identityState.value?.publicKeyHex
                 val pinnerLabel = when (pinnedMsg.pinnedByPubkey) {
-                    null -> "Pinned"
-                    selfPubKey -> "Pinned by you"
-                    theirPublicKeyHex -> "Pinned by $theirUsername"
-                    else -> "Pinned"
+                    null -> stringResource(R.string.chat_pinned)
+                    selfPubKey -> stringResource(R.string.chat_pinned_by_you)
+                    theirPublicKeyHex -> stringResource(R.string.chat_pinned_by_peer, theirUsername)
+                    else -> stringResource(R.string.chat_pinned)
                 }
                 Row(
                     modifier = Modifier
@@ -1659,7 +1661,7 @@ private fun E2EENoteRow(theirUsername: String) {
                     )
                 }
                 Text(
-                    text = "End-to-end encrypted · ED25519 · @$theirUsername",
+                    text = stringResource(R.string.chat_e2ee_note, theirUsername),
                     color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.7f),
                     fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
@@ -1678,12 +1680,13 @@ private fun ChatDateSep(millis: Long, dayStartMillis: Long) {
     // at midnight via [rememberDayStartMillis]. Without that dependency, the
     // separator captured "TODAY" once on first composition and never moved to
     // "YESTERDAY" after the day rolled over (Vladislav 2026-05-20 report).
+    val locale = LocalContext.current.resources.configuration.locales.get(0)
     val label = when {
-        millis >= dayStartMillis -> "TODAY"
-        millis >= dayStartMillis - DAY_MILLIS -> "YESTERDAY"
-        else -> java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US)
+        millis >= dayStartMillis -> stringResource(R.string.chat_today)
+        millis >= dayStartMillis - DAY_MILLIS -> stringResource(R.string.chat_yesterday)
+        else -> java.text.DateFormat.getDateInstance(java.text.DateFormat.LONG, locale)
             .format(java.util.Date(millis))
-            .uppercase(java.util.Locale.US)
+            .uppercase(locale)
     }
     Box(
         modifier = Modifier
@@ -1761,7 +1764,7 @@ private fun EmojiPanel(onEmoji: (String) -> Unit) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 10.dp, vertical = 6.dp),
-            placeholder = { Text("Search emoji…", color = TextDim, fontSize = 13.sp) },
+            placeholder = { Text(stringResource(R.string.chat_search_emoji), color = TextDim, fontSize = 13.sp) },
             singleLine = true,
             colors = OutlinedTextFieldDefaults.colors(
                 focusedTextColor = TextPrimary,
@@ -1905,26 +1908,26 @@ private fun MessageBubble(
         AlertDialog(
             onDismissRequest = { showDeleteDialog = false },
             containerColor = Surface,
-            title = { Text("Delete message?", color = TextPrimary) },
+            title = { Text(stringResource(R.string.chat_delete_message_title), color = TextPrimary) },
             text = {
                 if (canDeleteForBoth) {
-                    Text("Choose who to delete this message for.", color = TextDim, fontSize = 14.sp)
+                    Text(stringResource(R.string.chat_delete_choose_scope), color = TextDim, fontSize = 14.sp)
                 } else {
-                    Text("Delete this message for yourself?", color = TextDim, fontSize = 14.sp)
+                    Text(stringResource(R.string.chat_delete_for_self_question), color = TextDim, fontSize = 14.sp)
                 }
             },
             confirmButton = {
                 Column {
                     if (canDeleteForBoth) {
                         TextButton(onClick = { showDeleteDialog = false; onDeleteForBoth() }) {
-                            Text("Delete for everyone", color = Danger, fontSize = 13.sp)
+                            Text(stringResource(R.string.chat_delete_for_everyone), color = Danger, fontSize = 13.sp)
                         }
                     }
                     TextButton(onClick = { showDeleteDialog = false; onDeleteForMe() }) {
-                        Text("Delete for me", color = Danger, fontSize = 13.sp)
+                        Text(stringResource(R.string.chat_delete_for_me), color = Danger, fontSize = 13.sp)
                     }
                     TextButton(onClick = { showDeleteDialog = false }) {
-                        Text("Cancel", color = TextDim, fontSize = 13.sp)
+                        Text(stringResource(R.string.chat_cancel), color = TextDim, fontSize = 13.sp)
                     }
                 }
             },
@@ -2201,13 +2204,13 @@ private fun MessageBubble(
                         Spacer(Modifier.height(6.dp))
                         Text(
                             text = when (state) {
-                                LinkPreviewState.Idle -> "Tap to load link preview"
-                                LinkPreviewState.Loading -> "Loading preview…"
+                                LinkPreviewState.Idle -> stringResource(R.string.chat_link_preview_tap)
+                                LinkPreviewState.Loading -> stringResource(R.string.chat_link_preview_loading)
                                 LinkPreviewState.BlockedByPrivacyMode ->
-                                    "Preview off in this privacy mode"
-                                LinkPreviewState.Unavailable -> "Preview unavailable"
+                                    stringResource(R.string.chat_link_preview_privacy_off)
+                                LinkPreviewState.Unavailable -> stringResource(R.string.chat_link_preview_unavailable)
                                 LinkPreviewState.RefusedDestination ->
-                                    "Link points to a local address — preview blocked"
+                                    stringResource(R.string.chat_link_preview_local_blocked)
                                 is LinkPreviewState.Loaded -> ""
                             },
                             color = if (isSent) Color.White.copy(alpha = 0.6f)
@@ -2407,33 +2410,33 @@ private fun MessageBubble(
                             // ── Action list (bottom, expanded) ───────────────
                             ActionRow(
                                 icon = { c -> PhIconReply(color = c, size = 16.dp) },
-                                label = "Reply",
+                                label = stringResource(R.string.chat_reply),
                             ) {
                                 showActionPanel = false; onReply()
                             }
                             if (isSent && within24h) {
                                 ActionRow(
                                     icon = { c -> PhIconEdit(color = c, size = 16.dp) },
-                                    label = "Edit",
+                                    label = stringResource(R.string.chat_edit),
                                 ) {
                                     showActionPanel = false; onEdit()
                                 }
                             }
                             ActionRow(
                                 icon = { c -> PhIconCopy(color = c, size = 14.dp) },
-                                label = "Copy text",
+                                label = stringResource(R.string.chat_copy_text),
                             ) {
                                 showActionPanel = false; onCopy(rawText)
                             }
                             ActionRow(
                                 icon = { c -> PhIconPinAction(color = c, size = 16.dp) },
-                                label = if (entity.pinned) "Unpin" else "Pin",
+                                label = stringResource(if (entity.pinned) R.string.chat_unpin else R.string.chat_pin),
                             ) {
                                 showActionPanel = false; showPinChoice = true
                             }
                             ActionRow(
                                 icon = { c -> PhIconForward(color = c, size = 16.dp) },
-                                label = "Forward",
+                                label = stringResource(R.string.chat_forward),
                             ) {
                                 showActionPanel = false
                                 val senderLabel = if (entity.sent) "You" else theirUsername
@@ -2441,7 +2444,7 @@ private fun MessageBubble(
                             }
                             ActionRow(
                                 icon = { c -> PhIconBookmark(color = c, size = 16.dp) },
-                                label = "Save",
+                                label = stringResource(R.string.chat_save),
                             ) {
                                 showActionPanel = false
                                 bubbleCoroutineScope.launch {
@@ -2462,7 +2465,7 @@ private fun MessageBubble(
                             HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                             ActionRow(
                                 icon = { c -> PhIconTrash(color = c, size = 15.dp) },
-                                label = "Delete",
+                                label = stringResource(R.string.chat_delete),
                                 danger = true,
                             ) {
                                 showActionPanel = false; showDeleteDialog = true
@@ -2479,18 +2482,14 @@ private fun MessageBubble(
                     containerColor = Surface,
                     title = {
                         Text(
-                            text = if (entity.pinned) "Unpin message" else "Pin message",
+                            text = stringResource(if (entity.pinned) R.string.chat_unpin_message else R.string.chat_pin_message),
                             color = TextPrimary,
                             fontSize = 16.sp,
                         )
                     },
                     text = {
                         Text(
-                            text = if (entity.pinned) {
-                                "Choose where to unpin."
-                            } else {
-                                "Pin for everyone shows this message at the top of the chat for both of you. Pin for me keeps it private to your device."
-                            },
+                            text = stringResource(if (entity.pinned) R.string.chat_choose_where_to_unpin else R.string.chat_pin_explanation),
                             color = TextDim,
                             fontSize = 13.sp,
                         )
@@ -2498,7 +2497,7 @@ private fun MessageBubble(
                     confirmButton = {
                         TextButton(onClick = { showPinChoice = false; onPin() }) {
                             Text(
-                                text = if (entity.pinned) "Unpin for everyone" else "Pin for everyone",
+                                text = stringResource(if (entity.pinned) R.string.chat_unpin_for_everyone else R.string.chat_pin_for_everyone),
                                 color = CyanAccent,
                                 fontSize = 14.sp,
                             )
@@ -2508,13 +2507,13 @@ private fun MessageBubble(
                         Row {
                             TextButton(onClick = { showPinChoice = false; onPinLocal() }) {
                                 Text(
-                                    text = if (entity.pinned) "Unpin for me" else "Pin for me",
+                                    text = stringResource(if (entity.pinned) R.string.chat_unpin_for_me else R.string.chat_pin_for_me),
                                     color = TextPrimary,
                                     fontSize = 14.sp,
                                 )
                             }
                             TextButton(onClick = { showPinChoice = false }) {
-                                Text("Cancel", color = TextDim, fontSize = 14.sp)
+                                Text(stringResource(R.string.chat_cancel), color = TextDim, fontSize = 14.sp)
                             }
                         }
                     },
@@ -3010,7 +3009,7 @@ private fun AudioBubble(
             if (isSent && !isLoading) StatusIcon(status = status)
             if (isLoading) {
                 Text(
-                    text = if (isUploadingSender) "Sending" else "Receiving",
+                    text = stringResource(if (isUploadingSender) R.string.chat_voice_sending else R.string.chat_voice_receiving),
                     fontFamily = PhantomFontMono,
                     fontSize = 10.sp,
                     color = TextDim.copy(alpha = 0.7f),
@@ -3321,8 +3320,8 @@ private fun AudioBubbleFailed(reason: String, isSent: Boolean, timeStr: String, 
                 }
             }
             Column(modifier = Modifier.weight(1f)) {
-                Text(text = "Voice unavailable", color = Danger.copy(alpha = 0.85f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                Text(text = "Try again later", color = TextDim, fontSize = 11.sp)
+                Text(text = stringResource(R.string.chat_voice_unavailable), color = Danger.copy(alpha = 0.85f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Text(text = stringResource(R.string.chat_try_again_later), color = TextDim, fontSize = 11.sp)
                 Text(text = reason, color = TextDim.copy(alpha = 0.7f), fontFamily = PhantomFontMono, fontSize = 9.sp, maxLines = 1)
             }
         }
@@ -3619,7 +3618,7 @@ private fun InputBar(
                         decorationBox = { inner ->
                             if (text.isEmpty()) {
                                 Text(
-                                    text = "Message…",
+                                    text = stringResource(R.string.chat_message_hint),
                                     color = TextDim.copy(alpha = 0.4f),
                                     fontSize = 14.sp,
                                 )
@@ -4203,7 +4202,8 @@ private fun RecPanelDot(live: Boolean) {
 @Composable
 private fun RecPanelTimer(durationMs: Long, paused: Boolean) {
     val totalSeconds = (durationMs / 1000).toInt()
-    val label = "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
+    val locale = LocalConfiguration.current.locales[0]
+    val label = String.format(locale, "%d:%02d", totalSeconds / 60, totalSeconds % 60)
     Text(
         text = label,
         color = if (paused) TextDim else TextPrimary,
@@ -4286,7 +4286,7 @@ private fun RecPanelPausedPill() {
             )
         }
         Text(
-            text = "PAUSED",
+            text = stringResource(R.string.chat_recording_paused),
             color = TextDim,
             fontSize = 10.sp,
             fontFamily = PhantomFontMono,
@@ -4408,7 +4408,7 @@ private fun RecPanelSwipeZone(
                     drawLine(Danger, Offset(size.width * 0.05f, cy), Offset(size.width * 0.35f, cy + size.height * 0.35f), sw, cap)
                 }
                 Text(
-                    text = "discard",
+                    text = stringResource(R.string.chat_discard_recording),
                     color = Danger,
                     fontSize = 11.sp,
                     fontFamily = PhantomFontMono,
@@ -4532,10 +4532,10 @@ private fun BlockConfirmDialog(username: String, onConfirm: () -> Unit, onDismis
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
-        title = { Text("Block $username?", color = TextPrimary) },
-        text = { Text("They won't be able to send you messages.", color = TextDim, fontSize = 13.sp) },
-        confirmButton = { TextButton(onClick = onConfirm) { Text("Block", color = Danger) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = TextDim) } },
+        title = { Text(stringResource(R.string.chat_block_confirm_title, username), color = TextPrimary) },
+        text = { Text(stringResource(R.string.chat_block_confirm_body), color = TextDim, fontSize = 13.sp) },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(stringResource(R.string.chat_block), color = Danger) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.chat_cancel), color = TextDim) } },
     )
 }
 
@@ -4547,10 +4547,10 @@ private fun ReportDialog(username: String, onReport: (SafetyReportCategory) -> U
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
-        title = { Text("Report $username", color = TextPrimary) },
+        title = { Text(stringResource(R.string.chat_report_title, username), color = TextPrimary) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Select a reason:", color = TextDim, fontSize = 12.sp)
+                Text(stringResource(R.string.chat_report_reason), color = TextDim, fontSize = 12.sp)
                 Spacer(Modifier.height(4.dp))
                 SafetyReportCategory.entries.forEach { category ->
                     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -4572,7 +4572,7 @@ private fun ReportDialog(username: String, onReport: (SafetyReportCategory) -> U
                     androidx.compose.material3.OutlinedTextField(
                         value = otherText,
                         onValueChange = { otherText = it },
-                        placeholder = { Text("Describe the issue…", color = TextDim, fontSize = 13.sp) },
+                        placeholder = { Text(stringResource(R.string.chat_report_description_hint), color = TextDim, fontSize = 13.sp) },
                         modifier = Modifier.fillMaxWidth(),
                         minLines = 2,
                         maxLines = 4,
@@ -4592,20 +4592,21 @@ private fun ReportDialog(username: String, onReport: (SafetyReportCategory) -> U
                 onClick = { if (canSend) onReport(selected!!) },
                 enabled = canSend,
             ) {
-                Text("Send Report", color = if (canSend) CyanAccent else TextDim)
+                Text(stringResource(R.string.chat_send_report), color = if (canSend) CyanAccent else TextDim)
             }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = TextDim) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.chat_cancel), color = TextDim) } },
     )
 }
 
+@Composable
 private fun categoryLabel(category: SafetyReportCategory): String = when (category) {
-    SafetyReportCategory.SPAM            -> "Spam"
-    SafetyReportCategory.HARASSMENT      -> "Harassment"
-    SafetyReportCategory.THREATS         -> "Threats or violence"
-    SafetyReportCategory.CSAM            -> "Child safety"
-    SafetyReportCategory.ILLEGAL_CONTENT -> "Illegal content"
-    SafetyReportCategory.OTHER           -> "Other"
+    SafetyReportCategory.SPAM            -> stringResource(R.string.chat_report_spam)
+    SafetyReportCategory.HARASSMENT      -> stringResource(R.string.chat_report_harassment)
+    SafetyReportCategory.THREATS         -> stringResource(R.string.chat_report_threats)
+    SafetyReportCategory.CSAM            -> stringResource(R.string.chat_report_child_safety)
+    SafetyReportCategory.ILLEGAL_CONTENT -> stringResource(R.string.chat_report_illegal_content)
+    SafetyReportCategory.OTHER           -> stringResource(R.string.chat_report_other)
 }
 
 // ── Link preview ──────────────────────────────────────────────────────────────
@@ -4759,7 +4760,7 @@ private fun ChatTopBar(
                 Spacer(Modifier.height(2.dp))
                 if (isTyping) {
                     Text(
-                        text = "typing…",
+                        text = stringResource(R.string.chat_typing),
                         color = PhantomTokens.Colors.Cyan.copy(alpha = 0.85f),
                         fontSize = 11.sp,
                         fontFamily = PhantomFontMono,
@@ -4778,7 +4779,7 @@ private fun ChatTopBar(
                         )
                         Spacer(Modifier.width(5.dp))
                         Text(
-                            text = "online",
+                            text = stringResource(R.string.chat_online),
                             color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.65f),
                             fontSize = 10.sp,
                             fontFamily = PhantomFontMono,
@@ -4813,11 +4814,11 @@ private fun ChatTopBar(
                     containerColor = Surface2,
                 ) {
                     DropdownMenuItem(
-                        text = { Text("Report", color = TextPrimary, fontSize = 14.sp) },
+                        text = { Text(stringResource(R.string.chat_report), color = TextPrimary, fontSize = 14.sp) },
                         onClick = onReport,
                     )
                     DropdownMenuItem(
-                        text = { Text("Block", color = Danger, fontSize = 14.sp) },
+                        text = { Text(stringResource(R.string.chat_block), color = Danger, fontSize = 14.sp) },
                         onClick = onBlock,
                     )
                 }
