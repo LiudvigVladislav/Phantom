@@ -47,6 +47,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -233,7 +234,7 @@ internal fun Panel(
             )
             HeaderRow(onDismiss = onDismiss)
             Text(
-                text = "Preview only. Subscriptions are not available yet.",
+                text = stringResource(R.string.pricing_sheet_preview),
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -270,7 +271,7 @@ private fun HeaderRow(onDismiss: () -> Unit) {
         // word "PHANTOM PREMIUM" breaks naturally between words.
         // User's fontScale respected — no cap.
         Text(
-            text = "PHANTOM PREMIUM",
+            text = stringResource(R.string.pricing_sheet_title),
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -297,7 +298,7 @@ private fun CloseXButton(onClick: () -> Unit) {
             .background(Color(0x0DFFFFFF)) // rgba(255,255,255,.05)
             .clickable(
                 role = Role.Button,
-                onClickLabel = "Close pricing",
+                onClickLabel = stringResource(R.string.pricing_sheet_close),
                 onClick = onClick,
             ),
         contentAlignment = Alignment.Center,
@@ -352,9 +353,10 @@ private fun ColumnScope.TierList(
             .verticalScroll(scrollState),
     ) {
         PRICING_TIERS.forEach { tier ->
+            val cta = stringResource(tier.ctaRes)
             PricingTierCard(
                 tier = tier,
-                onCtaClick = { onCtaSelected(tier.cta) },
+                onCtaClick = { onCtaSelected(cta) },
             )
             Spacer(Modifier.height(14.dp))
         }
@@ -364,7 +366,7 @@ private fun ColumnScope.TierList(
 @Composable
 private fun Footer() {
     Text(
-        text = "Planned prices and features. Subscriptions are not available yet.",
+        text = stringResource(R.string.pricing_sheet_footer),
         color = DesignV2Tokens.Colors.TextQuaternary,
         style = TextStyle(
             fontFamily = DesignV2FontBody,

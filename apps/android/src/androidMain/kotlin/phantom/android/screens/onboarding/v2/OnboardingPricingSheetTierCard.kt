@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
@@ -98,7 +99,7 @@ internal fun PricingTierCard(
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = tier.name,
+                        text = stringResource(tier.nameRes),
                         color = DesignV2Tokens.Colors.TextPrimary,
                         style = TextStyle(
                             fontFamily = DesignV2FontDisplay,
@@ -112,7 +113,7 @@ internal fun PricingTierCard(
                 }
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        text = tier.price,
+                        text = stringResource(tier.priceRes),
                         color = DesignV2Tokens.Colors.TextPrimary,
                         style = TextStyle(
                             fontFamily = DesignV2FontDisplay,
@@ -123,7 +124,7 @@ internal fun PricingTierCard(
                         softWrap = false,
                     )
                     Text(
-                        text = "/mo",
+                        text = stringResource(R.string.pricing_monthly),
                         color = DesignV2Tokens.Colors.TextQuaternary,
                         style = TextStyle(
                             fontFamily = DesignV2FontBody,
@@ -137,7 +138,7 @@ internal fun PricingTierCard(
             }
             Spacer(Modifier.height(2.dp))
             Text(
-                text = tier.sub,
+                text = stringResource(tier.subRes),
                 color = DesignV2Tokens.Colors.TextQuaternary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -146,18 +147,21 @@ internal fun PricingTierCard(
                 ),
             )
 
-            if (tier.calloutTitle != null && tier.calloutBody != null) {
+            if (tier.calloutTitleRes != null && tier.calloutBodyRes != null) {
                 Spacer(Modifier.height(14.dp))
-                PricingCalloutBox(title = tier.calloutTitle, body = tier.calloutBody)
+                PricingCalloutBox(
+                    title = stringResource(tier.calloutTitleRes),
+                    body = stringResource(tier.calloutBodyRes),
+                )
             }
 
             Spacer(Modifier.height(14.dp))
-            tier.features.forEach { feature ->
-                PricingFeatureRow(text = feature)
+            tier.featureRes.forEach { feature ->
+                PricingFeatureRow(text = stringResource(feature))
             }
             Spacer(Modifier.height(4.dp))
             PricingCtaButton(
-                text = tier.cta,
+                text = stringResource(tier.ctaRes),
                 recommended = tier.recommended,
                 onClick = onCtaClick,
             )
@@ -182,7 +186,7 @@ private fun RecommendedRibbon(modifier: Modifier = Modifier) {
             .padding(horizontal = 8.dp, vertical = 3.dp),
     ) {
         Text(
-            text = "RECOMMENDED",
+            text = stringResource(R.string.pricing_recommended),
             color = Color(0xFF04222B),
             style = TextStyle(
                 fontFamily = DesignV2FontMono,

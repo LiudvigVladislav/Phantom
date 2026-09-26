@@ -655,4 +655,55 @@
     <string name="terms_accept_explanation">By tapping \"Accept &amp; Continue\" you confirm that you are at least 16 years old and agree to these terms and the Privacy Policy.</string>
     <string name="terms_scroll_hint">scroll to read all terms</string>
     <string name="terms_accept_button">ACCEPT &amp; CONTINUE</string>
+    <string name="pricing_name_free">Free</string>
+    <string name="pricing_name_plus" translatable="false">Plus</string>
+    <string name="pricing_name_pro" translatable="false">Pro</string>
+    <string name="pricing_name_business" translatable="false">Business</string>
+    <string name="pricing_price_plus" translatable="false">$4.99</string>
+    <string name="pricing_price_pro" translatable="false">$9.99</string>
+    <string name="pricing_price_business" translatable="false">$19.99</string>
+    <string name="pricing_monthly">/mo</string>
+    <string name="pricing_recommended">RECOMMENDED</string>
+    <string name="pricing_tagline_free">The foundation.</string>
+    <string name="pricing_tagline_plus">More control.</string>
+    <string name="pricing_tagline_pro">Full control.</string>
+    <string name="pricing_tagline_business">For teams &amp; organizations.</string>
+    <string name="pricing_cta_current">Current plan</string>
+    <string name="pricing_cta_plus">Plus coming soon</string>
+    <string name="pricing_cta_pro">Pro coming soon</string>
+    <string name="pricing_cta_business">Business coming soon</string>
+    <string name="pricing_feature_private_messages">1:1 end-to-end encrypted messages</string>
+    <string name="pricing_feature_free_groups">Group chats up to 8</string>
+    <string name="pricing_feature_calls">Voice &amp; video calls</string>
+    <string name="pricing_feature_free_disappearing">Disappearing messages up to 30 days</string>
+    <string name="pricing_feature_default_relay">Phntm.pro relay</string>
+    <string name="pricing_feature_everything_free">Everything in Free</string>
+    <string name="pricing_feature_plus_groups">Larger groups up to 64 members</string>
+    <string name="pricing_feature_plus_disappearing">Disappearing messages up to 1 year</string>
+    <string name="pricing_feature_custom_relay">Custom relay support</string>
+    <string name="pricing_feature_priority_routing">Priority message routing</string>
+    <string name="pricing_feature_premium_typeface">Premium typeface (PP Neue Montreal)</string>
+    <string name="pricing_feature_everything_plus">Everything in Plus</string>
+    <string name="pricing_feature_mono_typeface">Berkeley Mono for fingerprints &amp; keys</string>
+    <string name="pricing_feature_stealth">Stealth routing &amp; decoy traffic</string>
+    <string name="pricing_feature_tor_bridge">Tor-bridge fallback</string>
+    <string name="pricing_feature_self_hosted">Self-hosted relay support</string>
+    <string name="pricing_feature_sealed_sender">Advanced sealed sender</string>
+    <string name="pricing_feature_everything_pro">Everything in Pro</string>
+    <string name="pricing_feature_admin">Centralized admin console</string>
+    <string name="pricing_feature_sso">SSO &amp; audit logs</string>
+    <string name="pricing_feature_dedicated_relay">Dedicated relay cluster</string>
+    <string name="pricing_feature_priority_support">Priority support</string>
+    <string name="pricing_ghost_title">GHOST MODE</string>
+    <string name="pricing_ghost_body">Route every message through the Tor network with no silent downgrade to WSS or REALITY. Additional invisibility controls arrive in a future Pro release.</string>
+    <string name="pricing_unavailable">Subscriptions are not available yet</string>
+    <string name="pricing_sheet_title">PHANTOM PREMIUM</string>
+    <string name="pricing_sheet_close">Close pricing</string>
+    <string name="pricing_sheet_preview">Preview only. Subscriptions are not available yet.</string>
+    <string name="pricing_sheet_footer">Planned prices and features. Subscriptions are not available yet.</string>
+    <string name="premium_title">Upgrade</string>
+    <string name="premium_back">Back</string>
+    <string name="premium_preview">Planned plans and prices. Subscriptions are not available yet.</string>
+    <string name="premium_footer">Preview only. No purchase is available in this build.</string>
+    <string name="premium_free_price">Free forever</string>
 </resources>

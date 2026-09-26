@@ -3,6 +3,7 @@
 
 package phantom.android.screens.premium
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -17,11 +18,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 
@@ -45,11 +52,13 @@ fun PremiumScreen(
     var selected by remember { mutableStateOf(Tier.Pro) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    val unavailableMessage = stringResource(R.string.pricing_unavailable)
+    val backLabel = stringResource(R.string.premium_back)
 
     fun showComingSoon() {
         scope.launch {
             snackbarHostState.currentSnackbarData?.dismiss()
-            snackbarHostState.showSnackbar("Subscriptions are not available yet")
+            snackbarHostState.showSnackbar(unavailableMessage)
         }
     }
 
@@ -82,12 +91,15 @@ fun PremiumScreen(
                         .padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.size(40.dp).semantics { contentDescription = backLabel },
+                    ) {
                         PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
                     }
                     Spacer(Modifier.width(2.dp))
                     Text(
-                        text = "Upgrade",
+                        text = stringResource(R.string.premium_title),
                         color = TextPrimary,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Medium,
@@ -111,7 +123,7 @@ fun PremiumScreen(
             // density restrained and lets the plan card carry the visual
             // weight.
             Text(
-                text = "Planned plans and prices. Subscriptions are not available yet.",
+                text = stringResource(R.string.premium_preview),
                 color = TextDim.copy(alpha = 0.85f),
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -133,7 +145,7 @@ fun PremiumScreen(
             Spacer(Modifier.height(20.dp))
 
             Text(
-                text = "Preview only. No purchase is available in this build.",
+                text = stringResource(R.string.premium_footer),
                 color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.45f),
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
@@ -146,10 +158,15 @@ fun PremiumScreen(
     }
 }
 
-private enum class Tier { Free, Plus, Pro }
+private enum class Tier(@StringRes val labelRes: Int) {
+    Free(R.string.pricing_name_free),
+    Plus(R.string.pricing_name_plus),
+    Pro(R.string.pricing_name_pro),
+}
 
 @Composable
 private fun TierSelector(selected: Tier, onSelect: (Tier) -> Unit) {
+    val locale = LocalConfiguration.current.locales[0]
     // FULL_COMPOSE §11 selector: full pill (radius 9999), 32dp tab height,
     // active tab uses neutral SurfaceHover (NOT cyan — cyan is reserved for
     // active CTAs and trust signals only). Active label is TextPrimary so
@@ -180,7 +197,7 @@ private fun TierSelector(selected: Tier, onSelect: (Tier) -> Unit) {
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = tier.name.uppercase(),
+                    text = stringResource(tier.labelRes).uppercase(locale),
                     color = if (active) TextPrimary else TextDim,
                     fontSize = 10.sp,
                     fontFamily = PhantomFontMono,
@@ -198,18 +215,18 @@ private fun TierSelector(selected: Tier, onSelect: (Tier) -> Unit) {
 private fun FreePlanCard(onCta: () -> Unit) {
     PlanCardShell(
         recommended = false,
-        tierName = "Free",
+        tierName = stringResource(R.string.pricing_name_free),
         price = null,
         cadence = null,
-        tagline = "The foundation.",
+        tagline = stringResource(R.string.pricing_tagline_free),
         features = listOf(
-            "1:1 end-to-end encrypted messages",
-            "Group chats up to 8",
-            "Voice & video calls",
-            "Disappearing messages up to 30 days",
-            "Phntm.pro relay",
+            stringResource(R.string.pricing_feature_private_messages),
+            stringResource(R.string.pricing_feature_free_groups),
+            stringResource(R.string.pricing_feature_calls),
+            stringResource(R.string.pricing_feature_free_disappearing),
+            stringResource(R.string.pricing_feature_default_relay),
         ),
-        ctaLabel = "Current plan",
+        ctaLabel = stringResource(R.string.pricing_cta_current),
         ctaVariant = CtaVariant.Ghost,
         ghostInset = false,
         onCta = onCta,
@@ -220,19 +237,19 @@ private fun FreePlanCard(onCta: () -> Unit) {
 private fun PlusPlanCard(onCta: () -> Unit) {
     PlanCardShell(
         recommended = false,
-        tierName = "Plus",
-        price = "$4.99",
-        cadence = "/mo",
-        tagline = "More control.",
+        tierName = stringResource(R.string.pricing_name_plus),
+        price = stringResource(R.string.pricing_price_plus),
+        cadence = stringResource(R.string.pricing_monthly),
+        tagline = stringResource(R.string.pricing_tagline_plus),
         features = listOf(
-            "Everything in Free",
-            "Larger groups up to 64 members",
-            "Disappearing messages up to 1 year",
-            "Custom relay support",
-            "Priority message routing",
-            "Premium typeface (PP Neue Montreal)",
+            stringResource(R.string.pricing_feature_everything_free),
+            stringResource(R.string.pricing_feature_plus_groups),
+            stringResource(R.string.pricing_feature_plus_disappearing),
+            stringResource(R.string.pricing_feature_custom_relay),
+            stringResource(R.string.pricing_feature_priority_routing),
+            stringResource(R.string.pricing_feature_premium_typeface),
         ),
-        ctaLabel = "Plus coming soon",
+        ctaLabel = stringResource(R.string.pricing_cta_plus),
         ctaVariant = CtaVariant.Secondary,
         ghostInset = false,
         onCta = onCta,
@@ -243,19 +260,19 @@ private fun PlusPlanCard(onCta: () -> Unit) {
 private fun ProPlanCard(onCta: () -> Unit) {
     PlanCardShell(
         recommended = true,
-        tierName = "Pro",
-        price = "$9.99",
-        cadence = "/mo",
-        tagline = "Full control.",
+        tierName = stringResource(R.string.pricing_name_pro),
+        price = stringResource(R.string.pricing_price_pro),
+        cadence = stringResource(R.string.pricing_monthly),
+        tagline = stringResource(R.string.pricing_tagline_pro),
         features = listOf(
-            "Everything in Plus",
-            "Berkeley Mono for fingerprints & keys",
-            "Stealth routing & decoy traffic",
-            "Tor-bridge fallback",
-            "Self-hosted relay support",
-            "Advanced sealed sender",
+            stringResource(R.string.pricing_feature_everything_plus),
+            stringResource(R.string.pricing_feature_mono_typeface),
+            stringResource(R.string.pricing_feature_stealth),
+            stringResource(R.string.pricing_feature_tor_bridge),
+            stringResource(R.string.pricing_feature_self_hosted),
+            stringResource(R.string.pricing_feature_sealed_sender),
         ),
-        ctaLabel = "Pro coming soon",
+        ctaLabel = stringResource(R.string.pricing_cta_pro),
         ctaVariant = CtaVariant.Primary,
         ghostInset = true,
         onCta = onCta,
@@ -327,7 +344,7 @@ private fun PlanCardShell(
                     }
                 } else {
                     Text(
-                        text = "Free forever",
+                        text = stringResource(R.string.premium_free_price),
                         color = TextDim.copy(alpha = 0.55f),
                         fontSize = 13.sp,
                         modifier = Modifier.padding(bottom = 2.dp),
@@ -354,7 +371,7 @@ private fun PlanCardShell(
                         .padding(horizontal = 14.dp, vertical = 12.dp),
                 ) {
                     Text(
-                        text = "GHOST MODE",
+                        text = stringResource(R.string.pricing_ghost_title),
                         color = PhantomTokens.Colors.TextSecondary,
                         fontSize = 10.sp,
                         fontFamily = PhantomFontMono,
@@ -363,7 +380,7 @@ private fun PlanCardShell(
                     )
                     Spacer(Modifier.height(5.dp))
                     Text(
-                        text = "Become completely invisible on PHANTOM. Receive-only mode disables read receipts, presence, and discovery.",
+                        text = stringResource(R.string.pricing_ghost_body),
                         color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.75f),
                         fontSize = 12.sp,
                         lineHeight = 17.sp,
@@ -393,6 +410,7 @@ private fun PlanCardShell(
                     ) {
                         Text(
                             text = "✓",
+                            modifier = Modifier.clearAndSetSemantics { },
                             color = PhantomTokens.Colors.TextSecondary,
                             fontSize = 9.sp,
                             fontWeight = FontWeight.Bold,
@@ -490,7 +508,7 @@ private fun PlanCardShell(
                     .padding(horizontal = 8.dp, vertical = 3.dp),
             ) {
                 Text(
-                    text = "RECOMMENDED",
+                    text = stringResource(R.string.pricing_recommended),
                     color = BgDeep,
                     fontSize = 8.sp,
                     fontFamily = PhantomFontMono,

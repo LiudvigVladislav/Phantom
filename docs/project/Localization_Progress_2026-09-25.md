@@ -51,7 +51,7 @@ added to a release until the complete-flow gates in
   English resources for its headings, eight sections, links, scroll hint,
   and acceptance text. Its visible wording and acceptance behavior were
   preserved; extraction is not legal, privacy, or security approval. Pricing
-  copy remains unextracted.
+  extraction is recorded in the follow-up below.
 - Incoming-call and active-call screens now take status and action copy from
   English resources. Icon-only call controls have accessible action names that
   reflect mute and speaker state. The `RINGING` label describes an incoming
@@ -135,6 +135,17 @@ added to a release until the complete-flow gates in
   without recounting or altering the stored files. The debug-only chunk-size
   probe retains its technical byte labels and is not part of release copy.
 
+- Onboarding pricing and Settings Premium now use resource-backed names,
+  planned prices, descriptions, feature lists, notices, and action labels.
+  The same Ghost routing explanation appears in both; Premium no longer
+  promises complete invisibility or receive-only behavior. The pricing-sheet
+  backdrop, grab strip, close button, and Premium Back control have resource-
+  backed action names. Tier selection uses an enum, not translated labels.
+  Paid CTAs only show an unavailable notice; the onboarding toast no longer
+  duplicates "coming soon". See `Pricing_Copy_Extraction_2026-09-26.md` for
+  the scoped inventory and verification. This is English extraction, not a
+  billing implementation or a Russian release.
+
 The full `SessionOrderFullStackTest` class was also checked independently on
 Mac: 57/57 tests passed in 400.838 seconds. It is a regular integration test,
 not a Paparazzi snapshot test. Snapshot verification must use the repository's
@@ -184,10 +195,11 @@ The QR scanner's remaining hard-coded strings are diagnostic log messages,
 not visible UI.
 
 Nearby is an active navigation destination but not a working discovery flow.
-Its `nearby_discoverable` preference does not start a beacon or scan, while
-the toggle and animated radar imply live discovery. The screen is therefore
-blocked for truthful product-copy review rather than being translated as a
-working BLE/Wi-Fi Direct feature. No Nearby behavior was changed here.
+The earlier `nearby_discoverable` toggle and animated radar were removed in
+the approved product-copy follow-up. Its current unavailable title and body
+are resource-backed and say this device is not scanning or broadcasting.
+Existing stored values must not become future consent to broadcast. No
+discovery implementation or Russian translation is claimed.
 
 A targeted scan of non-screen Android copy found that `QrCodeImage` is called
 from Profile and is active; its accessibility label is now a resource.
@@ -217,8 +229,9 @@ working purchase. Ghost is locked without a verified Pro subscription, and
 the old discoverability toggle/radar were removed from Nearby in favor of an
 honest unavailable state. Create Channel has no
 ordinary UI entry even though its route can be restored, and the migration
-screen remains conditional and copy-locked by its ADR. These findings are
-not translations or owner-approved product decisions.
+screen remains conditional and copy-locked by its ADR. The approved preview
+decisions do not certify the planned features as implemented; the outstanding
+Terms, migration, and channel decisions are not made by this inventory.
 
 The source scan
 
@@ -226,9 +239,11 @@ The source scan
 rg -n 'Text\(|contentDescription\s*=|showSnackbar\(|label\s*=\s*"|body\s*=\s*"' apps/android/src/androidMain/kotlin/phantom/android/screens
 ```
 
-currently finds 612 anchor lines in 40 screen source files. An anchor may
+found 612 anchor lines in 40 screen source files at the initial inventory
+pass, not as a current coverage measurement. An anchor may
 contain no literal, several literals, or a dynamic value. A second scan finds
-22 additional Android source files outside `screens` with text, accessibility,
+22 additional Android source files outside `screens` at that same initial
+pass with text, accessibility,
 snackbar, notification, or toast candidates. Neither scan covers every
 possible user-visible string, shared-module error, XML resource, or server
 message. Do not use these counts as translation coverage.
@@ -263,10 +278,12 @@ migration contract and recovery policy before changing or releasing that copy.
 The onboarding-v2 How and privacy-tier copy now describes the implemented
 transport chains and read-receipt policy. The previous presence, last-seen,
 and Nearby-per-tier promises were unsupported: Settings has no separate
-last-seen control, and Nearby's discoverable toggle currently stores a local
-preference without running mesh discovery. The pricing sheet and legacy
-onboarding still contain aspirational claims; they require product review
-before translation. No transport or privacy-mode behavior changed here.
+last-seen control, and the former Nearby toggle only stored a local preference
+without running mesh discovery. Pricing now explicitly presents planned
+features; its resources do not certify implementation of those features.
+Legacy onboarding remains outside the active-flow extraction and must not be
+re-enabled with unreviewed claims. These copy changes do not alter transport
+or privacy-mode routing.
 
 The own-profile deletion text previously claimed that contacts would see an
 "Account deleted by user" event. The action only deletes the local identity

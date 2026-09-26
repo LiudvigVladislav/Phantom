@@ -1053,12 +1053,13 @@ internal fun OnboardingFlowV2Internal(
         // sheet closes before the toast renders (the toast is
         // subscribed via a LaunchedEffect on toastMessage which
         // handles the update on the next frame).
+        val subscriptionUnavailable = stringResource(R.string.pricing_unavailable)
         OnboardingPricingSheetV2(
             visible = pricingSheetVisible,
             onDismiss = { pricingSheetVisible = false },
-            onCtaSelected = { cta ->
+            onCtaSelected = {
                 pricingSheetVisible = false
-                toastMessage = "$cta — coming soon."
+                toastMessage = subscriptionUnavailable
             },
             onFullyDismissed = { pricingSheetPresent = false },
         )
