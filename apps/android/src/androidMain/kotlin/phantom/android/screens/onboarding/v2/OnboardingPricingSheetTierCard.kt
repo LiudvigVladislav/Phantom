@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -265,7 +266,7 @@ private fun PricingFeatureRow(text: String) {
 }
 
 @Composable
-private fun PricingCtaButton(
+internal fun PricingCtaButton(
     text: String,
     recommended: Boolean,
     onClick: () -> Unit,
@@ -277,7 +278,7 @@ private fun PricingCtaButton(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(50.dp)
+            .heightIn(min = 50.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(bg)
             .border(1.dp, borderColor, RoundedCornerShape(14.dp))
@@ -285,13 +286,15 @@ private fun PricingCtaButton(
                 role = Role.Button,
                 onClickLabel = text,
                 onClick = onClick,
-            ),
+            )
+            .padding(horizontal = 14.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = text,
             color = fg,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
                 fontSize = 14.5.sp,

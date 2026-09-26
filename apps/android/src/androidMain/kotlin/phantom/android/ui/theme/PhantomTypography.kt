@@ -5,10 +5,8 @@ package phantom.android.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.font.FontVariation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import phantom.android.R
@@ -25,7 +23,7 @@ import phantom.android.R
  *   - **JetBrains Mono** (technical / overlines) — variable weight 100–800
  *     in `jetbrains_mono_variable.ttf`.
  *
- * Each `Font(...)` declaration pins the wght axis with [FontVariation.weight]
+ * Each font declaration pins the wght axis through [bundledVariableFont]
  * so Compose's text engine pulls the right outline from the variable file
  * instead of synthesising bold/medium from a single weight cut.
  *
@@ -38,28 +36,22 @@ import phantom.android.R
 
 // ── FONT FAMILIES ───────────────────────────────────────────────────────────
 
-@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
-private fun geistFont(weight: FontWeight) = Font(
+private fun geistFont(weight: FontWeight) = bundledVariableFont(
     R.font.geist_variable,
     weight = weight,
     style = FontStyle.Normal,
-    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
 )
 
-@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
-private fun interFont(weight: FontWeight, italic: Boolean = false) = Font(
+private fun interFont(weight: FontWeight, italic: Boolean = false) = bundledVariableFont(
     R.font.inter_variable,
     weight = weight,
     style = if (italic) FontStyle.Italic else FontStyle.Normal,
-    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
 )
 
-@OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
-private fun jetbrainsMonoFont(weight: FontWeight) = Font(
+private fun jetbrainsMonoFont(weight: FontWeight) = bundledVariableFont(
     R.font.jetbrains_mono_variable,
     weight = weight,
     style = FontStyle.Normal,
-    variationSettings = FontVariation.Settings(FontVariation.weight(weight.weight)),
 )
 
 val PhantomFontGeist: FontFamily = FontFamily(
