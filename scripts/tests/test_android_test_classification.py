@@ -129,6 +129,16 @@ class AndroidTestClassificationGuardTest(unittest.TestCase):
         self.assertEqual(0, rc, out)
         self.assertIn('manifest == executed', out)
 
+    def test_committed_workflow_covers_the_real_test_tree(self):
+        env = dict(os.environ, PHANTOM_ANDROID_WORKFLOW=str(WORKFLOW),
+                   PHANTOM_ANDROID_UNIT_TEST_ROOT=str(
+                       REPO / 'apps/android/src/androidUnitTest/kotlin'))
+        done = subprocess.run([sys.executable, '-B', '-'],
+                              input=_guard_program(self.text), capture_output=True,
+                              text=True, env=env, cwd=REPO, timeout=60)
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertIn('manifest == executed', done.stdout)
+
     def test_control_1_a_source_class_missing_from_the_manifest_is_reported(self):
         manifest = self._consistent()
         extra = 'phantom.android.zz.UnlistedNewTest'
