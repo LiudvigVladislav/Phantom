@@ -24,6 +24,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -32,6 +35,7 @@ import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import phantom.android.R
 import phantom.android.ui.theme.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -45,6 +49,7 @@ fun QrScanScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
+    val backLabel = stringResource(R.string.qr_scan_back)
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -65,7 +70,7 @@ fun QrScanScreen(
             TopAppBar(
                 title = {
                     Text(
-                        text = "Scan QR code",
+                        text = stringResource(R.string.qr_scan_title),
                         color = TextPrimary,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Medium,
@@ -73,7 +78,7 @@ fun QrScanScreen(
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = onBack, modifier = Modifier.semantics { contentDescription = backLabel }) {
                         PhIconBack(color = TextPrimary, size = 20.dp)
                     }
                 },
@@ -98,7 +103,7 @@ fun QrScanScreen(
                 }
 
                 Text(
-                    text = "Point at the Phantom QR code",
+                    text = stringResource(R.string.qr_scan_instruction),
                     color = TextDim,
                     fontSize = 13.sp,
                     modifier = Modifier
@@ -109,13 +114,13 @@ fun QrScanScreen(
                 )
             } else {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Camera permission required", color = TextPrimary, fontSize = 15.sp)
+                    Text(stringResource(R.string.qr_scan_permission_required), color = TextPrimary, fontSize = 15.sp)
                     Spacer(Modifier.height(12.dp))
                     Button(
                         onClick = { launcher.launch(Manifest.permission.CAMERA) },
                         colors = ButtonDefaults.buttonColors(containerColor = CyanAccent),
                     ) {
-                        Text("Grant Permission", color = BgDeep)
+                        Text(stringResource(R.string.qr_scan_grant_permission), color = BgDeep)
                     }
                 }
             }

@@ -3,6 +3,7 @@
 
 package phantom.android.screens.onboarding.v2
 
+import androidx.annotation.StringRes
 import phantom.android.R
 
 /**
@@ -31,63 +32,63 @@ import phantom.android.R
  * called out as a future Pro capability.
  */
 internal data class PricingTierV2(
-    val name: String,
-    val price: String,
-    val sub: String,
+    @StringRes val nameRes: Int,
+    @StringRes val priceRes: Int,
+    @StringRes val subRes: Int,
     val iconRes: Int,
-    val cta: String,
+    @StringRes val ctaRes: Int,
     val recommended: Boolean = false,
-    val calloutTitle: String? = null,
-    val calloutBody: String? = null,
-    val features: List<String>,
+    @StringRes val calloutTitleRes: Int? = null,
+    @StringRes val calloutBodyRes: Int? = null,
+    val featureRes: List<Int>,
 )
 
 internal val PRICING_TIERS: List<PricingTierV2> = listOf(
     PricingTierV2(
-        name = "Plus",
-        price = "$3.99",
-        sub = "More control.",
+        nameRes = R.string.pricing_name_plus,
+        priceRes = R.string.pricing_price_plus,
+        subRes = R.string.pricing_tagline_plus,
         iconRes = R.drawable.ic_dv2_tier_plus,
-        cta = "Upgrade to Plus",
-        features = listOf(
-            "Everything in Free",
-            "Larger groups up to 64 members",
-            "Disappearing messages up to 1 year",
-            "Custom relay support",
-            "Priority message routing",
-            "Premium typeface (PP Neue Montreal)",
+        ctaRes = R.string.pricing_cta_plus,
+        featureRes = listOf(
+            R.string.pricing_feature_everything_free,
+            R.string.pricing_feature_plus_groups,
+            R.string.pricing_feature_plus_disappearing,
+            R.string.pricing_feature_custom_relay,
+            R.string.pricing_feature_priority_routing,
+            R.string.pricing_feature_premium_typeface,
         ),
     ),
     PricingTierV2(
-        name = "Pro",
-        price = "$9.99",
-        sub = "Full control.",
+        nameRes = R.string.pricing_name_pro,
+        priceRes = R.string.pricing_price_pro,
+        subRes = R.string.pricing_tagline_pro,
         iconRes = R.drawable.ic_dv2_tier_pro,
-        cta = "Upgrade to Pro",
+        ctaRes = R.string.pricing_cta_pro,
         recommended = true,
-        calloutTitle = "GHOST MODE",
-        calloutBody = "Route every message through the Tor network with no silent downgrade to WSS or REALITY. Additional invisibility controls arrive in a future Pro release.",
-        features = listOf(
-            "Everything in Plus",
-            "Berkeley Mono for fingerprints & keys",
-            "Stealth routing & decoy traffic",
-            "Tor-bridge fallback",
-            "Self-hosted relay support",
-            "Advanced sealed sender",
+        calloutTitleRes = R.string.pricing_ghost_title,
+        calloutBodyRes = R.string.pricing_ghost_body,
+        featureRes = listOf(
+            R.string.pricing_feature_everything_plus,
+            R.string.pricing_feature_mono_typeface,
+            R.string.pricing_feature_stealth,
+            R.string.pricing_feature_tor_bridge,
+            R.string.pricing_feature_self_hosted,
+            R.string.pricing_feature_sealed_sender,
         ),
     ),
     PricingTierV2(
-        name = "Business",
-        price = "$19.99",
-        sub = "For teams & organizations.",
+        nameRes = R.string.pricing_name_business,
+        priceRes = R.string.pricing_price_business,
+        subRes = R.string.pricing_tagline_business,
         iconRes = R.drawable.ic_dv2_tier_business,
-        cta = "Upgrade to Business",
-        features = listOf(
-            "Everything in Pro",
-            "Centralized admin console",
-            "SSO & audit logs",
-            "Dedicated relay cluster",
-            "Priority support",
+        ctaRes = R.string.pricing_cta_business,
+        featureRes = listOf(
+            R.string.pricing_feature_everything_pro,
+            R.string.pricing_feature_admin,
+            R.string.pricing_feature_sso,
+            R.string.pricing_feature_dedicated_relay,
+            R.string.pricing_feature_priority_support,
         ),
     ),
 )

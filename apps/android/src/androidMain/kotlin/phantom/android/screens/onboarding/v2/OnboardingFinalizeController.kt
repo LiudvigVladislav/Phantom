@@ -9,6 +9,7 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import phantom.android.premium.SubscriptionAccess
 import phantom.core.identity.IdentityKeyPair
 import phantom.core.identity.IdentityRecord
 import phantom.core.transport.PrivacyMode
@@ -142,6 +143,12 @@ class OnboardingFinalizeController(
         // a no-op. Persisted allows re-entry — that's the retry path.
         if (previousState is FinalizeState.Working) return
         if (previousState is FinalizeState.Complete) return
+
+        val committedMode = (previousState as? FinalizeState.Persisted)?.privacyMode ?: privacyMode
+        if (!SubscriptionAccess.permits(committedMode)) {
+            transientErrorMessage = "Ghost requires Pro. Choose Standard or Private to continue."
+            return
+        }
 
         state = FinalizeState.Working
         transientErrorMessage = null

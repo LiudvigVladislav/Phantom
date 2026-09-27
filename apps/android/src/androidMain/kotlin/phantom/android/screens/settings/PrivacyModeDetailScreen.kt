@@ -18,11 +18,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
+import phantom.android.premium.SubscriptionAccess
+import phantom.android.R
 import phantom.android.service.PhantomMessagingService
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
@@ -48,12 +51,14 @@ import phantom.core.transport.PrivacyMode
 fun PrivacyModeDetailScreen(
     container: AppContainer,
     onBack: () -> Unit,
+    onModeApplied: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var selected by remember { mutableStateOf(container.transportPreferences.privacyMode) }
     var pendingGhost by remember { mutableStateOf(false) }
+    val ghostAvailable = SubscriptionAccess.hasVerifiedPro()
 
     // Wait-time disclaimer surfaced on every mode switch. The chain walk
     // can take 30 s for Reality init alone; falling all the way through
@@ -63,9 +68,9 @@ fun PrivacyModeDetailScreen(
     // when the chain takes >30 s on Tecno МТС (cross-device test 2026-05-10).
     fun snackForMode(mode: PrivacyMode) {
         val msg = when (mode) {
-            PrivacyMode.Standard -> "Switching to Standard — direct connection should be ready in seconds."
-            PrivacyMode.Private  -> "Switching to Private — Reality probe up to 30 s, falls back to Tor (several minutes) if blocked."
-            PrivacyMode.Ghost    -> "Switching to Ghost — Tor bootstrap can take several minutes on censored networks."
+            PrivacyMode.Standard -> context.getString(R.string.privacy_mode_switch_standard)
+            PrivacyMode.Private  -> context.getString(R.string.privacy_mode_switch_private)
+            PrivacyMode.Ghost    -> context.getString(R.string.privacy_mode_switch_ghost)
         }
         scope.launch {
             snackbarHostState.currentSnackbarData?.dismiss()
@@ -77,14 +82,10 @@ fun PrivacyModeDetailScreen(
         AlertDialog(
             onDismissRequest = { pendingGhost = false },
             containerColor = Surface,
-            title = { Text("Switch to Ghost mode?", color = TextPrimary) },
+            title = { Text(stringResource(R.string.privacy_mode_ghost_confirm_title), color = TextPrimary) },
             text = {
                 Text(
-                    "Ghost routes every message through Tor only. If Tor cannot " +
-                        "bootstrap on the current network the app will show " +
-                        "\"Cannot reach relay\" instead of silently falling back to " +
-                        "REALITY or direct WSS — that silent downgrade would defeat " +
-                        "the privacy promise you are opting into.",
+                    stringResource(R.string.privacy_mode_ghost_confirm_body),
                     color = TextDim, fontSize = 13.sp, lineHeight = 18.sp,
                 )
             },
@@ -93,12 +94,15 @@ fun PrivacyModeDetailScreen(
                     pendingGhost = false
                     selected = PrivacyMode.Ghost
                     snackForMode(PrivacyMode.Ghost)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Ghost) }
-                }) { Text("Switch", color = CyanAccent) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Ghost)
+                        onModeApplied()
+                    }
+                }) { Text(stringResource(R.string.privacy_mode_switch_button), color = CyanAccent) }
             },
             dismissButton = {
                 TextButton(onClick = { pendingGhost = false }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.privacy_mode_cancel_button), color = TextDim)
                 }
             },
         )
@@ -142,7 +146,7 @@ fun PrivacyModeDetailScreen(
                     }
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "Privacy Mode",
+                        text = stringResource(R.string.settings_privacy_mode),
                         color = TextPrimary,
                         style = PhantomType.headline,
                     )
@@ -160,8 +164,7 @@ fun PrivacyModeDetailScreen(
         ) {
             // Header description.
             Text(
-                text = "Choose how PHANTOM connects to the relay. Different modes " +
-                    "trade latency for unlinkability.",
+                text = stringResource(R.string.privacy_mode_description),
                 color = TextDim,
                 fontSize = 13.sp,
                 lineHeight = 19.sp,
@@ -170,44 +173,53 @@ fun PrivacyModeDetailScreen(
 
             // Three mode cards — full-width, with title + description.
             ModeCard(
-                title = "Standard",
-                tagline = "direct WSS → REALITY → Tor",
-                description = "Lowest latency on clean networks; falls through to " +
-                    "REALITY then Tor onion if direct WSS is blocked. Read receipts on. " +
-                    "Default for new installations.",
+                title = stringResource(R.string.settings_privacy_standard),
+                tagline = stringResource(R.string.privacy_mode_standard_tagline),
+                description = stringResource(R.string.privacy_mode_standard_description),
                 active = selected == PrivacyMode.Standard,
                 onClick = {
                     if (selected == PrivacyMode.Standard) return@ModeCard
                     selected = PrivacyMode.Standard
                     snackForMode(PrivacyMode.Standard)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Standard) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Standard)
+                        onModeApplied()
+                    }
                 },
             )
             Spacer(Modifier.height(10.dp))
             ModeCard(
-                title = "Private",
-                tagline = "REALITY → Tor",
-                description = "Skip direct WSS entirely. The relay never sees your " +
-                    "source IP. Read receipts suppressed. Connect can take up to " +
-                    "30 seconds for Reality, longer if it falls back to Tor.",
+                title = stringResource(R.string.settings_privacy_private),
+                tagline = stringResource(R.string.privacy_mode_private_tagline),
+                description = stringResource(R.string.privacy_mode_private_description),
                 active = selected == PrivacyMode.Private,
                 onClick = {
                     if (selected == PrivacyMode.Private) return@ModeCard
                     selected = PrivacyMode.Private
                     snackForMode(PrivacyMode.Private)
-                    scope.launch { applyPrivacyModeFromDetail(container, context, PrivacyMode.Private) }
+                    scope.launch {
+                        applyPrivacyModeFromDetail(container, context, PrivacyMode.Private)
+                        onModeApplied()
+                    }
                 },
             )
             Spacer(Modifier.height(10.dp))
             ModeCard(
-                title = "Ghost",
-                tagline = "Tor onion only — no fallback",
-                description = "Maximum unlinkability. If Tor cannot bootstrap on " +
-                    "your network the app will show \"Cannot reach relay\" rather " +
-                    "than silently downgrading to a less-private path. Read receipts " +
-                    "suppressed. First-connect can take several minutes on " +
-                    "censored networks while bridges bootstrap.",
+                title = stringResource(R.string.settings_privacy_ghost),
+                tagline = if (ghostAvailable) {
+                    stringResource(R.string.privacy_mode_ghost_tagline)
+                } else {
+                    stringResource(R.string.privacy_mode_ghost_locked_tagline)
+                },
+                description = if (ghostAvailable) {
+                    stringResource(R.string.privacy_mode_ghost_description)
+                } else if (selected == PrivacyMode.Ghost) {
+                    stringResource(R.string.privacy_mode_ghost_saved_locked)
+                } else {
+                    stringResource(R.string.privacy_mode_ghost_locked_description)
+                },
                 active = selected == PrivacyMode.Ghost,
+                enabled = ghostAvailable,
                 onClick = {
                     if (selected == PrivacyMode.Ghost) return@ModeCard
                     pendingGhost = true
@@ -217,9 +229,7 @@ fun PrivacyModeDetailScreen(
             Spacer(Modifier.height(24.dp))
             // Footer note explaining the active-transport visibility.
             Text(
-                text = "The active transport is visible in the foreground notification " +
-                    "(\"Online via Reality · Standard\"). Mode switches reset the " +
-                    "active connection and walk the new chain.",
+                text = stringResource(R.string.privacy_mode_transport_note),
                 color = TextDim.copy(alpha = 0.7f),
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
@@ -235,6 +245,7 @@ private fun ModeCard(
     tagline: String,
     description: String,
     active: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Column(
@@ -247,7 +258,7 @@ private fun ModeCard(
                 color = if (active) CyanAccent else BorderSubtle,
                 shape = RoundedCornerShape(12.dp),
             )
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -266,7 +277,7 @@ private fun ModeCard(
                         .padding(horizontal = 6.dp, vertical = 2.dp),
                 ) {
                     Text(
-                        text = "ACTIVE",
+                        text = stringResource(R.string.privacy_mode_active),
                         color = BgDeep,
                         fontSize = 8.sp,
                         fontFamily = PhantomFontMono,

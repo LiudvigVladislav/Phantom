@@ -3,6 +3,8 @@
 
 package phantom.android.screens.onboarding.v2
 
+import androidx.compose.ui.res.stringResource
+import phantom.android.R
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -81,7 +83,7 @@ internal fun GrabStrip(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 role = Role.Button,
-                onClickLabel = "Close pricing",
+                onClickLabel = stringResource(R.string.pricing_sheet_close),
                 onClick = onDismiss,
             )
             .then(

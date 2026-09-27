@@ -66,6 +66,26 @@ class OnboardingV2FinalizeContractTest {
         }
     }
 
+    @Test
+    fun ghost_without_verified_pro_stops_before_any_finalize_side_effect() = runTest {
+        val calls = mutableListOf<String>()
+        val controller = OnboardingFinalizeController(
+            savePrivacyMode = { calls += "save mode" },
+            createOrLoad = { calls += "create identity"; makeRecord() to makeKeyPair() },
+            initMessaging = { _, _ -> calls += "init messaging" },
+        )
+
+        controller.finalize("alice", PrivacyMode.Ghost)
+
+        assertIs<FinalizeState.Idle>(controller.state)
+        assertTrue(calls.isEmpty())
+        assertNotNull(controller.transientErrorMessage)
+
+        controller.finalize("alice", PrivacyMode.Private)
+        assertIs<FinalizeState.Complete>(controller.state)
+        assertEquals(listOf("save mode", "create identity", "init messaging"), calls)
+    }
+
     private fun makeRecord(username: String = "alice"): IdentityRecord =
         IdentityRecord(
             id = "test-id-$username",

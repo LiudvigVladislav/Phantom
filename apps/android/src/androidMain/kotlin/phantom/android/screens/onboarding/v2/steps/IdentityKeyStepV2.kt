@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -116,7 +117,7 @@ fun IdentityKeyStepV2(
             // 29 sp / lineHeight 34 sp (Geist SemiBold), matching the
             // How-step title metric.
             Text(
-                text = "Your identity key",
+                text = stringResource(R.string.onboarding_identity_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontDisplay,
@@ -138,7 +139,7 @@ fun IdentityKeyStepV2(
             // Prior "is generated and stored" contradicted the preview
             // card's own "WILL BE GENERATED" copy.
             Text(
-                text = "Your private key will be generated and stored on this device when you finish onboarding. Your public key can then be shared for verification.",
+                text = stringResource(R.string.onboarding_identity_description),
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -185,7 +186,7 @@ fun IdentityKeyStepV2(
             OnboardingStepDotsV2(dotsIndex = dotsIndex)
             Spacer(Modifier.height(12.dp))
             PhantomButton(
-                text = "Continue",
+                text = stringResource(R.string.onboarding_continue),
                 onClick = onContinueClick,
                 enabled = canAdvance,
                 modifier = Modifier.fillMaxWidth(),
@@ -201,7 +202,7 @@ private fun UsernameInputSection(
     onUsernameChange: (String) -> Unit,
 ) {
     Text(
-        text = "USERNAME",
+        text = stringResource(R.string.onboarding_username_label),
         color = DesignV2Tokens.Colors.TextQuaternary,
         style = TextStyle(
             fontFamily = DesignV2FontMono,
@@ -218,19 +219,19 @@ private fun UsernameInputSection(
     val statusIconTint: androidx.compose.ui.graphics.Color?
     when (validation) {
         UsernameValidationV2.Empty -> {
-            helperText = "3–20 characters. Letters, numbers, and underscores."
+            helperText = stringResource(R.string.onboarding_username_hint)
             isError = false
             statusIconRes = null
             statusIconTint = null
         }
         UsernameValidationV2.Short -> {
-            helperText = "A little longer — at least 3 characters."
+            helperText = stringResource(R.string.onboarding_username_short)
             isError = true
             statusIconRes = R.drawable.ic_dv2_block
             statusIconTint = DesignV2Tokens.Colors.Error
         }
         UsernameValidationV2.InvalidChars -> {
-            helperText = "Only letters, numbers, and underscores."
+            helperText = stringResource(R.string.onboarding_username_invalid)
             isError = true
             statusIconRes = R.drawable.ic_dv2_block
             statusIconTint = DesignV2Tokens.Colors.Error
@@ -238,7 +239,7 @@ private fun UsernameInputSection(
         UsernameValidationV2.Valid -> {
             // Redline §C2: "available" would be a backend claim we can't
             // make. "format is valid" is what we actually check.
-            helperText = "Handle format is valid."
+            helperText = stringResource(R.string.onboarding_username_valid)
             isError = false
             statusIconRes = R.drawable.ic_dv2_confirm
             statusIconTint = DesignV2Tokens.Colors.Success
@@ -248,7 +249,7 @@ private fun UsernameInputSection(
     PhantomInput(
         value = username,
         onValueChange = onUsernameChange,
-        placeholder = "choose a handle",
+        placeholder = stringResource(R.string.onboarding_username_placeholder),
         helperText = helperText,
         isError = isError,
         useMonoFont = true,

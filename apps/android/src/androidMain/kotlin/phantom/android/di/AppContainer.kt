@@ -1516,6 +1516,9 @@ class AppContainer(private val context: Context) {
     }.isSuccess
 
     suspend fun setPrivacyMode(mode: PrivacyMode): phantom.core.transport.PrivacyModeChangeResult {
+        check(phantom.android.premium.SubscriptionAccess.permits(mode)) {
+            "Ghost requires a verified Pro subscription"
+        }
         // R-N1.17: the mode is written by the AUTHORITY, inside the
         // critical section that also bumps the epoch. A direct write
         // here as well would be a second owner of the same fact - the
@@ -1844,6 +1847,7 @@ class AppContainer(private val context: Context) {
     sealed interface MessagingInit {
         data object Uninitialized : MessagingInit
         data object Initializing : MessagingInit
+        data object AwaitingMigration : MessagingInit
         data object Ready : MessagingInit
         data class Failed(val cause: Throwable) : MessagingInit
     }
@@ -1851,6 +1855,11 @@ class AppContainer(private val context: Context) {
     @Volatile
     var messagingInit: MessagingInit = MessagingInit.Uninitialized
         private set
+
+    private val migrationProgress by lazy {
+        phantom.android.screens.migration.AndroidMigrationProgressStore(context)
+    }
+    private var closeMigrationClient: (() -> Unit)? = null
 
     /**
      * Stage 2 B7c: a Tor generation whose settlement this container owes
@@ -1933,7 +1942,15 @@ class AppContainer(private val context: Context) {
         identity: phantom.core.identity.IdentityRecord,
         localKeyPair: phantom.core.crypto.DhKeyPair,
     ) {
+        var identityForStack = identity
         when (val state = messagingInit) {
+            is MessagingInit.AwaitingMigration -> {
+                if (checkNotNull(migrationManager).needsMigration()) return
+                identityForStack = checkNotNull(identityManager.getIdentity())
+                check(identityForStack.id == identity.id && identityForStack.publicKeyHex == identity.publicKeyHex)
+                closeMigrationClient?.invoke()
+                closeMigrationClient = null
+            }
             is MessagingInit.Ready -> {
                 android.util.Log.i("PhantomMessaging", "RECV_DIAG init_messaging_already_ready")
                 return
@@ -1949,13 +1966,13 @@ class AppContainer(private val context: Context) {
         }
         messagingInit = MessagingInit.Initializing
         try {
-            buildMessagingStack(identity, localKeyPair)
+            buildMessagingStack(identityForStack, localKeyPair)
         } catch (t: Throwable) {
             closePartialMessagingStack(t)
             messagingInit = MessagingInit.Failed(t)
             throw t
         }
-        messagingInit = MessagingInit.Ready
+        if (messagingInit !is MessagingInit.AwaitingMigration) messagingInit = MessagingInit.Ready
     }
 
     /**
@@ -1972,6 +1989,8 @@ class AppContainer(private val context: Context) {
      */
     private suspend fun closePartialMessagingStack(cause: Throwable) {
         kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+            closeMigrationClient?.invoke()
+            closeMigrationClient = null
             android.util.Log.w(
                 "PhantomMessaging",
                 "RECV_DIAG init_messaging_failed_cleanup cause=${cause::class.simpleName}",
@@ -2140,6 +2159,54 @@ class AppContainer(private val context: Context) {
         // consume an OPK). Release APK never registers the receiver
         // so no debug-only access path exists in production.
         this.preKeyApi = preKeyApi
+
+        // Prepare only the gated prekey API while migration owns the local key stores.
+        // Do not construct transport collectors, lifecycle jobs or DMS until it completes.
+        migrationManager = phantom.core.messaging.MigrationManager(
+            identityManager = identityManager,
+            identityCrypto = sessionManagerIdentityCrypto,
+            signedPreKeyRepository = signedPreKeyRepo,
+            oneTimePreKeyRepository = oneTimePreKeyRepo,
+            ratchetStateRepository = ratchetRepo,
+            senderKeyRepository = senderKeyRepo,
+            conversationRepository = conversationRepo,
+            preKeyApi = preKeyApi,
+            x3dh = x3dh,
+            progressStore = migrationProgress,
+        )
+        closeMigrationClient = { restHttpClient.close() }
+        if (checkNotNull(migrationManager).needsMigration()) {
+            messagingInit = MessagingInit.AwaitingMigration
+            return
+        }
+        closeMigrationClient = null
+
+        // Sprint 2b-B L6 — startup recovery sweep. Runs BEFORE
+        // `initMessaging(...)` constructs DMS + starts receiving,
+        // so any orphan opk_reservation rows left by a mid-derive
+        // crash on a previous run are cleared before any new
+        // inbound envelope can derive against them. The sweep
+        // joins on pending_ratchet_state.conversation_id and only
+        // deletes reservations whose conversation has NO matching
+        // pending row (L6 join semantics). Threshold is 5 minutes
+        // per L6 lock — well above expected derivation latency,
+        // well below any user-facing reconnect cadence.
+        runCatching {
+            val sweptCount = opkReservationRepo.sweepOrphanReservations(
+                thresholdMs = System.currentTimeMillis() - 5L * 60L * 1000L,
+            )
+            if (sweptCount > 0) {
+                android.util.Log.i(
+                    "PhantomMessaging",
+                    "RECV_DIAG opk_reservation_startup_sweep_done swept=$sweptCount",
+                )
+            }
+        }.onFailure {
+            android.util.Log.w(
+                "PhantomMessaging",
+                "RECV_DIAG opk_reservation_startup_sweep_fail: ${it.message}",
+            )
+        }
 
         // PR-D1b (2026-05-16): construct the REST fallback orchestrator using
         // the same long-lived Ktor REST client. Wire it into the HybridRelayTransport
@@ -2929,23 +2996,6 @@ class AppContainer(private val context: Context) {
             }
         }
 
-        // PR C commit 12: MigrationManager — drives Alpha 1 → Alpha 2
-        // upgrade. Inspected by the launch path (`needsMigration()`);
-        // executed when the user taps Continue on MigrationScreen.
-        // Lives on AppContainer alongside DMS so the Activity can
-        // reach it before normal messaging starts.
-        migrationManager = phantom.core.messaging.MigrationManager(
-            identityManager = identityManager,
-            identityCrypto = sessionManagerIdentityCrypto,
-            signedPreKeyRepository = signedPreKeyRepo,
-            oneTimePreKeyRepository = oneTimePreKeyRepo,
-            ratchetStateRepository = ratchetRepo,
-            senderKeyRepository = senderKeyRepo,
-            conversationRepository = conversationRepo,
-            preKeyApi = preKeyApi,
-            x3dh = x3dh,
-        )
-
         // PR C-followup-1: PreKeyLifecycleService — drives the steady
         // state of the user's published bundle. Three operations:
         //
@@ -3372,6 +3422,11 @@ class AppContainer(private val context: Context) {
     private val initMessagingMutex = kotlinx.coroutines.sync.Mutex()
 
     suspend fun initMessagingFromStorage() {
+        check(phantom.android.premium.SubscriptionAccess.permits(
+            privacyModeCoordinator.state.value.requested,
+        )) {
+            "Ghost requires a verified Pro subscription"
+        }
         initMessagingMutex.withLock {
             if (messagingInit is MessagingInit.Ready) {
                 android.util.Log.i(
@@ -3380,8 +3435,8 @@ class AppContainer(private val context: Context) {
                 )
                 return@withLock
             }
-            val record = _identityState.value
-                ?: identityRepo.loadIdentity()?.also { _identityState.value = it }
+            // Migration can have backfilled signing keys since the last initialization.
+            val record = identityRepo.loadIdentity()?.also { _identityState.value = it }
                 ?: run {
                     android.util.Log.i(
                         "PhantomMessaging",
@@ -3397,32 +3452,6 @@ class AppContainer(private val context: Context) {
                 phantom.core.crypto.DhPublicKey(record.publicKeyHex.hexToByteArray()),
                 phantom.core.crypto.DhPrivateKey(record.dhPrivateKeyHex.hexToByteArray()),
             )
-            // Sprint 2b-B L6 — startup recovery sweep. Runs BEFORE
-            // `initMessaging(...)` constructs DMS + starts receiving,
-            // so any orphan opk_reservation rows left by a mid-derive
-            // crash on a previous run are cleared before any new
-            // inbound envelope can derive against them. The sweep
-            // joins on pending_ratchet_state.conversation_id and only
-            // deletes reservations whose conversation has NO matching
-            // pending row (L6 join semantics). Threshold is 5 minutes
-            // per L6 lock — well above expected derivation latency,
-            // well below any user-facing reconnect cadence.
-            runCatching {
-                val sweptCount = opkReservationRepo.sweepOrphanReservations(
-                    thresholdMs = System.currentTimeMillis() - 5L * 60L * 1000L,
-                )
-                if (sweptCount > 0) {
-                    android.util.Log.i(
-                        "PhantomMessaging",
-                        "RECV_DIAG opk_reservation_startup_sweep_done swept=$sweptCount",
-                    )
-                }
-            }.onFailure {
-                android.util.Log.w(
-                    "PhantomMessaging",
-                    "RECV_DIAG opk_reservation_startup_sweep_fail: ${it.message}",
-                )
-            }
             initMessagingLocked(record, dhKeyPair)
             android.util.Log.i(
                 "PhantomMessaging",

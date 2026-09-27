@@ -8,6 +8,7 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
@@ -33,6 +34,24 @@ import org.robolectric.annotation.Config
 class OnboardingV2PrivacyDialSemanticsTest {
     @get:Rule
     val composeTestRule = createComposeRule()
+
+    @Test
+    fun privacy_tier_copy_describes_routes_and_receipts_without_presence_claims() {
+        composeTestRule.setContent {
+            phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
+                formState = OnboardingFormStateV2(),
+                dotsIndex = 2,
+                onFormStateChange = {},
+                onContinueClick = {},
+                onGhostLockClick = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("REALITY and Tor fallback").assertExists()
+        composeTestRule.onNodeWithText("Read receipts enabled").assertExists()
+        composeTestRule.onAllNodesWithText("last seen", substring = true, ignoreCase = true).assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Nearby", substring = true, ignoreCase = true).assertCountEquals(0)
+    }
 
     // ── Commit 4 · Privacy dial semantics ──────────────────────────────
 
@@ -126,7 +145,7 @@ class OnboardingV2PrivacyDialSemanticsTest {
     @Test
     fun privacy_dial_unlock_cta_visible_only_when_ghost_selected() {
         // Only when Ghost is the currently-selected tier is the
-        // "Unlock with Phantom Pro" CTA rendered. On Standard /
+        // "Preview Phantom Pro" CTA rendered. On Standard /
         // Private the CTA MUST NOT exist in the semantic tree.
         composeTestRule.setContent {
             phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
@@ -140,7 +159,7 @@ class OnboardingV2PrivacyDialSemanticsTest {
             )
         }
         composeTestRule.waitForIdle()
-        composeTestRule.onAllNodesWithText("Unlock with Phantom Pro").assertCountEquals(0)
+        composeTestRule.onAllNodesWithText("Preview Phantom Pro").assertCountEquals(0)
     }
 
     @Test
@@ -148,7 +167,7 @@ class OnboardingV2PrivacyDialSemanticsTest {
         // Simulating the Ghost-selected state visually (though runtime
         // would never actually persist Ghost from onboarding). The
         // Ghost-tier card is what renders under this synthetic state,
-        // and its Unlock CTA must funnel through onGhostLockClick.
+        // and its preview CTA must funnel through onGhostLockClick.
         var ghostLockCount = 0
         composeTestRule.setContent {
             phantom.android.screens.onboarding.v2.steps.PrivacyLevelStepV2(
@@ -162,17 +181,21 @@ class OnboardingV2PrivacyDialSemanticsTest {
             )
         }
         composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Continue").assertIsNotEnabled()
+        composeTestRule.onNodeWithText(
+            "Ghost requires Pro. Choose Standard or Private to continue.",
+        ).assertExists()
         // Direct semantics-action invocation — same reasoning as the
         // pricing sheet CTA tests below: coordinate hit-testing on a
         // Row nested inside a card that may lay out below the
         // Pixel-5 viewport (411 × 891 dp) misses the click, but the
         // OnClick semantic is present and works fine when invoked
         // directly.
-        composeTestRule.onNodeWithText("Unlock with Phantom Pro")
+        composeTestRule.onNodeWithText("Preview Phantom Pro")
             .performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
         assert(ghostLockCount == 1) {
-            "Unlock CTA must fire onGhostLockClick exactly once; got $ghostLockCount."
+            "Preview CTA must fire onGhostLockClick exactly once; got $ghostLockCount."
         }
     }
 

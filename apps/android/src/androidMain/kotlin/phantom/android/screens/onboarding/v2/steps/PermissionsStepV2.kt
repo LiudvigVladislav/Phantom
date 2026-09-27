@@ -38,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
@@ -127,7 +128,7 @@ fun PermissionsStepV2(
                 .padding(top = 4.dp, bottom = 8.dp),
         ) {
             Text(
-                text = "Almost there",
+                text = stringResource(R.string.onboarding_permissions_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontDisplay,
@@ -138,7 +139,7 @@ fun PermissionsStepV2(
             )
             Spacer(Modifier.height(10.dp))
             Text(
-                text = "Everything below is optional and stays on your device. Skip anything you don't want.",
+                text = stringResource(R.string.onboarding_permissions_intro),
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -155,18 +156,18 @@ fun PermissionsStepV2(
             Spacer(Modifier.height(11.dp))
             InfoPermissionRow(
                 iconRes = R.drawable.ic_dv2_mic_on,
-                title = "Microphone",
-                body = "Asked when first used — for voice messages and calls.",
+                title = stringResource(R.string.onboarding_permissions_microphone_title),
+                body = stringResource(R.string.onboarding_permissions_microphone_body),
             )
             Spacer(Modifier.height(11.dp))
             InfoPermissionRow(
                 iconRes = R.drawable.ic_dv2_nearby,
-                title = "Nearby discovery",
-                body = "Asked when first used — for local-mesh people search.",
+                title = stringResource(R.string.onboarding_permissions_nearby_title),
+                body = stringResource(R.string.onboarding_permissions_nearby_body),
             )
             Spacer(Modifier.height(20.dp))
             Text(
-                text = "Phantom never uploads contacts,\nlocation, or usage analytics.",
+                text = stringResource(R.string.onboarding_permissions_privacy_note),
                 color = DesignV2Tokens.Colors.TextQuaternary,
                 style = TextStyle(
                     fontFamily = DesignV2FontMono,
@@ -188,7 +189,7 @@ fun PermissionsStepV2(
             OnboardingStepDotsV2(dotsIndex = dotsIndex)
             Spacer(Modifier.height(16.dp))
             PhantomButton(
-                text = "Done, let's go",
+                text = stringResource(R.string.onboarding_permissions_done),
                 onClick = onDoneClick,
                 enabled = true,
                 modifier = Modifier.fillMaxWidth(),
@@ -260,8 +261,11 @@ private fun NotificationsPermissionRow(
     // needs to know the tap will trigger a permission grant flow
     // (either OS dialog or Settings jump).
     val onClickLabel = if (checked)
-        "Notifications on — tap to manage in system settings"
-    else "Turn notifications on"
+        stringResource(R.string.onboarding_permissions_notifications_manage_a11y)
+    else stringResource(R.string.onboarding_permissions_notifications_enable_a11y)
+    val stateLabel = if (checked)
+        stringResource(R.string.onboarding_permissions_state_on)
+    else stringResource(R.string.onboarding_permissions_state_off)
 
     Row(
         modifier = Modifier
@@ -276,7 +280,7 @@ private fun NotificationsPermissionRow(
             )
             .semantics {
                 toggleableState = if (checked) ToggleableState.On else ToggleableState.Off
-                stateDescription = if (checked) "On" else "Off"
+                stateDescription = stateLabel
             }
             .padding(15.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -295,7 +299,7 @@ private fun NotificationsPermissionRow(
             // softWrap = true + maxLines > 1). Full text
             // preserved, user's fontScale respected — no cap.
             Text(
-                text = "Notifications",
+                text = stringResource(R.string.onboarding_permissions_notifications_title),
                 color = DesignV2Tokens.Colors.TextPrimary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,
@@ -316,7 +320,7 @@ private fun NotificationsPermissionRow(
             // is actually true: notifications are generated
             // locally without a push provider round-trip.
             Text(
-                text = "Notifications are generated locally on this device — no push provider sees the preview.",
+                text = stringResource(R.string.onboarding_permissions_notifications_body),
                 color = DesignV2Tokens.Colors.TextTertiary,
                 style = TextStyle(
                     fontFamily = DesignV2FontBody,

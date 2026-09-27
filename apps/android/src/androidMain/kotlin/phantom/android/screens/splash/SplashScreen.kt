@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import phantom.android.R
 import phantom.android.ui.theme.BgDeep
@@ -67,7 +68,7 @@ fun PhantomSplashScreen() {
         // has the intended border treatment baked in.
         Image(
             painter = painterResource(R.drawable.phantom_splash),
-            contentDescription = "PHANTOM logo",
+            contentDescription = stringResource(R.string.splash_logo),
             modifier = Modifier
                 .size(180.dp)
                 .scale(logoPulse),

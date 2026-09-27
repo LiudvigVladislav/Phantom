@@ -3,11 +3,11 @@
 
 package phantom.core.messaging
 
-import com.benasher44.uuid.uuid4
 import com.ionspin.kotlin.crypto.util.LibsodiumRandom
 import kotlinx.datetime.Clock
-import phantom.core.crypto.OneTimePreKey
-import phantom.core.crypto.SignedPreKey
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import phantom.core.crypto.SignedPreKeySigner
 import phantom.core.crypto.X3DHProtocol
 import phantom.core.identity.IdentityCrypto
@@ -36,11 +36,10 @@ import phantom.core.transport.WireSignedPreKey
  * the column; the 12.sqm migration left existing rows with the empty-
  * string sentinel that read as null on the Kotlin side).
  *
- * The flow is **idempotent**: each step checks whether it has already
- * run and skips work that's already done. A user who taps Continue,
- * then pulls the battery mid-publish, then re-launches should pick up
- * exactly where they left off without burning fresh randomness on
- * already-generated keys.
+ * An identity-scoped durable marker precedes key mutation and remains pending
+ * until publishing and all local cleanup finish. Retrying may repeat cleanup,
+ * so the platform must keep ordinary messaging and prekey jobs stopped until
+ * completion. A completed or already-current identity is never migrated again.
  *
  * UI integration:
  *  - The launch path inspects [needsMigration] before any messaging
@@ -63,65 +62,90 @@ class MigrationManager(
     private val conversationRepository: ConversationRepository,
     private val preKeyApi: PreKeyApi,
     private val x3dh: X3DHProtocol,
+    private val progressStore: MigrationProgressStore,
     /**
      * Optional clock injection for tests. Real callers leave this at
      * the default which uses kotlinx.datetime.Clock.System.
      */
     private val nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
 ) {
+    private val migrationMutex = Mutex()
 
     /**
-     * Returns true when the local state predates the Alpha 2 schema.
-     * Idempotent — safe to call on every launch.
-     *
-     * Detection uses the simplest observable invariant: the
-     * IdentityRecord's signing keypair is missing. Any other Alpha 1
-     * leftover (ratchet states, SenderKeys) only exists for users who
-     * had at least one onboarded session, so checking the identity
-     * record covers both fresh-Alpha-1-installs-that-never-bootstrapped
-     * and active Alpha 1 users.
+     * Pending progress survives signing-key backfill. Missing progress alone is
+     * not evidence of an interrupted migration in an already-current identity.
+     * Corrupt/unreadable progress fails closed instead of permitting startup.
      */
-    suspend fun needsMigration(): Boolean {
-        val record = identityManager.getIdentity() ?: return false
+    suspend fun needsMigration(): Boolean = migrationMutex.withLock {
+        val record = identityManager.getIdentity() ?: return@withLock false
         // No identity yet means the user is on the onboarding path; the
         // onboarding flow (PR C commit 13 lifecycle service) will
         // generate both keypairs together for new users.
-        return record.needsSigningKeyBackfill
+        when (progressStore.read(record.id)) {
+            MigrationProgress.IN_PROGRESS -> true
+            MigrationProgress.COMPLETE -> {
+                check(!record.needsSigningKeyBackfill) { "Completed migration has missing signing keys" }
+                false
+            }
+            MigrationProgress.NOT_STARTED -> record.needsSigningKeyBackfill
+        }
     }
 
     /**
      * Run the migration. Steps in order:
      *
+     *  0. Durably record IN_PROGRESS before any key mutation.
      *  1. Backfill the Ed25519 signing keypair on the IdentityRecord
      *     (preserves X25519 fields verbatim — see
      *     IdentityManager.backfillSigningKeyPair).
-     *  2. Generate a SignedPreKey + 100 OneTimePreKeys, sign the SPK
+     *  2. Generate a SignedPreKey + [OPK_BATCH_SIZE] OneTimePreKeys, sign the SPK
      *     with the freshly-backfilled Ed25519 secret, persist private
      *     halves to the local prekey tables.
      *  3. Publish the bundle to the relay via `POST /prekeys/publish`.
-     *     A retryable failure surfaces as [Result.failure]; non-
-     *     retryable (BadRequest, SigningKeyMismatch) bubbles as a
-     *     [MigrationException].
+     *     Failures return typed [MigrationException] values in [Result.failure].
      *  4. Wipe RatchetStateRepository — Alpha 1 sessions were rooted
      *     in the F12/F15-vulnerable bootstrap and must not survive.
      *  5. Wipe SenderKeyRepository — Alpha 1 SenderKey state can't be
      *     reused under Alpha 2 group sessions.
-     *  6. Mark every conversation `needsRehandshake = 1`. The chat list
-     *     surfaces a "needs re-handshake" indicator and the next
-     *     outbound message in such a conversation triggers the X3DH
-     *     4-DH bootstrap path on its own.
+     *  6. Mark every conversation `needsRehandshake = 1` without deleting it.
+     *  7. Durably record COMPLETE before reporting success.
      *
      * Idempotency notes:
      *  - Step 1 is idempotent (IdentityManager.backfillSigningKeyPair
      *    returns the existing keypair if already present).
      *  - Steps 2 + 3: if `signedPreKeyRepository.get()` returns non-null
-     *    AND `count() >= 100`, we skip generation and re-attempt only
+     *    AND `count() >= OPK_BATCH_SIZE`, we skip generation and re-attempt only
      *    the publish. A relay that reports SigningKeyMismatch on
      *    re-publish indicates the local keys diverged from server-side
      *    — surfaced as MigrationException.SigningKeyMismatch.
      *  - Steps 4–6 are inherently idempotent (DELETEs + UPDATE all).
      */
-    suspend fun runMigration(): Result<Unit> = runCatching {
+    suspend fun runMigration(): Result<Unit> = migrationMutex.withLock {
+        try {
+            migrateLocked()
+            Result.success(Unit)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Result.failure(failure)
+        }
+    }
+
+    private suspend fun migrateLocked() {
+        val before = identityManager.getIdentity() ?: throw MigrationException.NoIdentity
+        when (progressStore.read(before.id)) {
+            MigrationProgress.COMPLETE -> {
+                check(!before.needsSigningKeyBackfill) { "Completed migration has missing signing keys" }
+                return
+            }
+            MigrationProgress.NOT_STARTED -> {
+                // No marker + existing signing keys also describes healthy installed clients.
+                // Never infer consent to wipe their sessions from a direct/repeated UI call.
+                if (!before.needsSigningKeyBackfill) return
+                progressStore.write(before.id, MigrationProgress.IN_PROGRESS)
+            }
+            MigrationProgress.IN_PROGRESS -> Unit
+        }
         // ── Step 1: backfill Ed25519 signing keypair ─────────────────
         val signing: IdentitySigningKeyPair = identityManager.backfillSigningKeyPair()
         val identity = identityManager.getIdentity()
@@ -228,8 +252,7 @@ class MigrationManager(
         ratchetStateRepository.deleteAll()
         senderKeyRepository.deleteAll()
         conversationRepository.markAllNeedsRehandshake()
-
-        Unit
+        progressStore.write(before.id, MigrationProgress.COMPLETE)
     }
 
     @OptIn(ExperimentalUnsignedTypes::class)

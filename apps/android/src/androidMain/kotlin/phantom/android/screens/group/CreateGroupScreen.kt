@@ -20,6 +20,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -27,6 +32,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
@@ -44,6 +50,8 @@ fun CreateGroupScreen(
     var contacts by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
     var selectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isCreating by remember { mutableStateOf(false) }
+    val backLabel = stringResource(R.string.create_group_back)
+    val groupNameLabel = stringResource(R.string.create_group_name)
 
     LaunchedEffect(Unit) {
         contacts = container.conversationRepo.getActiveConversations()
@@ -67,12 +75,12 @@ fun CreateGroupScreen(
                         .padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                    IconButton(onClick = onBack, modifier = Modifier.size(32.dp).semantics { contentDescription = backLabel }) {
                         PhIconBack(color = TextPrimary, size = 20.dp)
                     }
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "New Group",
+                        text = stringResource(R.string.create_group_title),
                         color = TextPrimary,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Medium,
@@ -121,7 +129,7 @@ fun CreateGroupScreen(
                         )
                     } else {
                         Text(
-                            text = "Create Group",
+                            text = stringResource(R.string.create_group_action),
                             fontSize = 15.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -139,7 +147,7 @@ fun CreateGroupScreen(
             // Group name field
             item {
                 Spacer(Modifier.height(20.dp))
-                SectionLabel("Group Name")
+                SectionLabel(groupNameLabel)
                 Spacer(Modifier.height(8.dp))
                 Box(
                     modifier = Modifier
@@ -159,10 +167,10 @@ fun CreateGroupScreen(
                             fontSize = 15.sp,
                         ),
                         cursorBrush = SolidColor(CyanAccent),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().semantics { contentDescription = groupNameLabel },
                         decorationBox = { inner ->
                             if (groupName.isEmpty()) {
-                                Text("Enter group name…", color = TextDim, fontSize = 15.sp)
+                                Text(stringResource(R.string.create_group_name_hint), color = TextDim, fontSize = 15.sp)
                             }
                             inner()
                         },
@@ -173,7 +181,13 @@ fun CreateGroupScreen(
 
             // Members section header
             item {
-                SectionLabel("Add Members (${selectedIds.size} selected)")
+                SectionLabel(
+                    pluralStringResource(
+                        R.plurals.create_group_selected_members,
+                        selectedIds.size,
+                        selectedIds.size,
+                    )
+                )
                 Spacer(Modifier.height(4.dp))
             }
 
@@ -187,7 +201,7 @@ fun CreateGroupScreen(
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = "No contacts yet.\nAdd contacts from the chat list first.",
+                            text = stringResource(R.string.create_group_no_contacts),
                             color = TextDim,
                             fontSize = 13.sp,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -271,8 +285,9 @@ private fun ContactSelectRow(
 
 @Composable
 private fun SectionLabel(text: String) {
+    val locale = LocalConfiguration.current.locales[0]
     Text(
-        text = text.uppercase(),
+        text = text.uppercase(locale),
         color = TextDim,
         fontSize = 10.sp,
         fontFamily = PhantomFontMono,

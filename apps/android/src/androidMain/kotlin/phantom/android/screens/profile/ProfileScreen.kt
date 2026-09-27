@@ -13,6 +13,7 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
+import androidx.annotation.StringRes
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -36,6 +37,7 @@ import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -50,6 +52,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import phantom.android.di.AppContainer
+import phantom.android.R
 import phantom.android.qr.QrCodeImage
 import phantom.android.qr.generateQrBitmap
 import phantom.android.ui.*
@@ -75,6 +78,15 @@ private val GRADIENT_PRESETS: List<Pair<Color, Color>> = listOf(
 
 private fun prefsOf(context: Context): SharedPreferences =
     context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE)
+
+internal enum class ProfileField(val prefKey: String, @StringRes val labelRes: Int) {
+    FIRST_NAME("profile_first_name", R.string.profile_first_name),
+    LAST_NAME("profile_last_name", R.string.profile_last_name),
+    DATE_OF_BIRTH("profile_dob", R.string.profile_date_of_birth),
+    CITY("profile_city", R.string.profile_city),
+    COUNTRY("profile_country", R.string.profile_country),
+    ABOUT("profile_bio", R.string.profile_about),
+}
 
 // ── Screen ───────────────────────────────────────────────────────────────────
 
@@ -108,7 +120,7 @@ fun ProfileScreen(
     var showGradientPicker by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
-    var editingField by remember { mutableStateOf<String?>(null) }
+    var editingField by remember { mutableStateOf<ProfileField?>(null) }
     var editingValue by remember { mutableStateOf("") }
 
     val avatarFile = remember { File(context.filesDir, "profile_avatar.jpg") }
@@ -130,12 +142,12 @@ fun ProfileScreen(
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
-            firstName = prefs.getString("profile_first_name", "") ?: ""
-            lastName = prefs.getString("profile_last_name", "") ?: ""
-            dateOfBirth = prefs.getString("profile_dob", "") ?: ""
-            city = prefs.getString("profile_city", "") ?: ""
-            country = prefs.getString("profile_country", "") ?: ""
-            bio = prefs.getString("profile_bio", "") ?: ""
+            firstName = prefs.getString(ProfileField.FIRST_NAME.prefKey, "") ?: ""
+            lastName = prefs.getString(ProfileField.LAST_NAME.prefKey, "") ?: ""
+            dateOfBirth = prefs.getString(ProfileField.DATE_OF_BIRTH.prefKey, "") ?: ""
+            city = prefs.getString(ProfileField.CITY.prefKey, "") ?: ""
+            country = prefs.getString(ProfileField.COUNTRY.prefKey, "") ?: ""
+            bio = prefs.getString(ProfileField.ABOUT.prefKey, "") ?: ""
             gradientIndex = prefs.getInt("profile_gradient_index", -1)
             if (avatarFile.exists()) {
                 val bmp = BitmapFactory.decodeFile(avatarFile.absolutePath)
@@ -187,8 +199,8 @@ fun ProfileScreen(
                 country = country,
                 bio = bio,
                 onBadgeTap = { showAvatarChoiceDialog = true },
-                onEditField = { label, currentValue ->
-                    editingField = label
+                onEditField = { field, currentValue ->
+                    editingField = field
                     editingValue = currentValue
                 },
             )
@@ -240,7 +252,7 @@ fun ProfileScreen(
         AlertDialog(
             onDismissRequest = { showShareDialog = false },
             containerColor = Surface,
-            title = { Text("Share contact", color = TextPrimary, fontWeight = FontWeight.Medium) },
+            title = { Text(stringResource(R.string.profile_share_contact_title), color = TextPrimary, fontWeight = FontWeight.Medium) },
             text = {
                 Column {
                     TextButton(
@@ -261,13 +273,13 @@ fun ProfileScreen(
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
                                 withContext(Dispatchers.Main) {
-                                    context.startActivity(Intent.createChooser(intent, "Share QR via…"))
+                                    context.startActivity(Intent.createChooser(intent, context.getString(R.string.profile_share_qr_via)))
                                 }
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Send QR code (image)", color = CyanAccent)
+                        Text(stringResource(R.string.profile_send_qr_image), color = CyanAccent)
                     }
                     TextButton(
                         onClick = {
@@ -275,13 +287,13 @@ fun ProfileScreen(
                             val intent = Intent(Intent.ACTION_SEND).apply {
                                 type = "text/plain"
                                 putExtra(Intent.EXTRA_TEXT, shareIdentityString)
-                                putExtra(Intent.EXTRA_SUBJECT, "PHANTOM identity key")
+                                putExtra(Intent.EXTRA_SUBJECT, context.getString(R.string.profile_identity_key_subject))
                             }
-                            context.startActivity(Intent.createChooser(intent, "Share key via…"))
+                            context.startActivity(Intent.createChooser(intent, context.getString(R.string.profile_share_key_via)))
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Send text key", color = CyanAccent)
+                        Text(stringResource(R.string.profile_send_text_key), color = CyanAccent)
                     }
                     TextButton(
                         onClick = {
@@ -298,24 +310,24 @@ fun ProfileScreen(
                                     val intent = Intent(Intent.ACTION_SEND).apply {
                                         type = "text/plain"
                                         putExtra(Intent.EXTRA_TEXT, link)
-                                        putExtra(Intent.EXTRA_SUBJECT, "Join me on PHANTOM")
+                                        putExtra(Intent.EXTRA_SUBJECT, context.getString(R.string.profile_invite_subject))
                                     }
                                     withContext(kotlinx.coroutines.Dispatchers.Main) {
-                                        context.startActivity(Intent.createChooser(intent, "Share invite link via…"))
+                                        context.startActivity(Intent.createChooser(intent, context.getString(R.string.profile_share_invite_via)))
                                     }
                                 }
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Share invite link", color = CyanAccent)
+                        Text(stringResource(R.string.profile_share_invite_link), color = CyanAccent)
                     }
                 }
             },
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showShareDialog = false }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.profile_cancel), color = TextDim)
                 }
             },
         )
@@ -326,7 +338,7 @@ fun ProfileScreen(
         AlertDialog(
             onDismissRequest = { showAvatarChoiceDialog = false },
             containerColor = Surface,
-            title = { Text("Change avatar", color = TextPrimary, fontWeight = FontWeight.Medium) },
+            title = { Text(stringResource(R.string.profile_change_avatar), color = TextPrimary, fontWeight = FontWeight.Medium) },
             text = {
                 Column {
                     TextButton(
@@ -336,7 +348,7 @@ fun ProfileScreen(
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Choose photo", color = CyanAccent)
+                        Text(stringResource(R.string.profile_choose_photo), color = CyanAccent)
                     }
                     TextButton(
                         onClick = {
@@ -345,14 +357,14 @@ fun ProfileScreen(
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("Change gradient color", color = CyanAccent)
+                        Text(stringResource(R.string.profile_change_gradient), color = CyanAccent)
                     }
                 }
             },
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showAvatarChoiceDialog = false }) {
-                    Text("Cancel", color = TextDim)
+                    Text(stringResource(R.string.profile_cancel), color = TextDim)
                 }
             },
         )
@@ -373,30 +385,19 @@ fun ProfileScreen(
     }
 
     // ── Field edit dialog ────────────────────────────────────────────────────
-    editingField?.let { label ->
+    editingField?.let { field ->
         FieldEditDialog(
-            label = label,
+            field = field,
             initialValue = editingValue,
             onSave = { newValue ->
-                val prefKey = when (label) {
-                    "First name" -> "profile_first_name"
-                    "Last name" -> "profile_last_name"
-                    "Date of birth" -> "profile_dob"
-                    "City" -> "profile_city"
-                    "Country" -> "profile_country"
-                    "About" -> "profile_bio"
-                    else -> null
-                }
-                prefKey?.let { key ->
-                    prefs.edit().putString(key, newValue).apply()
-                    when (label) {
-                        "First name" -> firstName = newValue
-                        "Last name" -> lastName = newValue
-                        "Date of birth" -> dateOfBirth = newValue
-                        "City" -> city = newValue
-                        "Country" -> country = newValue
-                        "About" -> bio = newValue
-                    }
+                prefs.edit().putString(field.prefKey, newValue).apply()
+                when (field) {
+                    ProfileField.FIRST_NAME -> firstName = newValue
+                    ProfileField.LAST_NAME -> lastName = newValue
+                    ProfileField.DATE_OF_BIRTH -> dateOfBirth = newValue
+                    ProfileField.CITY -> city = newValue
+                    ProfileField.COUNTRY -> country = newValue
+                    ProfileField.ABOUT -> bio = newValue
                 }
                 editingField = null
             },
@@ -446,7 +447,7 @@ private fun ProfileTopBar(onBack: () -> Unit) {
 
             // Title — overline mono 11sp tracked uppercase.
             Text(
-                text = "PROFILE",
+                text = stringResource(R.string.profile_title),
                 color = TextDim,
                 fontSize = 11.sp,
                 fontFamily = PhantomFontMono,
@@ -478,7 +479,7 @@ private fun ProfileCard(
     country: String,
     bio: String,
     onBadgeTap: () -> Unit,
-    onEditField: (label: String, currentValue: String) -> Unit,
+    onEditField: (field: ProfileField, currentValue: String) -> Unit,
 ) {
     Surface(
         modifier = Modifier
@@ -506,7 +507,7 @@ private fun ProfileCard(
                 if (avatarBitmap != null) {
                     androidx.compose.foundation.Image(
                         bitmap = avatarBitmap,
-                        contentDescription = "Profile photo",
+                        contentDescription = stringResource(R.string.profile_photo_a11y),
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
                             .size(80.dp)
@@ -580,10 +581,11 @@ private fun ProfileCard(
             // Combine first + last name when both are filled so the header
             // matches the React mock ("Maya Hertzog", not just "Maya").
             // Falls through: full name → first name only → @username → "Loading…".
+            val loadingLabel = stringResource(R.string.profile_loading)
             val displayName = listOf(firstName, lastName)
                 .filter { it.isNotBlank() }
                 .joinToString(" ")
-                .ifEmpty { username.ifEmpty { "Loading…" } }
+                .ifEmpty { username.ifEmpty { loadingLabel } }
             Text(
                 text = displayName,
                 color = TextPrimary,
@@ -617,7 +619,7 @@ private fun ProfileCard(
                     .padding(horizontal = 7.dp, vertical = 3.dp),
             ) {
                 Text(
-                    text = "FREE",
+                    text = stringResource(R.string.profile_free_badge),
                     color = TextDim,
                     fontSize = 9.sp,
                     fontFamily = PhantomFontMono,
@@ -645,33 +647,33 @@ private fun ProfileCard(
                     ),
             ) {
                 ProfileEditField(
-                    label = "First name",
+                    label = stringResource(ProfileField.FIRST_NAME.labelRes),
                     value = firstName,
-                    onTap = { onEditField("First name", firstName) },
+                    onTap = { onEditField(ProfileField.FIRST_NAME, firstName) },
                 )
                 ProfileFieldDivider()
                 ProfileEditField(
-                    label = "Last name",
+                    label = stringResource(ProfileField.LAST_NAME.labelRes),
                     value = lastName,
-                    onTap = { onEditField("Last name", lastName) },
+                    onTap = { onEditField(ProfileField.LAST_NAME, lastName) },
                 )
                 ProfileFieldDivider()
                 ProfileEditField(
-                    label = "Date of birth",
+                    label = stringResource(ProfileField.DATE_OF_BIRTH.labelRes),
                     value = dateOfBirth,
-                    onTap = { onEditField("Date of birth", dateOfBirth) },
+                    onTap = { onEditField(ProfileField.DATE_OF_BIRTH, dateOfBirth) },
                 )
                 ProfileFieldDivider()
                 ProfileEditField(
-                    label = "City",
+                    label = stringResource(ProfileField.CITY.labelRes),
                     value = city,
-                    onTap = { onEditField("City", city) },
+                    onTap = { onEditField(ProfileField.CITY, city) },
                 )
                 ProfileFieldDivider()
                 ProfileEditField(
-                    label = "Country",
+                    label = stringResource(ProfileField.COUNTRY.labelRes),
                     value = country,
-                    onTap = { onEditField("Country", country) },
+                    onTap = { onEditField(ProfileField.COUNTRY, country) },
                 )
                 ProfileFieldDivider()
                 // Bio row last per FULL_COMPOSE §07 — sits at the bottom
@@ -679,10 +681,10 @@ private fun ProfileCard(
                 // grouped above. Multi-line value preview wraps to 2
                 // lines with ellipsis to keep the row height predictable.
                 ProfileEditField(
-                    label = "About",
+                    label = stringResource(ProfileField.ABOUT.labelRes),
                     value = bio,
-                    placeholder = "Add a short bio…",
-                    onTap = { onEditField("About", bio) },
+                    placeholder = stringResource(R.string.profile_bio_hint),
+                    onTap = { onEditField(ProfileField.ABOUT, bio) },
                     isLast = true,
                     valueMaxLines = 2,
                 )
@@ -801,7 +803,7 @@ internal fun QrKeyCard(
             }
             Spacer(Modifier.width(7.dp))
             Text(
-                text = "My Phantom QR",
+                text = stringResource(R.string.profile_my_qr),
                 color = PhantomTokens.Colors.TextSecondary,
                 fontSize = 10.sp,
                 fontFamily = PhantomFontMono,
@@ -832,7 +834,7 @@ internal fun QrKeyCard(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "Share my Phantom contact",
+                    text = stringResource(R.string.profile_share_my_contact),
                     color = BgDeep,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium,
@@ -882,8 +884,7 @@ private fun AdvancedCryptoDetailsSection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = if (expanded) "▾  Advanced cryptographic details"
-                       else "▸  Advanced cryptographic details",
+                text = (if (expanded) "▾  " else "▸  ") + stringResource(R.string.profile_advanced_crypto),
                 color = TextDim,
                 fontSize = 11.sp,
                 fontFamily = PhantomFontMono,
@@ -894,20 +895,20 @@ private fun AdvancedCryptoDetailsSection(
         if (expanded) {
             Spacer(Modifier.height(8.dp))
             AdvancedPublicKeyRow(
-                keyLabel = "Public key · Ed25519 (signing)",
+                keyLabel = stringResource(R.string.profile_ed25519_public_key),
                 fullHexDisplay = formatFullKeyForDisplay(signingPublicKeyHex),
-                shortIdLabel = "Short ID",
+                shortIdLabel = stringResource(R.string.profile_short_id),
                 shortIdValue = formatShortKeyIdForDisplay(signingPublicKeyHex),
-                copyButtonText = "Copy public key",
+                copyButtonText = stringResource(R.string.profile_copy_public_key),
                 onCopy = { onCopySigningKey(signingPublicKeyHex) },
             )
             Spacer(Modifier.height(12.dp))
             AdvancedPublicKeyRow(
-                keyLabel = "Public key · X25519 (encryption)",
+                keyLabel = stringResource(R.string.profile_x25519_public_key),
                 fullHexDisplay = formatFullKeyForDisplay(publicKeyHex),
-                shortIdLabel = "Short ID",
+                shortIdLabel = stringResource(R.string.profile_short_id),
                 shortIdValue = formatShortKeyIdForDisplay(publicKeyHex),
-                copyButtonText = "Copy public key",
+                copyButtonText = stringResource(R.string.profile_copy_public_key),
                 onCopy = { onCopyEncryptionKey(publicKeyHex) },
             )
             Spacer(Modifier.height(6.dp))
@@ -920,9 +921,7 @@ private fun AdvancedCryptoDetailsSection(
             // be shared). Pinned verbatim by
             // ProfileQrKeyCardSimplifiedTest.
             Text(
-                text = "These public keys identify your Phantom account and " +
-                    "may be shared for verification. They cannot unlock it. " +
-                    "Never share a private key or recovery backup.",
+                text = stringResource(R.string.profile_public_key_explainer),
                 color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center,
@@ -1025,7 +1024,7 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
     ) {
         // Section overline
         Text(
-            text = "ACCOUNT",
+            text = stringResource(R.string.profile_account_heading),
             color = TextDim,
             fontSize = 10.sp,
             fontFamily = PhantomFontMono,
@@ -1035,7 +1034,7 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
 
         AccountRow(
-            label = "Username",
+            label = stringResource(R.string.profile_username),
             value = "@${handle.ifEmpty { "—" }}",
         )
         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
@@ -1048,13 +1047,13 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "Plan",
+                text = stringResource(R.string.profile_plan),
                 color = TextDim,
                 fontSize = 14.sp,
                 modifier = Modifier.width(120.dp),
             )
             Text(
-                text = "Free",
+                text = stringResource(R.string.profile_free_plan),
                 color = TextPrimary,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
@@ -1068,7 +1067,7 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
                     .padding(horizontal = 10.dp, vertical = 4.dp),
             ) {
                 Text(
-                    text = "UPGRADE",
+                    text = stringResource(R.string.profile_upgrade),
                     color = BgDeep,
                     fontSize = 9.sp,
                     fontFamily = PhantomFontMono,
@@ -1080,24 +1079,19 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
 
         AccountRow(
-            label = "Member since",
+            label = stringResource(R.string.profile_member_since),
             // FULL_COMPOSE §07 AccountCard: month-year string from the
             // identity creation timestamp. Earlier hardcoded "—" was a
             // placeholder waiting for the real value to be wired through.
-            value = formatMemberSince(createdAt),
+            value = formatMemberSince(createdAt, LocalContext.current.resources.configuration.locales.get(0)),
         )
     }
     Spacer(Modifier.height(12.dp))
 }
 
-private fun formatMemberSince(createdAtMs: Long): String {
+internal fun formatMemberSince(createdAtMs: Long, locale: java.util.Locale): String {
     if (createdAtMs <= 0L) return "—"
-    // App copy is English-only — Locale.getDefault() picked up the
-    // device locale and rendered Russian month names (e.g. "мая 2026")
-    // even though every other label in the screen is English.
-    // Force Locale.ENGLISH so Member-since stays consistent with the
-    // surrounding UI until full localisation lands.
-    val fmt = java.text.SimpleDateFormat("MMMM yyyy", java.util.Locale.ENGLISH)
+    val fmt = java.text.SimpleDateFormat("MMMM yyyy", locale)
     return fmt.format(java.util.Date(createdAtMs))
 }
 
@@ -1203,7 +1197,7 @@ private fun DeleteSection(onDeleteTap: () -> Unit) {
         )
         Spacer(Modifier.height(18.dp))
         Text(
-            text = "Delete account",
+            text = stringResource(R.string.profile_delete_account),
             color = Danger.copy(alpha = 0.55f),
             fontSize = 13.sp,
             fontWeight = FontWeight.Normal,
@@ -1216,7 +1210,7 @@ private fun DeleteSection(onDeleteTap: () -> Unit) {
         Spacer(Modifier.height(8.dp))
 
         Text(
-            text = "Destructive. Keys deleted forever. Contacts see “Account deleted by user”.",
+            text = stringResource(R.string.profile_delete_warning),
             color = TextDim.copy(alpha = 0.7f),
             fontSize = 11.sp,
             textAlign = TextAlign.Center,
@@ -1239,7 +1233,7 @@ private fun GradientPickerDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
-        title = { Text("Choose gradient", color = TextPrimary, fontWeight = FontWeight.Medium) },
+        title = { Text(stringResource(R.string.profile_choose_gradient), color = TextPrimary, fontWeight = FontWeight.Medium) },
         text = {
             // -1 swatch = default + 8 presets = 9 items, show in 4-column grid
             val allBrushes: List<Brush> = listOf(defaultBrush) + GRADIENT_PRESETS.map { (c1, c2) ->
@@ -1277,7 +1271,7 @@ private fun GradientPickerDialog(
         confirmButton = {},
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel", color = TextDim)
+                Text(stringResource(R.string.profile_cancel), color = TextDim)
             }
         },
     )
@@ -1288,12 +1282,12 @@ private fun GradientPickerDialog(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FieldEditDialog(
-    label: String,
+    field: ProfileField,
     initialValue: String,
     onSave: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val isDateField = label == "Date of birth"
+    val isDateField = field == ProfileField.DATE_OF_BIRTH
 
     // For the date field we store digits only; the formatted "mm.dd.yyyy" view
     // is produced by DateMmDdYyyyVisualTransformation, and dots are added back
@@ -1305,7 +1299,7 @@ private fun FieldEditDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
-        title = { Text(label, color = TextPrimary, fontWeight = FontWeight.Medium) },
+        title = { Text(stringResource(field.labelRes), color = TextPrimary, fontWeight = FontWeight.Medium) },
         text = {
             OutlinedTextField(
                 value = text,
@@ -1324,7 +1318,7 @@ private fun FieldEditDialog(
                     VisualTransformation.None
                 },
                 placeholder = if (isDateField) {
-                    { Text("MM.DD.YYYY", color = TextDim.copy(alpha = 0.5f)) }
+                    { Text(stringResource(R.string.profile_date_hint), color = TextDim.copy(alpha = 0.5f)) }
                 } else null,
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = TextPrimary,
@@ -1341,12 +1335,12 @@ private fun FieldEditDialog(
                 val saved = if (isDateField) formatDob(text) else text.trim()
                 onSave(saved)
             }) {
-                Text("Save", color = CyanAccent)
+                Text(stringResource(R.string.profile_save), color = CyanAccent)
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel", color = TextDim)
+                Text(stringResource(R.string.profile_cancel), color = TextDim)
             }
         },
     )
@@ -1400,32 +1394,31 @@ private fun DeleteAccountDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
-        title = { Text("Delete Account?", color = Danger, fontWeight = FontWeight.Medium) },
+        title = { Text(stringResource(R.string.profile_delete_title), color = Danger, fontWeight = FontWeight.Medium) },
         text = {
             Column {
                 Text(
-                    "This is not a logout.",
+                    stringResource(R.string.profile_delete_not_logout),
                     color = TextPrimary,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Your encryption keys will be permanently deleted from this device. " +
-                        "There is no recovery — no phone number, no seed phrase, no backup.",
+                    stringResource(R.string.profile_delete_key_warning),
                     color = TextDim,
                     fontSize = 13.sp,
                     lineHeight = 19.sp,
                 )
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Your contacts will no longer be able to reach you at this identity.",
+                    stringResource(R.string.profile_delete_reachability),
                     color = TextDim,
                     fontSize = 13.sp,
                     lineHeight = 19.sp,
                 )
                 Spacer(Modifier.height(16.dp))
-                Text("Type your username to confirm:", color = TextDim, fontSize = 12.sp)
+                Text(stringResource(R.string.profile_delete_confirm_prompt), color = TextDim, fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = confirmText,
@@ -1436,9 +1429,9 @@ private fun DeleteAccountDialog(
                     supportingText = {
                         when {
                             confirmText.isNotEmpty() && !confirmed ->
-                                Text("Username doesn't match", color = Danger, fontSize = 11.sp)
+                                Text(stringResource(R.string.profile_username_mismatch), color = Danger, fontSize = 11.sp)
                             confirmed ->
-                                Text("Confirmed", color = Success, fontSize = 11.sp)
+                                Text(stringResource(R.string.profile_confirmed), color = Success, fontSize = 11.sp)
                         }
                     },
                     colors = OutlinedTextFieldDefaults.colors(
@@ -1461,12 +1454,12 @@ private fun DeleteAccountDialog(
         },
         confirmButton = {
             TextButton(onClick = { if (confirmed) onConfirm() }, enabled = confirmed) {
-                Text("Delete", color = if (confirmed) Danger else TextDim, fontWeight = FontWeight.Medium)
+                Text(stringResource(R.string.profile_delete), color = if (confirmed) Danger else TextDim, fontWeight = FontWeight.Medium)
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel", color = TextDim)
+                Text(stringResource(R.string.profile_cancel), color = TextDim)
             }
         },
     )
@@ -1476,7 +1469,7 @@ private fun DeleteAccountDialog(
 
 private fun copyToClipboard(context: Context, text: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    clipboard.setPrimaryClip(ClipData.newPlainText("Phantom Public Key", text))
+    clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.profile_clipboard_public_key), text))
 }
 
 private fun formatTimestamp(millis: Long): String {

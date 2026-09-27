@@ -18,10 +18,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 
@@ -31,6 +35,9 @@ fun IncomingCallScreen(
     onAnswer: () -> Unit,
     onReject: () -> Unit,
 ) {
+    val declineLabel = stringResource(R.string.call_decline)
+    val acceptLabel = stringResource(R.string.call_accept)
+
     // Pulsing animation: 1f → 1.15f → 1f, continuous
     val pulseScale = remember { Animatable(1f) }
     LaunchedEffect(Unit) {
@@ -108,7 +115,7 @@ fun IncomingCallScreen(
             Spacer(Modifier.height(8.dp))
 
             Text(
-                text = "Incoming call...",
+                text = stringResource(R.string.call_incoming_status),
                 color = TextDim,
                 fontSize = 14.sp,
                 fontFamily = PhantomFontMono,
@@ -136,12 +143,14 @@ fun IncomingCallScreen(
                         containerColor = Danger,
                         contentColor = Color.White,
                         shape = CircleShape,
-                        modifier = Modifier.size(72.dp),
+                        modifier = Modifier.size(72.dp).semantics {
+                            contentDescription = declineLabel
+                        },
                     ) {
                         PhIconCallEnd(color = Color.White, size = 28.dp)
                     }
                     Text(
-                        text = "Decline",
+                        text = declineLabel,
                         color = TextDim,
                         fontSize = 12.sp,
                         fontFamily = PhantomFontMono,
@@ -158,12 +167,14 @@ fun IncomingCallScreen(
                         containerColor = Success,
                         contentColor = Color.White,
                         shape = CircleShape,
-                        modifier = Modifier.size(72.dp),
+                        modifier = Modifier.size(72.dp).semantics {
+                            contentDescription = acceptLabel
+                        },
                     ) {
                         PhIconPhoneFill(color = Color.White, size = 28.dp)
                     }
                     Text(
-                        text = "Accept",
+                        text = acceptLabel,
                         color = TextDim,
                         fontSize = 12.sp,
                         fontFamily = PhantomFontMono,

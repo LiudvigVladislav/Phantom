@@ -125,7 +125,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *   ── Source-contract tripwire (NON-EXHAUSTIVE, tightened) ─
  *  45.  Combined test: no direct writes to former finalize
  *       fields; holder call parity (Done tap + resume = 2
- *       applyFinalizeOutcome + 2 runFinalize + 1 markInFlight).
+ *       controller outcomes + 2 runFinalize + 1 markInFlight), plus
+ *       one explicit subscription refusal before resumed finalization.
  *
  *   ── Defensive: transient error is cleared on next attempt ─
  *  46.  Retry after Phase-2 error clears
@@ -952,16 +953,32 @@ class OnboardingV2FinalizeOutcomeContractTest {
             "OnboardingFlowV2.kt must not directly assign " +
                 "`currentStep = OnboardingStepV2.FinaleConfirmation`. Found $finaleAssignments.")
 
-        val applyOutcomeCalls = Regex("""(?<![\w])finalizeHolder\.applyFinalizeOutcome\s*\(""")
-            .findAll(source).count()
-        assertEquals(2, applyOutcomeCalls,
-            "OnboardingFlowV2.kt must call finalizeHolder.applyFinalizeOutcome exactly " +
-                "twice (Done tap + resume LaunchedEffect). Found $applyOutcomeCalls.")
-        val runFinalizeCalls = Regex("""(?<!fun )\brunFinalize\s*\(""")
-            .findAll(source).count()
-        assertEquals(applyOutcomeCalls, runFinalizeCalls,
-            "runFinalize call count ($runFinalizeCalls) MUST equal " +
-                "finalizeHolder.applyFinalizeOutcome call count ($applyOutcomeCalls).")
+        fun assertOutcomeWiring(code: String) {
+            val applyOutcomeCalls = Regex("""\bfinalizeHolder\.applyFinalizeOutcome\s*\(""")
+                .findAll(code).count()
+            val resultCalls = Regex("""finalizeHolder\.applyFinalizeOutcome\(outcome\)""")
+                .findAll(code).count()
+            val guard = phantom.android.service.RetryWiringSourceScanner.blockAfter(
+                code, "if (!SubscriptionAccess.permits(formState.privacyMode))",
+            )
+            assertTrue(guard != null, "Restored unavailable plan must not resume finalization")
+            assertTrue("finalizeHolder.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)" in guard!!)
+            assertTrue("return@LaunchedEffect" in guard)
+            assertEquals(3, applyOutcomeCalls, "Two controller outcomes plus one subscription refusal")
+            assertEquals(2, resultCalls, "Done and resume must each apply their controller outcome")
+            val runFinalizeCalls = Regex("""(?<!fun )\brunFinalize\s*\(""").findAll(code).count()
+            assertEquals(resultCalls, runFinalizeCalls)
+        }
+        val code = phantom.android.service.RetryWiringSourceScanner.codeOnly(source)
+        assertOutcomeWiring(code)
+        kotlin.test.assertFailsWith<AssertionError> {
+            assertOutcomeWiring(code.replace(
+                "finalizeHolder.applyFinalizeOutcome(FinalizeOutcome.FailedBeforePersistence)", "",
+            ))
+        }
+        kotlin.test.assertFailsWith<AssertionError> {
+            assertOutcomeWiring(code + "\nfinalizeHolder.applyFinalizeOutcome(outcome)")
+        }
         val markInFlightCalls = Regex("""(?<![\w])finalizeHolder\.markInFlight\s*\(""")
             .findAll(source).count()
         assertEquals(1, markInFlightCalls,

@@ -3,6 +3,8 @@
 
 package phantom.android.ui
 
+import android.app.Application
+import phantom.android.R
 import phantom.android.transport.ConnectionUiState
 import java.io.IOException
 import java.net.ConnectException
@@ -11,10 +13,14 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
 
 /**
  * DWS-UX.1 (2026-06-17) — pins the production
- * [phantom.android.ui.connectionErrorLabel] discriminator. Pre-
+ * [phantom.android.ui.connectionErrorKind] discriminator. Pre-
  * DWS-UX the label was the bare string `"Offline — reconnecting"`
  * inlined into the composable's `when` arm, which implied that
  * recovery was actively in progress. When the
@@ -28,68 +34,79 @@ import kotlin.test.assertEquals
  * false-confidence (the test could stay green while the production
  * code drifted). The discriminator was therefore lifted out of the
  * composable into the file-level
- * [phantom.android.ui.connectionErrorLabel] function so that this
+ * [phantom.android.ui.connectionErrorKind] function so that this
  * test calls the real production code path.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [32], application = Application::class)
 class ConnectionBannerErrorLabelTest {
 
     /** Sugar so the test reads cleanly. Delegates to production code. */
-    private fun labelFor(cause: Throwable): String =
-        connectionErrorLabel(cause)
+    private fun kindFor(cause: Throwable): ConnectionErrorKind =
+        connectionErrorKind(cause)
+
+    @Test
+    fun error_kinds_keep_their_user_facing_resource() {
+        assertEquals(R.string.connection_offline_reconnecting, ConnectionErrorKind.RECONNECTING.labelRes)
+        assertEquals(R.string.connection_check_setup, ConnectionErrorKind.CHECK_SETUP.labelRes)
+        val resources = RuntimeEnvironment.getApplication().resources
+        assertEquals("Offline — reconnecting", resources.getString(ConnectionErrorKind.RECONNECTING.labelRes))
+        assertEquals("Cannot connect — please check setup", resources.getString(ConnectionErrorKind.CHECK_SETUP.labelRes))
+    }
 
     @Test
     fun socket_timeout_keeps_reconnecting_promise() {
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(SocketTimeoutException("read timed out")),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(SocketTimeoutException("read timed out")),
         )
     }
 
     @Test
     fun socket_exception_keeps_reconnecting_promise() {
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(SocketException("broken pipe")),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(SocketException("broken pipe")),
         )
     }
 
     @Test
     fun connect_exception_keeps_reconnecting_promise() {
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(ConnectException("connection refused")),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(ConnectException("connection refused")),
         )
     }
 
     @Test
     fun unknown_host_keeps_reconnecting_promise() {
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(UnknownHostException("no DNS")),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(UnknownHostException("no DNS")),
         )
     }
 
     @Test
     fun generic_io_exception_keeps_reconnecting_promise() {
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(IOException("flush failed")),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(IOException("flush failed")),
         )
     }
 
     @Test
     fun illegal_state_falls_back_to_check_setup() {
         assertEquals(
-            "Cannot connect — please check setup",
-            labelFor(IllegalStateException("signer not provisioned")),
+            ConnectionErrorKind.CHECK_SETUP,
+            kindFor(IllegalStateException("signer not provisioned")),
         )
     }
 
     @Test
     fun illegal_argument_falls_back_to_check_setup() {
         assertEquals(
-            "Cannot connect — please check setup",
-            labelFor(IllegalArgumentException("relay URL malformed")),
+            ConnectionErrorKind.CHECK_SETUP,
+            kindFor(IllegalArgumentException("relay URL malformed")),
         )
     }
 
@@ -103,8 +120,8 @@ class ConnectionBannerErrorLabelTest {
         // test and the banner together.
         val wrapped = RuntimeException(SocketTimeoutException("inner"))
         assertEquals(
-            "Cannot connect — please check setup",
-            labelFor(wrapped),
+            ConnectionErrorKind.CHECK_SETUP,
+            kindFor(wrapped),
         )
     }
 
@@ -116,8 +133,8 @@ class ConnectionBannerErrorLabelTest {
         // entirely.
         val state = ConnectionUiState.Error(SocketTimeoutException("from wire"))
         assertEquals(
-            "Offline — reconnecting",
-            labelFor(state.cause),
+            ConnectionErrorKind.RECONNECTING,
+            kindFor(state.cause),
         )
     }
 }

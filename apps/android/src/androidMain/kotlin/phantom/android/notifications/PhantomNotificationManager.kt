@@ -17,6 +17,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import phantom.android.MainActivity
+import phantom.android.R
 
 /**
  * Local-only notification manager for PHANTOM — no Firebase, no FCM.
@@ -45,7 +46,6 @@ object PhantomNotificationManager {
     private const val LOG_TAG = "PhantomNotif"
 
     const val CHANNEL_ID = "phantom_messages"
-    const val CHANNEL_NAME = "Messages"
 
     // Intent extra keys — must match what MainActivity reads
     const val EXTRA_CONVERSATION_ID  = "conversationId"
@@ -68,10 +68,10 @@ object PhantomNotificationManager {
         val importance = NotificationManager.IMPORTANCE_HIGH
         val channel = NotificationChannel(
             CHANNEL_ID,
-            CHANNEL_NAME,
+            context.getString(R.string.notification_messages_channel_name),
             importance,
         ).apply {
-            description     = "Incoming PHANTOM messages"
+            description     = context.getString(R.string.notification_messages_channel_description)
             enableVibration(true)
             enableLights(true)
             lightColor      = 0xFF00D4FF.toInt() // CyanAccent
@@ -220,7 +220,7 @@ object PhantomNotificationManager {
 
         // Inline reply action — lets users respond without opening the app
         val remoteInput = RemoteInput.Builder(KEY_REPLY_TEXT)
-            .setLabel("Reply…")
+            .setLabel(context.getString(R.string.notification_reply_hint))
             .build()
 
         val replyIntent = Intent(context, QuickReplyReceiver::class.java).apply {
@@ -237,7 +237,7 @@ object PhantomNotificationManager {
 
         val replyAction = NotificationCompat.Action.Builder(
             android.R.drawable.ic_menu_send,
-            "Reply",
+            context.getString(R.string.notification_reply_action),
             replyPendingIntent,
         ).addRemoteInput(remoteInput).build()
 

@@ -54,6 +54,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -70,7 +71,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
 /**
  * OnboardingPricingSheetV2 — Bottom sheet with Plus / Pro / Business
  * pricing tier cards. Opens when the user taps the Ghost Mode
- * segment on Step 3 (Privacy) or the "Unlock with Phantom Pro" CTA
+ * segment on Step 3 (Privacy) or the "Preview Phantom Pro" CTA
  * inside the Ghost tier card.
  *
  * Layout matches handoff `Onboarding.dc.html` §buildPricing lines
@@ -85,11 +86,11 @@ import phantom.android.ui.designv2.DesignV2Tokens
  *     tracking / TextQuaternary) on the left, circular 30 dp close-X
  *     button on the right.
  *   - Content is a vertical scroll region up to ~56 vh:
- *       - Plus tier — $3.99 · "More control."
+ *       - Plus tier — $4.99 · "More control."
  *       - Pro tier  — $9.99 · "Full control." — recommended, with
  *         GHOST MODE callout box.
  *       - Business tier — $19.99 · "For teams & organizations."
- *   - Footer: "Cancel any time. No data sold, ever." centered, 11.5 sp,
+ *   - Footer: preview availability note centered, 11.5 sp,
  *     TextQuaternary.
  *
  * Handoff visual features implemented in round-3 (was carved out
@@ -137,7 +138,7 @@ import phantom.android.ui.designv2.DesignV2Tokens
  * Accessibility: backdrop is a Role.Button with click-action label
  * "Close pricing"; grab-strip is a separate Role.Button with the
  * same label; close-X is a Role.Button with label "Close pricing".
- * Tier CTAs each carry Role.Button + text "Upgrade to Plus/Pro/Business".
+ * Tier CTAs carry Role.Button + a coming-soon label.
  * Decorative bits (tier hex icons, feature check rondels, close-X
  * path, grab-strip handle) are cleared via
  * `Modifier.clearAndSetSemantics { }`.
@@ -256,7 +257,7 @@ private fun Backdrop(onDismiss: () -> Unit) {
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 role = Role.Button,
-                onClickLabel = "Close pricing",
+                onClickLabel = stringResource(R.string.pricing_sheet_close),
                 onClick = onDismiss,
             ),
     )

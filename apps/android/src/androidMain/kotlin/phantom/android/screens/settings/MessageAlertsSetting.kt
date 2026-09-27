@@ -16,10 +16,12 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import phantom.android.notifications.NotificationsTapAction
+import phantom.android.R
 import phantom.android.notifications.decideNotificationsTapAction
 import phantom.android.notifications.isEffectiveNotificationsEnabled
 import phantom.android.notifications.markNotificationPermissionRequested
@@ -73,7 +75,7 @@ internal fun MessageAlertsSetting(
 
     SettingsToggleRow(
         icon = { PhIconBell(color = CyanAccent, size = 16.dp) },
-        label = "Message Alerts",
+        label = stringResource(R.string.settings_message_alerts),
         checked = isEffectiveNotificationsEnabled(holder.gateState.value),
         onCheckedChange = {
             if (!busy) {

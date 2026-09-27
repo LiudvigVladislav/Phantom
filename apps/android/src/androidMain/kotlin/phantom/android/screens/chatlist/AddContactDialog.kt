@@ -7,9 +7,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.core.storage.ConversationEntity
@@ -31,13 +35,15 @@ fun AddContactDialog(
     val resolvedKey = parsed?.second ?: ""
     val resolvedName = parsed?.first ?: ""
     val isValid = resolvedKey.length == 64 && resolvedKey.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+    val keyLabel = stringResource(R.string.add_contact_key_label)
+    val nicknameLabel = stringResource(R.string.add_contact_nickname_label)
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PhantomTokens.Colors.SurfaceElevated,
         title = {
             Text(
-                "Add contact",
+                stringResource(R.string.add_contact_title),
                 color = TextPrimary,
                 fontSize = 17.sp,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
@@ -47,7 +53,7 @@ fun AddContactDialog(
         text = {
             Column {
                 Text(
-                    "Paste their key (from Profile → Share my key)",
+                    stringResource(R.string.add_contact_key_instruction),
                     color = TextDim,
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
@@ -56,18 +62,23 @@ fun AddContactDialog(
                 OutlinedTextField(
                     value = pasteValue,
                     onValueChange = { pasteValue = it },
-                    placeholder = { Text("username:key or key…", color = TextDim) },
+                    modifier = Modifier.semantics { contentDescription = keyLabel },
+                    placeholder = { Text(stringResource(R.string.add_contact_key_placeholder), color = TextDim) },
                     singleLine = true,
                     isError = pasteValue.isNotEmpty() && !isValid,
                     supportingText = {
                         when {
                             pasteValue.isEmpty() -> {}
                             isValid && resolvedName.isNotEmpty() ->
-                                Text("✓  @$resolvedName", color = Success, fontSize = 11.sp)
+                                Text(
+                                    stringResource(R.string.add_contact_name_recognized, resolvedName),
+                                    color = Success,
+                                    fontSize = 11.sp,
+                                )
                             isValid ->
-                                Text("✓  Key recognised", color = Success, fontSize = 11.sp)
+                                Text(stringResource(R.string.add_contact_key_recognized), color = Success, fontSize = 11.sp)
                             else ->
-                                Text("Must be 64 hex characters", color = Danger, fontSize = 11.sp)
+                                Text(stringResource(R.string.add_contact_key_invalid), color = Danger, fontSize = 11.sp)
                         }
                     },
                     colors = OutlinedTextFieldDefaults.colors(
@@ -80,7 +91,7 @@ fun AddContactDialog(
                 )
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Local nickname (optional)",
+                    nicknameLabel,
                     color = TextDim,
                     fontSize = 12.sp,
                 )
@@ -88,9 +99,14 @@ fun AddContactDialog(
                 OutlinedTextField(
                     value = localAlias,
                     onValueChange = { localAlias = it },
+                    modifier = Modifier.semantics { contentDescription = nicknameLabel },
                     placeholder = {
                         Text(
-                            if (resolvedName.isNotEmpty()) "@$resolvedName" else "Leave blank to use their name",
+                            if (resolvedName.isNotEmpty()) {
+                                stringResource(R.string.add_contact_name_placeholder, resolvedName)
+                            } else {
+                                stringResource(R.string.add_contact_nickname_placeholder)
+                            },
                             color = TextDim.copy(alpha = 0.5f),
                         )
                     },
@@ -132,13 +148,13 @@ fun AddContactDialog(
                 if (loading) {
                     CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = CyanAccent)
                 } else {
-                    Text("Add", color = if (isValid) CyanAccent else TextDim)
+                    Text(stringResource(R.string.add_contact_add), color = if (isValid) CyanAccent else TextDim)
                 }
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) {
-                Text("Cancel", color = TextDim)
+                Text(stringResource(R.string.add_contact_cancel), color = TextDim)
             }
         },
     )

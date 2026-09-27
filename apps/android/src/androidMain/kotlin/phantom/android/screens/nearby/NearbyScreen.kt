@@ -3,59 +3,44 @@
 
 package phantom.android.screens.nearby
 
-import androidx.compose.animation.core.*
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import phantom.android.di.AppContainer
+import phantom.android.R
 import phantom.android.navigation.Screen
-import phantom.android.ui.*
-import phantom.android.ui.theme.*
+import phantom.android.ui.BottomNavPill
+import phantom.android.ui.NavTab
+import phantom.android.ui.theme.BorderSubtle
+import phantom.android.ui.theme.PhantomTokens
+import phantom.android.ui.theme.PhantomFontGeist
+import phantom.android.ui.theme.PhantomFontInter
+import phantom.android.ui.theme.Surface
+import phantom.android.ui.theme.TextPrimary
 
-/**
- * NearbyScreen — Design Brief v3 §13: signature mesh-discovery screen.
- *
- * Architectural truth: PHANTOM finds peers over BLE / WiFi-Direct, not via
- * any cloud directory. The radar visual makes that physical fact visible —
- * concentric rings sweeping around the user's device, with detected peers
- * laid out in the list below.
- *
- * Stage 0 (this commit): pure visual scaffold. The peer list is a static
- * sample; the rings sweep purely for aesthetic. Real BLE/WiFi-Direct
- * scanning lands in a later transport milestone.
- */
 @Composable
-fun NearbyScreen(
-    container: AppContainer,
-    onNavigate: (Screen) -> Unit,
-    onProfile: () -> Unit = {},
-) {
-    // Discoverable toggle persists per-user — until BLE / WiFi-Direct
-    // discovery actually ships (Phase 7), the switch is decorative but
-    // the preference still round-trips so users get the visual feedback
-    // they expect.
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    val prefs = ctx.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
-    var discoverable by remember {
-        mutableStateOf(prefs.getBoolean("nearby_discoverable", true))
-    }
-    val deviceCount = 0  // No mesh transport yet; honest count.
-
+fun NearbyScreen(onNavigate: (Screen) -> Unit) {
     Scaffold(
         containerColor = PhantomTokens.Colors.SurfaceDeep,
         topBar = {
@@ -72,27 +57,14 @@ fun NearbyScreen(
                         .padding(horizontal = PhantomTokens.Spacing.comfortable),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Nearby",
-                            color = TextPrimary,
-                            style = PhantomType.headline,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = "BLUETOOTH · WI-FI DIRECT · MESH",
-                            color = PhantomTokens.Colors.TextTertiary,
-                            fontSize = 9.sp,
-                            fontFamily = PhantomFontMono,
-                            letterSpacing = 1.5.sp,
-                        )
-                    }
                     Text(
-                        text = "$deviceCount DEVICE${if (deviceCount == 1) "" else "S"}",
-                        color = PhantomTokens.Colors.TextTertiary,
-                        fontSize = 10.sp,
-                        fontFamily = PhantomFontMono,
-                        letterSpacing = 1.6.sp,
+                        text = stringResource(R.string.nearby_title),
+                        color = TextPrimary,
+                        style = TextStyle(
+                            fontFamily = PhantomFontGeist,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Medium,
+                        ),
                     )
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
@@ -104,97 +76,35 @@ fun NearbyScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 110.dp),
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.Center)
+                    .padding(horizontal = PhantomTokens.Spacing.comfortable),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                item { RadarPanel() }
-
-                // Discoverable toggle card — FULL_COMPOSE Nearby Screen:
-                // visible BLE / WiFi-Direct beacon switch with a short
-                // helper line. State stored in `phantom_prefs` so the
-                // preference survives across launches.
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                horizontal = PhantomTokens.Spacing.comfortable,
-                                vertical = PhantomTokens.Spacing.baseUnit,
-                            )
-                            .clip(RoundedCornerShape(PhantomTokens.Radius.md))
-                            .background(PhantomTokens.Colors.SurfaceElevated)
-                            .border(
-                                1.dp,
-                                BorderSubtle,
-                                RoundedCornerShape(PhantomTokens.Radius.md),
-                            )
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Discoverable by others",
-                                color = TextPrimary,
-                                fontSize = 14.sp,
-                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
-                            )
-                            Spacer(Modifier.height(2.dp))
-                            Text(
-                                text = "Broadcast a short-range beacon so contacts can find you.",
-                                color = PhantomTokens.Colors.TextTertiary,
-                                fontSize = 12.sp,
-                                lineHeight = 16.sp,
-                            )
-                        }
-                        Spacer(Modifier.width(12.dp))
-                        Switch(
-                            checked = discoverable,
-                            onCheckedChange = {
-                                discoverable = it
-                                prefs.edit().putBoolean("nearby_discoverable", it).apply()
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = PhantomTokens.Colors.SurfaceDeep,
-                                checkedTrackColor = PhantomTokens.Colors.Cyan,
-                                checkedBorderColor = PhantomTokens.Colors.Cyan,
-                                uncheckedThumbColor = TextDim,
-                                uncheckedTrackColor = PhantomTokens.Colors.SurfaceHover,
-                                uncheckedBorderColor = BorderSubtle,
-                            ),
-                        )
-                    }
-                }
-
-                // BLE / WiFi-Direct discovery isn't wired into the transport
-                // layer yet, so we surface an honest empty state instead of
-                // mocking peers. Replace with the real peer feed once the
-                // mesh transport milestone lands.
-                item {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                horizontal = PhantomTokens.Spacing.comfortable,
-                                vertical = PhantomTokens.Spacing.gap,
-                            ),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        Text(
-                            text = "LOOKING FOR PEERS",
-                            color = PhantomTokens.Colors.TextTertiary,
-                            style = PhantomType.overline,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = "Mesh discovery (BLE / WiFi-Direct) is coming in a future build. Stay close to your contact and we'll find them when ready.",
-                            color = PhantomTokens.Colors.TextSecondary,
-                            style = PhantomType.caption,
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                        )
-                    }
-                }
+                Text(
+                    text = stringResource(R.string.nearby_unavailable_title),
+                    color = TextPrimary,
+                    style = TextStyle(
+                        fontFamily = PhantomFontGeist,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = stringResource(R.string.nearby_unavailable_body),
+                    color = PhantomTokens.Colors.TextSecondary,
+                    style = TextStyle(
+                        fontFamily = PhantomFontInter,
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp,
+                    ),
+                    textAlign = TextAlign.Center,
+                )
             }
 
             BottomNavPill(
@@ -212,82 +122,3 @@ fun NearbyScreen(
         }
     }
 }
-
-@Composable
-private fun RadarPanel() {
-    val transition = rememberInfiniteTransition(label = "radar")
-    val sweepAngle by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 4000, easing = LinearEasing),
-        ),
-        label = "sweep",
-    )
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp)
-            .padding(horizontal = PhantomTokens.Spacing.comfortable, vertical = PhantomTokens.Spacing.comfortable)
-            .clip(RoundedCornerShape(PhantomTokens.Radius.lg))
-            .background(PhantomTokens.Colors.SurfaceElevated)
-            .border(
-                1.dp,
-                PhantomTokens.Colors.BorderSubtle,
-                RoundedCornerShape(PhantomTokens.Radius.lg),
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        Canvas(modifier = Modifier.size(220.dp)) {
-            val w = size.width
-            val h = size.height
-            val cx = w / 2f
-            val cy = h / 2f
-            val maxR = minOf(cx, cy) - 4f
-
-            // Concentric rings — 3 levels, fading outward.
-            for (i in 1..3) {
-                val r = maxR * (i / 3f)
-                drawCircle(
-                    color = PhantomTokens.Colors.Cyan.copy(alpha = 0.18f - (i - 1) * 0.04f),
-                    radius = r,
-                    center = Offset(cx, cy),
-                    style = Stroke(width = 1f),
-                )
-            }
-
-            // Sweep arm — cyan fading gradient.
-            rotate(degrees = sweepAngle, pivot = Offset(cx, cy)) {
-                drawCircle(
-                    brush = Brush.sweepGradient(
-                        colors = listOf(
-                            Color.Transparent,
-                            Color.Transparent,
-                            Color.Transparent,
-                            PhantomTokens.Colors.Cyan.copy(alpha = 0.18f),
-                            PhantomTokens.Colors.Cyan.copy(alpha = 0.55f),
-                        ),
-                        center = Offset(cx, cy),
-                    ),
-                    radius = maxR,
-                    center = Offset(cx, cy),
-                )
-            }
-
-            // Center dot — the user's own device.
-            drawCircle(
-                color = PhantomTokens.Colors.Cyan,
-                radius = 5f,
-                center = Offset(cx, cy),
-            )
-            drawCircle(
-                color = PhantomTokens.Colors.Cyan.copy(alpha = 0.25f),
-                radius = 14f,
-                center = Offset(cx, cy),
-            )
-        }
-
-    }
-}
-

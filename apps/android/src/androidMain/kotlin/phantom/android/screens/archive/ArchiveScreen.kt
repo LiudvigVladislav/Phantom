@@ -25,6 +25,10 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -34,6 +38,7 @@ import phantom.android.navigation.Screen
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.android.R
 import phantom.core.storage.ConversationEntity
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -46,6 +51,8 @@ fun ArchiveScreen(
     val scope = rememberCoroutineScope()
     var archived by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
     var showMenuFor by remember { mutableStateOf<String?>(null) }
+    val locale = LocalConfiguration.current.locales[0]
+    val backLabel = stringResource(R.string.archive_back)
 
     suspend fun reload() {
         archived = runCatching { container.conversationRepo.getArchivedConversations() }.getOrElse { emptyList() }
@@ -72,11 +79,11 @@ fun ArchiveScreen(
                     .padding(horizontal = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                IconButton(onClick = onBack, modifier = Modifier.size(32.dp).semantics { contentDescription = backLabel }) {
                     PhIconBack(color = TextPrimary, size = 20.dp)
                 }
                 Text(
-                    text = "ARCHIVED",
+                    text = stringResource(R.string.archive_title),
                     modifier = Modifier.weight(1f),
                     textAlign = TextAlign.Center,
                     color = TextDim,
@@ -112,10 +119,10 @@ fun ArchiveScreen(
                         drawPath(path, TextDim.copy(alpha = 0.4f), style = st)
                     }
                     Spacer(Modifier.height(16.dp))
-                    Text("No archived chats", color = TextDim, fontSize = 15.sp)
+                    Text(stringResource(R.string.archive_empty_title), color = TextDim, fontSize = 15.sp)
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "Long-press a chat to archive it",
+                        stringResource(R.string.archive_empty_hint),
                         color = TextDim.copy(alpha = 0.5f),
                         fontSize = 12.sp,
                         fontFamily = PhantomFontMono,
@@ -155,7 +162,7 @@ fun ArchiveScreen(
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
                                     )
-                                    val timeStr = conv.lastMessageAt?.let { formatArchiveTime(it) } ?: ""
+                                    val timeStr = conv.lastMessageAt?.let { formatArchiveTime(it, locale) } ?: ""
                                     Text(text = timeStr, color = TextDim, fontSize = 11.sp)
                                 }
                                 Spacer(Modifier.height(3.dp))
@@ -176,7 +183,7 @@ fun ArchiveScreen(
                             offset = DpOffset(20.dp, 0.dp),
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Unarchive", color = TextPrimary, fontSize = 14.sp) },
+                                text = { Text(stringResource(R.string.archive_unarchive), color = TextPrimary, fontSize = 14.sp) },
                                 onClick = {
                                     showMenuFor = null
                                     scope.launch {
@@ -198,13 +205,13 @@ fun ArchiveScreen(
     }
 }
 
-private fun formatArchiveTime(millis: Long): String {
+private fun formatArchiveTime(millis: Long, locale: java.util.Locale): String {
     val now = System.currentTimeMillis()
     val diff = now - millis
     val dayMs = 86_400_000L
     return when {
-        diff < dayMs     -> java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(millis))
-        diff < 7 * dayMs -> java.text.SimpleDateFormat("EEE", java.util.Locale.US).format(java.util.Date(millis))
-        else             -> java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date(millis))
+        diff < dayMs     -> java.text.SimpleDateFormat("HH:mm", locale).format(java.util.Date(millis))
+        diff < 7 * dayMs -> java.text.SimpleDateFormat("EEE", locale).format(java.util.Date(millis))
+        else             -> java.text.SimpleDateFormat("dd MMM", locale).format(java.util.Date(millis))
     }
 }

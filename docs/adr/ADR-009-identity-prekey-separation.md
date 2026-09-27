@@ -424,6 +424,14 @@ What **does** happen in migration:
 
 ### Migration UX (per Vladislav 2026-04-29 confirmed)
 
+**Superseded for migration recovery and UI copy on 2026-09-26:** the owner
+approved the local progress marker and recovery correction described in
+[Migration Recovery](../project/Migration_Recovery_2026-09-26.md). That contract
+replaces the UX text and completion-detection examples in this section and the
+later Alpha-1 backfill subsection. The original copy below is retained as
+historical rationale, not current product copy. No change to this ADR's wire
+format or cryptographic primitives is made by this amendment.
+
 A one-time `MigrationScreen` is shown on first launch after Alpha 2
 install when old ratchet states are detected. Copy:
 
@@ -610,6 +618,11 @@ Hardening (out of scope for ADR-009, tracked for a future ADR):
   so a key swap on either side surfaces visibly to manual verifiers.
 
 #### Alpha-1 backfill — how existing identities get their Ed25519 key
+
+The following original detection description is historical. Since the
+2026-09-26 correction, IN_PROGRESS remains authoritative after backfill and
+normal messaging cannot initialize until cleanup and durable completion finish.
+See the migration recovery amendment above; key presence alone is not completion.
 
 Alpha-1's `IdentityRecord` has no signing keypair. The migration
 detector checks for this:

@@ -40,10 +40,12 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.theme.BgDeep
 import phantom.android.ui.theme.CyanAccent
 import phantom.android.ui.theme.PhantomFontMono
@@ -137,7 +139,7 @@ fun TermsScreenV2(
         // gate in line with the contract without any visual regression
         // meaningful at 26 sp Light.
         Text(
-            text = "Terms of Use",
+            text = stringResource(R.string.terms_title),
             color = TextPrimary,
             fontSize = 26.sp,
             fontWeight = FontWeight.Light,
@@ -147,7 +149,7 @@ fun TermsScreenV2(
         Spacer(Modifier.height(6.dp))
 
         Text(
-            text = "Please read before continuing",
+            text = stringResource(R.string.terms_subtitle),
             color = TextDim,
             fontSize = 13.sp,
             fontWeight = FontWeight.Normal,
@@ -169,50 +171,50 @@ fun TermsScreenV2(
                 .padding(horizontal = 20.dp, vertical = 22.dp),
         ) {
             Text(
-                text = "Welcome to PHANTOM",
+                text = stringResource(R.string.terms_welcome),
                 color = TextPrimary,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Medium,
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "A quick read before you start:",
+                text = stringResource(R.string.terms_intro),
                 color = TextDim,
                 fontSize = 13.sp,
             )
             Spacer(Modifier.height(20.dp))
 
             TosSectionV2(
-                title = "1. End-to-end encrypted",
-                body = "Your messages are encrypted on your device and only the recipient can decrypt them. Our servers cannot read your conversations — and we built it that way on purpose.",
+                title = stringResource(R.string.terms_section_1_title),
+                body = stringResource(R.string.terms_section_1_body),
             )
             TosSectionV2(
-                title = "2. We cannot give away what we do not have",
-                body = "PHANTOM is designed so that we have no access to your messages, contacts, or activity. If anyone — including authorities — asks us for your data, we have nothing to provide.",
+                title = stringResource(R.string.terms_section_2_title),
+                body = stringResource(R.string.terms_section_2_body),
             )
             TosSectionV2(
-                title = "3. You must be 16 or older",
-                body = "We require all users to be at least 16. This is for safety and legal compliance reasons.",
+                title = stringResource(R.string.terms_section_3_title),
+                body = stringResource(R.string.terms_section_3_body),
             )
             TosSectionV2(
-                title = "4. Your keys, your account",
-                body = "Your identity is cryptographic keys stored only on your device. We cannot reset, recover, or transfer them. Lose your device without backup — lose your account.",
+                title = stringResource(R.string.terms_section_4_title),
+                body = stringResource(R.string.terms_section_4_body),
             )
             TosSectionV2(
-                title = "5. No phone number, no email, no real name",
-                body = "Pick a username and you are in. We do not link your account to any other identifier.",
+                title = stringResource(R.string.terms_section_5_title),
+                body = stringResource(R.string.terms_section_5_body),
             )
             TosSectionV2(
-                title = "6. Use PHANTOM responsibly",
-                body = "We do not endorse illegal use of the service. Reports of abuse can be sent to abuse@phntm.pro.",
+                title = stringResource(R.string.terms_section_6_title),
+                body = stringResource(R.string.terms_section_6_body),
             )
             TosSectionV2(
-                title = "7. PHANTOM is in Alpha",
-                body = "Things may break. Bugs happen. Updates may change how the app works.",
+                title = stringResource(R.string.terms_section_7_title),
+                body = stringResource(R.string.terms_section_7_body),
             )
             TosSectionV2(
-                title = "8. We collect the bare minimum",
-                body = "Only your public key and the IP you connect from — needed to route messages. None of it is logged or stored long-term. See the full Privacy Policy below for details.",
+                title = stringResource(R.string.terms_section_8_title),
+                body = stringResource(R.string.terms_section_8_body),
                 isLast = true,
             )
             Spacer(Modifier.height(20.dp))
@@ -223,7 +225,7 @@ fun TermsScreenV2(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Read full Terms",
+                    text = stringResource(R.string.terms_full_terms),
                     color = CyanAccent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
@@ -238,7 +240,7 @@ fun TermsScreenV2(
                     },
                 )
                 Text(
-                    text = "Privacy Policy",
+                    text = stringResource(R.string.terms_privacy_policy),
                     color = CyanAccent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
@@ -255,7 +257,7 @@ fun TermsScreenV2(
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                text = "By tapping \"Accept & Continue\" you confirm that you are at least 16 years old and agree to these terms and the Privacy Policy.",
+                text = stringResource(R.string.terms_accept_explanation),
                 color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 lineHeight = 17.sp,
@@ -271,7 +273,7 @@ fun TermsScreenV2(
                 modifier = Modifier.alpha(arrowAlpha),
             ) {
                 Text(
-                    text = "scroll to read all terms",
+                    text = stringResource(R.string.terms_scroll_hint),
                     color = TextDim.copy(alpha = 0.5f),
                     fontSize = 10.sp,
                     letterSpacing = 1.sp,
@@ -332,7 +334,7 @@ fun TermsScreenV2(
             // label — full text preserved, no ellipsis, user's
             // fontScale respected.
             Text(
-                text = "ACCEPT & CONTINUE",
+                text = stringResource(R.string.terms_accept_button),
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 2.5.sp,

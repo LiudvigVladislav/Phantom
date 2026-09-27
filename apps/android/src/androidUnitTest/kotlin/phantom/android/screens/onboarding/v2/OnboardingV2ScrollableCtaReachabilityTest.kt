@@ -141,7 +141,7 @@ class OnboardingV2ScrollableCtaReachabilityTest {
         // Standard tier — lives inside the tier card body in the
         // scrollable body.
         composeTestRule.onNodeWithText(
-            "Discoverable in Nearby",
+            "Read receipts enabled",
             substring = true,
         ).performScrollTo().assertIsDisplayed()
         composeTestRule.onNodeWithText("Continue")

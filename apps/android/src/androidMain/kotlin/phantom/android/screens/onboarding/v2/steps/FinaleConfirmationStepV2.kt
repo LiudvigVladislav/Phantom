@@ -17,11 +17,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.designv2.DesignV2FontBody
 import phantom.android.ui.designv2.DesignV2FontDisplay
 import phantom.android.ui.designv2.DesignV2Tokens
@@ -63,7 +65,7 @@ fun FinaleConfirmationStepV2(
     ) {
         Spacer(Modifier.weight(1f))
         Text(
-            text = "Identity created",
+            text = stringResource(R.string.onboarding_finale_title),
             style = TextStyle(
                 fontFamily = DesignV2FontDisplay,
                 fontWeight = FontWeight.SemiBold,
@@ -76,7 +78,7 @@ fun FinaleConfirmationStepV2(
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            text = "Your identity is created and stored on this device.",
+            text = stringResource(R.string.onboarding_finale_description),
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
                 fontWeight = FontWeight.Normal,
@@ -89,7 +91,7 @@ fun FinaleConfirmationStepV2(
         )
         Spacer(Modifier.weight(1f))
         PhantomButton(
-            text = "Continue",
+            text = stringResource(R.string.onboarding_continue),
             onClick = onContinueClick,
             modifier = Modifier.fillMaxWidth(),
         )

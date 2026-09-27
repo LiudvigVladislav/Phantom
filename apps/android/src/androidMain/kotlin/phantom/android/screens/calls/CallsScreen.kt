@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -29,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import phantom.android.R
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
 import phantom.android.calls.startCallBeforeNavigation
@@ -38,6 +40,7 @@ import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -74,7 +77,7 @@ fun CallsScreen(
                 )
             }
         } else {
-            Toast.makeText(context, "Нужно разрешение на микрофон", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.calls_microphone_permission), Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -97,7 +100,7 @@ fun CallsScreen(
         topBar = {
             PhantomTopBar(
                 userName = userName,
-                title = "Calls",
+                title = stringResource(R.string.nav_calls),
                 onProfile = onProfile,
                 onAddContact = { onNavigate(Screen.ChatList) },
                 onScanQr = { onNavigate(Screen.QrScan) },
@@ -105,12 +108,12 @@ fun CallsScreen(
                 avatarMenuContent = { close ->
                     DropdownMenuItem(
                         leadingIcon = { PhIconPhone(color = TextDim, size = 15.dp) },
-                        text = { Text("Missed only", fontSize = 14.sp) },
+                        text = { Text(stringResource(R.string.calls_missed_only), fontSize = 14.sp) },
                         onClick = { close() },
                     )
                     DropdownMenuItem(
                         leadingIcon = { PhIconCheck3(color = TextDim, size = 15.dp) },
-                        text = { Text("Select calls", fontSize = 14.sp) },
+                        text = { Text(stringResource(R.string.calls_select_calls), fontSize = 14.sp) },
                         onClick = { close() },
                     )
                     HorizontalDivider()
@@ -118,7 +121,7 @@ fun CallsScreen(
                         leadingIcon = { PhIconPerson(color = CyanAccent, size = 15.dp) },
                         text = {
                             Text(
-                                "Profile",
+                                stringResource(R.string.nav_profile),
                                 color = CyanAccent,
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Medium,
@@ -153,7 +156,7 @@ fun CallsScreen(
                     contentPadding = PaddingValues(bottom = 180.dp),
                 ) {
                     item {
-                        SectionHeader(text = "Contacts")
+                        SectionHeader(text = stringResource(R.string.calls_contacts))
                     }
                     items(contacts, key = { it.id }) { conv ->
                         ContactCallRow(
@@ -190,7 +193,7 @@ fun CallsScreen(
                         )
                     }
 
-                    item { SectionHeader(text = "Recent") }
+                    item { SectionHeader(text = stringResource(R.string.calls_recent)) }
                     item {
                         // No call_log table yet — render the canonical
                         // CallHistoryRow only when entries exist. For now,
@@ -203,7 +206,7 @@ fun CallsScreen(
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                text = "No calls yet · all calls are end-to-end encrypted",
+                                text = stringResource(R.string.calls_no_recent),
                                 color = TextDim,
                                 fontSize = 12.sp,
                                 lineHeight = 18.sp,
@@ -285,9 +288,9 @@ private fun CallDateGroupHeader(label: String) {
 private fun CallHistoryRow(entry: CallHistoryEntry, onCallback: () -> Unit) {
     val nameColor = if (entry.direction == CallDirection.MISSED) Danger else TextPrimary
     val directionLabel = when (entry.direction) {
-        CallDirection.INCOMING -> "Incoming"
-        CallDirection.OUTGOING -> "Outgoing"
-        CallDirection.MISSED -> "Missed"
+        CallDirection.INCOMING -> stringResource(R.string.calls_incoming)
+        CallDirection.OUTGOING -> stringResource(R.string.calls_outgoing)
+        CallDirection.MISSED -> stringResource(R.string.calls_missed)
     }
     Row(
         modifier = Modifier
@@ -325,7 +328,7 @@ private fun CallHistoryRow(entry: CallHistoryEntry, onCallback: () -> Unit) {
             horizontalAlignment = Alignment.End,
         ) {
             Text(
-                text = formatCallDate(entry.occurredAt),
+                text = formatCallDate(entry.occurredAt, LocalContext.current.resources.configuration.locales.get(0)),
                 color = TextDim,
                 fontSize = 11.sp,
                 fontFamily = PhantomFontMono,
@@ -347,15 +350,15 @@ private fun CallHistoryRow(entry: CallHistoryEntry, onCallback: () -> Unit) {
     }
 }
 
-private fun formatCallDate(millis: Long): String {
+private fun formatCallDate(millis: Long, locale: Locale): String {
     val cal = java.util.Calendar.getInstance().apply { timeInMillis = millis }
     val now = java.util.Calendar.getInstance()
     val sameDay = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) &&
             cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)
     return if (sameDay) {
-        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(millis))
+        java.text.SimpleDateFormat("HH:mm", locale).format(java.util.Date(millis))
     } else {
-        java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(java.util.Date(millis))
+        java.text.SimpleDateFormat("MMM d", locale).format(java.util.Date(millis))
     }
 }
 
@@ -401,7 +404,7 @@ private fun ContactCallRow(conv: ConversationEntity, onCall: () -> Unit) {
             ) {
                 PhIconPhone(color = CyanAccent, size = 14.dp)
                 Text(
-                    text = "Call",
+                    text = stringResource(R.string.calls_call_action),
                     color = CyanAccent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,

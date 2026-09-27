@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -182,7 +183,7 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
 
         // Tagline — Inter 15 sp, TextSecondary.
         Text(
-            text = "Private communication, built to last.",
+            text = stringResource(R.string.onboarding_welcome_tagline),
             color = DesignV2Tokens.Colors.TextSecondary,
             style = TextStyle(
                 fontFamily = DesignV2FontBody,
@@ -206,7 +207,7 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
 
         // Corrected footer copy per redline §C3.
         Text(
-            text = "Your identity is created on this device.\nNo phone number required.",
+            text = stringResource(R.string.onboarding_welcome_identity_note),
             color = DesignV2Tokens.Colors.TextQuaternary,
             style = TextStyle(
                 fontFamily = DesignV2FontMono,
@@ -228,7 +229,7 @@ fun WelcomeStepV2(onContinueClick: () -> Unit) {
             .padding(bottom = 24.dp),
     ) {
         PhantomButton(
-            text = "Get started",
+            text = stringResource(R.string.onboarding_get_started),
             onClick = onContinueClick,
             modifier = Modifier.fillMaxWidth(),
         )

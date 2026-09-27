@@ -29,6 +29,8 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,6 +42,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.ConnectionBanner
 import phantom.android.navigation.Screen
@@ -49,6 +52,9 @@ import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
 import phantom.core.storage.ConversationEntity
 import phantom.core.storage.GroupEntity
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -254,7 +260,7 @@ private fun ChatsTab(
                     modifier = Modifier.fillMaxWidth(),
                     decorationBox = { inner ->
                         if (searchQuery.isEmpty()) {
-                            Text("Search messages, contacts", color = TextDim, fontSize = 13.sp)
+                            Text(stringResource(R.string.chat_list_search_hint), color = TextDim, fontSize = 13.sp)
                         }
                         inner()
                     },
@@ -262,7 +268,7 @@ private fun ChatsTab(
             }
         }
 
-        item { SectionLabel(text = "Pinned", showPin = true) }
+        item { SectionLabel(text = stringResource(R.string.chat_list_pinned), showPin = true) }
 
         item(key = "__notes__") {
             NotesRow(onClick = { onNavigate(Screen.SavedMessages) })
@@ -296,8 +302,8 @@ private fun ChatsTab(
                     }
                     Spacer(Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Message requests", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                        Text("$requestCount new from unverified peers", color = TextDim, fontSize = 12.sp)
+                        Text(stringResource(R.string.chat_list_message_requests), color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(pluralStringResource(R.plurals.chat_list_unverified_requests, requestCount, requestCount), color = TextDim, fontSize = 12.sp)
                     }
                     Box(
                         modifier = Modifier
@@ -316,7 +322,7 @@ private fun ChatsTab(
             }
         }
 
-        item { SectionLabel(text = "Chats") }
+        item { SectionLabel(text = stringResource(R.string.chat_list_chats)) }
 
         items(filtered, key = { it.id }) { conv ->
             ChatRow(
@@ -369,7 +375,7 @@ private fun ChatsTab(
                         .padding(32.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text("No results for \"$searchQuery\"", color = TextDim, fontSize = 13.sp)
+                    Text(stringResource(R.string.chat_list_no_results, searchQuery), color = TextDim, fontSize = 13.sp)
                 }
             }
         }
@@ -390,7 +396,7 @@ private fun ChatsTab(
 
         // ── Groups ────────────────────────────────────────────────────────────
         if (groups.isNotEmpty()) {
-            item { SectionLabel(text = "Groups") }
+            item { SectionLabel(text = stringResource(R.string.chat_list_groups)) }
             items(groups, key = { "g_${it.id}" }) { group ->
                 GroupRow(
                     group = group,
@@ -401,7 +407,7 @@ private fun ChatsTab(
 
         // ── Channels ──────────────────────────────────────────────────────────
         if (channels.isNotEmpty()) {
-            item { SectionLabel(text = "Channels") }
+            item { SectionLabel(text = stringResource(R.string.chat_list_channels)) }
             items(channels, key = { "c_${it.id}" }) { channel ->
                 GroupRow(
                     group = channel,
@@ -417,6 +423,9 @@ private fun ChatsTab(
 @Composable
 private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
     val isUnread = group.unreadCount > 0
+    val locale = LocalContext.current.resources.configuration.locales.get(0)
+    val voiceMessage = stringResource(R.string.chat_list_voice_message)
+    val fallbackSubtitle = stringResource(if (group.isChannel) R.string.chat_list_channel else R.string.chat_list_group)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -439,7 +448,7 @@ private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Spacer(Modifier.width(8.dp))
-                val timeStr = group.lastMessageAt?.let { formatChatTime(it) } ?: ""
+                val timeStr = group.lastMessageAt?.let { formatChatTime(it, locale) } ?: ""
                 Text(
                     text = timeStr,
                     color = if (isUnread) CyanAccent else TextDim,
@@ -451,11 +460,11 @@ private fun GroupRow(group: GroupEntity, onClick: () -> Unit) {
                 val subtitle = buildString {
                     if (!group.lastMessagePreview.isNullOrBlank()) {
                         val p = group.lastMessagePreview!!
-                        append(if (p.startsWith("[AUDIO:")) "🎤 Voice message" else p)
+                        append(if (p.startsWith("[AUDIO:")) voiceMessage else p)
                     }
                 }
                 Text(
-                    text = subtitle.ifBlank { if (group.isChannel) "Channel" else "Group" },
+                    text = subtitle.ifBlank { fallbackSubtitle },
                     color = TextDim,
                     fontSize = 13.sp,
                     maxLines = 1,
@@ -543,7 +552,7 @@ private fun NotesRow(onClick: () -> Unit) {
         // tag reinforces the role rather than implying recency.
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Personal notes & saved",
+                text = stringResource(R.string.chat_list_personal_notes),
                 color = TextPrimary,
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
@@ -551,13 +560,13 @@ private fun NotesRow(onClick: () -> Unit) {
             )
             Spacer(Modifier.height(3.dp))
             Text(
-                text = "Your private space",
+                text = stringResource(R.string.chat_list_private_space),
                 color = TextDim.copy(alpha = 0.65f),
                 fontSize = 13.sp,
             )
         }
         Text(
-            text = "PINNED",
+            text = stringResource(R.string.chat_list_pinned_tag),
             color = TextDim.copy(alpha = 0.5f),
             fontSize = 9.sp,
             fontFamily = PhantomFontMono,
@@ -604,7 +613,7 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
         }
         Spacer(Modifier.width(14.dp))
         Text(
-            text = "Archive",
+            text = stringResource(R.string.chat_list_archive),
             color = TextPrimary,
             fontSize = 15.sp,
             fontWeight = FontWeight.Normal,
@@ -629,6 +638,8 @@ private fun ChatRow(
     val isMuted = conv.mutedUntil != null && conv.mutedUntil!! > System.currentTimeMillis()
     val isPinned = conv.pinned
     val context = LocalContext.current
+    val locale = context.resources.configuration.locales.get(0)
+    val voiceMessage = stringResource(R.string.chat_list_voice_message)
     var showContextMenu by remember { mutableStateOf(false) }
 
     val contactDisplayName = remember(conv.id) {
@@ -701,7 +712,7 @@ private fun ChatRow(
                         modifier = Modifier.padding(end = 4.dp),
                     )
                 }
-                val timeStr = conv.lastMessageAt?.let { formatChatTime(it) } ?: ""
+                val timeStr = conv.lastMessageAt?.let { formatChatTime(it, locale) } ?: ""
                 // Phase 2 mockup: timestamps are mono, tertiary 65%. Cyan
                 // accent on unread is a PHANTOM-specific affordance kept on
                 // top of the design token (the mockup uses muted tertiary, but
@@ -731,7 +742,7 @@ private fun ChatRow(
                 Text(
                     text = run {
                         val p = conv.lastMessagePreview ?: ""
-                        if (p.startsWith("[AUDIO:")) "🎤 Voice message" else p
+                        if (p.startsWith("[AUDIO:")) voiceMessage else p
                     },
                     color = TextDim,
                     fontSize = 14.sp,
@@ -773,7 +784,7 @@ private fun ChatRow(
         DropdownMenuItem(
             text = {
                 Text(
-                    text = if (isPinned) "Unpin" else "Pin to top",
+                    text = stringResource(if (isPinned) R.string.chat_list_unpin else R.string.chat_list_pin_to_top),
                     color = TextPrimary,
                     fontSize = 14.sp,
                 )
@@ -786,7 +797,7 @@ private fun ChatRow(
         DropdownMenuItem(
             text = {
                 Text(
-                    text = if (isMuted) "Unmute" else "Mute notifications",
+                    text = stringResource(if (isMuted) R.string.chat_list_unmute else R.string.chat_list_mute_notifications),
                     color = TextPrimary,
                     fontSize = 14.sp,
                 )
@@ -798,7 +809,7 @@ private fun ChatRow(
         )
         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         DropdownMenuItem(
-            text = { Text("Archive", color = TextPrimary, fontSize = 14.sp) },
+            text = { Text(stringResource(R.string.chat_list_archive), color = TextPrimary, fontSize = 14.sp) },
             onClick = {
                 showContextMenu = false
                 onArchive()
@@ -826,14 +837,14 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawQrFinderDots(co
     drawCircle(color = color, radius = dotR, center = Offset(gap + box / 2f, s.height - box / 2f - gap))
 }
 
-private fun formatChatTime(millis: Long): String {
+private fun formatChatTime(millis: Long, locale: Locale): String {
     val now = System.currentTimeMillis()
     val diff = now - millis
     val dayMs = 86_400_000L
     return when {
-        diff < dayMs -> java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(millis))
-        diff < 7 * dayMs -> java.text.SimpleDateFormat("EEE", java.util.Locale.US).format(java.util.Date(millis))
-        else -> java.text.SimpleDateFormat("dd MMM", java.util.Locale.US).format(java.util.Date(millis))
+        diff < dayMs -> SimpleDateFormat("HH:mm", locale).format(Date(millis))
+        diff < 7 * dayMs -> SimpleDateFormat("EEE", locale).format(Date(millis))
+        else -> SimpleDateFormat("dd MMM", locale).format(Date(millis))
     }
 }
 

@@ -17,10 +17,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.ui.theme.*
 
 /**
@@ -137,9 +139,9 @@ private fun AmbientCircleMotif() {
 fun EmptyChats(onAddContact: () -> Unit, modifier: Modifier = Modifier) {
     EmptyState(
         icon = { PhIconMessage(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
-        primaryText = "No conversations yet",
-        secondaryText = "Add a contact to start a private, encrypted conversation.",
-        ctaLabel = "Add contact",
+        primaryText = stringResource(R.string.empty_chats_title),
+        secondaryText = stringResource(R.string.empty_chats_description),
+        ctaLabel = stringResource(R.string.empty_chats_action),
         onCta = onAddContact,
         modifier = modifier,
     )
@@ -149,8 +151,8 @@ fun EmptyChats(onAddContact: () -> Unit, modifier: Modifier = Modifier) {
 fun EmptyCalls(modifier: Modifier = Modifier) {
     EmptyState(
         icon = { PhIconPhone(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
-        primaryText = "No call history",
-        secondaryText = "All calls are end-to-end encrypted. No record is stored.",
+        primaryText = stringResource(R.string.empty_calls_title),
+        secondaryText = stringResource(R.string.empty_calls_description),
         modifier = modifier,
     )
 }
@@ -159,9 +161,9 @@ fun EmptyCalls(modifier: Modifier = Modifier) {
 fun EmptyContacts(onFindPeople: () -> Unit, modifier: Modifier = Modifier) {
     EmptyState(
         icon = { PhIconPerson(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
-        primaryText = "No contacts yet",
-        secondaryText = "Search for a username or scan a QR code to connect.",
-        ctaLabel = "Find people",
+        primaryText = stringResource(R.string.empty_contacts_title),
+        secondaryText = stringResource(R.string.empty_contacts_description),
+        ctaLabel = stringResource(R.string.empty_contacts_action),
         onCta = onFindPeople,
         modifier = modifier,
     )
@@ -171,8 +173,8 @@ fun EmptyContacts(onFindPeople: () -> Unit, modifier: Modifier = Modifier) {
 fun EmptySearch(modifier: Modifier = Modifier) {
     EmptyState(
         icon = { PhIconSearch(color = PhantomTokens.Colors.TextTertiary, size = 48.dp) },
-        primaryText = "No results",
-        secondaryText = "Try a different username or check your spelling.",
+        primaryText = stringResource(R.string.empty_search_title),
+        secondaryText = stringResource(R.string.empty_search_description),
         modifier = modifier,
     )
 }

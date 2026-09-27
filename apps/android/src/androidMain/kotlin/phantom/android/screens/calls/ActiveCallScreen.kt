@@ -9,6 +9,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.semantics.Role
 import phantom.android.ui.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -16,6 +17,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -23,8 +27,18 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import phantom.android.calls.ActiveCall
 import phantom.android.calls.CallState
+import phantom.android.R
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+
+internal fun callStatusResource(state: CallState): Int? = when (state) {
+    CallState.IDLE -> null
+    CallState.CALLING -> R.string.call_calling
+    CallState.RINGING -> R.string.call_ringing
+    CallState.IN_CALL -> R.string.call_connected
+    CallState.ENDED -> R.string.call_ended
+    CallState.REJECTED -> R.string.call_rejected
+}
 
 private fun formatCallDuration(seconds: Long): String {
     val h = seconds / 3600
@@ -55,6 +69,15 @@ fun ActiveCallScreen(
             }
         }
     }
+    val statusResource = callStatusResource(call.state)
+    val backLabel = stringResource(R.string.call_back_to_chat)
+    val muteLabel = stringResource(
+        if (call.isMuted) R.string.call_unmute_microphone else R.string.call_mute_microphone,
+    )
+    val speakerLabel = stringResource(
+        if (call.isSpeakerOn) R.string.call_speaker_off else R.string.call_speaker_on,
+    )
+    val endLabel = stringResource(R.string.call_end)
 
     Box(
         modifier = Modifier
@@ -69,7 +92,8 @@ fun ActiveCallScreen(
                 .size(36.dp)
                 .clip(CircleShape)
                 .background(Surface2)
-                .clickable(onClick = onBack)
+                .semantics { contentDescription = backLabel }
+                .clickable(role = Role.Button, onClick = onBack)
                 .align(Alignment.TopStart),
             contentAlignment = Alignment.Center,
         ) {
@@ -98,9 +122,9 @@ fun ActiveCallScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            when (call.state) {
-                CallState.IN_CALL -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+            if (statusResource != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (call.state == CallState.IN_CALL) {
                         Box(
                             modifier = Modifier
                                 .size(6.dp)
@@ -108,44 +132,19 @@ fun ActiveCallScreen(
                                 .background(Success),
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "Connected",
-                            color = Success,
-                            fontSize = 11.sp,
-                            fontFamily = PhantomFontMono,
-                            letterSpacing = 1.6.sp,
-                        )
                     }
+                    Text(
+                        text = stringResource(statusResource),
+                        color = when (call.state) {
+                            CallState.IN_CALL -> Success
+                            CallState.REJECTED -> Danger
+                            else -> TextDim
+                        },
+                        fontSize = 11.sp,
+                        fontFamily = PhantomFontMono,
+                        letterSpacing = 1.6.sp,
+                    )
                 }
-                CallState.CALLING -> Text(
-                    text = "CALLING…",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 1.6.sp,
-                )
-                CallState.RINGING -> Text(
-                    text = "CONNECTING…",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 1.6.sp,
-                )
-                CallState.ENDED -> Text(
-                    text = "CALL ENDED",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 1.6.sp,
-                )
-                CallState.REJECTED -> Text(
-                    text = "CALL DECLINED",
-                    color = Danger,
-                    fontSize = 11.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 1.6.sp,
-                )
-                else -> {}
             }
 
             Spacer(Modifier.height(28.dp))
@@ -209,7 +208,8 @@ fun ActiveCallScreen(
                         .size(54.dp)
                         .clip(CircleShape)
                         .background(if (call.isMuted) CyanAccent else PhantomTokens.Colors.SurfaceHover)
-                        .clickable(onClick = onToggleMute),
+                        .semantics { contentDescription = muteLabel }
+                        .clickable(role = Role.Button, onClick = onToggleMute),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (call.isMuted) PhIconMicOff(color = BgDeep, size = 22.dp)
@@ -221,7 +221,8 @@ fun ActiveCallScreen(
                         .size(58.dp)
                         .clip(CircleShape)
                         .background(Danger)
-                        .clickable(onClick = onHangup),
+                        .semantics { contentDescription = endLabel }
+                        .clickable(role = Role.Button, onClick = onHangup),
                     contentAlignment = Alignment.Center,
                 ) {
                     PhIconCallEnd(color = Color.White, size = 26.dp)
@@ -232,7 +233,8 @@ fun ActiveCallScreen(
                         .size(54.dp)
                         .clip(CircleShape)
                         .background(if (call.isSpeakerOn) CyanAccent else PhantomTokens.Colors.SurfaceHover)
-                        .clickable(onClick = onToggleSpeaker),
+                        .semantics { contentDescription = speakerLabel }
+                        .clickable(role = Role.Button, onClick = onToggleSpeaker),
                     contentAlignment = Alignment.Center,
                 ) {
                     if (call.isSpeakerOn) PhIconVolume(color = BgDeep, size = 22.dp)

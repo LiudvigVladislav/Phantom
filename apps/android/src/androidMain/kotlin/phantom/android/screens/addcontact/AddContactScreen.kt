@@ -19,10 +19,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
 import phantom.android.ui.*
@@ -64,6 +68,7 @@ fun AddContactScreen(
     val ownUsername by container.identityState.collectAsState()
     val ownHandle = ownUsername?.username.orEmpty()
     val ownPubKey = ownUsername?.publicKeyHex.orEmpty()
+    val backLabel = stringResource(R.string.add_contact_screen_back)
 
     Scaffold(
         containerColor = PhantomTokens.Colors.SurfaceDeep,
@@ -86,14 +91,14 @@ fun AddContactScreen(
                             if (state == AddContactState.Search) onBack()
                             else state = AddContactState.Search
                         },
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(40.dp).semantics { contentDescription = backLabel },
                     ) {
                         PhIconBack(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
                     }
                     Spacer(Modifier.width(4.dp))
                     Text(
                         text = when (state) {
-                            AddContactState.Search -> "Add contact"
+                            AddContactState.Search -> stringResource(R.string.add_contact_screen_title)
                             AddContactState.Found -> "Verify identity"
                             AddContactState.Connected -> "Connected"
                         },
@@ -166,16 +171,9 @@ private fun SearchState(
     ownHandle: String,
     ownPubKey: String,
 ) {
-    // Search-by-username is hidden in Alpha 2: there is no directory
-    // service to query against. The username namespace and lookup
-    // endpoint land with Phase 2 / ADR-007 (planned July 2026). Until
-    // then users add contacts via QR scan or by accepting an invite
-    // link — the two flows still surfaced below.
-    //
-    // Replacing the BasicTextField with a small informational card so
-    // users understand WHY there's no search box, rather than silently
-    // dropping the input. Once ADR-007 lands, restore the original
-    // search Row in this position.
+    // Search requires a directory service that is not implemented. Keep
+    // the available QR and public-key paths visible without a release-date
+    // promise for username lookup.
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -189,13 +187,13 @@ private fun SearchState(
         Spacer(Modifier.width(10.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Search by username — coming Jul 2026",
+                text = stringResource(R.string.add_contact_screen_search_unavailable),
                 color = TextDim,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Medium,
             )
             Text(
-                text = "Username directory ships in Phase 2",
+                text = stringResource(R.string.add_contact_screen_search_alternative),
                 color = TextDim.copy(alpha = 0.6f),
                 fontSize = 11.sp,
             )
@@ -227,14 +225,14 @@ private fun SearchState(
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Scan QR code",
+                text = stringResource(R.string.add_contact_screen_scan_qr),
                 color = TextPrimary,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                text = "Camera-based handshake",
+                text = stringResource(R.string.add_contact_screen_scan_qr_hint),
                 color = TextDim,
                 fontSize = 12.sp,
             )
@@ -270,14 +268,14 @@ private fun SearchState(
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Add by key",
+                text = stringResource(R.string.add_contact_screen_add_by_key),
                 color = TextPrimary,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                text = "Paste username:key or just the key",
+                text = stringResource(R.string.add_contact_screen_add_by_key_hint),
                 color = TextDim,
                 fontSize = 12.sp,
             )
@@ -290,7 +288,7 @@ private fun SearchState(
     // Suggested contacts overline (placeholder list — empty until address-book
     // integration ships).
     Text(
-        text = "PEOPLE YOU MAY KNOW",
+        text = stringResource(R.string.add_contact_screen_suggestions),
         color = TextDim,
         fontSize = 10.sp,
         fontFamily = PhantomFontMono,
@@ -307,7 +305,7 @@ private fun SearchState(
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "No suggestions yet — discover peers via Nearby or QR.",
+            text = stringResource(R.string.add_contact_screen_no_suggestions),
             color = TextDim,
             fontSize = 12.sp,
             textAlign = TextAlign.Center,
@@ -318,7 +316,7 @@ private fun SearchState(
 
     // Own username card
     Text(
-        text = "YOUR USERNAME",
+        text = stringResource(R.string.add_contact_screen_own_username),
         color = TextDim,
         fontSize = 10.sp,
         fontFamily = PhantomFontMono,
@@ -334,7 +332,8 @@ private fun SearchState(
             .padding(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Text(
-            text = if (ownHandle.isNotEmpty()) "@$ownHandle" else "@yourname",
+            text = if (ownHandle.isNotEmpty()) "@$ownHandle"
+                else stringResource(R.string.add_contact_screen_username_unavailable),
             color = TextPrimary,
             fontSize = 16.sp,
             fontFamily = PhantomFontMono,
@@ -342,7 +341,10 @@ private fun SearchState(
         if (ownPubKey.length >= 8) {
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "key: ${ownPubKey.take(8).uppercase()}…",
+                text = stringResource(
+                    R.string.add_contact_screen_key_preview,
+                    ownPubKey.take(8).uppercase(java.util.Locale.ROOT),
+                ),
                 color = PhantomTokens.Colors.TextTertiary,
                 fontSize = 11.sp,
                 fontFamily = PhantomFontMono,
