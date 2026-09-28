@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -33,6 +34,8 @@ import phantom.android.navigation.Screen
 import phantom.android.locale.AppLanguageStore
 import phantom.android.locale.LanguagePicker
 import phantom.android.locale.languageLabel
+import phantom.android.locale.LegalDocument
+import phantom.android.locale.legalDocumentUrl
 import phantom.android.screens.onboarding.v2.openMessageChannelSettings
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
@@ -70,6 +73,7 @@ fun SettingsScreen(
     onProfile: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    val language = LocalConfiguration.current.locales[0].language
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var showLanguagePicker by remember { mutableStateOf(false) }
@@ -350,7 +354,7 @@ fun SettingsScreen(
                         icon = { PhIconFileText(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_privacy_policy),
                         onClick = {
-                            context.openUrl("https://phntm.pro/privacy")
+                            context.openUrl(legalDocumentUrl(LegalDocument.Privacy, language))
                         },
                     )
                 }

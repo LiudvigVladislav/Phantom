@@ -79,6 +79,24 @@ class AppLanguageStoreTest {
     }
 
     @Test
+    fun legalLinksFollowTheDisplayedLanguage() {
+        assertEquals("https://phntm.pro/terms/ru", legalDocumentUrl(LegalDocument.Terms, "ru"))
+        assertEquals("https://phntm.pro/privacy/ru", legalDocumentUrl(LegalDocument.Privacy, "ru"))
+        assertEquals("https://phntm.pro/terms", legalDocumentUrl(LegalDocument.Terms, "en"))
+        assertEquals("https://phntm.pro/privacy", legalDocumentUrl(LegalDocument.Privacy, "en"))
+    }
+
+    @Test
+    @Config(qualifiers = "ru-rRU")
+    fun firstRunTermsAndAcceptanceAreRussianUnderRussianSystemLocale() {
+        assertEquals(AppLanguage.RUSSIAN, AppLanguageStore.effectiveLanguage(context))
+        assertEquals("Условия использования", context.getString(R.string.terms_title))
+        assertEquals("Полные условия", context.getString(R.string.terms_full_terms))
+        assertEquals("Политика конфиденциальности", context.getString(R.string.terms_privacy_policy))
+        assertEquals("ПРИНЯТЬ И ПРОДОЛЖИТЬ", context.getString(R.string.terms_accept_button))
+    }
+
+    @Test
     @Config(sdk = [32, 35], qualifiers = "en-rUS")
     fun defaultFollowsSystemWithoutWritingAnOverrideButManualChoiceWins() {
         assertEquals(AppLanguage.ENGLISH, AppLanguageStore.effectiveLanguage(context))
