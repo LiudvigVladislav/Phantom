@@ -167,7 +167,7 @@ fun ArchiveScreen(
                                 }
                                 Spacer(Modifier.height(3.dp))
                                 Text(
-                                    text = conv.lastMessagePreview ?: "",
+                                    text = phantom.android.screens.chatlist.conversationPreview(conv, container.messageRepo),
                                     color = TextDim,
                                     fontSize = 13.sp,
                                     maxLines = 1,

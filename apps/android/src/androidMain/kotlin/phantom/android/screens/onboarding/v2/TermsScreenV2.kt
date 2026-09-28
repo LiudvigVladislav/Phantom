@@ -11,7 +11,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -40,12 +39,15 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import phantom.android.R
+import phantom.android.locale.LegalDocument
+import phantom.android.locale.legalDocumentUrl
 import phantom.android.ui.theme.BgDeep
 import phantom.android.ui.theme.CyanAccent
 import phantom.android.ui.theme.PhantomFontMono
@@ -220,9 +222,9 @@ fun TermsScreenV2(
             Spacer(Modifier.height(20.dp))
 
             val linkContext = LocalContext.current
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(20.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            val language = LocalConfiguration.current.locales[0].language
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
                     text = stringResource(R.string.terms_full_terms),
@@ -234,7 +236,7 @@ fun TermsScreenV2(
                         linkContext.startActivity(
                             android.content.Intent(
                                 android.content.Intent.ACTION_VIEW,
-                                android.net.Uri.parse("https://phntm.pro/terms"),
+                                android.net.Uri.parse(legalDocumentUrl(LegalDocument.Terms, language)),
                             ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                         )
                     },
@@ -249,7 +251,7 @@ fun TermsScreenV2(
                         linkContext.startActivity(
                             android.content.Intent(
                                 android.content.Intent.ACTION_VIEW,
-                                android.net.Uri.parse("https://phntm.pro/privacy"),
+                                android.net.Uri.parse(legalDocumentUrl(LegalDocument.Privacy, language)),
                             ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                         )
                     },

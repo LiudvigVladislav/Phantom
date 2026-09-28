@@ -40,7 +40,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.invisibleToUser
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
@@ -1148,7 +1148,7 @@ internal fun OnboardingRepairRequiredScreen(onExit: () -> Unit) {
             .fillMaxSize()
             .background(DesignV2Tokens.Colors.Surface)
             .padding(24.dp)
-            .semantics { contentDescription = "OnboardingRepairRequiredScreen" },
+            .testTag("OnboardingRepairRequiredScreen"),
         contentAlignment = Alignment.Center,
     ) {
         androidx.compose.foundation.layout.Column(

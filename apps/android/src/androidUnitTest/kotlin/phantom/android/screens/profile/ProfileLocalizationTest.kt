@@ -35,8 +35,16 @@ class ProfileLocalizationTest {
         val english = formatMemberSince(date, Locale.ENGLISH)
         val russian = formatMemberSince(date, Locale.forLanguageTag("ru"))
         assertEquals("February 2026", english)
-        assertTrue(russian.contains("2026"))
+        assertEquals("февраль 2026", russian)
         assertNotEquals(english, russian)
         assertEquals("—", formatMemberSince(0L, Locale.ENGLISH))
+    }
+
+    @Test
+    fun septemberIsNominativeNotGenitive() {
+        val date = java.time.Instant.parse("2026-09-21T12:00:00Z").toEpochMilli()
+        assertEquals("сентябрь 2026", formatMemberSince(date, Locale.forLanguageTag("ru-RU")))
+        assertEquals("September 2026", formatMemberSince(date, Locale.US))
+        assertEquals("—", formatMemberSince(-1, Locale.forLanguageTag("ru")))
     }
 }

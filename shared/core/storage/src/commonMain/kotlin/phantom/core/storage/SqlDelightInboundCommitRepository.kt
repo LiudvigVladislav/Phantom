@@ -38,6 +38,11 @@ class SqlDelightInboundCommitRepository(
         nowMs: Long,
     ): Unit = withContext(Dispatchers.IO) {
         db.transaction {
+            db.conversationQueries.ensureIncomingConversation(
+                id = conversationId,
+                theirUsername = senderPubKeyHex.take(8),
+                theirPublicKeyHex = senderPubKeyHex,
+            )
             db.messageQueries.insertMessage(
                 id = message.id,
                 conversation_id = message.conversationId,
@@ -48,6 +53,7 @@ class SqlDelightInboundCommitRepository(
                 created_at = message.createdAt,
                 expires_at_ms = message.expiresAtMs,
             )
+            db.conversationQueries.revealChatWithMessage(conversationId)
             db.processedEnvelopeQueries.markProcessed(
                 envelope_id = envelopeId,
                 conversation_id = conversationId,

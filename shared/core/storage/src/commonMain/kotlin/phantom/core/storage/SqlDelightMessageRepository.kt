@@ -20,6 +20,11 @@ class SqlDelightMessageRepository(
             db.messageQueries.getMessages(conversationId).executeAsList().map { it.toEntity() }
         }
 
+    override suspend fun getLatestMessages(conversationId: String): List<MessageEntity> =
+        withContext(Dispatchers.IO) {
+            db.messageQueries.getLatestMessages(conversationId).executeAsList().map { it.toEntity() }
+        }
+
     /**
      * PR-UI-CHAT-THREAD-STATE1 — reactive message stream for one conversation.
      *
@@ -54,16 +59,19 @@ class SqlDelightMessageRepository(
 
     override suspend fun insertMessage(entity: MessageEntity): Unit =
         withContext(Dispatchers.IO) {
-            db.messageQueries.insertMessage(
-                id = entity.id,
-                conversation_id = entity.conversationId,
-                ciphertext = entity.ciphertext,
-                plaintext_cache = entity.plaintextCache,
-                sent = if (entity.sent) 1L else 0L,
-                status = entity.status.name.lowercase(),
-                created_at = entity.createdAt,
-                expires_at_ms = entity.expiresAtMs,
-            )
+            db.transaction {
+                db.messageQueries.insertMessage(
+                    id = entity.id,
+                    conversation_id = entity.conversationId,
+                    ciphertext = entity.ciphertext,
+                    plaintext_cache = entity.plaintextCache,
+                    sent = if (entity.sent) 1L else 0L,
+                    status = entity.status.name.lowercase(),
+                    created_at = entity.createdAt,
+                    expires_at_ms = entity.expiresAtMs,
+                )
+                db.conversationQueries.revealChatWithMessage(entity.conversationId)
+            }
         }
 
     override suspend fun replaceMessage(entity: MessageEntity): Unit =

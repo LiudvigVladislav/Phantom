@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -30,6 +31,11 @@ import phantom.android.BuildConfig
 import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.navigation.Screen
+import phantom.android.locale.AppLanguageStore
+import phantom.android.locale.LanguagePicker
+import phantom.android.locale.languageLabel
+import phantom.android.locale.LegalDocument
+import phantom.android.locale.legalDocumentUrl
 import phantom.android.screens.onboarding.v2.openMessageChannelSettings
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
@@ -43,7 +49,7 @@ import phantom.core.transport.PrivacyMode
  *
  * Structure (top → bottom):
  *   1. Profile card (avatar + name + tier badge + chevron → ProfileScreen)
- *   2. Account            — Profile, Username, Plan
+ *   2. Account            — Username, Plan
  *   3. Privacy & Security — Identity Signing, Privacy Mode, Read Receipts,
  *                           Last Seen, Screenshot Protection
  *   4. Notifications      — Message Alerts, Call Alerts, Sound
@@ -67,8 +73,17 @@ fun SettingsScreen(
     onProfile: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    val language = LocalConfiguration.current.locales[0].language
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    var showLanguagePicker by remember { mutableStateOf(false) }
+    if (showLanguagePicker) LanguagePicker(
+        onDismiss = { showLanguagePicker = false },
+        onError = {
+            showLanguagePicker = false
+            scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.language_error)) }
+        },
+    )
     val identity by container.identityState.collectAsState()
     val userName = identity?.username ?: ""
     val selfAvatarBitmap by container.selfAvatar.collectAsState()
@@ -86,13 +101,19 @@ fun SettingsScreen(
         PrivacyMode.Ghost -> stringResource(R.string.settings_privacy_ghost)
     }
 
-    // Storage & Cache — sum of cacheDir + databases dir, recomputed on entry.
+    val playbackCache = remember(context) { PlaybackCache(context.cacheDir) }
+    var showStorage by remember { mutableStateOf(false) }
     var cacheSizeBytes by remember { mutableStateOf<Long?>(null) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(playbackCache) {
         cacheSizeBytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            computeCacheSizeBytes(context)
+            runCatching { playbackCache.sizeBytes() }.getOrNull()
         }
     }
+    if (showStorage) StorageDialog(
+        cache = playbackCache,
+        onDismiss = { showStorage = false },
+        onSizeChanged = { cacheSizeBytes = it },
+    )
 
     fun showComingSoon() {
         scope.launch {
@@ -169,23 +190,15 @@ fun SettingsScreen(
             item {
                 SettingsGroupCard {
                     SettingsRowItem(
-                        icon = { PhIconPerson(color = CyanAccent, size = 16.dp) },
-                        label = stringResource(R.string.settings_profile),
-                        value = userName,
-                        onClick = onProfile,
-                    )
-                    HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsRowItem(
                         icon = { PhIconKey(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_username),
                         value = if (userName.isNotEmpty()) "@$userName" else "",
                         onClick = { showComingSoon() },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsRowItemWithBadge(
+                    SettingsRowItem(
                         icon = { PhIconCreditCard(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_plan),
-                        badge = { UpgradeBadge() },
                         value = stringResource(R.string.settings_free),
                         onClick = { onNavigate(Screen.Premium) },
                     )
@@ -209,11 +222,9 @@ fun SettingsScreen(
                         onClick = { onNavigate(Screen.PrivacyModeDetail) },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsRowItem(
-                        icon = { PhIconDoubleCheck(color = CyanAccent, size = 16.dp) },
-                        label = stringResource(R.string.settings_read_receipts),
-                        value = stringResource(if (privacyState.maySendReadReceipts) R.string.settings_on else R.string.settings_off),
-                        onClick = { onNavigate(Screen.PrivacyModeDetail) },
+                    ReadReceiptsSetting(
+                        privacyAllows = privacyState.maySendReadReceipts,
+                        onError = { scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.read_receipts_error)) } },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
@@ -240,11 +251,9 @@ fun SettingsScreen(
                         }
                     })
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
-                    SettingsRowItem(
-                        icon = { PhIconPhone(color = CyanAccent, size = 16.dp) },
-                        label = stringResource(R.string.settings_call_alerts),
-                        value = stringResource(R.string.settings_no_separate_alert),
-                    )
+                    CallAlertsSetting(onError = {
+                        scope.launch { snackbarHostState.showSnackbar(context.getString(R.string.settings_notification_error)) }
+                    })
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
                         icon = { PhIconVolume(color = CyanAccent, size = 16.dp) },
@@ -278,8 +287,8 @@ fun SettingsScreen(
                     SettingsRowItem(
                         icon = { PhIconGlobe(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_language),
-                        value = stringResource(R.string.settings_english),
-                        onClick = { showComingSoon() },
+                        value = languageLabel(AppLanguageStore.selected(context)),
+                        onClick = { showLanguagePicker = true },
                     )
                 }
             }
@@ -292,7 +301,9 @@ fun SettingsScreen(
                     SettingsRowItem(
                         icon = { PhIconDatabase(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_local_storage),
-                        value = cacheSizeBytes?.let { android.text.format.Formatter.formatShortFileSize(context, it) } ?: "…",
+                        value = stringResource(R.string.settings_cache_summary,
+                            cacheSizeBytes?.let { android.text.format.Formatter.formatShortFileSize(context, it) } ?: "…"),
+                        onClick = { showStorage = true },
                     )
                     HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                     SettingsRowItem(
@@ -343,7 +354,7 @@ fun SettingsScreen(
                         icon = { PhIconFileText(color = CyanAccent, size = 16.dp) },
                         label = stringResource(R.string.settings_privacy_policy),
                         onClick = {
-                            context.openUrl("https://phntm.pro/privacy")
+                            context.openUrl(legalDocumentUrl(LegalDocument.Privacy, language))
                         },
                     )
                 }
@@ -595,21 +606,6 @@ private fun android.content.Context.openUrl(url: String) {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     runCatching { startActivity(intent) }
-}
-
-/**
- * Sum cacheDir + database files recursively. Used to render the "Storage &
- * Cache" row trailing value in the Advanced section.
- */
-private fun computeCacheSizeBytes(context: android.content.Context): Long {
-    fun walk(file: java.io.File): Long {
-        if (!file.exists()) return 0L
-        if (file.isFile) return file.length()
-        return file.listFiles()?.sumOf { walk(it) } ?: 0L
-    }
-    val cache = walk(context.cacheDir)
-    val db = walk(context.getDatabasePath("placeholder").parentFile ?: java.io.File(""))
-    return cache + db
 }
 
 /**

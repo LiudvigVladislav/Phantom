@@ -24,18 +24,46 @@ import java.io.File
  */
 actual class VoiceFileStore(private val context: Context) {
 
+    private val voiceDir get() = File(context.filesDir, "voice")
+
     actual suspend fun save(
         mediaId: String,
         audioBytes: ByteArray,
         mime: String,
     ): String = withContext(Dispatchers.IO) {
-        val dir = File(context.filesDir, "voice").also { it.mkdirs() }
+        val dir = voiceDir.also { it.mkdirs() }
         val ext = mimeToExtension(mime)
         // mediaId is base64url (URL-safe, no padding) — safe as a filename.
         val file = File(dir, "$mediaId.$ext")
         file.writeBytes(audioBytes)
         file.absolutePath
     }
+
+    actual suspend fun deleteStored(mediaId: String, path: String): Boolean = withContext(Dispatchers.IO) {
+        val file = File(path)
+        if (!isManaged(file, mediaId)) return@withContext false
+        !file.exists() || file.delete()
+    }
+
+    actual suspend fun pruneOrphans(referencedPaths: Set<String>): Int = withContext(Dispatchers.IO) {
+        val dir = voiceDir
+        if (!dir.exists()) return@withContext 0
+        val references = referencedPaths.map { File(it).absolutePath }.toSet()
+        var removed = 0
+        dir.listFiles().orEmpty().forEach { file ->
+            if (file.isFile && file.absolutePath !in references &&
+                file.canonicalFile.parentFile == dir.canonicalFile && file.delete()) {
+                removed++
+            }
+        }
+        removed
+    }
+
+    private fun isManaged(file: File, mediaId: String): Boolean =
+        mediaId.isNotBlank() && mediaId.all { it.isLetterOrDigit() || it == '-' || it == '_' } &&
+            file.name.startsWith("$mediaId.") &&
+            file.absoluteFile.parentFile == voiceDir.absoluteFile &&
+            file.canonicalFile.parentFile == voiceDir.canonicalFile
 
     private fun mimeToExtension(mime: String): String = when {
         mime.startsWith("audio/ogg")  -> "ogg"

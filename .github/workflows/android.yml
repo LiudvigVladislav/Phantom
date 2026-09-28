@@ -209,6 +209,7 @@ jobs:
             --tests "phantom.android.messaging.SessionOrderFullStackTest" \
             --tests "phantom.android.navigation.ScreenSaverTest" \
             --tests "phantom.android.navigation.StartupRouteResolverTest" \
+            --tests "phantom.android.notifications.CallNotificationsTest" \
             --tests "phantom.android.notifications.NotificationsOptInMigrationTest" \
             --tests "phantom.android.notifications.NotificationChannelCopyTest" \
             --tests "phantom.android.premium.SubscriptionAccessTest" \
@@ -218,7 +219,9 @@ jobs:
             --tests "phantom.android.screens.chat.ChatScrollTargetTest" \
             --tests "phantom.android.screens.chat.ComposerSendStateTest" \
             --tests "phantom.android.screens.chatlist.AddContactCopyTest" \
+            --tests "phantom.android.screens.chatlist.ConversationPreviewTest" \
             --tests "phantom.android.screens.contact.ContactProfileLocalizationTest" \
+            --tests "phantom.android.screens.contact.ContactProfileLocalDeletionTest" \
             --tests "phantom.android.screens.group.GroupChatCopyTest" \
             --tests "phantom.android.screens.lock.AppLockHostTest" \
             --tests "phantom.android.screens.migration.AndroidMigrationProgressStoreTest" \
@@ -235,6 +238,9 @@ jobs:
             --tests "phantom.android.screens.onboarding.v2.OnboardingV2StateTest" \
             --tests "phantom.android.screens.premium.PricingResourceTest" \
             --tests "phantom.android.screens.profile.ProfileLocalizationTest" \
+            --tests "phantom.android.screens.saved.SavedScrollTargetTest" \
+            --tests "phantom.android.screens.saved.SavedVoiceDraftTest" \
+            --tests "phantom.android.screens.settings.PlaybackCacheTest" \
             --tests "phantom.android.screens.requests.MessageRequestsCopyTest" \
             --tests "phantom.android.screens.verify.VerifyScreenLocalizationTest" \
             --tests "phantom.android.service.ConnectRetryWiringTest" \
@@ -331,7 +337,14 @@ jobs:
           # setContent under Robolectric, so they belong to the isolated
           # per-class matrix, not to the shared JVM batch.
           - phantom.android.navigation.NotificationChatNavigationTest
+          - phantom.android.navigation.ProfileReturnTest
           - phantom.android.screens.settings.MessageAlertsSettingTest
+          - phantom.android.screens.chat.ChatPresenceTest
+          - phantom.android.screens.chat.DisappearingTimerTest
+          - phantom.android.screens.saved.SavedComposerTest
+          - phantom.android.screens.settings.CallAlertsSettingTest
+          - phantom.android.screens.settings.ReadReceiptsSettingTest
+          - phantom.android.screens.settings.StorageDialogTest
           # 2026-09-10: second test class declared in an already-listed
           # file. A `--tests` filter selects a CLASS, so a file's second
           # class never ran until it was listed by its own name.
@@ -439,11 +452,14 @@ jobs:
           MANIFEST = """
           phantom.android.MainActivityStartupCopyTest
           phantom.android.notifications.NotificationChannelCopyTest
+          phantom.android.notifications.CallNotificationsTest
           phantom.android.premium.SubscriptionAccessTest
           phantom.android.screens.addcontact.AddContactEntryCopyTest
           phantom.android.screens.calls.CallScreenCopyTest
           phantom.android.screens.chatlist.AddContactCopyTest
+          phantom.android.screens.chatlist.ConversationPreviewTest
           phantom.android.screens.contact.ContactProfileLocalizationTest
+          phantom.android.screens.contact.ContactProfileLocalDeletionTest
           phantom.android.screens.group.GroupChatCopyTest
           phantom.android.screens.lock.AppLockHostTest
           phantom.android.screens.migration.AndroidMigrationProgressStoreTest
@@ -455,6 +471,13 @@ jobs:
           phantom.android.screens.premium.PremiumPriceTest
           phantom.android.screens.premium.PricingResourceTest
           phantom.android.screens.profile.ProfileLocalizationTest
+          phantom.android.screens.saved.SavedComposerTest
+          phantom.android.screens.saved.SavedScrollTargetTest
+          phantom.android.screens.saved.SavedVoiceDraftTest
+          phantom.android.screens.settings.CallAlertsSettingTest
+          phantom.android.screens.settings.PlaybackCacheTest
+          phantom.android.screens.settings.ReadReceiptsSettingTest
+          phantom.android.screens.settings.StorageDialogTest
           phantom.android.screens.requests.MessageRequestsCopyTest
           phantom.android.screens.verify.VerifyScreenLocalizationTest
           phantom.android.service.ForegroundNotificationCopyTest
@@ -504,13 +527,16 @@ jobs:
           phantom.android.messaging.SessionOrderDbSpikeTest
           phantom.android.messaging.SessionOrderFullStackTest
           phantom.android.navigation.NotificationChatNavigationTest
+          phantom.android.navigation.ProfileReturnTest
           phantom.android.navigation.ScreenSaverTest
           phantom.android.navigation.StartupRouteLateWriteIntegrationTest
           phantom.android.navigation.StartupRouteResolverTest
           phantom.android.notifications.NotificationsOptInMigrationTest
           phantom.android.proguard.GomobileJniKeepRulePinTest
           phantom.android.screens.chat.ChatScrollTargetTest
+          phantom.android.screens.chat.ChatPresenceTest
           phantom.android.screens.chat.ComposerSendStateTest
+          phantom.android.screens.chat.DisappearingTimerTest
           phantom.android.screens.onboarding.v2.FinaleIdentityCreatedTest
           phantom.android.screens.onboarding.v2.IdentityKeyPreviewAnimatedCardTest
           phantom.android.screens.onboarding.v2.KeyPreviewAnimationPhaseTest
@@ -684,6 +710,8 @@ jobs:
 
       - name: Test classification guard regressions
         run: python3 -B -m unittest discover -s scripts/tests -p test_android_test_classification.py -v
+      - name: Validate English and Russian resource contracts
+        run: python3 scripts/validation/localization_resources.py --self-test
 
   # =================================================================
   # 6. assembleDebug + APK artifact. Runs after all test shards succeed.

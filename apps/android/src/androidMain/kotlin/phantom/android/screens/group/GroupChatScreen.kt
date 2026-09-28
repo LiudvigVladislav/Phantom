@@ -46,6 +46,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import phantom.android.R
+import phantom.android.screens.chat.clearComposerDraft
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
@@ -70,7 +71,10 @@ fun GroupChatScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
-    var inputText by remember { mutableStateOf("") }
+    val composerDraft = phantom.android.screens.chat.rememberComposerDraft(
+        container.identityState.value?.publicKeyHex, "group:$groupId",
+    )
+    var inputText by composerDraft.text
     val listState = rememberLazyListState()
     var showMenu by remember { mutableStateOf(false) }
     var memberCount by remember { mutableStateOf(0) }
@@ -222,6 +226,7 @@ fun GroupChatScreen(
                     showMenu = false
                     scope.launch {
                         container.groupMessagingService?.leaveGroup(groupId)
+                        context.clearComposerDraft("group:$groupId")
                         onBack()
                     }
                 },

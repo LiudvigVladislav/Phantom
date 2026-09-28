@@ -214,7 +214,9 @@ class PhantomMessagingService : Service() {
         // tag is exact-match invisible to that filter.
         Log.i("PhantomMessaging", "RECV_DIAG service_onCreate pid=${android.os.Process.myPid()}")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification(getString(R.string.service_status_starting)))
+        startForeground(NOTIFICATION_ID, buildNotification(
+            phantom.android.locale.AppLanguageStore.stringsContext(this).getString(R.string.service_status_starting),
+        ))
         acquireKeepAliveLocks()
         // ADR-020 Phase 2: subscribe to TransportManager state for live
         // foreground-notification text. This replaces the old per-subsystem
@@ -227,6 +229,27 @@ class PhantomMessagingService : Service() {
         // overlay — on recovery to WS_ACTIVE the next TransportManager state
         // emission resets the notification to its normal label.
         startRestFallbackNotificationOverlay()
+        serviceScope.launch {
+            val container = awaitContainerForService() ?: return@launch
+            phantom.android.locale.AppLanguageStore.configurationChanges.collect {
+                createNotificationChannel()
+                phantom.android.notifications.PhantomNotificationManager.createChannel(this@PhantomMessagingService)
+                val strings = phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService)
+                val privacy = container.privacyModeCoordinator.state.value
+                val transport = container.transportManager.state.value
+                val presentation = container.connectionUiState.value
+                val text = when {
+                    !phantom.android.premium.SubscriptionAccess.permits(privacy.requested) ->
+                        strings.getString(R.string.service_status_ghost_requires_pro)
+                    presentation == phantom.android.transport.ConnectionUiState.LimitedRealtime ||
+                        presentation == phantom.android.transport.ConnectionUiState.Recovering ->
+                        foregroundRestStatus(strings, Companion.transportNameForOverlay(transport),
+                            privacy.effective, presentation == phantom.android.transport.ConnectionUiState.Recovering)
+                    else -> foregroundTransportStatus(strings, transport, privacy.effective)
+                }
+                pushNotificationText(text)
+            }
+        }
         // PR-LTE-NETCHANGE1 P2 fix (architect 2026-05-28): the
         // NetworkChangeObserver registration was previously kicked off
         // from BOTH onCreate (here) AND onStartCommand's post-init
@@ -268,9 +291,10 @@ class PhantomMessagingService : Service() {
                         container.privacyModeCoordinator.state.value.requested,
                     )
                 ) {
-                    getString(R.string.service_status_ghost_requires_pro)
+                    phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService)
+                        .getString(R.string.service_status_ghost_requires_pro)
                 } else {
-                    foregroundTransportStatus(this@PhantomMessagingService, state, effectiveMode)
+                    foregroundTransportStatus(phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService), state, effectiveMode)
                 }
                 Log.i(
                     TAG,
@@ -309,9 +333,9 @@ class PhantomMessagingService : Service() {
                 )
                 val text = when (presentation) {
                     phantom.android.transport.ConnectionUiState.LimitedRealtime ->
-                        foregroundRestStatus(this@PhantomMessagingService, transportName, effectiveMode, false)
+                        foregroundRestStatus(phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService), transportName, effectiveMode, false)
                     phantom.android.transport.ConnectionUiState.Recovering ->
-                        foregroundRestStatus(this@PhantomMessagingService, transportName, effectiveMode, true)
+                        foregroundRestStatus(phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService), transportName, effectiveMode, true)
                     else ->
                         null // Let the TransportManager state collector reassert
                 }
@@ -1253,7 +1277,8 @@ class PhantomMessagingService : Service() {
                         container.privacyModeCoordinator.state.value.requested,
                     )
                 ) {
-                    pushNotificationText(getString(R.string.service_status_ghost_requires_pro))
+                    pushNotificationText(phantom.android.locale.AppLanguageStore.stringsContext(this@PhantomMessagingService)
+                        .getString(R.string.service_status_ghost_requires_pro))
                     Log.w("PhantomMessaging", "service_start_blocked reason=ghost_entitlement_missing")
                     return@serviceStartupOrNull null
                 }
@@ -1923,12 +1948,13 @@ class PhantomMessagingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
+        val strings = phantom.android.locale.AppLanguageStore.stringsContext(this)
         val channel = NotificationChannel(
             CHANNEL_ID,
-            getString(R.string.service_channel_name),
+            strings.getString(R.string.service_channel_name),
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = getString(R.string.service_channel_description)
+            description = strings.getString(R.string.service_channel_description)
             setShowBadge(false)
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)

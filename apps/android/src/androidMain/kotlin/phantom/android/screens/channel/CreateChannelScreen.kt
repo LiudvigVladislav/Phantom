@@ -23,6 +23,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.stringResource
+import phantom.android.R
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.ui.theme.*
@@ -62,7 +64,7 @@ fun CreateChannelScreen(
                     }
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "New Channel",
+                        text = stringResource(R.string.channel_new),
                         color = TextPrimary,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Medium,
@@ -111,7 +113,7 @@ fun CreateChannelScreen(
                         )
                     } else {
                         Text(
-                            text = "Create Channel",
+                            text = stringResource(R.string.channel_create),
                             fontSize = 15.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
@@ -188,7 +190,7 @@ fun CreateChannelScreen(
 
             // Description text
             Text(
-                text = "CHANNEL NAME",
+                text = stringResource(R.string.channel_name),
                 color = TextDim,
                 fontSize = 10.sp,
                 fontFamily = PhantomFontMono,
@@ -216,7 +218,7 @@ fun CreateChannelScreen(
                     modifier = Modifier.fillMaxWidth(),
                     decorationBox = { inner ->
                         if (channelName.isEmpty()) {
-                            Text("Enter channel name…", color = TextDim, fontSize = 15.sp)
+                            Text(stringResource(R.string.channel_name_hint), color = TextDim, fontSize = 15.sp)
                         }
                         inner()
                     },
@@ -236,13 +238,13 @@ fun CreateChannelScreen(
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
-                        text = "How channels work",
+                        text = stringResource(R.string.channel_about_title),
                         color = CyanAccent,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
                     )
                     Text(
-                        text = "Channels broadcast messages to subscribers. Only admins can post. Subscribers can read and react.",
+                        text = stringResource(R.string.channel_about),
                         color = TextDim,
                         fontSize = 12.sp,
                         lineHeight = 18.sp,

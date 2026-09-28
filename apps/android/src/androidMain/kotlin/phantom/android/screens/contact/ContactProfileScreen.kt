@@ -37,6 +37,16 @@ import phantom.android.screens.verify.verificationKeyIsValid
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
 import phantom.android.ui.theme.PhantomFontMono
+import phantom.core.messaging.LocalConversationDeletionOutcome
+
+internal suspend fun deleteLocalConversationAndNavigate(
+    delete: suspend () -> Result<LocalConversationDeletionOutcome>,
+    onDeleted: (LocalConversationDeletionOutcome) -> Unit,
+): Result<LocalConversationDeletionOutcome> {
+    val result = delete()
+    result.onSuccess(onDeleted)
+    return result
+}
 
 internal fun contactKeyPreview(publicKeyHex: String): String? {
     if (!verificationKeyIsValid(publicKeyHex)) {
@@ -87,20 +97,6 @@ fun ContactProfileScreen(
     var showReportSheet by remember { mutableStateOf(false) }
     var isVerified by remember { mutableStateOf(false) }
     var keyChangedAt by remember { mutableStateOf<Long?>(null) }
-    var showTimerSheet by remember { mutableStateOf(false) }
-    var disappearingTimer by remember { mutableStateOf(0L) }
-
-    val timerOptions = listOf(
-        0L to stringResource(R.string.contact_profile_timer_off),
-        30L to stringResource(R.string.contact_profile_timer_30_seconds),
-        300L to stringResource(R.string.contact_profile_timer_5_minutes),
-        3600L to stringResource(R.string.contact_profile_timer_1_hour),
-        86400L to stringResource(R.string.contact_profile_timer_1_day),
-        604800L to stringResource(R.string.contact_profile_timer_1_week),
-    )
-
-    fun timerLabel(secs: Long): String =
-        timerOptions.firstOrNull { it.first == secs }?.second ?: timerOptions.first().second
 
     LaunchedEffect(conversationId) {
         val conv = container.conversationRepo.getConversation(conversationId)
@@ -109,7 +105,6 @@ fun ContactProfileScreen(
             notesText = conv.notes ?: ""
             savedNotesText = conv.notes ?: ""
             isVerified = conv.isVerified
-            disappearingTimer = conv.disappearingTimerSecs
             keyChangedAt = conv.identityKeyChangedAt
         }
     }
@@ -117,29 +112,12 @@ fun ContactProfileScreen(
     // ── Dialogs ──────────────────────────────────────────────────────────────
 
     if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            containerColor = Surface,
-            title = { Text(stringResource(R.string.contact_profile_delete_conversation_title), color = TextPrimary) },
-            text = {
-                Text(
-                    stringResource(R.string.contact_profile_delete_explanation),
-                    color = TextDim, fontSize = 14.sp,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    showDeleteDialog = false
-                    scope.launch {
-                        container.conversationRepo.deleteConversation(conversationId)
-                        container.messagingService?.removeConversationMutex(conversationId)
-                        onDeleteConversation()
-                    }
-                }) { Text(stringResource(R.string.contact_profile_delete), color = Danger) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteDialog = false }) { Text(stringResource(R.string.contact_profile_cancel), color = TextDim) }
-            },
+        LocalConversationDeletionDialog(
+            conversationId = conversationId,
+            theirUsername = theirUsername,
+            messagingService = container.messagingService,
+            onDismiss = { showDeleteDialog = false },
+            onDeleted = onDeleteConversation,
         )
     }
 
@@ -269,7 +247,7 @@ fun ContactProfileScreen(
 
     Scaffold(
         containerColor = BgDeep,
-        contentWindowInsets = WindowInsets(0),
+        contentWindowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom),
         topBar = {
             Column(
                 modifier = Modifier
@@ -533,17 +511,9 @@ fun ContactProfileScreen(
                             drawRoundRect(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(0f, size.height * 0.28f), size = androidx.compose.ui.geometry.Size(size.width * 0.72f, size.height * 0.72f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx()), style = st)
                         }
                     },
-                    label = stringResource(R.string.contact_profile_copy_key),
+                    label = stringResource(if (keyCopied) R.string.contact_profile_copied else R.string.contact_profile_copy_key),
                     value = stringResource(R.string.contact_profile_encryption_key),
-                    right = {
-                        Text(
-                            text = stringResource(if (keyCopied) R.string.contact_profile_copied else R.string.contact_profile_copy),
-                            color = if (keyCopied) Success else CyanAccent,
-                            fontSize = 10.sp,
-                            fontFamily = PhantomFontMono,
-                            letterSpacing = 1.8.sp,
-                        )
-                    },
+                    right = {},
                     onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.contact_profile_clipboard_key), conversation.theirPublicKeyHex))
@@ -663,34 +633,6 @@ fun ContactProfileScreen(
                 }
             }
 
-            // ── Settings card ─────────────────────────────────────────────────
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 14.dp)
-                    .padding(top = 12.dp)
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Surface)
-                    .border(1.dp, Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-            ) {
-                Column {
-                    CKeyRow(
-                        icon = {
-                            Canvas(Modifier.size(16.dp)) {
-                                val sw = 1.4.dp.toPx(); val st = Stroke(sw, cap = StrokeCap.Round)
-                                drawOval(CyanAccent, topLeft = androidx.compose.ui.geometry.Offset(size.width * 0.25f, size.height * 0.1f), size = androidx.compose.ui.geometry.Size(size.width * 0.5f, size.height * 0.5f), style = st)
-                                drawLine(CyanAccent, androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.6f), androidx.compose.ui.geometry.Offset(size.width / 2f, size.height * 0.9f), sw, StrokeCap.Round)
-                            }
-                        },
-                        label = stringResource(R.string.contact_profile_disappearing_messages),
-                        value = timerLabel(disappearingTimer),
-                        right = { ChevronIcon() },
-                        onClick = { showTimerSheet = true },
-                    )
-                }
-            }
-
             // ── Danger zone ───────────────────────────────────────────────────
             Column(
                 modifier = Modifier
@@ -731,7 +673,7 @@ fun ContactProfileScreen(
                 )
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(64.dp))
         }
     }
 
@@ -997,62 +939,6 @@ fun ContactProfileScreen(
         }
     }
 
-    // ── Disappearing-messages timer sheet ────────────────────────────────────
-    if (showTimerSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showTimerSheet = false },
-            containerColor = Surface,
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 32.dp),
-            ) {
-                Text(
-                    text = stringResource(R.string.contact_profile_disappearing_messages).uppercase(LocalContext.current.resources.configuration.locales.get(0)),
-                    color = TextDim,
-                    fontSize = 10.sp,
-                    fontFamily = PhantomFontMono,
-                    letterSpacing = 2.sp,
-                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
-                )
-                timerOptions.forEach { (secs, label) ->
-                    val selected = disappearingTimer == secs
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                scope.launch {
-                                    container.conversationRepo.setDisappearingTimer(conversationId, secs)
-                                    val recipientKey = conversation.theirPublicKeyHex
-                                    if (recipientKey.isNotEmpty()) {
-                                        container.messagingService?.sendDisappearingTimerUpdate(
-                                            timerSecs = secs,
-                                            conversationId = conversationId,
-                                            recipientPublicKeyHex = recipientKey,
-                                        )
-                                    }
-                                    disappearingTimer = secs
-                                    showTimerSheet = false
-                                }
-                            }
-                            .padding(horizontal = 24.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = label,
-                            color = if (selected) CyanAccent else TextPrimary,
-                            fontSize = 14.sp,
-                            modifier = Modifier.weight(1f),
-                        )
-                        if (selected) {
-                            PhIconCheck(color = CyanAccent, size = 18.dp)
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ── Shared composables ────────────────────────────────────────────────────────

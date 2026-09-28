@@ -46,6 +46,7 @@ import phantom.android.R
 import phantom.android.di.AppContainer
 import phantom.android.ui.ConnectionBanner
 import phantom.android.navigation.Screen
+import phantom.android.screens.contact.LocalConversationDeletionDialog
 import phantom.android.screens.group.GroupInitialsAvatar
 import phantom.android.ui.*
 import phantom.android.ui.theme.*
@@ -105,7 +106,7 @@ fun ChatListScreen(
     var reloadKey by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(reloadKey) {
-        conversations = container.conversationRepo.getActiveConversations()
+        conversations = container.conversationRepo.getVisibleChats()
         requestCount = container.conversationRepo.getMessageRequests().size
         groups = runCatching { container.groupRepo.getGroups() }.getOrElse { emptyList() }
         Log.i(
@@ -327,6 +328,9 @@ private fun ChatsTab(
         items(filtered, key = { it.id }) { conv ->
             ChatRow(
                 conv = conv,
+                preview = conversationPreview(conv, container.messageRepo),
+                messagingService = container.messagingService,
+                onDeleted = onReload,
                 onClick = {
                     // PR-UI-CHAT-THREAD-CACHE1 — fire-and-forget preload before
                     // navigation. NON-SUSPEND on purpose: navigation must not
@@ -545,11 +549,7 @@ private fun NotesRow(onClick: () -> Unit) {
             PhIconBookmark(color = TextDim, size = 18.dp)
         }
         Spacer(Modifier.width(14.dp))
-        // FULL_COMPOSE §03 mobile mock copy: title "Personal notes & saved"
-        // (the user-facing label), subtitle "Your private space" (the
-        // helper text). Right-aligned mono "PINNED" tag instead of a
-        // weekday timestamp — Notes is the canonical pinned row, so the
-        // tag reinforces the role rather than implying recency.
+        // Keep the canonical pinned row distinct from recency-ordered chats.
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = stringResource(R.string.chat_list_personal_notes),
@@ -629,7 +629,10 @@ private fun ArchiveRow(onClick: () -> Unit = {}) {
 @Composable
 private fun ChatRow(
     conv: ConversationEntity,
+    preview: String,
+    messagingService: phantom.core.messaging.MessagingService?,
     onClick: () -> Unit,
+    onDeleted: () -> Unit,
     onArchive: () -> Unit = {},
     onTogglePin: () -> Unit = {},
     onToggleMute: () -> Unit = {},
@@ -639,8 +642,8 @@ private fun ChatRow(
     val isPinned = conv.pinned
     val context = LocalContext.current
     val locale = context.resources.configuration.locales.get(0)
-    val voiceMessage = stringResource(R.string.chat_list_voice_message)
     var showContextMenu by remember { mutableStateOf(false) }
+    var showDeleteDialog by remember { mutableStateOf(false) }
 
     val contactDisplayName = remember(conv.id) {
         val raw = context.getSharedPreferences("phantom_prefs", android.content.Context.MODE_PRIVATE)
@@ -740,10 +743,7 @@ private fun ChatRow(
             Spacer(Modifier.height(3.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = run {
-                        val p = conv.lastMessagePreview ?: ""
-                        if (p.startsWith("[AUDIO:")) voiceMessage else p
-                    },
+                    text = preview,
                     color = TextDim,
                     fontSize = 14.sp,
                     maxLines = 1,
@@ -809,11 +809,27 @@ private fun ChatRow(
         )
         HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
         DropdownMenuItem(
-            text = { Text(stringResource(R.string.chat_list_archive), color = TextPrimary, fontSize = 14.sp) },
+            text = { Text(stringResource(R.string.chat_list_move_to_archive), color = TextPrimary, fontSize = 14.sp) },
             onClick = {
                 showContextMenu = false
                 onArchive()
             },
+        )
+        DropdownMenuItem(
+            text = { Text(stringResource(R.string.chat_list_delete), color = Danger, fontSize = 14.sp) },
+            onClick = {
+                showContextMenu = false
+                showDeleteDialog = true
+            },
+        )
+    }
+    if (showDeleteDialog) {
+        LocalConversationDeletionDialog(
+            conversationId = conv.id,
+            theirUsername = conv.theirUsername,
+            messagingService = messagingService,
+            onDismiss = { showDeleteDialog = false },
+            onDeleted = onDeleted,
         )
     }
     } // end Box

@@ -8,6 +8,7 @@ enum class TrustTier { TRUSTED, REQUEST, BLOCKED }
 interface ConversationRepository {
     suspend fun getAllConversations(): List<ConversationEntity>
     suspend fun getActiveConversations(): List<ConversationEntity>
+    suspend fun getVisibleChats(): List<ConversationEntity> = getActiveConversations().filterNot { it.chatHidden }
     suspend fun getMessageRequests(): List<ConversationEntity>
     suspend fun getConversation(id: String): ConversationEntity?
     suspend fun upsertConversation(entity: ConversationEntity)
@@ -114,4 +115,5 @@ data class ConversationEntity(
      * future "give up repair after N hours" policies.
      */
     val sessionSuspectSetAtMs: Long? = null,
+    val chatHidden: Boolean = false,
 )

@@ -21,6 +21,11 @@ class SqlDelightConversationRepository(
             db.conversationQueries.getActiveConversations().executeAsList().map { it.toEntity() }
         }
 
+    override suspend fun getVisibleChats(): List<ConversationEntity> =
+        withContext(Dispatchers.IO) {
+            db.conversationQueries.getVisibleChats().executeAsList().map { it.toEntity() }
+        }
+
     override suspend fun getMessageRequests(): List<ConversationEntity> =
         withContext(Dispatchers.IO) {
             db.conversationQueries.getMessageRequests().executeAsList().map { it.toEntity() }
@@ -52,6 +57,7 @@ class SqlDelightConversationRepository(
                 needs_rehandshake = if (entity.needsRehandshake) 1L else 0L,
                 session_suspect = if (entity.sessionSuspect) 1L else 0L,
                 session_suspect_set_at_ms = entity.sessionSuspectSetAtMs,
+                chat_hidden = if (entity.chatHidden && entity.lastMessageAt == null) 1L else 0L,
             )
         }
 
@@ -212,5 +218,6 @@ class SqlDelightConversationRepository(
         needsRehandshake = needs_rehandshake != 0L,
         sessionSuspect = session_suspect != 0L,
         sessionSuspectSetAtMs = session_suspect_set_at_ms,
+        chatHidden = chat_hidden != 0L,
     )
 }

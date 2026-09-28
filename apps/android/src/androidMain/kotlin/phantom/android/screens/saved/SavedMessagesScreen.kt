@@ -52,8 +52,8 @@ import phantom.core.storage.ConversationEntity
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageStatus
 import phantom.core.storage.TrustTier
+import phantom.android.screens.chat.AudioBubble
 
-private const val SAVED_CONV_ID = "saved_messages_local"
 private const val SAVED_USERNAME = "Notes"
 
 @Composable
@@ -63,22 +63,23 @@ fun SavedMessagesScreen(
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    var messages by remember { mutableStateOf<List<MessageEntity>>(emptyList()) }
-    var inputText by remember { mutableStateOf("") }
-    var editingMessageId by remember { mutableStateOf<String?>(null) }
+    val messages by remember(container.messageRepo) {
+        container.messageRepo.observeMessages(SAVED_CONV_ID)
+    }.collectAsState(initial = emptyList())
+    var initialScroll by remember { mutableStateOf(true) }
+    var scrollTargetId by remember { mutableStateOf<String?>(null) }
+    val composerDraft = phantom.android.screens.chat.rememberComposerDraft(
+        container.identityState.value?.publicKeyHex, "saved:$SAVED_CONV_ID",
+    )
+    var inputText by composerDraft.text
+    var editingMessageId by composerDraft.editingId
     var forwardNoteText by remember { mutableStateOf<String?>(null) }
     var conversations by remember { mutableStateOf<List<ConversationEntity>>(emptyList()) }
     val listState = rememberLazyListState()
     val backLabel = stringResource(R.string.saved_back)
-    val sendLabel = stringResource(if (editingMessageId != null) R.string.saved_save_changes else R.string.saved_save_note)
     val pinUnavailable = stringResource(R.string.saved_pin_unavailable)
 
-    suspend fun reload() {
-        messages = container.messageRepo.getMessages(SAVED_CONV_ID)
-    }
-
-    LaunchedEffect(Unit) {
-        conversations = container.conversationRepo.getActiveConversations()
+    suspend fun ensureConversation() {
         val existing = container.conversationRepo.getConversation(SAVED_CONV_ID)
         if (existing == null) {
             container.conversationRepo.upsertConversation(
@@ -94,8 +95,18 @@ fun SavedMessagesScreen(
                 )
             )
         }
-        reload()
-        if (messages.isNotEmpty()) listState.scrollToItem(messages.lastIndex)
+    }
+    LaunchedEffect(Unit) {
+        conversations = container.conversationRepo.getActiveConversations().filter { it.id != SAVED_CONV_ID }
+        ensureConversation()
+    }
+    LaunchedEffect(messages, scrollTargetId, initialScroll) {
+        val target = savedScrollTarget(messages.map { it.id }, scrollTargetId, initialScroll)
+        if (target != null) {
+            listState.scrollToItem(target)
+            scrollTargetId = null
+            initialScroll = false
+        }
     }
 
     // Forward from Notes dialog
@@ -283,7 +294,6 @@ fun SavedMessagesScreen(
                             onDelete = {
                                 scope.launch {
                                     container.messageRepo.deleteMessage(msg.id)
-                                    reload()
                                 }
                             },
                             onCopy = { text ->
@@ -306,88 +316,27 @@ fun SavedMessagesScreen(
             }
         }
 
-        // Input bar
-        Surface(color = Surface, tonalElevation = 0.dp) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = {
-                        Text(
-                            stringResource(if (editingMessageId != null) R.string.saved_edit_hint else R.string.saved_new_hint),
-                            color = TextDim, fontSize = 14.sp,
-                        )
-                    },
-                    singleLine = false,
-                    maxLines = 4,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = TextPrimary,
-                        unfocusedTextColor = TextPrimary,
-                        focusedBorderColor = CyanAccent.copy(alpha = 0.4f),
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.08f),
-                        cursorColor = CyanAccent,
-                    ),
-                    shape = RoundedCornerShape(20.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-                if (inputText.isNotBlank()) {
-                    IconButton(
-                        onClick = {
-                            val text = inputText.trim()
-                            if (text.isEmpty()) return@IconButton
-                            val editId = editingMessageId
-                            inputText = ""
-                            editingMessageId = null
-                            scope.launch {
-                                if (editId != null) {
-                                    container.messageRepo.updateMessageText(editId, text)
-                                } else {
-                                    val now = System.currentTimeMillis()
-                                    container.messageRepo.insertMessage(
-                                        MessageEntity(
-                                            id = uuid4().toString(),
-                                            conversationId = SAVED_CONV_ID,
-                                            ciphertext = ByteArray(0),
-                                            plaintextCache = text,
-                                            sent = true,
-                                            status = MessageStatus.DELIVERED,
-                                            createdAt = now,
-                                        )
-                                    )
-                                    container.conversationRepo.upsertConversation(
-                                        ConversationEntity(
-                                            id = SAVED_CONV_ID,
-                                            theirUsername = SAVED_USERNAME,
-                                            theirPublicKeyHex = "",
-                                            lastMessagePreview = text.take(60),
-                                            lastMessageAt = now,
-                                            unreadCount = 0,
-                                            trustTier = TrustTier.TRUSTED,
-                                            blocked = false,
-                                        )
-                                    )
-                                    if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
-                                }
-                                reload()
-                            }
-                        },
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(color = CyanAccent)
-                            .semantics { contentDescription = sendLabel },
-                    ) {
-                        PhIconArrowUp(color = BgDeep, size = 17.dp)
-                    }
-                }
-            }
-        }
+        SavedComposer(
+            text = inputText,
+            onTextChange = { inputText = it },
+            isEditing = editingMessageId != null,
+            onCancelEdit = { editingMessageId = null; inputText = "" },
+            onSaveText = { text ->
+                ensureConversation()
+                val editId = editingMessageId
+                val targetId = editId ?: uuid4().toString()
+                if (editId != null) container.messageRepo.updateMessageText(editId, text)
+                else container.messageRepo.insertMessage(savedMessage(targetId, text, System.currentTimeMillis()))
+                inputText = ""
+                editingMessageId = null
+                scrollTargetId = targetId
+            },
+            onSaveVoice = { id, body ->
+                ensureConversation()
+                container.messageRepo.insertMessage(savedMessage(id, body, System.currentTimeMillis()))
+                scrollTargetId = id
+            },
+        )
     }
 }
 
@@ -403,6 +352,7 @@ private fun SavedMessageBubble(
     onPin: () -> Unit,
 ) {
     val rawText = entity.plaintextCache ?: ""
+    val isVoice = rawText.startsWith("[AUDIO:") || rawText.startsWith("[AUDIO_LOCAL:")
     val locale = LocalConfiguration.current.locales[0]
     val timeStr = run {
         val date = java.util.Date(entity.createdAt)
@@ -433,11 +383,11 @@ private fun SavedMessageBubble(
                 modifier = Modifier
                     .widthIn(min = 80.dp, max = 280.dp)
                     .background(
-                        color = Surface2,
+                        color = if (isVoice) Color.Transparent else Surface2,
                         shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
                     )
                     .combinedClickable(onClick = {}, onLongClick = { showActions = true })
-                    .padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp),
+                    .then(if (isVoice) Modifier else Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp, bottom = 6.dp)),
             ) {
                 if (isForwarded) {
                     Text(
@@ -449,7 +399,9 @@ private fun SavedMessageBubble(
                     )
                     Spacer(Modifier.height(3.dp))
                 }
-                Box {
+                if (isVoice) {
+                    AudioBubble(rawText, true, timeStr, entity.status, LocalContext.current, showDeliveryStatus = false)
+                } else Box {
                     Text(
                         text = bodyText,
                         modifier = Modifier.padding(end = 40.dp),
@@ -473,6 +425,7 @@ private fun SavedMessageBubble(
                 containerColor = Surface2,
                 offset = DpOffset(0.dp, 4.dp),
             ) {
+                if (!isVoice) {
                 DropdownMenuItem(
                     leadingIcon = {
                         phantom.android.ui.PhIconForward(
@@ -514,6 +467,7 @@ private fun SavedMessageBubble(
                         text = { Text(stringResource(R.string.saved_edit), color = TextPrimary, fontSize = 14.sp) },
                         onClick = { showActions = false; onEdit(bodyText) },
                     )
+                }
                 }
                 HorizontalDivider(color = BorderSubtle, thickness = 1.dp)
                 DropdownMenuItem(

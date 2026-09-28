@@ -425,6 +425,11 @@ class SqlDelightSessionTransactionRepository(
             }
 
             transactionProbe("after_state")
+            db.conversationQueries.ensureIncomingConversation(
+                id = conversationId,
+                theirUsername = senderPubKeyHex.take(8),
+                theirPublicKeyHex = senderPubKeyHex,
+            )
             db.messageQueries.insertMessage(
                 id = message.id,
                 conversation_id = message.conversationId,
@@ -435,6 +440,7 @@ class SqlDelightSessionTransactionRepository(
                 created_at = message.createdAt,
                 expires_at_ms = message.expiresAtMs,
             )
+            db.conversationQueries.revealChatWithMessage(conversationId)
             transactionProbe("after_message")
             db.processedEnvelopeQueries.markProcessed(
                 envelope_id = envelopeId,

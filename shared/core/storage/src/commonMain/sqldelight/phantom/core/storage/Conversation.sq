@@ -33,7 +33,8 @@ CREATE TABLE conversation (
     -- produces NO chat-list UI indicator (debug-build hold path is
     -- silent by design). See 19.sqm for the full distinction.
     session_suspect INTEGER NOT NULL DEFAULT 0,
-    session_suspect_set_at_ms INTEGER
+    session_suspect_set_at_ms INTEGER,
+    chat_hidden INTEGER NOT NULL DEFAULT 0
 );
 
 getAllConversations:
@@ -44,6 +45,11 @@ SELECT * FROM conversation
 WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != '' AND archived = 0
 ORDER BY pinned DESC, last_message_at DESC;
 
+getVisibleChats:
+SELECT * FROM conversation
+WHERE blocked = 0 AND trust_tier = 'TRUSTED' AND their_public_key_hex != '' AND archived = 0 AND chat_hidden = 0
+ORDER BY pinned DESC, last_message_at DESC;
+
 getMessageRequests:
 SELECT * FROM conversation
 WHERE blocked = 0 AND trust_tier = 'REQUEST'
@@ -51,6 +57,10 @@ ORDER BY last_message_at DESC;
 
 getConversation:
 SELECT * FROM conversation WHERE id = ?;
+
+ensureIncomingConversation:
+INSERT OR IGNORE INTO conversation(id, their_username, their_public_key_hex, trust_tier)
+VALUES (:id, :theirUsername, :theirPublicKeyHex, 'REQUEST');
 
 upsertConversation:
 INSERT OR REPLACE INTO conversation(
@@ -60,8 +70,17 @@ INSERT OR REPLACE INTO conversation(
     is_verified, disappearing_timer_secs, archived,
     identity_key_changed_at, muted_until, pinned,
     needs_rehandshake,
-    session_suspect, session_suspect_set_at_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    session_suspect, session_suspect_set_at_ms, chat_hidden
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+hideClearedChat:
+UPDATE conversation SET chat_hidden = 1, last_message_preview = NULL,
+    last_message_at = NULL, unread_count = 0, pinned = 0, archived = 0
+WHERE id = ?;
+
+revealChatWithMessage:
+UPDATE conversation SET chat_hidden = 0
+WHERE id = :id AND EXISTS (SELECT 1 FROM message WHERE conversation_id = :id);
 
 setNeedsRehandshake:
 UPDATE conversation SET needs_rehandshake = :flag WHERE id = :id;
@@ -128,7 +147,7 @@ unarchiveConversation:
 UPDATE conversation SET archived = 0 WHERE id = ?;
 
 getArchivedConversations:
-SELECT * FROM conversation WHERE archived = 1 ORDER BY last_message_at DESC;
+SELECT * FROM conversation WHERE archived = 1 AND chat_hidden = 0 ORDER BY last_message_at DESC;
 
 setIdentityKeyChangedAt:
 UPDATE conversation SET identity_key_changed_at = :ts, is_verified = 0 WHERE id = :id;

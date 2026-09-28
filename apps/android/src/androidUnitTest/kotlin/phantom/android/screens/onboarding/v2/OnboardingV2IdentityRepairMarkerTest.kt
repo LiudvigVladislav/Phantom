@@ -14,7 +14,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
-import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -276,7 +276,7 @@ class OnboardingV2NextLaunchQuarantineTest {
                 "identity on disk with no marker.",
         )
         // Repair screen visible as belt-and-suspenders check.
-        composeTestRule.onNodeWithContentDescription("OnboardingRepairRequiredScreen")
+        composeTestRule.onNodeWithTag("OnboardingRepairRequiredScreen")
             .assertIsDisplayed()
         // Activity NOT finishing yet — Exit hasn't been tapped.
         assertFalse(
@@ -371,7 +371,7 @@ class OnboardingV2NextLaunchQuarantineTest {
         composeTestRule.waitForIdle()
         // Repair screen visible EVEN THOUGH the disk marker is
         // absent — the explicit override wins.
-        composeTestRule.onNodeWithContentDescription("OnboardingRepairRequiredScreen")
+        composeTestRule.onNodeWithTag("OnboardingRepairRequiredScreen")
             .assertIsDisplayed()
         composeTestRule.onNodeWithText("Identity repair required").assertIsDisplayed()
     }
