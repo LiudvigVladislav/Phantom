@@ -28,26 +28,41 @@ and `signing.properties` — double verify after any edits.
 This fingerprint is pinned in `deploy/well-known/assetlinks.json` for
 Android App Links verification on `https://phntm.pro/invite/`.
 
-## Backup — mandatory before the first `assembleRelease`
+## Backup — mandatory before distributing another signed APK
 
 1. Copy `phantom-release.keystore` to an **encrypted external drive**
    (VeraCrypt container, LUKS volume, macOS encrypted DMG).
 2. Copy `signing.properties` to a **separate** medium (NOT the same drive
    as the keystore) — ideally printed paper in a safe, or 1Password.
 3. Store passwords in **1Password** under "PHANTOM Release Keystore".
-4. Verify recovery every 6 months: mount backup, run
-   `keytool -list -keystore phantom-release.keystore -storepass <pw>`.
+4. Verify recovery before distribution and every 6 months using the procedure
+   below. A successful build from the active key is not proof that the backup
+   can be restored.
 5. If any backup is corrupted, refresh it immediately.
 
-## Re-extracting the SHA-256 fingerprint
+## Recovery drill
+
+Mount the encrypted backup and retrieve its passwords from the separate
+credential store. Run this against the **backup**, not the active keystore.
+`keytool` and `jarsigner` prompt for passwords; never put passwords in command
+arguments, shell history, build logs, or this repository.
 
 ```bash
-keytool -list -v \
-  -keystore keystores/phantom-release.keystore \
-  -alias phantom \
-  -storepass "$(awk -F= '/^storePassword/{print $2}' keystores/signing.properties)" \
-  | grep "SHA256:" | awk '{print $2}'
+backup_key="/Volumes/YOUR-ENCRYPTED-VOLUME/phantom-release.keystore"
+keytool -list -v -keystore "$backup_key" -alias phantom
+
+probe_dir="$(mktemp -d)"
+jar --create --file "$probe_dir/probe.jar" -C keystores README.md
+jarsigner -keystore "$backup_key" -signedjar "$probe_dir/signed.jar" \
+  "$probe_dir/probe.jar" phantom
+jarsigner -verify "$probe_dir/signed.jar"
 ```
+
+Require `PrivateKeyEntry`, the exact SHA-256 fingerprint above, a successful
+sign operation, and `jar verified.` Self-signed certificate warnings are
+expected for this key. Delete the disposable probe files afterwards; never
+copy the backup key into the repository or a temporary unencrypted directory.
+Record the drill date and result without recording passwords or key bytes.
 
 ## Rotating the key
 

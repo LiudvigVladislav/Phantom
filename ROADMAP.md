@@ -39,9 +39,14 @@ carriers, routes, and dates rather than every network or future DPI policy.
 
 - Finish the current Android design-parity pass and cut a new signed Alpha
   candidate from the resulting integrated tree.
+- Before distributing that candidate, verify an encrypted off-machine backup
+  of the Android release key and a separate copy of its credentials by signing
+  a disposable artifact with the restored key. Its certificate must match the
+  fingerprint pinned in `deploy/well-known/assetlinks.json`.
 - Complete English/Russian localization: follow the device language by default,
-  offer an in-app System/English/Russian selector, and verify whole user flows
-  rather than shipping a partially translated UI. See
+  offer only English/Russian choices in Settings, and keep the device language
+  as the implicit default until a user makes an explicit choice. Verify whole
+  user flows rather than shipping a partially translated UI. See
   [`Localization_RU_Contract.md`](docs/project/Localization_RU_Contract.md).
 - Audit every Settings control against its actual authority. Remove or label
   no-op switches, verify notifications and privacy on devices, and describe
