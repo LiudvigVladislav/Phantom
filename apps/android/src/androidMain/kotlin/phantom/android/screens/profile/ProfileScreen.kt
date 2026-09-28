@@ -1091,7 +1091,7 @@ private fun AccountCard(handle: String, createdAt: Long, onUpgrade: () -> Unit) 
 
 internal fun formatMemberSince(createdAtMs: Long, locale: java.util.Locale): String {
     if (createdAtMs <= 0L) return "—"
-    val fmt = java.text.SimpleDateFormat("MMMM yyyy", locale)
+    val fmt = java.text.SimpleDateFormat("LLLL yyyy", locale)
     return fmt.format(java.util.Date(createdAtMs))
 }
 

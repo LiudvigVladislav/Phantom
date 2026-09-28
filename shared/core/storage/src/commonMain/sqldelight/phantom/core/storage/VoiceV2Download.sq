@@ -28,6 +28,9 @@ SELECT * FROM voice_v2_downloads WHERE media_id = ?;
 findPending:
 SELECT * FROM voice_v2_downloads WHERE status = 'pending' ORDER BY created_at_ms ASC;
 
+listByConversation:
+SELECT * FROM voice_v2_downloads WHERE conversation_id = ?;
+
 update:
 UPDATE voice_v2_downloads
 SET status = ?, failure_reason = ?, last_attempt_at_ms = ?
@@ -35,6 +38,9 @@ WHERE media_id = ?;
 
 delete:
 DELETE FROM voice_v2_downloads WHERE media_id = ?;
+
+deleteByConversation:
+DELETE FROM voice_v2_downloads WHERE conversation_id = ?;
 
 deleteAll:
 DELETE FROM voice_v2_downloads;

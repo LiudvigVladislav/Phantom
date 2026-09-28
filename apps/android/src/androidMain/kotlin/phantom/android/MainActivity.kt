@@ -32,6 +32,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import phantom.android.di.AppContainer
 import phantom.android.locale.AppLanguageStore
+import phantom.android.screens.chat.clearComposerDraft
 import phantom.android.service.PhantomMessagingService
 import phantom.android.screens.splash.PhantomSplashScreen
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -349,6 +350,9 @@ private fun PhantomApp(
     var currentScreen by rememberSaveable(stateSaver = ScreenSaver) {
         mutableStateOf<Screen?>(null)
     }
+    var profileOrigin by rememberSaveable(stateSaver = ScreenSaver) {
+        mutableStateOf<Screen?>(Screen.ChatList)
+    }
     // scannedQrValue carries both QR-scanner results and decoded invite deep links —
     // both resolve to the same "username:pubkeyHex" format consumed by AddContactDialog.
     var scannedQrValue by remember { mutableStateOf<String?>(null) }
@@ -526,7 +530,7 @@ private fun PhantomApp(
     // when block below; top-level destinations (ChatList / Calls /
     // Nearby / Settings) return null so Android's default behaviour
     // (move task to back / exit) kicks in.
-    val parent = parentScreenOf(currentScreen)
+    val parent = parentScreenOf(currentScreen, profileOrigin)
     BackHandler(enabled = parent != null) {
         currentScreen = parent
     }
@@ -671,7 +675,7 @@ private fun PhantomApp(
         is Screen.ChatList -> ChatListScreen(
             container = container,
             onNavigate = { currentScreen = it },
-            onProfile = { currentScreen = Screen.Profile },
+            onProfile = { profileOrigin = Screen.ChatList; currentScreen = Screen.Profile },
             onScanQr = { currentScreen = Screen.QrScan },
             scannedQr = scannedQrValue,
             onScannedQrConsumed = { scannedQrValue = null },
@@ -679,7 +683,7 @@ private fun PhantomApp(
         is Screen.Calls -> CallsScreen(
             container = container,
             onNavigate = { currentScreen = it },
-            onProfile = { currentScreen = Screen.Profile },
+            onProfile = { profileOrigin = Screen.Calls; currentScreen = Screen.Profile },
         )
         is Screen.Nearby -> phantom.android.screens.nearby.NearbyScreen(
             onNavigate = { currentScreen = it },
@@ -695,7 +699,7 @@ private fun PhantomApp(
         is Screen.Settings -> SettingsScreen(
             container = container,
             onNavigate = { currentScreen = it },
-            onProfile = { currentScreen = Screen.Profile },
+            onProfile = { profileOrigin = Screen.Settings; currentScreen = Screen.Profile },
         )
         is Screen.PrivacyModeDetail -> phantom.android.screens.settings.PrivacyModeDetailScreen(
             container = container,
@@ -704,8 +708,11 @@ private fun PhantomApp(
         )
         is Screen.Profile -> ProfileScreen(
             container = container,
-            onBack = { currentScreen = Screen.ChatList },
-            onLogout = { currentScreen = Screen.Onboarding },
+            onBack = { currentScreen = parentScreenOf(screen, profileOrigin) },
+            onLogout = {
+                startupContext.clearComposerDraft()
+                currentScreen = Screen.Onboarding
+            },
         )
         is Screen.MessageRequests -> MessageRequestsScreen(
             container = container,
@@ -734,7 +741,10 @@ private fun PhantomApp(
             theirUsername = screen.theirUsername,
             container = container,
             onBack = { currentScreen = Screen.Chat(screen.conversationId, screen.theirUsername) },
-            onDeleteConversation = { currentScreen = Screen.ChatList },
+            onDeleteConversation = {
+                startupContext.clearComposerDraft("chat:${screen.conversationId}")
+                currentScreen = Screen.ChatList
+            },
             onVerify = {
                 currentScreen = Screen.Verify(screen.conversationId, screen.theirUsername)
             },
@@ -847,7 +857,7 @@ private fun PhantomApp(
  * The mapping mirrors the literal `onBack` lambdas wired in the main
  * `when` block so swipe-back behaviour matches the in-UI back button.
  */
-private fun parentScreenOf(screen: Screen?): Screen? = when (screen) {
+internal fun parentScreenOf(screen: Screen?, profileOrigin: Screen? = Screen.ChatList): Screen? = when (screen) {
     null,
     Screen.Onboarding,
     Screen.Migration,
@@ -863,7 +873,10 @@ private fun parentScreenOf(screen: Screen?): Screen? = when (screen) {
     Screen.Premium -> Screen.Settings
     Screen.PrivacyModeDetail -> Screen.Settings
     Screen.AddContact -> Screen.ChatList
-    Screen.Profile -> Screen.ChatList
+    Screen.Profile -> when (profileOrigin) {
+        Screen.Settings, Screen.Calls -> profileOrigin
+        else -> Screen.ChatList
+    }
     Screen.MessageRequests -> Screen.ChatList
     Screen.QrScan -> Screen.ChatList
     Screen.SavedMessages -> Screen.ChatList

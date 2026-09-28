@@ -158,6 +158,9 @@ INSERT OR REPLACE INTO voice_chunks(
 countChunks:
 SELECT COUNT(idx) AS cnt FROM voice_chunks WHERE voice_id = :voice_id;
 
+countByConversation:
+SELECT COUNT(*) FROM voice_chunks WHERE conversation_id = ?;
+
 -- Finalizer — at `startReceiving` we scan for voices whose chunk count
 -- has already reached `total` (i.e. the previous run got to "all chunks
 -- saved" but crashed before assembly + insertMessage). Returns one row

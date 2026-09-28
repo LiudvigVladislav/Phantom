@@ -15,6 +15,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -421,6 +422,8 @@ class AppContainer(private val context: Context) {
     )
     val conversationRepo = SqlDelightConversationRepository(dbHolder.database)
     val messageRepo      = SqlDelightMessageRepository(dbHolder.database)
+    private val localDeletionRepo = phantom.core.storage.SqlDelightLocalConversationDeletionRepository(dbHolder.database)
+    private val voiceFileStore = phantom.core.messaging.VoiceFileStore(context)
 
     /**
      * PR-UI-CHAT-THREAD-CACHE1 — hot, in-memory `StateFlow<List<MessageEntity>>`
@@ -1915,6 +1918,7 @@ class AppContainer(private val context: Context) {
     // Initialised in initMessaging — requires identity.publicKeyHex and transport.
     var callManager: CallManager? = null
         private set
+    private var callAlertJob: kotlinx.coroutines.Job? = null
 
     /**
      * Stage 2 B1: the guarded entry. Every caller that does not already
@@ -1999,6 +2003,8 @@ class AppContainer(private val context: Context) {
             // `startReceiving`, which happens later in `prepareStart`.
             messagingService = null
             groupMessagingService = null
+            callAlertJob?.cancelAndJoin()
+            callAlertJob = null
             callManager = null
             // Stage 2: the Hybrid owns its collectors AND the transport's
             // single signal subscription.
@@ -2756,7 +2762,7 @@ class AppContainer(private val context: Context) {
                 mediaTransport = gatedMediaTransport,
                 tokenProvider  = mediaAuthTokenProviderLocal,
                 mediaCrypto    = mediaCryptoLocal,
-                fileStore      = phantom.core.messaging.VoiceFileStore(context),
+                fileStore      = voiceFileStore,
                 log            = { msg -> android.util.Log.i("PhantomMedia", msg) },
             )
 
@@ -3067,6 +3073,12 @@ class AppContainer(private val context: Context) {
             }
         }
 
+        runCatching {
+            voiceFileStore.pruneOrphans(localDeletionRepo.referencedVoiceFiles())
+        }.onFailure { failure ->
+            android.util.Log.w("PhantomMedia", "Voice file cleanup will retry next start", failure)
+        }
+
         val service = DefaultMessagingService(
             identity = identity,
             localKeyPair = localKeyPair,
@@ -3075,6 +3087,8 @@ class AppContainer(private val context: Context) {
             transport = transport,
             messageRepository = messageRepo,
             conversationRepository = conversationRepo,
+            localDeletionRepository = localDeletionRepo,
+            voiceFileStore = voiceFileStore,
             processedEnvelopeRepository = processedEnvelopeRepo,
             inboundCommitRepository = inboundCommitRepo,
             controlEventCommitRepository = controlEventCommitRepo,
@@ -3087,6 +3101,11 @@ class AppContainer(private val context: Context) {
             // haven't yet been backfilled by the migration flow
             // (PR C commit 12). DMS surfaces null as a hard send error.
             signingKeyProvider = { identityManager.loadSigningKeyPair() },
+            canSendReadReceipts = {
+                phantom.android.privacy.ReadReceiptPreference.allowed(
+                    context, privacyModeCoordinator.state.value.maySendReadReceipts,
+                )
+            },
             // PR-C1 (2026-05-17): voice send guard via TransportCapabilities.
             // Single source of truth: transportCapabilities.value.canSendVoice.
             // Voice is allowed ONLY on WsActive + no Tor. Limited realtime
@@ -3385,6 +3404,8 @@ class AppContainer(private val context: Context) {
         )
         cm.initialize()
         callManager = cm
+        callAlertJob?.cancelAndJoin()
+        callAlertJob = phantom.android.notifications.CallNotifications.observe(context, appScope, cm.activeCall)
 
         service.onCallMessage = { payload, fromPubKeyHex ->
             appScope.launch {

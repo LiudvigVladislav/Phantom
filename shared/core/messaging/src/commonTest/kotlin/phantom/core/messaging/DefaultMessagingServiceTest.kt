@@ -58,6 +58,8 @@ private class FakeMessageRepository(
      * row, so a failing insert produced a lying enqueue event.
      */
     val insertMessageException: Throwable? = null,
+    val persistStatusUpdates: Boolean = false,
+    val beforeInsert: suspend (MessageEntity) -> Unit = {},
 ) : MessageRepository {
     val messages = mutableListOf<MessageEntity>()
     val statusUpdates = mutableMapOf<String, MessageStatus>()
@@ -72,12 +74,17 @@ private class FakeMessageRepository(
         messages.firstOrNull { it.id == id }
 
     override suspend fun insertMessage(entity: MessageEntity) {
+        beforeInsert(entity)
         insertMessageException?.let { throw it }
         if (messages.any { it.id == entity.id }) return
         messages += entity
     }
     override suspend fun updateStatus(messageId: String, status: MessageStatus) {
         statusUpdates[messageId] = status
+        if (persistStatusUpdates) {
+            val index = messages.indexOfFirst { it.id == messageId }
+            if (index >= 0) messages[index] = messages[index].copy(status = status)
+        }
     }
     override suspend fun replaceMessage(entity: MessageEntity) {
         // residual N1 Revision 4: in-place envelope rewrite, never a delete.
@@ -1777,6 +1784,8 @@ class DefaultMessagingServiceTest {
         pendingRatchetStateRepository: phantom.core.storage.PendingRatchetStateRepository? = null,
         sessionTransactionRepository: phantom.core.storage.SessionTransactionRepository? = null,
         nowMsProvider: () -> Long = { Clock.System.now().toEpochMilliseconds() },
+        canSendReadReceipts: () -> Boolean = { true },
+        localDeletionRepository: phantom.core.storage.LocalConversationDeletionRepository? = null,
     ): DefaultMessagingService {
         // sendMessage paths reach SealedSender.seal which uses libsodium.
         // On JVM the lib is loaded via JNA; calling Box.keypair() before
@@ -1839,7 +1848,195 @@ class DefaultMessagingServiceTest {
             pendingRatchetStateRepository = pendingRatchetStateRepository,
             sessionTransactionRepository = sessionTransactionRepository,
             nowMsProvider = nowMsProvider,
+            canSendReadReceipts = canSendReadReceipts,
+            localDeletionRepository = localDeletionRepository,
         )
+    }
+
+    @Test
+    fun own_send_cannot_recreate_locally_deleted_contact() = runTest {
+        val conversations = FakeConversationRepository()
+        conversations.upsertConversation(ConversationEntity("conv-1", "peer", "ccdd", null, null, 0))
+        val messages = FakeMessageRepository()
+        val transport = FakeRelayTransport()
+        val deletion = object : phantom.core.storage.LocalConversationDeletionRepository {
+            override suspend fun deleteIfIdle(conversationId: String): List<phantom.core.storage.LocalVoiceFile> {
+                conversations.deleteConversation(conversationId)
+                return emptyList()
+            }
+            override suspend fun referencedVoiceFiles(): Set<String> = emptySet()
+        }
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations, transport = transport,
+            localDeletionRepository = deletion,
+        )
+
+        assertTrue(service.deleteConversationLocally("conv-1").isSuccess)
+
+        val result = service.sendMessage(
+            OutgoingMessage("new-after-delete", "conv-1", "ccdd", "Hello again"),
+        )
+
+        assertTrue(result.isFailure)
+        assertTrue(messages.messages.isEmpty())
+        assertNull(conversations.getConversation("conv-1"))
+        assertTrue(transport.sent.isEmpty())
+
+        val restartedService = buildService(
+            this, msgRepo = messages, convRepo = conversations, transport = transport,
+            localDeletionRepository = deletion,
+        )
+        assertTrue(restartedService.sendMessage(
+            OutgoingMessage("after-restart", "conv-1", "ccdd", "Still deleted"),
+        ).isFailure)
+        assertTrue(transport.sent.isEmpty())
+
+        conversations.upsertConversation(
+            ConversationEntity("conv-1", "peer", "ccdd", null, null, 0, trustTier = phantom.core.storage.TrustTier.REQUEST)
+        )
+        assertTrue(restartedService.sendMessage(OutgoingMessage("before-accept", "conv-1", "ccdd", "Not yet")).isFailure)
+        assertTrue(messages.messages.isEmpty())
+        assertTrue(transport.sent.isEmpty())
+
+        conversations.upsertConversation(ConversationEntity("conv-1", "peer", "ccdd", null, null, 0))
+        assertTrue(restartedService.sendMessage(OutgoingMessage("after-readd", "conv-1", "ccdd", "Hello again")).isSuccess)
+    }
+
+    @Test
+    fun incoming_message_recreates_locally_deleted_conversation_before_message_insert() = runTest {
+        val conversations = FakeConversationRepository()
+        val messages = FakeMessageRepository(beforeInsert = { row ->
+            assertNotNull(conversations.getConversation(row.conversationId))
+        })
+        val transport = FakeRelayTransport()
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations,
+            transport = transport, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+
+        transport.deliver(r18TextEnvelope("fresh-after-delete", "Welcome back"))
+        testScheduler.runCurrent()
+
+        assertEquals("fresh-after-delete", messages.messages.single().id)
+        assertEquals(false, conversations.getConversation("aabb_ccdd")?.blocked)
+        assertTrue("fresh-after-delete" in transport.ackedDelivers)
+    }
+
+    @Test
+    fun local_deletion_waits_for_outbound_send_before_removing_conversation() = runTest {
+        val conversations = FakeConversationRepository()
+        conversations.upsertConversation(
+            ConversationEntity("conv-1", "peer", "ccdd", null, null, 0),
+        )
+        val messages = FakeMessageRepository()
+        val sendEntered = CompletableDeferred<Unit>()
+        val releaseSend = CompletableDeferred<Unit>()
+        val transport = FakeRelayTransport().apply {
+            beforeSend = { sendEntered.complete(Unit); releaseSend.await() }
+        }
+        var deletionReached = false
+        val deletion = object : phantom.core.storage.LocalConversationDeletionRepository {
+            override suspend fun deleteIfIdle(conversationId: String): List<phantom.core.storage.LocalVoiceFile> {
+                deletionReached = true
+                messages.deleteMessagesForConversation(conversationId)
+                conversations.deleteConversation(conversationId)
+                return emptyList()
+            }
+            override suspend fun referencedVoiceFiles(): Set<String> = emptySet()
+        }
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations,
+            transport = transport, localDeletionRepository = deletion,
+        )
+        val send = backgroundScope.launch {
+            assertTrue(service.sendMessage(OutgoingMessage("in-flight", "conv-1", "ccdd", "hello")).isSuccess)
+        }
+        sendEntered.await()
+        val delete = backgroundScope.launch { assertTrue(service.deleteConversationLocally("conv-1").isSuccess) }
+        testScheduler.runCurrent()
+        assertFalse(deletionReached)
+        assertNotNull(conversations.getConversation("conv-1"))
+
+        releaseSend.complete(Unit)
+        send.join()
+        delete.join()
+        assertTrue(deletionReached)
+        assertNull(conversations.getConversation("conv-1"))
+        assertTrue(messages.messages.isEmpty())
+    }
+
+    @Test
+    fun local_deletion_waits_for_inbound_commit_before_removing_conversation() = runTest {
+        val conversations = FakeConversationRepository()
+        val insertEntered = CompletableDeferred<Unit>()
+        val releaseInsert = CompletableDeferred<Unit>()
+        val messages = FakeMessageRepository(beforeInsert = {
+            insertEntered.complete(Unit)
+            releaseInsert.await()
+        })
+        val transport = FakeRelayTransport()
+        var deletionReached = false
+        val deletion = object : phantom.core.storage.LocalConversationDeletionRepository {
+            override suspend fun deleteIfIdle(conversationId: String): List<phantom.core.storage.LocalVoiceFile> {
+                deletionReached = true
+                messages.deleteMessagesForConversation(conversationId)
+                conversations.deleteConversation(conversationId)
+                return emptyList()
+            }
+            override suspend fun referencedVoiceFiles(): Set<String> = emptySet()
+        }
+        val service = buildService(
+            this, msgRepo = messages, convRepo = conversations, transport = transport,
+            localDeletionRepository = deletion, scope = backgroundScope,
+        )
+        service.startReceiving()
+        testScheduler.runCurrent()
+        transport.deliver(r18TextEnvelope("inbound-in-flight", "hello"))
+        insertEntered.await()
+        val delete = backgroundScope.launch { assertTrue(service.deleteConversationLocally("aabb_ccdd").isSuccess) }
+        testScheduler.runCurrent()
+        assertFalse(deletionReached)
+
+        releaseInsert.complete(Unit)
+        delete.join()
+        assertTrue("inbound-in-flight" in transport.ackedDelivers)
+        assertTrue(deletionReached)
+        assertNull(conversations.getConversation("aabb_ccdd"))
+        assertTrue(messages.messages.isEmpty())
+    }
+
+    @Test
+    fun clear_history_and_delete_contact_take_distinct_guarded_paths() = runTest {
+        val conversations = FakeConversationRepository()
+        conversations.upsertConversation(ConversationEntity("conv-1", "peer", "ccdd", null, null, 0))
+        val operations = mutableListOf<String>()
+        val deletion = object : phantom.core.storage.LocalConversationDeletionRepository {
+            override suspend fun clearHistoryIfIdle(conversationId: String): List<phantom.core.storage.LocalVoiceFile> {
+                operations += "history:$conversationId"
+                assertNotNull(conversations.getConversation(conversationId))
+                return emptyList()
+            }
+            override suspend fun deleteIfIdle(conversationId: String): List<phantom.core.storage.LocalVoiceFile> {
+                operations += "contact:$conversationId"
+                conversations.deleteConversation(conversationId)
+                return emptyList()
+            }
+            override suspend fun referencedVoiceFiles(): Set<String> = emptySet()
+        }
+        val transport = FakeRelayTransport()
+        val service = buildService(
+            this, convRepo = conversations, transport = transport, localDeletionRepository = deletion,
+        )
+
+        assertTrue(service.clearConversationHistoryLocally("conv-1").isSuccess)
+        assertNotNull(conversations.getConversation("conv-1"))
+        assertEquals(listOf("history:conv-1"), operations)
+        assertTrue(service.deleteConversationLocally("conv-1").isSuccess)
+        assertNull(conversations.getConversation("conv-1"))
+        assertEquals(listOf("history:conv-1", "contact:conv-1"), operations)
+        assertTrue(transport.sent.isEmpty(), "Local deletion must not send a peer-side delete")
     }
 
     @Test
@@ -3186,6 +3383,76 @@ class DefaultMessagingServiceTest {
     }
 
     // ── C-2: read receipts via sealed Double Ratchet pipeline ─────────────────
+
+    @Test
+    fun markConversationRead_livePolicyCannotBeOverriddenByCaller() = runTest {
+        val messages = FakeMessageRepository()
+        messages.insertMessage(MessageEntity("policy-read", "conv-1", ByteArray(0), "hello",
+            false, MessageStatus.DELIVERED, 0L))
+        val transport = FakeRelayTransport()
+        var encryptions = 0
+        val ratchet = object : DoubleRatchet by PassthroughDoubleRatchet() {
+            override fun encrypt(state: RatchetState, plaintext: ByteArray): Pair<RatchetState, EncryptedMessage> {
+                encryptions++
+                return PassthroughDoubleRatchet().encrypt(state, plaintext)
+            }
+        }
+        val service = buildService(this, msgRepo = messages, transport = transport,
+            canSendReadReceipts = { false }, ratchet = ratchet)
+        service.markConversationRead("conv-1", "ccdd", true)
+        assertTrue(transport.sent.isEmpty())
+        assertEquals(0, encryptions, "a denied receipt must not consume a ratchet step")
+        assertEquals(MessageStatus.READ, messages.statusUpdates["policy-read"])
+    }
+
+    @Test
+    fun markConversationRead_policyChangeDuringBatchDropsRemainingReceipts() = runTest {
+        var allowed = true
+        val messages = FakeMessageRepository(persistStatusUpdates = true)
+        repeat(3) { index ->
+            messages.insertMessage(MessageEntity("policy-$index", "conv-1", ByteArray(0), "hello",
+                false, MessageStatus.DELIVERED, index.toLong()))
+        }
+        val transport = FakeRelayTransport().apply { beforeSend = { allowed = false } }
+        val service = buildService(this, msgRepo = messages, transport = transport,
+            canSendReadReceipts = { allowed })
+        service.markConversationRead("conv-1", "ccdd", true)
+        assertEquals(1, transport.sent.size, "one admitted receipt; remaining receipts must be dropped")
+        repeat(3) { assertEquals(MessageStatus.READ, messages.statusUpdates["policy-$it"]) }
+        allowed = true
+        service.markConversationRead("conv-1", "ccdd", true)
+        assertEquals(1, transport.sent.size, "re-enabling must not disclose previously opened messages")
+    }
+
+    @Test
+    fun markConversationRead_policyRevokedWhileWaitingForOutboundBarrier() = runTest {
+        var allowed = true
+        val reached = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val messages = FakeMessageRepository()
+        messages.insertMessage(MessageEntity("waiting-read", "conv-1", ByteArray(0), "hello",
+            false, MessageStatus.DELIVERED, 0L))
+        val transport = FakeRelayTransport().apply {
+            beforeSend = { reached.complete(Unit); release.await() }
+        }
+        val service = buildService(this, msgRepo = messages, transport = transport,
+            canSendReadReceipts = { allowed })
+        val sending = launch { service.sendMessage(OutgoingMessage("outgoing", "conv-1", "ccdd", "hi")) }
+        try {
+            kotlinx.coroutines.withTimeout(1_000) { reached.await() }
+            val reading = launch { service.markConversationRead("conv-1", "ccdd", true) }
+            testScheduler.runCurrent()
+            assertFalse(reading.isCompleted)
+            allowed = false
+            release.complete(Unit)
+            sending.join()
+            reading.join()
+            assertEquals(1, transport.sent.size, "only the text message, no stale-policy receipt")
+            assertEquals(MessageStatus.READ, messages.statusUpdates["waiting-read"])
+        } finally {
+            release.complete(Unit)
+        }
+    }
 
     private suspend fun unreadReceiptFixture(
         testScope: TestScope,

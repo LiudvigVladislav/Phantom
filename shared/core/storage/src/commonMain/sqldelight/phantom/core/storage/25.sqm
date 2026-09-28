@@ -1,0 +1,1 @@
+ALTER TABLE conversation ADD COLUMN chat_hidden INTEGER NOT NULL DEFAULT 0;

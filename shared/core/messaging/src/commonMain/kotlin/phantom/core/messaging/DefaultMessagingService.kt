@@ -43,6 +43,8 @@ import phantom.core.storage.ConversationRepository
 import phantom.core.storage.DecryptFailedEnvelopeRepository
 import phantom.core.storage.ControlEventCommitRepository
 import phantom.core.storage.InboundCommitRepository
+import phantom.core.storage.LocalConversationBusyException
+import phantom.core.storage.LocalConversationDeletionRepository
 import phantom.core.storage.MessageEntity
 import phantom.core.storage.MessageRepository
 import phantom.core.storage.MessageStatus
@@ -423,6 +425,8 @@ class DefaultMessagingService(
      * this PR is a guard, not a delivery path.
      */
     private val canSendVoice: () -> Boolean = { true },
+    /** Rechecked under the outbound barrier; false drops receipts, never local reads. */
+    private val canSendReadReceipts: () -> Boolean = { true },
     /**
      * Durable receive-side reassembly buffer for chunked voice
      * (PR-D2b.1, 2026-05-17). When present, the 1:1 voice receive
@@ -588,6 +592,8 @@ class DefaultMessagingService(
      * named work).
      */
     private val opkNotFoundMetric: OpkNotFoundMetric? = null,
+    private val localDeletionRepository: LocalConversationDeletionRepository? = null,
+    private val voiceFileStore: VoiceFileStore? = null,
 ) : MessagingService {
 
     private val _bootstrapReady = MutableStateFlow(false)
@@ -609,6 +615,8 @@ class DefaultMessagingService(
     // (the DMS scope coroutine and any UI-triggered cancel call) reach it.
     private val voiceUploadJobsLock = Mutex()
     private val voiceUploadJobs = mutableMapOf<String, Job>()
+    private val voiceDownloadLifecycleLock = Mutex()
+    private val activeVoiceDownloads = mutableMapOf<String, Int>()
     private val USER_CANCELLED_UPLOAD = "user_cancelled_upload"
 
     init {
@@ -754,9 +762,67 @@ class DefaultMessagingService(
         }
     }
 
-    override suspend fun removeConversationMutex(conversationId: String) {
-        sessionMutexesLock.withLock { sessionMutexes.remove(conversationId) }
-        outboundMutexesLock.withLock { outboundMutexes.remove(conversationId) }
+    private suspend fun ensureIncomingConversation(
+        conversationId: String,
+        senderPubKeyHex: String,
+        senderUsername: String,
+    ) {
+        if (conversationRepository.getConversation(conversationId) != null) return
+        conversationRepository.upsertConversation(
+            ConversationEntity(
+                id = conversationId,
+                theirUsername = senderUsername.ifBlank { senderPubKeyHex.take(8) },
+                theirPublicKeyHex = senderPubKeyHex,
+                lastMessagePreview = null,
+                lastMessageAt = null,
+                unreadCount = 0,
+                trustTier = TrustTier.REQUEST,
+                blocked = false,
+            )
+        )
+    }
+
+    override suspend fun deleteConversationLocally(
+        conversationId: String,
+    ): Result<LocalConversationDeletionOutcome> = eraseLocalConversation(conversationId, removeContact = true)
+
+    override suspend fun clearConversationHistoryLocally(
+        conversationId: String,
+    ): Result<LocalConversationDeletionOutcome> = eraseLocalConversation(conversationId, removeContact = false)
+
+    private suspend fun eraseLocalConversation(
+        conversationId: String,
+        removeContact: Boolean,
+    ): Result<LocalConversationDeletionOutcome> {
+        val repository = localDeletionRepository
+            ?: return Result.failure(IllegalStateException("local deletion unavailable"))
+        return try {
+            val files = inboundDeliveryLock.withLock {
+                withOutboundPermit(conversationId) {
+                    mutexFor(conversationId).withLock {
+                        if (voiceSendInProgress.contains(conversationId)) {
+                            throw LocalConversationBusyException(LocalConversationBusyException.Reason.VOICE_UPLOAD)
+                        }
+                        voiceDownloadLifecycleLock.withLock {
+                            if ((activeVoiceDownloads[conversationId] ?: 0) > 0) {
+                                throw LocalConversationBusyException(LocalConversationBusyException.Reason.VOICE_DOWNLOAD)
+                            }
+                            if (removeContact) repository.deleteIfIdle(conversationId)
+                            else repository.clearHistoryIfIdle(conversationId)
+                        }
+                    }
+                }
+            }
+            var cleanupPending = false
+            files.forEach { file ->
+                if (voiceFileStore?.deleteStored(file.messageId, file.path) != true) cleanupPending = true
+            }
+            Result.success(LocalConversationDeletionOutcome(cleanupPending))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            Result.failure(failure)
+        }
     }
 
     companion object {
@@ -1948,6 +2014,12 @@ class DefaultMessagingService(
         permit: OutboundPermit,
     ): Result<Unit> = runCatching {
         permit.requireConversation(message.conversationId)
+        val existingConversation = conversationRepository.getConversation(message.conversationId)
+        if (localDeletionRepository != null) {
+            check(existingConversation?.trustTier == TrustTier.TRUSTED) {
+                "sendMessage: contact must be added or accepted before sending"
+            }
+        }
         // PR-G1 (2026-05-12): trace entry. Pair with `SEND_TRACE` lines in
         // encryptUnderLock to localise where a delayed first-send blocks.
         val convTag = message.conversationId.take(12)
@@ -2001,6 +2073,21 @@ class DefaultMessagingService(
         // the common fail-closed outbound barrier used by every control path.
         check(settleAndDrainOutbox(permit, message.recipientPublicKeyHex)) {
             "outbox_unsettled conv=$convTag: predecessors could not be settled and drained"
+        }
+
+        if (existingConversation == null) {
+            conversationRepository.upsertConversation(
+                ConversationEntity(
+                    id = message.conversationId,
+                    theirUsername = message.recipientPublicKeyHex.take(8),
+                    theirPublicKeyHex = message.recipientPublicKeyHex,
+                    lastMessagePreview = null,
+                    lastMessageAt = null,
+                    unreadCount = 0,
+                    trustTier = TrustTier.TRUSTED,
+                    blocked = false,
+                )
+            )
         }
 
         try {
@@ -2239,6 +2326,9 @@ class DefaultMessagingService(
         // ── Legacy audio_chunk path (kept for tests + backward compat) ──────────
         return withOutboundPermit(conversationId) { permit ->
             runCatching {
+                check(conversationRepository.getConversation(conversationId) != null) {
+                    "sendAudio: conversation was removed before voice send"
+                }
                 val recipientPublicKeyHex = conv.theirPublicKeyHex
                 check(settleAndDrainOutbox(permit, recipientPublicKeyHex)) {
                     "outbox_unsettled conv=${conversationId.take(12)} before legacy audio"
@@ -2386,17 +2476,6 @@ class DefaultMessagingService(
         val sender = voiceV2Sender!! // safe: caller already null-checked
         val recipientPublicKeyHex = conv.theirPublicKeyHex
 
-        // Step 1 — In-progress guard
-        val alreadyInProgress = mutexFor(conversationId).withLock {
-            if (voiceSendInProgress.contains(conversationId)) true
-            else { voiceSendInProgress.add(conversationId); false }
-        }
-        if (alreadyInProgress) {
-            return Result.failure(IllegalStateException(
-                "A voice message is still uploading. Please wait."
-            ))
-        }
-
         val insertedAtMs = Clock.System.now().toEpochMilliseconds()
         val outgoingTimerSecs = conversationRepository.getDisappearingTimer(conversationId)
         val outgoingExpiresAtMs = if (outgoingTimerSecs > 0L) insertedAtMs + outgoingTimerSecs * 1_000L else null
@@ -2404,21 +2483,34 @@ class DefaultMessagingService(
         // Step 2 — Local row INSERT (QUEUED). Q1: sender stores Base64 for self-contained playback.
         val localMsgId = uuid4().toString()
         val fullBase64 = Base64.encode(audioBytes)
-        messageRepository.insertMessage(
-            MessageEntity(
-                id             = localMsgId,
-                conversationId = conversationId,
-                ciphertext     = ByteArray(0),
-                plaintextCache = "[AUDIO:$fullBase64]",
-                sent           = true,
-                status         = MessageStatus.QUEUED,
-                createdAt      = insertedAtMs,
-                expiresAtMs    = outgoingExpiresAtMs,
-            )
-        )
-
-        // Step 3 — Status → UPLOADING
-        messageRepository.updateStatus(localMsgId, MessageStatus.UPLOADING)
+        try {
+            mutexFor(conversationId).withLock {
+                check(conversationRepository.getConversation(conversationId) != null) {
+                    "sendAudio: conversation was removed before voice upload"
+                }
+                check(!voiceSendInProgress.contains(conversationId)) {
+                    "A voice message is still uploading. Please wait."
+                }
+                messageRepository.insertMessage(
+                    MessageEntity(
+                        id             = localMsgId,
+                        conversationId = conversationId,
+                        ciphertext     = ByteArray(0),
+                        plaintextCache = "[AUDIO:$fullBase64]",
+                        sent           = true,
+                        status         = MessageStatus.QUEUED,
+                        createdAt      = insertedAtMs,
+                        expiresAtMs    = outgoingExpiresAtMs,
+                    )
+                )
+                messageRepository.updateStatus(localMsgId, MessageStatus.UPLOADING)
+                voiceSendInProgress.add(conversationId)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            return Result.failure(failure)
+        }
 
         // Steps 4–7 launched on the DMS-injected appScope so the upload survives
         // UI lifecycle changes (MB8, Test #58). The caller (ChatScreen viewModelScope
@@ -2762,16 +2854,18 @@ class DefaultMessagingService(
                         MessagingLogLevel.INFO,
                         "VOICE_RX finalizer_resume voiceId=${rv.voiceId.take(8)} total=${rv.total}",
                     )
-                    assembleAndDispatch1to1Voice(
-                        voiceId = rv.voiceId,
-                        conversationId = rv.conversationId,
-                        senderPubKeyHex = rv.senderPubKeyHex,
-                        senderUsername = "",
-                        mimeType = rv.mimeType,
-                        durationMs = rv.durationMs,
-                        nowMs = nowMs,
-                        origin = "finalizer",
-                    )
+                    inboundDeliveryLock.withLock {
+                        assembleAndDispatch1to1Voice(
+                            voiceId = rv.voiceId,
+                            conversationId = rv.conversationId,
+                            senderPubKeyHex = rv.senderPubKeyHex,
+                            senderUsername = "",
+                            mimeType = rv.mimeType,
+                            durationMs = rv.durationMs,
+                            nowMs = nowMs,
+                            origin = "finalizer",
+                        )
+                    }
                 }
                 messagingLog(
                     MessagingLogLevel.INFO,
@@ -2978,6 +3072,7 @@ class DefaultMessagingService(
             "VOICE_RX message_insert_start voiceId=${voiceId.take(8)} bytes=${assembled.size} source=$origin",
         )
         val inserted = runCatching {
+            ensureIncomingConversation(conversationId, senderPubKeyHex, senderUsername)
             messageRepository.insertMessage(
                 MessageEntity(
                     id = voiceId,
@@ -4947,6 +5042,7 @@ class DefaultMessagingService(
                             "VOICE_RX message_insert_start chunkId=${chunkId.take(8)} messageId=${deliver.messageId.take(8)} bytes=${complete.size}",
                         )
                         runCatching {
+                            ensureIncomingConversation(conversationId, senderPubKeyHex, payload.senderUsername)
                             messageRepository.insertMessage(
                                 MessageEntity(
                                     id = deliver.messageId,
@@ -5393,6 +5489,7 @@ class DefaultMessagingService(
                         nowMs = Clock.System.now().toEpochMilliseconds(),
                     )
                 } else {
+                    ensureIncomingConversation(conversationId, senderPubKeyHex, payload.senderUsername)
                     messageRepository.insertMessage(inboundRow)
                     processedEnvelopeRepository?.markProcessed(
                         envelopeId = deliver.messageId,
@@ -5699,11 +5796,15 @@ class DefaultMessagingService(
     ): Result<Unit> {
         val result = runCatching {
             permit.requireConversation(conversationId)
+            if (payload.type == MessagePayload.TYPE_READ_RECEIPT && !canSendReadReceipts()) return@runCatching
             if (!settleAndDrainOutbox(permit, theirPublicKeyHex)) {
                 throw OutboundNotAttemptedException(
                     "outbound barrier refused ${payload.type} for ${conversationId.take(12)}",
                 )
             }
+            // Settlement may suspend. Re-read the policy before admitting a new
+            // ratchet step; already admitted receipts cannot be recalled.
+            if (payload.type == MessagePayload.TYPE_READ_RECEIPT && !canSendReadReceipts()) return@runCatching
             val sealedSender = try {
                 Base64.encode(sealSender(identity.publicKeyHex, hexToBytes(theirPublicKeyHex)))
             } catch (cancelled: CancellationException) {
@@ -5763,7 +5864,7 @@ class DefaultMessagingService(
         // Do not reset it again after network suspension: new messages may arrive.
         conversationRepository.resetUnread(conversationId)
         unreadMessages.forEach { msg ->
-            if (sendReceipt) {
+            if (sendReceipt && canSendReadReceipts()) {
                 // C-2: route the read receipt through the sealed Double Ratchet
                 // pipeline. The relay sees just another sealed envelope — no
                 // `from`, `to`, or `messageId` in plaintext.
@@ -7026,6 +7127,7 @@ class DefaultMessagingService(
         // Step 3 — Insert local message row (DOWNLOADING)
         val timerSecs = conversationRepository.getDisappearingTimer(conversationId)
         val expiresAtMs = if (timerSecs > 0L) nowMs + timerSecs * 1_000L else null
+        ensureIncomingConversation(conversationId, senderPubKeyHex, senderUsername)
         messageRepository.insertMessage(
             MessageEntity(
                 id             = manifest.mediaId, // stable PK mirrors D2b.1 voiceId pattern
@@ -7147,8 +7249,15 @@ class DefaultMessagingService(
      * in TransportCapabilitiesResolver (separate Commit 5 step per design §8).
      */
     internal open suspend fun runVoiceV2DownloadTask(mediaId: String) {
+        val trackedConversation = voiceDownloadLifecycleLock.withLock {
+            voiceV2DownloadRepository?.find(mediaId)?.conversationId?.also { conversationId ->
+                activeVoiceDownloads[conversationId] = (activeVoiceDownloads[conversationId] ?: 0) + 1
+            }
+        }
+        if (voiceV2DownloadRepository != null && trackedConversation == null) return
         try {
-            voiceV2DownloadOrchestrator?.runDownloadTask(
+            try {
+                voiceV2DownloadOrchestrator?.runDownloadTask(
                 mediaId = mediaId,
                 onChunkDownloaded = { received, total ->
                     // Receiver row PK == mediaId (see handleVoiceV2Manifest insert path).
@@ -7159,10 +7268,10 @@ class DefaultMessagingService(
                         direction = MediaProgressBus.Direction.DOWNLOAD,
                     )
                 },
-            )
-        } finally {
-            mediaProgressBus.clear(mediaId)
-        }
+                )
+            } finally {
+                mediaProgressBus.clear(mediaId)
+            }
         // R5-1 — UI/state propagation after download completes.
         // The orchestrator updated `plaintextCache` to `[AUDIO_LOCAL:<path>]` and
         // set status=DELIVERED in the DB, but ChatScreen observes the
@@ -7185,10 +7294,21 @@ class DefaultMessagingService(
                 receivedAt         = Clock.System.now().toEpochMilliseconds(),
             )
         )
-        messagingLog(
+            messagingLog(
             MessagingLogLevel.INFO,
             "MEDIA_RX message_ready mediaId=${mediaId.take(8)} path=AUDIO_LOCAL",
-        )
+            )
+        } finally {
+            if (trackedConversation != null) {
+                withContext(NonCancellable) {
+                    voiceDownloadLifecycleLock.withLock {
+                        val remaining = (activeVoiceDownloads[trackedConversation] ?: 1) - 1
+                        if (remaining == 0) activeVoiceDownloads.remove(trackedConversation)
+                        else activeVoiceDownloads[trackedConversation] = remaining
+                    }
+                }
+            }
+        }
     }
 }
 

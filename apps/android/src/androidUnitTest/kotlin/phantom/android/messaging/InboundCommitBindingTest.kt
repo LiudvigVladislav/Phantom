@@ -154,7 +154,7 @@ class InboundCommitBindingTest {
             pending("ambiguous"); reserve("two", "ambiguous"); reserve("three", "ambiguous")
             pending("different-time"); reserve("four", "different-time", 11)
             pending("initiator", "'artifacts'"); reserve("unrelated", "initiator")
-            assertEquals(25L, PhantomDatabase.Schema.version)
+            assertEquals(26L, PhantomDatabase.Schema.version)
             PhantomDatabase.Schema.migrate(driver, 22L, 23L)
             val repo = SqlDelightPendingRatchetStateRepository(PhantomDatabase(driver))
             assertEquals(PendingOpkBinding.Unknown, repo.get("missing")?.opkBinding)

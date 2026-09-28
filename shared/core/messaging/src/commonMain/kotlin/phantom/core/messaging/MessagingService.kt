@@ -23,6 +23,8 @@ class OutboundNotAttemptedException(
  */
 class OutboundSubmissionException(message: String) : IllegalStateException(message)
 
+data class LocalConversationDeletionOutcome(val mediaCleanupPending: Boolean)
+
 interface MessagingService {
     /**
      * Becomes true once the initial prekey-bundle bootstrap succeeds (or
@@ -73,13 +75,13 @@ interface MessagingService {
     // Start listening for relay messages (call after transport is connected)
     suspend fun startReceiving()
 
-    /**
-     * Release the per-conversation [kotlinx.coroutines.sync.Mutex] entry held for
-     * [conversationId]. Call this whenever a conversation is permanently deleted so
-     * the entry is not retained in the session-mutex map indefinitely.
-     * Default is a no-op; [DefaultMessagingService] overrides.
-     */
-    suspend fun removeConversationMutex(conversationId: String) {}
+    /** Removes the contact and history only on this device; the peer is unaffected. */
+    suspend fun deleteConversationLocally(conversationId: String): Result<LocalConversationDeletionOutcome> =
+        Result.failure(IllegalStateException("local deletion unavailable"))
+
+    /** Removes local history but keeps the trusted contact and ratchet session. */
+    suspend fun clearConversationHistoryLocally(conversationId: String): Result<LocalConversationDeletionOutcome> =
+        Result.failure(IllegalStateException("local history clearing unavailable"))
 
     /**
      * Re-attempt every locally-stored message that's currently sitting

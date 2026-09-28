@@ -16,8 +16,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -58,7 +57,7 @@ import phantom.android.ui.designv2.components.PhantomButton
  */
 /**
  * @param reason retained purely for diagnostic side-channel
- *   (contentDescription tag, potential logging) — mini-round
+ *   (potential logging) — mini-round
  *   §P2 pin: the composable itself renders NO user-facing text
  *   that names the reason. Prior shape rendered "Reason:
  *   identity load failed" etc; architect flagged that as
@@ -82,7 +81,7 @@ internal fun OnboardingStartupErrorScreen(
             .fillMaxSize()
             .background(DesignV2Tokens.Colors.Surface)
             .padding(24.dp)
-            .semantics { contentDescription = "OnboardingStartupErrorScreen" },
+            .testTag("OnboardingStartupErrorScreen"),
         contentAlignment = Alignment.Center,
     ) {
         Column(

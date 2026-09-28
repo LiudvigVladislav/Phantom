@@ -16,6 +16,7 @@ import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import org.junit.Rule
@@ -67,15 +68,16 @@ class OnboardingV2StartupErrorScreenTest {
     }
 
     @Test
-    fun screen_has_content_description_for_semantics_pinning() {
+    fun screen_has_test_tag_without_spoken_technical_identifier() {
         composeTestRule.setContent {
             OnboardingStartupErrorScreen(
                 reason = TransientReason.LoadIdentityThrew,
                 onRetry = { },
             )
         }
-        composeTestRule.onNodeWithContentDescription("OnboardingStartupErrorScreen")
+        composeTestRule.onNodeWithTag("OnboardingStartupErrorScreen")
             .assertIsDisplayed()
+        composeTestRule.onNodeWithContentDescription("OnboardingStartupErrorScreen").assertDoesNotExist()
     }
 
     @Test

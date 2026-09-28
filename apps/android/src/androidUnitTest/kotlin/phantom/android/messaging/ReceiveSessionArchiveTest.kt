@@ -261,7 +261,7 @@ class ReceiveSessionArchiveTest {
         try {
             driver.execute(null, "CREATE TABLE ratchet_state (conversation_id TEXT PRIMARY KEY NOT NULL, state_blob TEXT NOT NULL)", 0)
             driver.execute(null, "INSERT INTO ratchet_state VALUES ('conv', 'unchanged')", 0)
-            assertEquals(25L, PhantomDatabase.Schema.version)
+            assertEquals(26L, PhantomDatabase.Schema.version)
             PhantomDatabase.Schema.migrate(driver, 24L, 25L)
             val db = PhantomDatabase(driver)
             assertEquals("unchanged", SqlDelightRatchetStateRepository(db).getRatchetState("conv"))

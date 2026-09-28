@@ -24,6 +24,13 @@ import phantom.android.notifications.PhantomNotificationManager
 
 class PhantomApplication : Application() {
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        AppLanguageStore.configurationChanged()
+        PhantomNotificationManager.createChannel(this)
+        phantom.android.notifications.CallNotifications.createChannel(this)
+    }
+
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(AppLanguageStore.localizedBaseContext(base))
     }
@@ -54,6 +61,7 @@ class PhantomApplication : Application() {
         System.loadLibrary("sqlcipher")
         // Channel must exist before the first notification — idempotent, safe to call here.
         PhantomNotificationManager.createChannel(this)
+        phantom.android.notifications.CallNotifications.createChannel(this)
         logNotificationStartupSnapshot()
         Log.d("PHANTOM_INIT", "Application onCreate — starting background init")
         initScope.launch {

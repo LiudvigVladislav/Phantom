@@ -18,6 +18,7 @@ import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import phantom.android.MainActivity
 import phantom.android.R
+import phantom.android.locale.AppLanguageStore
 
 /**
  * Local-only notification manager for PHANTOM — no Firebase, no FCM.
@@ -60,6 +61,7 @@ object PhantomNotificationManager {
      * Must be called before any [showMessageNotification] call (done in Application.onCreate).
      */
     fun createChannel(context: Context) {
+        val strings = AppLanguageStore.stringsContext(context)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             Log.i(LOG_TAG, "NOTIF channel_create_skipped reason=pre_o sdk=${Build.VERSION.SDK_INT}")
             return
@@ -68,10 +70,10 @@ object PhantomNotificationManager {
         val importance = NotificationManager.IMPORTANCE_HIGH
         val channel = NotificationChannel(
             CHANNEL_ID,
-            context.getString(R.string.notification_messages_channel_name),
+            strings.getString(R.string.notification_messages_channel_name),
             importance,
         ).apply {
-            description     = context.getString(R.string.notification_messages_channel_description)
+            description     = strings.getString(R.string.notification_messages_channel_description)
             enableVibration(true)
             enableLights(true)
             lightColor      = 0xFF00D4FF.toInt() // CyanAccent
@@ -220,7 +222,7 @@ object PhantomNotificationManager {
 
         // Inline reply action — lets users respond without opening the app
         val remoteInput = RemoteInput.Builder(KEY_REPLY_TEXT)
-            .setLabel(context.getString(R.string.notification_reply_hint))
+            .setLabel(AppLanguageStore.stringsContext(context).getString(R.string.notification_reply_hint))
             .build()
 
         val replyIntent = Intent(context, QuickReplyReceiver::class.java).apply {
@@ -237,7 +239,7 @@ object PhantomNotificationManager {
 
         val replyAction = NotificationCompat.Action.Builder(
             android.R.drawable.ic_menu_send,
-            context.getString(R.string.notification_reply_action),
+            AppLanguageStore.stringsContext(context).getString(R.string.notification_reply_action),
             replyPendingIntent,
         ).addRemoteInput(remoteInput).build()
 

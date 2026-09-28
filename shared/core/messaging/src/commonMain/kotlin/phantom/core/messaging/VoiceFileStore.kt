@@ -13,7 +13,8 @@ package phantom.core.messaging
  * The returned path is embedded in [phantom.core.storage.MessageEntity.plaintextCache]
  * as `[AUDIO_LOCAL:<path>]` so [AudioBubble] can read the file directly.
  *
- * Cleanup (delete on message delete / TTL) is out of scope for PR-M1w round 1.
+ * Local conversation deletion removes managed files; startup pruning finishes
+ * cleanup interrupted after the database transaction. Expiry cleanup is separate.
  */
 expect class VoiceFileStore {
 
@@ -27,4 +28,10 @@ expect class VoiceFileStore {
      * @return Absolute path to the written file.
      */
     suspend fun save(mediaId: String, audioBytes: ByteArray, mime: String): String
+
+    /** Refuses paths outside this app's voice directory or not owned by [mediaId]. */
+    suspend fun deleteStored(mediaId: String, path: String): Boolean
+
+    /** Removes files left behind if local-history deletion crashed after its DB commit. */
+    suspend fun pruneOrphans(referencedPaths: Set<String>): Int
 }

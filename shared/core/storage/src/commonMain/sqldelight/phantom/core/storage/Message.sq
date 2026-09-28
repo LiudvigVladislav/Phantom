@@ -16,6 +16,14 @@ CREATE TABLE message (
 getMessages:
 SELECT * FROM message WHERE conversation_id = ? ORDER BY created_at ASC;
 
+getLocalVoiceReferences:
+SELECT plaintext_cache FROM message WHERE plaintext_cache LIKE '[AUDIO_LOCAL:%]';
+
+getLatestMessages:
+SELECT * FROM message
+WHERE conversation_id = :conversationId
+AND created_at = (SELECT MAX(created_at) FROM message WHERE conversation_id = :conversationId);
+
 getMessageById:
 SELECT * FROM message WHERE id = ?;
 

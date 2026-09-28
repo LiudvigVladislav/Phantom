@@ -10,7 +10,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onFirst
-import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -65,14 +65,14 @@ class OnboardingV2RepairRequiredScreenTest {
 
     @Test
     fun screen_has_content_description_for_semantics_pinning() {
-        // Distinct contentDescription tag ("OnboardingRepairRequiredScreen")
+        // Distinct test tag ("OnboardingRepairRequiredScreen")
         // makes the screen findable from an outer integration test
         // that drives the full flow — outer test doesn't need to
         // know the exact copy text, only the semantic tag.
         composeTestRule.setContent {
             OnboardingRepairRequiredScreen(onExit = { /* ignored */ })
         }
-        composeTestRule.onNodeWithContentDescription("OnboardingRepairRequiredScreen")
+        composeTestRule.onNodeWithTag("OnboardingRepairRequiredScreen")
             .assertIsDisplayed()
     }
 
@@ -204,7 +204,7 @@ class OnboardingV2RepairRequiredIntegrationTest {
         composeTestRule.waitForIdle()
 
         // Repair screen visible.
-        composeTestRule.onNodeWithContentDescription("OnboardingRepairRequiredScreen")
+        composeTestRule.onNodeWithTag("OnboardingRepairRequiredScreen")
             .assertIsDisplayed()
         composeTestRule.onNodeWithText("Identity repair required").assertIsDisplayed()
 

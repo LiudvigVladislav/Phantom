@@ -18,6 +18,23 @@ import kotlin.test.assertEquals
 @Config(sdk = [35], application = Application::class)
 class NotificationChannelCopyTest {
     @Test
+    @Config(sdk = [32])
+    fun localeChangeRenamesExistingChannelWithoutResettingItsSettings() {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val id = PhantomNotificationManager.CHANNEL_ID
+        manager.createNotificationChannel(android.app.NotificationChannel(id, "Custom", NotificationManager.IMPORTANCE_LOW))
+        phantom.android.locale.AppLanguageStore.set(context, phantom.android.locale.AppLanguage.RUSSIAN)
+        PhantomNotificationManager.createChannel(context)
+        assertEquals("Сообщения", manager.getNotificationChannel(id).name.toString())
+        assertEquals(NotificationManager.IMPORTANCE_LOW, manager.getNotificationChannel(id).importance)
+        phantom.android.locale.AppLanguageStore.set(context, phantom.android.locale.AppLanguage.ENGLISH)
+        PhantomNotificationManager.createChannel(context)
+        assertEquals("Messages", manager.getNotificationChannel(id).name.toString())
+        assertEquals(NotificationManager.IMPORTANCE_LOW, manager.getNotificationChannel(id).importance)
+    }
+
+    @Test
     fun existingChannelIdUsesResourceBackedCopy() {
         val context = RuntimeEnvironment.getApplication()
         PhantomNotificationManager.createChannel(context)

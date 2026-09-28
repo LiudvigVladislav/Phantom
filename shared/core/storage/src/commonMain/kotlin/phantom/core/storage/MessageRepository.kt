@@ -8,6 +8,13 @@ import kotlinx.coroutines.flow.Flow
 interface MessageRepository {
     suspend fun getMessages(conversationId: String): List<MessageEntity>
 
+    /** Read-only evidence for a conversation preview; ties must remain visible to the caller. */
+    suspend fun getLatestMessages(conversationId: String): List<MessageEntity> {
+        val messages = getMessages(conversationId)
+        val latest = messages.maxOfOrNull { it.createdAt }
+        return messages.filter { it.createdAt == latest }
+    }
+
     /**
      * PR-UI-CHAT-THREAD-STATE1 (2026-05-25) — reactive message stream for a
      * conversation. Cold Flow: subscribes on collect; emits once immediately

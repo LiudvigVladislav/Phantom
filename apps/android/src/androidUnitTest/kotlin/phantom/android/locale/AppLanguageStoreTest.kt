@@ -15,6 +15,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import phantom.android.R
+import phantom.android.screens.chat.ComposerDrafts
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [32], application = Application::class)
@@ -48,6 +50,105 @@ class AppLanguageStoreTest {
         val localized = AppLanguageStore.localizedBaseContext(context)
         assertEquals("ru", localized.resources.configuration.locales.get(0).language)
         assertEquals(original, context.resources.configuration.locales.get(0).language)
+        assertEquals("Язык", localized.getString(R.string.settings_language))
+        assertEquals(AppLanguage.RUSSIAN, AppLanguageStore.effectiveLanguage(context))
+    }
+
+    @Test
+    fun switchingBackToEnglishRefreshesLongLivedRussianContexts() {
+        AppLanguageStore.set(context, AppLanguage.RUSSIAN)
+        val oldContext = AppLanguageStore.stringsContext(context)
+        val revision = AppLanguageStore.configurationChanges.value
+        AppLanguageStore.set(context, AppLanguage.ENGLISH)
+        assertTrue(AppLanguageStore.configurationChanges.value > revision)
+        assertEquals("Reply", AppLanguageStore.stringsContext(oldContext).getString(R.string.notification_reply_action))
+        assertEquals("Ответить", oldContext.getString(R.string.notification_reply_action))
+    }
+
+    @Test
+    @Config(qualifiers = "ru-rRU")
+    fun russianSystemIsAutomaticAndExplicitEnglishOverridesIt() {
+        assertEquals(AppLanguage.SYSTEM, AppLanguageStore.selected(context))
+        assertEquals(AppLanguage.RUSSIAN, AppLanguageStore.effectiveLanguage(context))
+        assertEquals("Язык", AppLanguageStore.stringsContext(context).getString(R.string.settings_language))
+        AppLanguageStore.set(context, AppLanguage.ENGLISH)
+        assertEquals(AppLanguage.ENGLISH, AppLanguageStore.effectiveLanguage(context))
+        assertEquals("Language", AppLanguageStore.stringsContext(context).getString(R.string.settings_language))
+        AppLanguageStore.set(context, AppLanguage.SYSTEM)
+        assertEquals("Язык", AppLanguageStore.stringsContext(context).getString(R.string.settings_language))
+    }
+
+    @Test
+    @Config(sdk = [32, 35], qualifiers = "en-rUS")
+    fun defaultFollowsSystemWithoutWritingAnOverrideButManualChoiceWins() {
+        assertEquals(AppLanguage.ENGLISH, AppLanguageStore.effectiveLanguage(context))
+        assertEquals(AppLanguage.SYSTEM, AppLanguageStore.selected(context))
+        assertTrue(!context.getSharedPreferences("phantom_prefs", Context.MODE_PRIVATE).contains("app_language"))
+        RuntimeEnvironment.setQualifiers("ru-rRU")
+        assertEquals(AppLanguage.RUSSIAN, AppLanguageStore.effectiveLanguage(context))
+        AppLanguageStore.set(context, AppLanguage.ENGLISH)
+        assertEquals(AppLanguage.ENGLISH, AppLanguageStore.effectiveLanguage(context))
+        RuntimeEnvironment.setQualifiers("en-rUS")
+        AppLanguageStore.set(context, AppLanguage.RUSSIAN)
+        assertEquals(AppLanguage.RUSSIAN, AppLanguageStore.effectiveLanguage(context))
+        assertEquals("Язык", AppLanguageStore.stringsContext(context).getString(R.string.settings_language))
+    }
+
+    @Test
+    @Config(sdk = [32, 35], qualifiers = "fr-rFR")
+    fun unsupportedSystemLanguageDefaultsToEnglishWithoutPersistingIt() {
+        assertEquals(AppLanguage.ENGLISH, AppLanguageStore.effectiveLanguage(context))
+        assertEquals(AppLanguage.SYSTEM, AppLanguageStore.selected(context))
+    }
+
+    @Test
+    fun russianPluralFormsAreResolvedByAndroid() {
+        AppLanguageStore.set(context, AppLanguage.RUSSIAN)
+        val resources = AppLanguageStore.stringsContext(context).resources
+        assertEquals("1 участник", resources.getQuantityString(R.plurals.group_members, 1, 1))
+        assertEquals("2 участника", resources.getQuantityString(R.plurals.group_members, 2, 2))
+        assertEquals("5 участников", resources.getQuantityString(R.plurals.group_members, 5, 5))
+        assertEquals("21 участник", resources.getQuantityString(R.plurals.group_members, 21, 21))
+    }
+
+    @Test
+    fun composerDraftsSurviveNavigationAndNeverCrossIdentityOrConversation() {
+        val owner = androidx.lifecycle.ViewModelStore()
+        val provider = androidx.lifecycle.ViewModelProvider(
+            owner, androidx.lifecycle.ViewModelProvider.NewInstanceFactory(),
+        )
+        val first = provider[ComposerDrafts::class.java].get("identity-a", "chat:a")
+        first.text.value = "Unsent / Не отправлено"
+        first.editingId.value = "edit-id"
+        val recreatedProvider = androidx.lifecycle.ViewModelProvider(
+            owner, androidx.lifecycle.ViewModelProvider.NewInstanceFactory(),
+        )
+        val resumed = recreatedProvider[ComposerDrafts::class.java].get("identity-a", "chat:a")
+        assertSame(first, resumed)
+        assertEquals("Unsent / Не отправлено", resumed.text.value)
+        assertEquals("edit-id", resumed.editingId.value)
+        assertEquals("", provider[ComposerDrafts::class.java].get("identity-a", "group:a").text.value)
+        assertEquals("", provider[ComposerDrafts::class.java].get("identity-b", "chat:a").text.value)
+        assertEquals("", provider[ComposerDrafts::class.java].get("identity-a", "chat:a").text.value)
+        owner.clear()
+    }
+
+    @Test
+    fun deletingAConversationAndClearingTheOwnerDiscardDraftReferences() {
+        val owner = androidx.lifecycle.ViewModelStore()
+        val holder = androidx.lifecycle.ViewModelProvider(
+            owner, androidx.lifecycle.ViewModelProvider.NewInstanceFactory(),
+        )[ComposerDrafts::class.java]
+        val draft = holder.get("identity", "chat:a")
+        draft.text.value = "private draft"
+        draft.editingId.value = "edit-id"
+        holder.clear("chat:a")
+        assertEquals("", draft.text.value)
+        assertEquals(null, draft.editingId.value)
+        val second = holder.get("identity", "chat:b")
+        second.text.value = "another draft"
+        owner.clear()
+        assertEquals("", second.text.value)
     }
 
     @Test

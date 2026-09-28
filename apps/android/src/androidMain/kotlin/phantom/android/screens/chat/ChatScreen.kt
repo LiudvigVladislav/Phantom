@@ -68,6 +68,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import phantom.android.R
@@ -253,7 +255,10 @@ fun ChatScreen(
         .observe(conversationId)
         .collectAsState(initial = initialSnapshot)
 
-    var inputText by remember { mutableStateOf("") }
+    val composerDraft = rememberComposerDraft(
+        container.identityState.value?.publicKeyHex, "chat:$conversationId",
+    )
+    var inputText by composerDraft.text
     // PR-UI-CHAT-THREAD-CACHE1 v1.1 — `LazyListState` keyed to `conversationId`
     // so every chat-open starts fresh at the visual bottom. With
     // `reverseLayout = true` the visual bottom = source index 0, so
@@ -369,6 +374,24 @@ fun ChatScreen(
     }
 
     var showMenu by remember { mutableStateOf(false) }
+    var showDisappearingTimer by remember { mutableStateOf(false) }
+    if (showDisappearingTimer) DisappearingTimerDialog(
+        load = { container.conversationRepo.getDisappearingTimer(conversationId) },
+        apply = { seconds ->
+            val conversation = container.conversationRepo.getConversation(conversationId)
+                ?: error("Missing conversation")
+            applyDisappearingTimer(
+                seconds,
+                setLocal = { container.conversationRepo.setDisappearingTimer(conversationId, it) },
+                send = {
+                    container.messagingService?.sendDisappearingTimerUpdate(
+                        seconds, conversationId, conversation.theirPublicKeyHex,
+                    ) ?: Result.failure(IllegalStateException("Messaging unavailable"))
+                },
+            )
+        },
+        onDismiss = { showDisappearingTimer = false },
+    )
     var showBlockDialog by remember { mutableStateOf(false) }
     var showReportDialog by remember { mutableStateOf(false) }
     val snackbarHostState = remember { androidx.compose.material3.SnackbarHostState() }
@@ -392,8 +415,8 @@ fun ChatScreen(
     }
 
     // Reply / Edit / Forward state
-    var replyToMessage by remember { mutableStateOf<MessageEntity?>(null) }
-    var editingMessage by remember { mutableStateOf<MessageEntity?>(null) }
+    var replyToMessage by composerDraft.reply
+    var editingMessage by composerDraft.editing
     // residual N1 Revision 4 — ephemeral in-flight guard for the new-message
     // send. It lives exactly as long as the screen; no persisted status and no
     // database field is involved. Its only job is that a second tap while the
@@ -877,7 +900,6 @@ fun ChatScreen(
         topBar = {
             ChatTopBar(
                 theirUsername = theirUsername,
-                isConnected = isConnected,
                 isVerified = isVerified,
                 isTyping = isContactTyping,
                 onBack = onBack,
@@ -936,6 +958,7 @@ fun ChatScreen(
                 onDismissMenu = { showMenu = false },
                 onReport = { showMenu = false; showReportDialog = true },
                 onBlock = { showMenu = false; showBlockDialog = true },
+                onDisappearingTimer = { showMenu = false; showDisappearingTimer = true },
             )
         },
         bottomBar = {
@@ -1737,10 +1760,18 @@ private fun startOfDayMillis(now: Long): Long {
 
 // ── Emoji panel ───────────────────────────────────────────────────────────────
 
-private val CATEGORY_ICONS = listOf("🙂", "🖐️", "🐱", "🍎", "⚽", "✈️", "💡", "#️⃣")
+private val CATEGORY_ICONS = listOf("🙂", "🖐️", "🐱", "🍎", "⚽", "✈️", "💡", "#️⃣", "🏳️")
+
+internal val EMOJI_CATEGORY_LABELS = mapOf(
+    "smileys" to R.string.emoji_smileys, "people" to R.string.emoji_people,
+    "animals" to R.string.emoji_animals, "food" to R.string.emoji_food,
+    "activities" to R.string.emoji_activities, "travel" to R.string.emoji_travel,
+    "objects" to R.string.emoji_objects, "symbols" to R.string.emoji_symbols,
+    "flags" to R.string.emoji_flags,
+)
 
 @Composable
-private fun EmojiPanel(onEmoji: (String) -> Unit) {
+internal fun EmojiPanel(onEmoji: (String) -> Unit) {
     var selectedCategory by remember { mutableStateOf(0) }
     var searchQuery by remember { mutableStateOf("") }
 
@@ -1800,7 +1831,7 @@ private fun EmojiPanel(onEmoji: (String) -> Unit) {
                 }
             }
             Text(
-                text = EMOJI_CATEGORIES.getOrNull(selectedCategory)?.label ?: "",
+                text = stringResource(EMOJI_CATEGORY_LABELS.getValue(EMOJI_CATEGORIES[selectedCategory].id)),
                 color = TextDim,
                 fontSize = 10.sp,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
@@ -2552,9 +2583,11 @@ private fun ActionRow(
     }
 }
 
+@Composable
 private fun formatMessageTime(millis: Long): String {
     val date = java.util.Date(millis)
-    val fmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+    val locale = androidx.compose.ui.platform.LocalConfiguration.current.locales.get(0)
+    val fmt = java.text.SimpleDateFormat("HH:mm", locale)
     return fmt.format(date)
 }
 
@@ -2692,12 +2725,13 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCheckmark(
  * tween, one playhead-bar repaint per audio tick, zero layout passes.
  */
 @Composable
-private fun AudioBubble(
+internal fun AudioBubble(
     plaintextCache: String,
     isSent: Boolean,
     timeStr: String,
     status: MessageStatus,
     context: android.content.Context,
+    showDeliveryStatus: Boolean = true,
     progress: MediaProgressBus.Progress? = null,
     // PR-MEDIA-UPLOAD-CANCEL1 — wired by the sender side only. The X
     // button on an outgoing uploading bubble routes here; the lambda owns
@@ -3006,7 +3040,7 @@ private fun AudioBubble(
                 fontSize = 10.sp,
                 color = TextDim,
             )
-            if (isSent && !isLoading) StatusIcon(status = status)
+            if (showDeliveryStatus && isSent && !isLoading) StatusIcon(status = status)
             if (isLoading) {
                 Text(
                     text = stringResource(if (isUploadingSender) R.string.chat_voice_sending else R.string.chat_voice_receiving),
@@ -3369,12 +3403,13 @@ private fun formatSpeed(speed: Float): String = when (speed) {
 // ── Input bar ─────────────────────────────────────────────────────────────────
 
 @Composable
-private fun InputBar(
+internal fun InputBar(
     text: String,
     onTextChange: (String) -> Unit,
     onEmojiToggle: () -> Unit,
     emojiPanelOpen: Boolean,
     isEditing: Boolean = false,
+    actionLabel: String? = null,
     recordingState: RecordingPanelState? = null,
     recordingDurationMs: Long = 0L,
     waveformAmplitudes: List<Float> = emptyList(),
@@ -3393,6 +3428,9 @@ private fun InputBar(
     onSend: () -> Unit,
 ) {
     val haptic = LocalHapticFeedback.current
+    val emojiLabel = stringResource(R.string.chat_emoji_action)
+    val micLabel = stringResource(R.string.chat_record_action)
+    val sendLabel = actionLabel ?: stringResource(R.string.chat_send_action)
     val density = androidx.compose.ui.platform.LocalDensity.current
     // PR-UI-REC2 — distance the finger must move up from the press-down point
     // before we transition from `Recording` to `Locked`. 60 dp is the WhatsApp /
@@ -3480,6 +3518,7 @@ private fun InputBar(
                 // swipe gesture is already arming the same outcome.
                 RecPanelControl(
                     onClick = if (isSwipeOverlayActive) ({}) else onCancelRecording,
+                    label = stringResource(R.string.chat_cancel_recording),
                     background = Color.Transparent,
                     border = false,
                 ) {
@@ -3544,6 +3583,7 @@ private fun InputBar(
                 if (!isPressHoldRecording) {
                     RecPanelControl(
                         onClick = if (isSwipeOverlayActive) ({}) else if (isLive) onPauseRecording else onResumeRecording,
+                        label = stringResource(if (isLive) R.string.chat_pause_recording else R.string.chat_resume_recording),
                         background = Surface2,
                         border = true,
                     ) {
@@ -3588,7 +3628,8 @@ private fun InputBar(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .clickable(onClick = onEmojiToggle),
+                        .clickable(onClick = onEmojiToggle)
+                        .semantics { contentDescription = emojiLabel },
                     contentAlignment = Alignment.Center,
                 ) {
                     PhIconSmile(color = TextDim, size = 22.dp)
@@ -3666,6 +3707,7 @@ private fun InputBar(
                         )
                         .clip(CircleShape)
                         .background(PhantomTokens.Colors.Cyan)
+                        .semantics { contentDescription = sendLabel }
                         .clickable(onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             Log.i("PhantomUI", "COMPOSER_ACTION send_text_clicked")
@@ -3710,6 +3752,7 @@ private fun InputBar(
                         .size(micBoxSize)
                         .clip(CircleShape)
                         .background(if (isSendVoiceVisual) PhantomTokens.Colors.Cyan else Color.Transparent)
+                        .semantics { contentDescription = if (isSendVoiceVisual) sendLabel else micLabel }
                         .pointerInput(Unit) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -4139,6 +4182,7 @@ private fun LockHintChip() {
 @Composable
 private fun RecPanelControl(
     onClick: () -> Unit,
+    label: String,
     background: Color,
     border: Boolean,
     content: @Composable () -> Unit,
@@ -4152,7 +4196,8 @@ private fun RecPanelControl(
                 if (border) Modifier.border(1.dp, BorderSubtle, CircleShape)
                 else Modifier
             )
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
         content()
@@ -4463,7 +4508,7 @@ private fun RecPanelSwipeZone(
 
 // ── Recording helper ──────────────────────────────────────────────────────────
 
-private fun startChatRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
+internal fun startChatRecording(context: android.content.Context): Pair<java.io.File, android.media.MediaRecorder> {
     // PR-M2a: voice-note codec profile (was music-grade in PR-D2a).
     //   OPUS @ 16 kHz mono 24 kbps  (API 29+, primary)
     //   AAC_ELD @ 16 kHz mono 24 kbps  (API 26-28 fallback; AAC-LD is voice-optimised)
@@ -4489,7 +4534,9 @@ private fun startChatRecording(context: android.content.Context): Pair<java.io.F
     val mime = if (useOpus) "audio/ogg" else "audio/m4a"
 
     @Suppress("DEPRECATION")
-    val recorder = android.media.MediaRecorder().apply {
+    val recorder = android.media.MediaRecorder()
+    try {
+      recorder.apply {
         setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
         if (useOpus) {
             setOutputFormat(android.media.MediaRecorder.OutputFormat.OGG)
@@ -4512,6 +4559,11 @@ private fun startChatRecording(context: android.content.Context): Pair<java.io.F
         setOutputFile(file.absolutePath)
         prepare()
         start()
+      }
+    } catch (error: Exception) {
+        runCatching { recorder.release() }
+        file.delete()
+        throw error
     }
     // Diagnostic log: confirms the recorder actually applied the chosen profile
     // rather than silently defaulting to something else. PR-M2a Test #62
@@ -4674,9 +4726,8 @@ private val CircleShape = RoundedCornerShape(50)
 // ── Chat top bar ──────────────────────────────────────────────────────────────
 
 @Composable
-private fun ChatTopBar(
+internal fun ChatTopBar(
     theirUsername: String,
-    isConnected: Boolean,
     isVerified: Boolean = false,
     isTyping: Boolean = false,
     onBack: () -> Unit,
@@ -4687,7 +4738,9 @@ private fun ChatTopBar(
     onDismissMenu: () -> Unit,
     onReport: () -> Unit,
     onBlock: () -> Unit,
+    onDisappearingTimer: () -> Unit,
 ) {
+    val moreLabel = stringResource(R.string.chat_more_actions)
     // PHANTOM_FULL_COMPOSE §05 layout:
     //   [← back] [Avatar 36dp] [name + @username] [Phone] [MoreHoriz]
     // 56dp height, BorderSubtle bottom hairline.
@@ -4720,7 +4773,8 @@ private fun ChatTopBar(
                 GradientAvatar(
                     name = theirUsername,
                     size = 36.dp,
-                    online = if (isConnected) true else null,
+                    // Our relay connection does not establish the peer's presence.
+                    online = null,
                     verified = isVerified,
                 )
             }
@@ -4765,27 +4819,6 @@ private fun ChatTopBar(
                         fontSize = 11.sp,
                         fontFamily = PhantomFontMono,
                     )
-                } else if (isConnected) {
-                    // Online state row per FULL_COMPOSE §05: 5dp Success
-                    // dot + mono "online" label. Falls back to the @handle
-                    // line when the transport is offline so the user always
-                    // sees something meaningful below the name.
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(5.dp)
-                                .clip(CircleShape)
-                                .background(Success),
-                        )
-                        Spacer(Modifier.width(5.dp))
-                        Text(
-                            text = stringResource(R.string.chat_online),
-                            color = PhantomTokens.Colors.TextTertiary.copy(alpha = 0.65f),
-                            fontSize = 10.sp,
-                            fontFamily = PhantomFontMono,
-                            letterSpacing = 0.4.sp,
-                        )
-                    }
                 } else {
                     Text(
                         text = "@$theirUsername",
@@ -4805,7 +4838,7 @@ private fun ChatTopBar(
                 PhIconPhone(color = PhantomTokens.Colors.TextSecondary, size = 20.dp)
             }
             Box {
-                IconButton(onClick = onMoreMenu, modifier = Modifier.size(40.dp)) {
+                IconButton(onClick = onMoreMenu, modifier = Modifier.size(40.dp).semantics { contentDescription = moreLabel }) {
                     PhIconMoreHoriz(color = PhantomTokens.Colors.TextSecondary, size = 18.dp)
                 }
                 DropdownMenu(
@@ -4813,6 +4846,10 @@ private fun ChatTopBar(
                     onDismissRequest = onDismissMenu,
                     containerColor = Surface2,
                 ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.contact_profile_disappearing_messages), color = TextPrimary, fontSize = 14.sp) },
+                        onClick = onDisappearingTimer,
+                    )
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.chat_report), color = TextPrimary, fontSize = 14.sp) },
                         onClick = onReport,
