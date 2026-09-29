@@ -11,13 +11,11 @@
   "//":   "on the VPS via deploy/xray/render-config.sh and mount that into",
   "//":   "the container read-only.",
 
-  "//": "Path A architecture: VLESS clients are routed to relay.phntm.pro,",
-  "//": "which is the Caddy container on the SAME VPS. We resolve that name",
-  "//": "to the docker container directly (DNS hosts override below) instead",
-  "//": "of going via the public IP and relying on NAT hairpin — hairpin is",
-  "//": "kernel-version-dependent on Linux and silently hangs the connection",
-  "//": "when it doesn't work. Resolving to `caddy` (the docker-compose",
-  "//": "service name, reachable via the bridge network DNS) is deterministic.",
+  "//": "Path A architecture: VLESS clients are routed to relay.phntm.pro.",
+  "//": "Xray 26.9.9 blocks private destinations from VLESS by default.",
+  "//": "The pinned public relay IP below avoids a broad private-network",
+  "//": "exception. The local hairpin path was verified on this VPS before",
+  "//": "deployment; recheck it after host networking changes.",
 
   "log": {
     "loglevel": "warning",
@@ -30,15 +28,10 @@
   },
 
   "dns": {
-    "//": "Force `relay.phntm.pro` to resolve to the docker-compose service",
-    "//": "named `caddy` on the internal bridge network, so the freedom",
-    "//": "outbound below opens a TCP connection straight to the Caddy",
-    "//": "container instead of egressing to the host's public IP and",
-    "//": "depending on NAT hairpin to come back. `caddy` resolves via the",
-    "//": "bridge network's embedded DNS as long as the xray container",
-    "//": "shares the `phantom-internal` network (it does — see compose).",
+    "//": "Pin the same public endpoint as OperatorXrayConfig.SERVER_HOST.",
+    "//": "The finalRules below permit this IP on TCP/443 and block all else.",
     "hosts": {
-      "relay.phntm.pro": "caddy"
+      "relay.phntm.pro": "65.108.154.152"
     }
   },
 
@@ -103,7 +96,16 @@
       "//": "this, freedom would defer name resolution to the kernel which",
       "//": "ignores Xray's hosts map.",
       "settings": {
-        "domainStrategy": "UseIP"
+        "domainStrategy": "UseIP",
+        "finalRules": [
+          {
+            "action": "allow",
+            "network": "tcp",
+            "port": "443",
+            "ip": ["65.108.154.152/32"]
+          },
+          { "action": "block" }
+        ]
       }
     },
     { "tag": "block",  "protocol": "blackhole" }
