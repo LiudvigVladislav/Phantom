@@ -87,9 +87,16 @@ not the older `test -config`):
 
 ```sh
 docker run --rm -v "$(pwd)/config.json:/etc/xray/config.json:ro" \
-    ghcr.io/xtls/xray-core:latest run -test -c /etc/xray/config.json
+    ghcr.io/xtls/xray-core:26.9.9@sha256:45338c4df61fda061c47ce62aafda6c5d7d59cbdefc33f2e335d8b0c748b748a run -test -c /etc/xray/config.json
 # Expect: exit code 0 and a "Configuration OK." line in the output
 ```
+
+The pinned public relay IP in `config.json.template` must match
+`OperatorXrayConfig.SERVER_HOST`. Xray 26.9.9 blocks private destinations
+from VLESS by default; the outbound allows only that IP on TCP/443 and blocks
+other targets. Before a host-networking change, verify the relay health
+through an authenticated REALITY client. A syntax-only healthcheck cannot
+detect a broken local hairpin route.
 
 ---
 

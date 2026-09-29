@@ -408,7 +408,8 @@ services:
   # Xray source files modified). Same posture as v2rayNG / Hiddify.
   # ──────────────────────────────────────────────────────────────────────
   xray:
-    image: ghcr.io/xtls/xray-core:latest
+    # 26.3.27 rejects the current Microsoft TLS certificate record (8273 > 8192 bytes).
+    image: ghcr.io/xtls/xray-core:26.9.9@sha256:45338c4df61fda061c47ce62aafda6c5d7d59cbdefc33f2e335d8b0c748b748a
     container_name: phantom-xray
     restart: unless-stopped
     # Override the image's default CMD (which runs `xray -confdir
